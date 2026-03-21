@@ -1,0 +1,37 @@
+{
+  "name": "@torkbot/sledge",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A SQLite-backed event and work engine that stays consistent across retries, restarts, and failures.",
+  "exports": {
+    "./ledger": "./src/ledger/ledger.ts",
+    "./database-ledger-engine": "./src/ledger/database-ledger-engine.ts",
+    "./better-sqlite3-ledger": "./src/ledger/better-sqlite3-ledger.ts",
+    "./turso-ledger": "./src/ledger/turso-ledger.ts",
+    "./runtime/contracts": "./src/runtime/contracts.ts",
+    "./runtime/virtual-runtime": "./src/runtime/virtual-runtime.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test src/**/*.test.ts",
+    "typecheck": "tsc --noEmit --pretty",
+    "lint": "prettier -c ."
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.48",
+    "@tursodatabase/database": "^0.5.1",
+    "better-sqlite3": "^12.6.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.12.0",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
