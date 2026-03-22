@@ -547,3 +547,54 @@ test("resumeEvents continues from opaque cursor", async () => {
     });
   });
 });
+
+test("tail iterator return stops stream without external abort", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: () => {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("message.received", { id: 1 });
+
+  const iterator = ledger
+    .tailEvents({
+      last: 1,
+      signal: AbortSignal.timeout(30_000),
+    })
+    [Symbol.asyncIterator]();
+
+  const first = await nextWithTimeout(iterator);
+  assert.equal(first.done, false);
+
+  if (iterator.return === undefined) {
+    throw new Error("expected iterator.return to exist");
+  }
+
+  const closed = await iterator.return();
+  assert.equal(closed.done, true);
+
+  const done = await nextWithTimeout(iterator);
+  assert.equal(done.done, true);
+});

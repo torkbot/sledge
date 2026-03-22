@@ -842,6 +842,58 @@ function openDatabaseLedgerEngine<
     return decodeRow(row, EventIdRowSchema).event_id;
   }
 
+  function createManagedStreamIterator(input: {
+    createIterator(
+      signal: AbortSignal,
+    ): AsyncIterator<LedgerStreamEvent<TEvents>>;
+    externalSignal: AbortSignal;
+    closeReason: string;
+  }): AsyncIterableIterator<LedgerStreamEvent<TEvents>> {
+    const localController = new AbortController();
+    const streamSignal = AbortSignal.any([
+      input.externalSignal,
+      localController.signal,
+    ]);
+
+    const iterator = input.createIterator(streamSignal);
+
+    return {
+      next: async () => {
+        return await iterator.next();
+      },
+      return: async () => {
+        if (!localController.signal.aborted) {
+          localController.abort(new Error(input.closeReason));
+        }
+
+        if (iterator.return === undefined) {
+          return {
+            done: true,
+            value: undefined,
+          };
+        }
+
+        return await iterator.return();
+      },
+      throw: async (error: unknown) => {
+        if (!localController.signal.aborted) {
+          localController.abort(
+            error instanceof Error ? error : new Error(input.closeReason),
+          );
+        }
+
+        if (iterator.throw === undefined) {
+          throw error;
+        }
+
+        return await iterator.throw(error);
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  }
+
   async function* streamEventsFromAfterEventId(input: {
     readonly afterEventId: number;
     readonly signal: AbortSignal;
@@ -1453,13 +1505,13 @@ function openDatabaseLedgerEngine<
         );
       }
 
-      return {
-        async *[Symbol.asyncIterator](): AsyncIterator<
+      const createIterator = (streamSignal: AbortSignal) => {
+        const iterate = async function* (): AsyncIterable<
           LedgerStreamEvent<TEvents>
         > {
           await startup;
 
-          if (signal.aborted || closed) {
+          if (streamSignal.aborted || closed) {
             return;
           }
 
@@ -1469,7 +1521,7 @@ function openDatabaseLedgerEngine<
           const historicalEvents = await readLastEvents(last);
 
           for (const event of historicalEvents) {
-            if (signal.aborted || closed) {
+            if (streamSignal.aborted || closed) {
               return;
             }
 
@@ -1483,7 +1535,19 @@ function openDatabaseLedgerEngine<
 
           yield* streamEventsFromAfterEventId({
             afterEventId,
-            signal,
+            signal: streamSignal,
+          });
+        };
+
+        return iterate()[Symbol.asyncIterator]();
+      };
+
+      return {
+        [Symbol.asyncIterator](): AsyncIterator<LedgerStreamEvent<TEvents>> {
+          return createManagedStreamIterator({
+            createIterator,
+            externalSignal: signal,
+            closeReason: "tail iterator closed",
           });
         },
       };
@@ -1491,10 +1555,20 @@ function openDatabaseLedgerEngine<
     resumeEvents: ({ cursor, signal }) => {
       const afterEventId = decodeCursor(cursor);
 
-      return streamEventsFromAfterEventId({
-        afterEventId,
-        signal,
-      });
+      return {
+        [Symbol.asyncIterator](): AsyncIterator<LedgerStreamEvent<TEvents>> {
+          return createManagedStreamIterator({
+            createIterator: (streamSignal) => {
+              return streamEventsFromAfterEventId({
+                afterEventId,
+                signal: streamSignal,
+              })[Symbol.asyncIterator]();
+            },
+            externalSignal: signal,
+            closeReason: "resume iterator closed",
+          });
+        },
+      };
     },
     close,
     [Symbol.asyncDispose]: close,
