@@ -39,6 +39,10 @@ import { Type } from "@sinclair/typebox";
 
 import { defineLedgerModel } from "@torkbot/sledge/ledger";
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
+import {
+  NodeRuntimeScheduler,
+  SystemRuntimeClock,
+} from "@torkbot/sledge/runtime/node-runtime";
 
 const model = defineLedgerModel({
   events: {
@@ -103,6 +107,8 @@ const model = defineLedgerModel({
 });
 
 const db = new Database("./app.sqlite");
+const clock = new SystemRuntimeClock();
+const scheduler = new NodeRuntimeScheduler();
 
 const ledger = createBetterSqliteLedger({
   database: db,
@@ -120,17 +126,8 @@ const ledger = createBetterSqliteLedger({
     },
   }),
   timing: {
-    clock: { nowMs: () => Date.now() },
-    scheduler: {
-      scheduleOnce: (delayMs, task) => {
-        const timeout = setTimeout(task, delayMs);
-        return { cancel: () => clearTimeout(timeout) };
-      },
-      scheduleRepeating: (everyMs, task) => {
-        const interval = setInterval(task, everyMs);
-        return { cancel: () => clearInterval(interval) };
-      },
-    },
+    clock,
+    scheduler,
   },
 });
 
