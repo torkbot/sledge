@@ -34,6 +34,50 @@ async function sleepMs(ms: number): Promise<void> {
   });
 }
 
+async function nextWithTimeout<T>(
+  iterator: AsyncIterator<T>,
+  timeoutMs: number = 2_000,
+): Promise<IteratorResult<T>> {
+  let timeout: NodeJS.Timeout | null = null;
+
+  try {
+    return await Promise.race([
+      iterator.next(),
+      new Promise<IteratorResult<T>>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`iterator.next timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+async function settlesWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timeout: NodeJS.Timeout | null = null;
+
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeout = setTimeout(() => {
+          resolve(false);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== null) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
@@ -356,4 +400,296 @@ test("emit fails fast when busy retries are disabled", async () => {
       force: true,
     });
   }
+});
+
+test("tailEvents does not expose rolled back in-flight events", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  let releaseMaterializer!: () => void;
+  const materializerGate = new Promise<void>((resolve) => {
+    releaseMaterializer = () => {
+      resolve();
+    };
+  });
+
+  let materializerStarted = false;
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register(builder) {
+      builder.materialize("message.received", async () => {
+        materializerStarted = true;
+        await materializerGate;
+
+        throw new Error("materialization failure");
+      });
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  const emit = ledger.emit("message.received", {
+    id: 1,
+  });
+
+  await waitFor(runtime, () => materializerStarted);
+
+  const abortController = new AbortController();
+  const iterator = ledger
+    .tailEvents({
+      last: 1,
+      signal: abortController.signal,
+    })
+    [Symbol.asyncIterator]();
+
+  const next = iterator.next();
+  assert.equal(await settlesWithin(next, 20), false);
+
+  releaseMaterializer();
+
+  await assert.rejects(emit);
+
+  assert.equal(await settlesWithin(next, 20), false);
+
+  abortController.abort();
+
+  const done = await next;
+  assert.equal(done.done, true);
+});
+
+test("tailEvents yields last N events then follows new events", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: () => {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("message.received", { id: 1 });
+  await ledger.emit("message.received", { id: 2 });
+  await ledger.emit("message.received", { id: 3 });
+
+  const abortController = new AbortController();
+  const iterator = ledger
+    .tailEvents({
+      last: 2,
+      signal: abortController.signal,
+    })
+    [Symbol.asyncIterator]();
+
+  const first = await nextWithTimeout(iterator);
+  const second = await nextWithTimeout(iterator);
+
+  assert.equal(first.done, false);
+  assert.equal(second.done, false);
+
+  if (first.done || second.done) {
+    throw new Error("expected backlog events");
+  }
+
+  assert.equal(first.value.event.payload.id, 2);
+  assert.equal(second.value.event.payload.id, 3);
+  assert.equal(typeof first.value.cursor, "string");
+
+  const follow = nextWithTimeout(iterator);
+
+  await ledger.emit("message.received", { id: 4 });
+
+  const third = await follow;
+
+  assert.equal(third.done, false);
+
+  if (third.done) {
+    throw new Error("expected followed event");
+  }
+
+  assert.equal(third.value.event.payload.id, 4);
+
+  abortController.abort();
+
+  const done = await nextWithTimeout(iterator);
+  assert.equal(done.done, true);
+});
+
+test("resumeEvents continues from opaque cursor", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: () => {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("message.received", { id: 1 });
+  await ledger.emit("message.received", { id: 2 });
+  await ledger.emit("message.received", { id: 3 });
+
+  const tailAbortController = new AbortController();
+  const tailIterator = ledger
+    .tailEvents({
+      last: 2,
+      signal: tailAbortController.signal,
+    })
+    [Symbol.asyncIterator]();
+
+  const first = await nextWithTimeout(tailIterator);
+
+  assert.equal(first.done, false);
+
+  if (first.done) {
+    throw new Error("expected first tail event");
+  }
+
+  tailAbortController.abort();
+
+  const resumeAbortController = new AbortController();
+  const resumeIterator = ledger
+    .resumeEvents({
+      cursor: first.value.cursor,
+      signal: resumeAbortController.signal,
+    })
+    [Symbol.asyncIterator]();
+
+  const resumed = await nextWithTimeout(resumeIterator);
+
+  assert.equal(resumed.done, false);
+
+  if (resumed.done) {
+    throw new Error("expected resumed event");
+  }
+
+  assert.equal(resumed.value.event.payload.id, 3);
+
+  const follow = nextWithTimeout(resumeIterator);
+  await ledger.emit("message.received", { id: 4 });
+
+  const followed = await follow;
+
+  assert.equal(followed.done, false);
+
+  if (followed.done) {
+    throw new Error("expected followed resumed event");
+  }
+
+  assert.equal(followed.value.event.payload.id, 4);
+
+  resumeAbortController.abort();
+
+  const done = await nextWithTimeout(resumeIterator);
+  assert.equal(done.done, true);
+
+  assert.throws(() => {
+    ledger.resumeEvents({
+      cursor: "bad-cursor",
+      signal: AbortSignal.timeout(1_000),
+    });
+  });
+});
+
+test("tail iterator return stops stream without external abort", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: () => {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("message.received", { id: 1 });
+
+  const iterator = ledger
+    .tailEvents({
+      last: 1,
+      signal: AbortSignal.timeout(30_000),
+    })
+    [Symbol.asyncIterator]();
+
+  const first = await nextWithTimeout(iterator);
+  assert.equal(first.done, false);
+
+  if (iterator.return === undefined) {
+    throw new Error("expected iterator.return to exist");
+  }
+
+  const closed = await iterator.return();
+  assert.equal(closed.done, true);
+
+  const done = await nextWithTimeout(iterator);
+  assert.equal(done.done, true);
 });
