@@ -213,8 +213,13 @@ async function sleepMs(ms: number): Promise<void> {
   });
 }
 
+const CURSOR_ALPHABET =
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
 const cursorSqids = new Sqids({
+  alphabet: CURSOR_ALPHABET,
   minLength: 6,
+  blocklist: new Set(),
 });
 
 function encodeCursor(afterEventId: number): LedgerCursor {
@@ -1453,6 +1458,10 @@ function openDatabaseLedgerEngine<
           LedgerStreamEvent<TEvents>
         > {
           await startup;
+
+          if (signal.aborted || closed) {
+            return;
+          }
 
           // Capture a follow boundary before reading backlog so we never skip
           // events appended during tail startup when `last` resolves to no rows.

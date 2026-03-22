@@ -55,7 +55,7 @@
     "@sinclair/typebox": "^0.34.48",
     "@tursodatabase/database": "^0.5.1",
     "better-sqlite3": "^12.6.2",
-    "sqids": "^0.3.0"
+    "sqids": "0.3.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
