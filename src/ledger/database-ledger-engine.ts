@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { Static, TSchema } from "@sinclair/typebox";
+import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import type {
   BoundLedgerModel,
@@ -231,6 +231,45 @@ function decodeCursor(cursor: LedgerCursor): number {
   return afterEventId;
 }
 
+const EventEnvelopeRowSchema = Type.Object({
+  event_id: Type.Number(),
+  ts_ms: Type.Number(),
+  event_name: Type.String(),
+  payload_json: Type.String(),
+  causation_event_id: Type.Union([Type.Null(), Type.Number()]),
+  dedupe_key: Type.Union([Type.Null(), Type.String()]),
+});
+
+const EventIdRowSchema = Type.Object({
+  event_id: Type.Number(),
+});
+
+const AvailableAtRowSchema = Type.Object({
+  available_at_ms: Type.Number(),
+});
+
+const WorkIdRowSchema = Type.Object({
+  work_id: Type.Number(),
+});
+
+const ClaimedWorkRowSchema = Type.Object({
+  work_id: Type.Number(),
+  queue_name: Type.String(),
+  payload_json: Type.String(),
+  source_event_id: Type.Number(),
+  attempt: Type.Number(),
+  lease_id: Type.Union([Type.Null(), Type.String()]),
+  lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
+  lease_expires_at_ms: Type.Union([Type.Null(), Type.Number()]),
+});
+
+function decodeRow<const TSchemaDef extends TSchema>(
+  row: StorageRow,
+  schema: TSchemaDef,
+): Static<TSchemaDef> {
+  return Value.Decode(schema, row);
+}
+
 function readEventEnvelopeFromRow<
   TEvents extends Record<string, TSchema>,
   TEventName extends keyof TEvents,
@@ -240,7 +279,8 @@ function readEventEnvelopeFromRow<
     readonly events: TEvents;
   },
 ): EventEnvelope<TEvents, TEventName> {
-  const eventName = readStringField(row, "event_name") as TEventName;
+  const decodedRow = decodeRow(row, EventEnvelopeRowSchema);
+  const eventName = decodedRow.event_name as TEventName;
   const eventSchema = model.events[eventName];
 
   if (eventSchema === undefined) {
@@ -249,71 +289,17 @@ function readEventEnvelopeFromRow<
 
   const payload = Value.Decode(
     eventSchema,
-    parseJson(readStringField(row, "payload_json"), "events.payload_json"),
+    parseJson(decodedRow.payload_json, "events.payload_json"),
   );
 
   return {
-    eventId: readNumberField(row, "event_id"),
-    tsMs: readNumberField(row, "ts_ms"),
+    eventId: decodedRow.event_id,
+    tsMs: decodedRow.ts_ms,
     eventName,
     payload,
-    causationEventId: readNullableNumberField(row, "causation_event_id"),
-    dedupeKey: readNullableStringField(row, "dedupe_key"),
+    causationEventId: decodedRow.causation_event_id,
+    dedupeKey: decodedRow.dedupe_key,
   };
-}
-
-function readNumberField(row: StorageRow, field: string): number {
-  const value = row[field];
-
-  if (typeof value !== "number") {
-    throw new Error(`expected numeric field ${field}`);
-  }
-
-  return value;
-}
-
-function readNullableNumberField(
-  row: StorageRow,
-  field: string,
-): number | null {
-  const value = row[field];
-
-  if (value === null) {
-    return null;
-  }
-
-  if (typeof value !== "number") {
-    throw new Error(`expected nullable numeric field ${field}`);
-  }
-
-  return value;
-}
-
-function readStringField(row: StorageRow, field: string): string {
-  const value = row[field];
-
-  if (typeof value !== "string") {
-    throw new Error(`expected string field ${field}`);
-  }
-
-  return value;
-}
-
-function readNullableStringField(
-  row: StorageRow,
-  field: string,
-): string | null {
-  const value = row[field];
-
-  if (value === null) {
-    return null;
-  }
-
-  if (typeof value !== "string") {
-    throw new Error(`expected nullable string field ${field}`);
-  }
-
-  return value;
 }
 
 function openDatabaseLedgerEngine<
@@ -539,7 +525,7 @@ function openDatabaseLedgerEngine<
           );
         }
 
-        eventId = readNumberField(existing, "event_id");
+        eventId = decodeRow(existing, EventIdRowSchema).event_id;
       }
     }
 
@@ -709,7 +695,7 @@ function openDatabaseLedgerEngine<
       return;
     }
 
-    scheduleDispatchAt(readNumberField(row, "available_at_ms"));
+    scheduleDispatchAt(decodeRow(row, AvailableAtRowSchema).available_at_ms);
   }
 
   function notifyEventWaiters(): void {
@@ -825,7 +811,7 @@ function openDatabaseLedgerEngine<
       return 0;
     }
 
-    return readNumberField(row, "event_id");
+    return decodeRow(row, EventIdRowSchema).event_id;
   }
 
   async function* streamEventsFromAfterEventId(input: {
@@ -884,7 +870,7 @@ function openDatabaseLedgerEngine<
         return null;
       }
 
-      const candidateWorkId = readNumberField(candidate, "work_id");
+      const candidateWorkId = decodeRow(candidate, WorkIdRowSchema).work_id;
       const leaseId = randomUUID();
       const leaseExpiresAtMs = nowMs + leaseMs;
 
@@ -926,32 +912,28 @@ function openDatabaseLedgerEngine<
         return null;
       }
 
-      if (readNullableStringField(claimed, "lease_id") !== leaseId) {
+      const decodedClaimed = decodeRow(claimed, ClaimedWorkRowSchema);
+
+      if (decodedClaimed.lease_id !== leaseId) {
         return null;
       }
 
-      const leaseAcquiredAtMs = readNullableNumberField(
-        claimed,
-        "lease_acquired_at_ms",
-      );
-      const leaseExpiresAtMsValue = readNullableNumberField(
-        claimed,
-        "lease_expires_at_ms",
-      );
-
-      if (leaseAcquiredAtMs === null || leaseExpiresAtMsValue === null) {
+      if (
+        decodedClaimed.lease_acquired_at_ms === null ||
+        decodedClaimed.lease_expires_at_ms === null
+      ) {
         return null;
       }
 
       return {
-        workId: readNumberField(claimed, "work_id"),
-        queueName: readStringField(claimed, "queue_name"),
-        payloadJson: readStringField(claimed, "payload_json"),
-        sourceEventId: readNumberField(claimed, "source_event_id"),
-        attempt: readNumberField(claimed, "attempt"),
+        workId: decodedClaimed.work_id,
+        queueName: decodedClaimed.queue_name,
+        payloadJson: decodedClaimed.payload_json,
+        sourceEventId: decodedClaimed.source_event_id,
+        attempt: decodedClaimed.attempt,
         leaseId,
-        leaseAcquiredAtMs,
-        leaseExpiresAtMs: leaseExpiresAtMsValue,
+        leaseAcquiredAtMs: decodedClaimed.lease_acquired_at_ms,
+        leaseExpiresAtMs: decodedClaimed.lease_expires_at_ms,
       };
     });
   }
