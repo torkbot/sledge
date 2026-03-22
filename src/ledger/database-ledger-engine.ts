@@ -368,6 +368,7 @@ function openDatabaseLedgerEngine<
   const leaseExpiryTasks = new Map<string, { cancel(): void }>();
   const leaseHeartbeatTasks = new Map<string, { cancel(): void }>();
   const eventWaiters = new Set<() => void>();
+  let appendSequence = 0;
 
   let mutationTail: Promise<void> = Promise.resolve();
 
@@ -714,6 +715,8 @@ function openDatabaseLedgerEngine<
   }
 
   function notifyEventWaiters(): void {
+    appendSequence += 1;
+
     const waiters = [...eventWaiters.values()];
     eventWaiters.clear();
 
@@ -725,6 +728,7 @@ function openDatabaseLedgerEngine<
   async function waitForEventAppend(input: {
     readonly signal: AbortSignal;
     readonly timeoutMs: number;
+    readonly observedAppendSequence: number;
   }): Promise<void> {
     if (input.signal.aborted || closed) {
       return;
@@ -762,7 +766,11 @@ function openDatabaseLedgerEngine<
       });
       eventWaiters.add(onEvent);
 
-      if (input.signal.aborted || closed) {
+      if (
+        input.signal.aborted ||
+        closed ||
+        appendSequence !== input.observedAppendSequence
+      ) {
         finish();
       }
     });
@@ -849,6 +857,7 @@ function openDatabaseLedgerEngine<
         return;
       }
 
+      const observedAppendSequence = appendSequence;
       const events = await readEventsAfter(currentAfterEventId, readLimit);
 
       if (events.length > 0) {
@@ -871,6 +880,7 @@ function openDatabaseLedgerEngine<
       await waitForEventAppend({
         signal: input.signal,
         timeoutMs: 250,
+        observedAppendSequence,
       });
     }
   }
