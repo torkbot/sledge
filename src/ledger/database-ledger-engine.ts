@@ -727,7 +727,6 @@ function openDatabaseLedgerEngine<
 
   async function waitForEventAppend(input: {
     readonly signal: AbortSignal;
-    readonly timeoutMs: number;
     readonly observedAppendSequence: number;
   }): Promise<void> {
     if (input.signal.aborted || closed) {
@@ -745,10 +744,6 @@ function openDatabaseLedgerEngine<
         finish();
       };
 
-      const timeoutTask = scheduler.scheduleOnce(input.timeoutMs, () => {
-        finish();
-      });
-
       const finish = () => {
         if (settled) {
           return;
@@ -757,7 +752,6 @@ function openDatabaseLedgerEngine<
         settled = true;
         eventWaiters.delete(onEvent);
         input.signal.removeEventListener("abort", onAbort);
-        timeoutTask.cancel();
         resolve();
       };
 
@@ -879,7 +873,6 @@ function openDatabaseLedgerEngine<
 
       await waitForEventAppend({
         signal: input.signal,
-        timeoutMs: 250,
         observedAppendSequence,
       });
     }
