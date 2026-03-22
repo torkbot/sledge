@@ -1454,19 +1454,17 @@ function openDatabaseLedgerEngine<
         > {
           await startup;
 
+          // Capture a follow boundary before reading backlog so we never skip
+          // events appended during tail startup when `last` resolves to no rows.
+          let afterEventId = await readLatestEventId();
           const historicalEvents = await readLastEvents(last);
-          let afterEventId = 0;
-
-          if (historicalEvents.length === 0) {
-            afterEventId = await readLatestEventId();
-          }
 
           for (const event of historicalEvents) {
             if (signal.aborted || closed) {
               return;
             }
 
-            afterEventId = event.eventId;
+            afterEventId = Math.max(afterEventId, event.eventId);
 
             yield {
               event,
