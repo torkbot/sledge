@@ -7,6 +7,8 @@ import type {
   EventEnvelope,
   Ledger,
   LedgerBuilder,
+  LedgerCursor,
+  LedgerStreamEvent,
   LedgerTiming,
   MaterializerFunction,
   ProjectorFunction,
@@ -210,6 +212,56 @@ async function sleepMs(ms: number): Promise<void> {
   });
 }
 
+function encodeCursor(afterEventId: number): LedgerCursor {
+  return `v1:${afterEventId}`;
+}
+
+function decodeCursor(cursor: LedgerCursor): number {
+  if (!cursor.startsWith("v1:")) {
+    throw new Error("invalid cursor format");
+  }
+
+  const rawValue = cursor.slice(3);
+  const afterEventId = Number(rawValue);
+
+  if (!Number.isInteger(afterEventId) || afterEventId < 0) {
+    throw new Error("invalid cursor payload");
+  }
+
+  return afterEventId;
+}
+
+function readEventEnvelopeFromRow<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends keyof TEvents,
+>(
+  row: StorageRow,
+  model: {
+    readonly events: TEvents;
+  },
+): EventEnvelope<TEvents, TEventName> {
+  const eventName = readStringField(row, "event_name") as TEventName;
+  const eventSchema = model.events[eventName];
+
+  if (eventSchema === undefined) {
+    throw new Error(`unknown event name in event row: ${String(eventName)}`);
+  }
+
+  const payload = Value.Decode(
+    eventSchema,
+    parseJson(readStringField(row, "payload_json"), "events.payload_json"),
+  );
+
+  return {
+    eventId: readNumberField(row, "event_id"),
+    tsMs: readNumberField(row, "ts_ms"),
+    eventName,
+    payload,
+    causationEventId: readNullableNumberField(row, "causation_event_id"),
+    dedupeKey: readNullableStringField(row, "dedupe_key"),
+  };
+}
+
 function readNumberField(row: StorageRow, field: string): number {
   const value = row[field];
 
@@ -314,6 +366,7 @@ function openDatabaseLedgerEngine<
   const leaseAbortControllers = new Map<string, AbortController>();
   const leaseExpiryTasks = new Map<string, { cancel(): void }>();
   const leaseHeartbeatTasks = new Map<string, { cancel(): void }>();
+  const eventWaiters = new Set<() => void>();
 
   let mutationTail: Promise<void> = Promise.resolve();
 
@@ -657,6 +710,158 @@ function openDatabaseLedgerEngine<
     }
 
     scheduleDispatchAt(readNumberField(row, "available_at_ms"));
+  }
+
+  function notifyEventWaiters(): void {
+    const waiters = [...eventWaiters.values()];
+    eventWaiters.clear();
+
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  async function waitForEventAppend(input: {
+    readonly signal: AbortSignal;
+    readonly timeoutMs: number;
+  }): Promise<void> {
+    if (input.signal.aborted || closed) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        eventWaiters.delete(onEvent);
+        input.signal.removeEventListener("abort", onAbort);
+        timeoutTask.cancel();
+        resolve();
+      };
+
+      const onEvent = () => {
+        finish();
+      };
+
+      const onAbort = () => {
+        finish();
+      };
+
+      const timeoutTask = scheduler.scheduleOnce(input.timeoutMs, () => {
+        finish();
+      });
+
+      eventWaiters.add(onEvent);
+      input.signal.addEventListener("abort", onAbort);
+    });
+  }
+
+  async function readEventsAfter(
+    afterEventId: number,
+    limit: number,
+  ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
+    const rows = await database
+      .prepare(
+        `SELECT
+           event_id,
+           ts_ms,
+           event_name,
+           payload_json,
+           causation_event_id,
+           dedupe_key
+         FROM events
+         WHERE event_id > ?
+         ORDER BY event_id ASC
+         LIMIT ?`,
+      )
+      .all(afterEventId, limit);
+
+    return rows.map((row) => {
+      return readEventEnvelopeFromRow(row, model);
+    });
+  }
+
+  async function readLastEvents(
+    limit: number,
+  ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
+    const rows = await database
+      .prepare(
+        `SELECT
+           event_id,
+           ts_ms,
+           event_name,
+           payload_json,
+           causation_event_id,
+           dedupe_key
+         FROM events
+         ORDER BY event_id DESC
+         LIMIT ?`,
+      )
+      .all(limit);
+
+    const envelopes = rows.map((row) => {
+      return readEventEnvelopeFromRow(row, model);
+    });
+
+    return envelopes.reverse();
+  }
+
+  async function readLatestEventId(): Promise<number> {
+    const row = await database
+      .prepare(
+        `SELECT event_id
+         FROM events
+         ORDER BY event_id DESC
+         LIMIT 1`,
+      )
+      .get();
+
+    if (row === undefined) {
+      return 0;
+    }
+
+    return readNumberField(row, "event_id");
+  }
+
+  async function* streamEventsFromAfterEventId(input: {
+    readonly afterEventId: number;
+    readonly signal: AbortSignal;
+  }): AsyncIterable<LedgerStreamEvent<TEvents>> {
+    await startup;
+
+    let currentAfterEventId = input.afterEventId;
+    const readLimit = 256;
+
+    while (!closed) {
+      if (input.signal.aborted) {
+        return;
+      }
+
+      const events = await readEventsAfter(currentAfterEventId, readLimit);
+
+      if (events.length > 0) {
+        for (const event of events) {
+          currentAfterEventId = event.eventId;
+
+          yield {
+            event,
+            cursor: encodeCursor(event.eventId),
+          };
+        }
+
+        continue;
+      }
+
+      await waitForEventAppend({
+        signal: input.signal,
+        timeoutMs: 250,
+      });
+    }
   }
 
   async function claimNextDueWork(): Promise<PersistedWorkLease | null> {
@@ -1046,7 +1251,7 @@ function openDatabaseLedgerEngine<
       };
     }
 
-    await runInTransaction(async () => {
+    const emittedEvents = await runInTransaction(async () => {
       const active = await database
         .prepare(
           `SELECT work_id
@@ -1058,11 +1263,17 @@ function openDatabaseLedgerEngine<
         .get(claimed.workId, claimed.leaseId);
 
       if (active === undefined) {
-        return;
+        return 0;
       }
 
+      let createdCount = 0;
+
       for (const stagedEvent of stagedEvents) {
-        await appendEventInTransaction(stagedEvent);
+        const appended = await appendEventInTransaction(stagedEvent);
+
+        if (appended.created) {
+          createdCount += 1;
+        }
       }
 
       switch (outcome.outcome) {
@@ -1116,6 +1327,8 @@ function openDatabaseLedgerEngine<
             .run(outcome.error, claimed.workId, claimed.leaseId);
           break;
       }
+
+      return createdCount;
     });
 
     stopLeaseHeartbeat();
@@ -1123,6 +1336,10 @@ function openDatabaseLedgerEngine<
     leaseExpiryTasks.get(claimed.leaseId)?.cancel();
     leaseExpiryTasks.delete(claimed.leaseId);
     leaseAbortControllers.delete(claimed.leaseId);
+
+    if (emittedEvents > 0) {
+      notifyEventWaiters();
+    }
 
     scheduleDispatchAt(clock.nowMs());
   }
@@ -1133,6 +1350,7 @@ function openDatabaseLedgerEngine<
     }
 
     closed = true;
+    notifyEventWaiters();
 
     scheduledDispatch?.cancel();
     scheduledDispatch = null;
@@ -1189,6 +1407,7 @@ function openDatabaseLedgerEngine<
       );
 
       if (result.created) {
+        notifyEventWaiters();
         scheduleDispatchAt(clock.nowMs());
       }
     },
@@ -1211,6 +1430,54 @@ function openDatabaseLedgerEngine<
       const decodedResult = Value.Decode(schema.result, rawResult);
 
       return decodedResult as never;
+    },
+    tailEvents: ({ last, signal }) => {
+      if (!Number.isInteger(last) || last < 0) {
+        throw new Error(
+          `last must be a non-negative integer, received ${last}`,
+        );
+      }
+
+      return {
+        async *[Symbol.asyncIterator](): AsyncIterator<
+          LedgerStreamEvent<TEvents>
+        > {
+          await startup;
+
+          const historicalEvents = await readLastEvents(last);
+          let afterEventId = 0;
+
+          if (historicalEvents.length === 0) {
+            afterEventId = await readLatestEventId();
+          }
+
+          for (const event of historicalEvents) {
+            if (signal.aborted || closed) {
+              return;
+            }
+
+            afterEventId = event.eventId;
+
+            yield {
+              event,
+              cursor: encodeCursor(event.eventId),
+            };
+          }
+
+          yield* streamEventsFromAfterEventId({
+            afterEventId,
+            signal,
+          });
+        },
+      };
+    },
+    resumeEvents: ({ cursor, signal }) => {
+      const afterEventId = decodeCursor(cursor);
+
+      return streamEventsFromAfterEventId({
+        afterEventId,
+        signal,
+      });
     },
     close,
     [Symbol.asyncDispose]: close,

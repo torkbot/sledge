@@ -28,6 +28,7 @@ Use `@torkbot/sledge` when you want:
 - **Notification pipelines** (email/push/slack) with retries and dead-letter outcomes
 - **Long-running tool/API jobs** that survive worker restarts
 - **Outbox-style orchestration** without split-brain between writes and job enqueue
+- **Client-side materialization** (browser/mobile/worker) by tailing events and resuming with an opaque cursor
 
 ---
 
@@ -195,6 +196,38 @@ await ledger.emit(
 ```
 
 Same key => same durable event winner, no duplicate downstream materialization.
+
+## Event consumers (tail + resume)
+
+You can materialize ledger events outside the process (for example, to browser state) with two APIs:
+
+- `tailEvents({ last, signal })`: `tail -f -n <last>` semantics
+- `resumeEvents({ cursor, signal })`: continue from a previously persisted opaque cursor
+
+```ts
+const controller = new AbortController();
+
+for await (const item of ledger.tailEvents({
+  last: 100,
+  signal: controller.signal,
+})) {
+  const event = item.event;
+  const cursor = item.cursor;
+
+  // apply event to external read model
+  // persist cursor for reconnect/resume
+}
+
+// Later (e.g. reconnect):
+for await (const item of ledger.resumeEvents({
+  cursor: persistedCursor,
+  signal: controller.signal,
+})) {
+  // continue exactly after persisted cursor
+}
+```
+
+Cursor values are opaque by contract. Persist and reuse them as-is.
 
 ## Long-running handlers
 

@@ -264,6 +264,20 @@ export type RegisterFunction<
 /**
  * Running ledger runtime surface.
  */
+export type LedgerCursor = string;
+
+export type LedgerStreamEvent<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends keyof TEvents = keyof TEvents,
+> = {
+  readonly event: EventEnvelope<TEvents, TEventName>;
+  /**
+   * Opaque resume token. Treat this as an implementation detail and persist it
+   * as-is for resume operations.
+   */
+  readonly cursor: LedgerCursor;
+};
+
 export interface Ledger<
   TEvents extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQuerySchema>,
@@ -278,6 +292,16 @@ export interface Ledger<
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>>;
+
+  tailEvents(input: {
+    readonly last: number;
+    readonly signal: AbortSignal;
+  }): AsyncIterable<LedgerStreamEvent<TEvents>>;
+
+  resumeEvents(input: {
+    readonly cursor: LedgerCursor;
+    readonly signal: AbortSignal;
+  }): AsyncIterable<LedgerStreamEvent<TEvents>>;
 
   close(): Promise<void>;
 }
