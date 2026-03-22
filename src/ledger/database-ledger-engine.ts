@@ -779,67 +779,79 @@ function openDatabaseLedgerEngine<
     afterEventId: number,
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
-    const rows = await database
-      .prepare(
-        `SELECT
-           event_id,
-           ts_ms,
-           event_name,
-           payload_json,
-           causation_event_id,
-           dedupe_key
-         FROM events
-         WHERE event_id > ?
-         ORDER BY event_id ASC
-         LIMIT ?`,
-      )
-      .all(afterEventId, limit);
+    // Serialize stream reads after mutations so consumers never observe
+    // uncommitted event rows from in-flight write transactions.
+    return await runSerialized(async () => {
+      const rows = await database
+        .prepare(
+          `SELECT
+             event_id,
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             dedupe_key
+           FROM events
+           WHERE event_id > ?
+           ORDER BY event_id ASC
+           LIMIT ?`,
+        )
+        .all(afterEventId, limit);
 
-    return rows.map((row) => {
-      return readEventEnvelopeFromRow(row, model);
+      return rows.map((row) => {
+        return readEventEnvelopeFromRow(row, model);
+      });
     });
   }
 
   async function readLastEvents(
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
-    const rows = await database
-      .prepare(
-        `SELECT
-           event_id,
-           ts_ms,
-           event_name,
-           payload_json,
-           causation_event_id,
-           dedupe_key
-         FROM events
-         ORDER BY event_id DESC
-         LIMIT ?`,
-      )
-      .all(limit);
+    // Serialize stream reads after mutations so consumers never observe
+    // uncommitted event rows from in-flight write transactions.
+    return await runSerialized(async () => {
+      const rows = await database
+        .prepare(
+          `SELECT
+             event_id,
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             dedupe_key
+           FROM events
+           ORDER BY event_id DESC
+           LIMIT ?`,
+        )
+        .all(limit);
 
-    const envelopes = rows.map((row) => {
-      return readEventEnvelopeFromRow(row, model);
+      const envelopes = rows.map((row) => {
+        return readEventEnvelopeFromRow(row, model);
+      });
+
+      return envelopes.reverse();
     });
-
-    return envelopes.reverse();
   }
 
   async function readLatestEventId(): Promise<number> {
-    const row = await database
-      .prepare(
-        `SELECT event_id
-         FROM events
-         ORDER BY event_id DESC
-         LIMIT 1`,
-      )
-      .get();
+    // Serialize stream reads after mutations so consumers never observe
+    // uncommitted event rows from in-flight write transactions.
+    return await runSerialized(async () => {
+      const row = await database
+        .prepare(
+          `SELECT event_id
+           FROM events
+           ORDER BY event_id DESC
+           LIMIT 1`,
+        )
+        .get();
 
-    if (row === undefined) {
-      return 0;
-    }
+      if (row === undefined) {
+        return 0;
+      }
 
-    return decodeRow(row, EventIdRowSchema).event_id;
+      return decodeRow(row, EventIdRowSchema).event_id;
+    });
   }
 
   function createManagedStreamIterator(input: {

@@ -219,9 +219,11 @@ for await (const item of ledger.tailEvents({
 }
 
 // Later (e.g. reconnect):
+const resumeController = new AbortController();
+
 for await (const item of ledger.resumeEvents({
   cursor: persistedCursor,
-  signal: controller.signal,
+  signal: resumeController.signal,
 })) {
   // continue exactly after persisted cursor
 }
