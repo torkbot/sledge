@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
+import Sqids from "sqids";
 import type {
   BoundLedgerModel,
   EventEnvelope,
@@ -212,8 +213,12 @@ async function sleepMs(ms: number): Promise<void> {
   });
 }
 
+const cursorSqids = new Sqids({
+  minLength: 6,
+});
+
 function encodeCursor(afterEventId: number): LedgerCursor {
-  return `v1:${afterEventId}`;
+  return `v1:${cursorSqids.encode([afterEventId])}`;
 }
 
 function decodeCursor(cursor: LedgerCursor): number {
@@ -221,8 +226,18 @@ function decodeCursor(cursor: LedgerCursor): number {
     throw new Error("invalid cursor format");
   }
 
-  const rawValue = cursor.slice(3);
-  const afterEventId = Number(rawValue);
+  const token = cursor.slice(3);
+  const decoded = cursorSqids.decode(token);
+
+  if (decoded.length !== 1) {
+    throw new Error("invalid cursor payload");
+  }
+
+  const afterEventId = decoded[0];
+
+  if (afterEventId === undefined) {
+    throw new Error("invalid cursor payload");
+  }
 
   if (!Number.isInteger(afterEventId) || afterEventId < 0) {
     throw new Error("invalid cursor payload");
@@ -718,18 +733,6 @@ function openDatabaseLedgerEngine<
     await new Promise<void>((resolve) => {
       let settled = false;
 
-      const finish = () => {
-        if (settled) {
-          return;
-        }
-
-        settled = true;
-        eventWaiters.delete(onEvent);
-        input.signal.removeEventListener("abort", onAbort);
-        timeoutTask.cancel();
-        resolve();
-      };
-
       const onEvent = () => {
         finish();
       };
@@ -742,8 +745,26 @@ function openDatabaseLedgerEngine<
         finish();
       });
 
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        eventWaiters.delete(onEvent);
+        input.signal.removeEventListener("abort", onAbort);
+        timeoutTask.cancel();
+        resolve();
+      };
+
+      input.signal.addEventListener("abort", onAbort, {
+        once: true,
+      });
       eventWaiters.add(onEvent);
-      input.signal.addEventListener("abort", onAbort);
+
+      if (input.signal.aborted || closed) {
+        finish();
+      }
     });
   }
 
@@ -832,6 +853,10 @@ function openDatabaseLedgerEngine<
 
       if (events.length > 0) {
         for (const event of events) {
+          if (input.signal.aborted || closed) {
+            return;
+          }
+
           currentAfterEventId = event.eventId;
 
           yield {
