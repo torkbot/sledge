@@ -1,48 +1,46 @@
 ## Scope
 
-`@torkbot/sledge` is a focused library for durable event + work orchestration on SQLite-backed runtimes.
+`@torkbot/sledge` is a focused library for durable event and work orchestration on SQLite-backed runtimes.
 
-Optimize for correctness, clarity, and predictable behavior under retries/restarts/contention. Prefer breaking changes over carrying bad abstractions.
+Prioritize correctness, legibility, and operational predictability over convenience.
 
-## API design principles
+## Design principles
 
-- Keep public APIs semantic and minimal.
-- Do not leak storage mechanics into user-facing contracts unless absolutely necessary.
-- Cursor contracts must be opaque by API contract. Consumers persist and replay cursors; they must not parse or construct them.
-- Prefer separate APIs for distinct intent over overloaded option bags with conflicting semantics.
+- Keep public APIs small, semantic, and transport-agnostic.
+- Avoid leaking storage internals into API contracts.
+- Prefer one clear way to do a thing; avoid overlapping capabilities.
+- Favor clean refactors and breaking changes over preserving flawed abstractions.
 
-## Correctness and consistency
+## Correctness expectations
 
-- Treat this as a distributed/concurrent system even when single-process is common.
-- Avoid races around stream handoff, cancellation, and wakeups.
-- Consumer reads must not observe uncommitted writes from in-flight transactions.
-- Avoid steady-state polling when event-driven wakeups can provide correctness without idle load.
+- Treat runtime behavior as concurrent/distributed: races, contention, retries, and interruption are normal.
+- Preserve transactional integrity between event append, projection, and work materialization.
+- Design cancellation and restart behavior explicitly; no silent hangs.
+- Keep read/write semantics deterministic and well-scoped.
 
-## Data validation
+## Validation and typing
 
-- Treat all I/O as untrusted (DB rows, external payloads, adapter boundaries).
-- Validate with TypeBox `Value.Decode(...)` at boundaries.
-- Use `Value.Encode(...)` on writes where canonical encoding matters.
-- Avoid ad hoc field-parsing helpers when schema decoding can express the contract.
+- Treat all I/O as untrusted data.
+- Validate boundary data with TypeBox `Value.Decode(...)`.
+- Use strict TypeScript.
+- Avoid `any`; use `unknown` for untrusted values and thrown errors.
+- Minimize type casts; use them only when unavoidable and local.
 
-## TypeScript and Node conventions
+## Node/TypeScript conventions
 
-- Strict TypeScript only.
-- Avoid `any` and avoid casts unless unavoidable.
-- Use `unknown` for untrusted data and thrown errors.
-- Avoid top-level await in executable entry points.
 - Prefer `node --run` over `npm run`.
-- Prefer `#privateField` and `readonly` where applicable.
-- Prefer `AbortSignal` propagation and explicit cancellation handling.
+- Avoid top-level await in executable entry points.
+- Prefer `#privateField` and `readonly` where appropriate.
+- Propagate cancellation with `AbortSignal`.
 
 ## Code style
 
-- Production-legible, non-clever code.
-- Add durable intent comments for non-obvious invariants and trade-offs.
-- No tombstone/deprecation comments tied to review history.
+- Write production-legible code; avoid clever or compressed patterns.
+- Add intent comments for non-obvious invariants/trade-offs.
+- Avoid comments tied to PR/discussion history.
 - Avoid conditional object spread for optionals; use explicit assignment/branches.
 
-## Testing and quality gates
+## Quality gates
 
 After changes, run:
 
@@ -50,18 +48,12 @@ After changes, run:
 - `node --run typecheck`
 - `node --run test`
 
-If packaging/publish surface changes, also run:
+When package surface/build behavior changes, also run:
 
 - `node --run build`
 - `npm pack --dry-run`
 
 ## Release hygiene
 
-- Keep `README.md` aligned with real API behavior.
+- Keep `README.md` aligned with current API behavior.
 - Keep `CHANGELOG.md` updated for user-visible changes.
-- Preserve backward compatibility only when it is clearly worth the cost; otherwise choose cleaner contracts.
-
-## Working in this repo
-
-- Do not use bash heredoc syntax. Write content to a temporary file and reference it.
-- When posting to GitHub via `gh`, use `--body-file` from a temporary file.
