@@ -234,6 +234,7 @@ Start simple; tune only when you observe contention/throughput issues.
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`
 - `@torkbot/sledge/runtime/contracts`
+- `@torkbot/sledge/runtime/node-runtime`
 - `@torkbot/sledge/runtime/virtual-runtime`
 
 ## Development
@@ -241,5 +242,13 @@ Start simple; tune only when you observe contention/throughput issues.
 ```bash
 node --run typecheck
 node --run test
+node --run build
 node --run lint
 ```
+
+## Publishing notes
+
+- The package is published as compiled JavaScript in `dist/` (with `.d.ts` types).
+- Source remains strict TypeScript in `src/`.
+- `prepublishOnly` runs `node --run build` automatically.
+- Node version is pinned via `engines.node` because runtime code uses explicit resource management (`using` / `await using`).

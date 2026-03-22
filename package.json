@@ -4,22 +4,52 @@
   "private": false,
   "type": "module",
   "description": "A SQLite-backed event and work engine that stays consistent across retries, restarts, and failures.",
-  "exports": {
-    "./ledger": "./src/ledger/ledger.ts",
-    "./database-ledger-engine": "./src/ledger/database-ledger-engine.ts",
-    "./better-sqlite3-ledger": "./src/ledger/better-sqlite3-ledger.ts",
-    "./turso-ledger": "./src/ledger/turso-ledger.ts",
-    "./runtime/contracts": "./src/runtime/contracts.ts",
-    "./runtime/node-runtime": "./src/runtime/node-runtime.ts",
-    "./runtime/virtual-runtime": "./src/runtime/virtual-runtime.ts"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
   },
+  "exports": {
+    "./ledger": {
+      "types": "./dist/ledger/ledger.d.ts",
+      "default": "./dist/ledger/ledger.js"
+    },
+    "./database-ledger-engine": {
+      "types": "./dist/ledger/database-ledger-engine.d.ts",
+      "default": "./dist/ledger/database-ledger-engine.js"
+    },
+    "./better-sqlite3-ledger": {
+      "types": "./dist/ledger/better-sqlite3-ledger.d.ts",
+      "default": "./dist/ledger/better-sqlite3-ledger.js"
+    },
+    "./turso-ledger": {
+      "types": "./dist/ledger/turso-ledger.d.ts",
+      "default": "./dist/ledger/turso-ledger.js"
+    },
+    "./runtime/contracts": {
+      "types": "./dist/runtime/contracts.d.ts",
+      "default": "./dist/runtime/contracts.js"
+    },
+    "./runtime/node-runtime": {
+      "types": "./dist/runtime/node-runtime.d.ts",
+      "default": "./dist/runtime/node-runtime.js"
+    },
+    "./runtime/virtual-runtime": {
+      "types": "./dist/runtime/virtual-runtime.d.ts",
+      "default": "./dist/runtime/virtual-runtime.js"
+    }
+  },
+  "types": "./dist/ledger/ledger.d.ts",
   "files": [
-    "src"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
+    "build": "rm -rf dist && tsc --project tsconfig.build.json --pretty",
     "test": "node --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit --pretty",
-    "lint": "prettier -c ."
+    "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/**/*.ts",
+    "prepublishOnly": "node --run build"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.48",
@@ -33,6 +63,6 @@
     "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.6.0"
   }
 }
