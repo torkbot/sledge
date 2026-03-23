@@ -1,8 +1,8 @@
 # Agent driver example (sledge-backed)
 
-This example captures the **intended user-facing API** for driving a durable agent on top of sledge.
+This example specifies a **production-oriented, ledger-backed agent design** on top of sledge.
 
-It intentionally stops short of implementing the full ledger model and `agent.advance` work handler. The goal is to lock the API, event contracts, and query contracts first, then implement orchestration against those tests.
+The implementation is intentionally staged: we lock API contracts and behavioral tests first, then implement the durable ledger model and internal `agent.advance` orchestration to satisfy those tests.
 
 ## Why this shape
 
@@ -81,6 +81,10 @@ The scaffold defines query contracts for common app reads:
 - `agent.branch.head`: latest node for an `(agentId, branchId)`
 - `agent.pending-inputs`: pending `next_opportunity` and `when_idle` inputs for a branch
 - `agent.node.children`: children for a given `(agentId, nodeId)`
+
+## Current status
+
+The test suite is intentionally written as a guiding-light specification for the real runtime and is expected to fail until the durable model + `agent.advance` handler are implemented.
 
 ## pi-ai anticipation
 

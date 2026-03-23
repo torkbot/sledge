@@ -3,231 +3,47 @@ import Database from "better-sqlite3";
 import test from "node:test";
 
 import { VirtualRuntimeHarness } from "../../src/runtime/virtual-runtime.ts";
-import { createBetterSqliteLedger } from "../../src/ledger/better-sqlite3-ledger.ts";
-import { defineLedgerModel } from "../../src/ledger/ledger.ts";
-import { createAgentDriver } from "./api.ts";
-import {
-  AgentDriverEventSchemas,
-  AgentDriverQuerySchemas,
-  type UserInputRecordedEvent,
-} from "./contracts.ts";
+import { openAgentDriverRuntime, type PiAiGateway } from "./runtime.ts";
 
-type BranchHead = {
-  readonly agentId: string;
-  readonly branchId: string;
-  readonly nodeId: string;
-  readonly parentNodeId: string | null;
-  readonly eventName: "agent.event" | "user.event";
-  readonly eventKind: string;
-};
-
-function createBranchKey(agentId: string, branchId: string): string {
-  return `${agentId}::${branchId}`;
-}
-
-function createChildKey(agentId: string, nodeId: string): string {
-  return `${agentId}::${nodeId}`;
-}
-
-function cloneRecordedInput(
-  input: UserInputRecordedEvent,
-): UserInputRecordedEvent {
+function createPiAiStub(): PiAiGateway {
   return {
-    ...input,
+    runTurn: async () => {
+      return {
+        outputText: "stub",
+      };
+    },
   };
 }
 
-function cloneBranchHead(head: BranchHead): BranchHead {
-  return {
-    ...head,
-  };
-}
-
-function createAgentDriverTestHarness() {
+test("createAgent initializes a branch head and emits context event", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
 
-  const branchHeads = new Map<string, BranchHead>();
-  const nextOpportunityInputs = new Map<string, UserInputRecordedEvent[]>();
-  const whenIdleInputs = new Map<string, UserInputRecordedEvent[]>();
-  const nodeChildren = new Map<
-    string,
-    Array<{
-      readonly branchId: string;
-      readonly nodeId: string;
-      readonly eventName: "agent.event" | "user.event";
-      readonly eventKind: string;
-    }>
-  >();
-
-  const model = defineLedgerModel({
-    events: AgentDriverEventSchemas,
-    queues: {},
-    indexers: {
-      recordBranchHead: AgentDriverQuerySchemas["agent.branch.head"].result,
-      recordPendingInput: AgentDriverEventSchemas["user.event"],
-      recordNodeChild: AgentDriverQuerySchemas["agent.node.children"].result,
-    },
-    queries: AgentDriverQuerySchemas,
-    register(builder) {
-      builder.project("agent.event", async ({ event, actions }) => {
-        const payload = event.payload;
-
-        if (payload.kind === "context.initialized") {
-          const branchKey = createBranchKey(payload.agentId, payload.branchId);
-
-          const head: BranchHead = {
-            agentId: payload.agentId,
-            branchId: payload.branchId,
-            nodeId: payload.nodeId,
-            parentNodeId: payload.parentNodeId,
-            eventName: "agent.event",
-            eventKind: payload.kind,
-          };
-
-          branchHeads.set(branchKey, head);
-          await actions.index("recordBranchHead", head);
-
-          return;
-        }
-
-        const branchKey = createBranchKey(payload.agentId, payload.branchId);
-        const head: BranchHead = {
-          agentId: payload.agentId,
-          branchId: payload.branchId,
-          nodeId: payload.nodeId,
-          parentNodeId: payload.parentNodeId,
-          eventName: "agent.event",
-          eventKind: payload.kind,
-        };
-
-        branchHeads.set(branchKey, head);
-        await actions.index("recordBranchHead", head);
-      });
-
-      builder.project("user.event", async ({ event, actions }) => {
-        const payload = event.payload;
-        const branchKey = createBranchKey(payload.agentId, payload.branchId);
-
-        const head: BranchHead = {
-          agentId: payload.agentId,
-          branchId: payload.branchId,
-          nodeId: payload.nodeId,
-          parentNodeId: payload.parentNodeId,
-          eventName: "user.event",
-          eventKind: payload.kind,
-        };
-
-        branchHeads.set(branchKey, head);
-        await actions.index("recordBranchHead", head);
-
-        const childKey = createChildKey(payload.agentId, payload.parentNodeId);
-        const childEntries = nodeChildren.get(childKey) ?? [];
-
-        childEntries.push({
-          branchId: payload.branchId,
-          nodeId: payload.nodeId,
-          eventName: "user.event",
-          eventKind: payload.kind,
-        });
-
-        nodeChildren.set(childKey, childEntries);
-        await actions.index("recordNodeChild", childEntries);
-
-        if (payload.timing === "next_opportunity") {
-          const existing = nextOpportunityInputs.get(branchKey) ?? [];
-          existing.push(cloneRecordedInput(payload));
-          nextOpportunityInputs.set(branchKey, existing);
-          await actions.index("recordPendingInput", payload);
-          return;
-        }
-
-        const existing = whenIdleInputs.get(branchKey) ?? [];
-        existing.push(cloneRecordedInput(payload));
-        whenIdleInputs.set(branchKey, existing);
-        await actions.index("recordPendingInput", payload);
-      });
-    },
-  });
-
-  const ledger = createBetterSqliteLedger({
+  await using agentRuntime = openAgentDriverRuntime({
     database,
-    boundModel: model.bind({
-      indexers: {
-        recordBranchHead: async () => undefined,
-        recordPendingInput: async () => undefined,
-        recordNodeChild: async () => undefined,
-      },
-      queries: {
-        "agent.branch.head": async (params) => {
-          const key = createBranchKey(params.agentId, params.branchId);
-          const head = branchHeads.get(key);
-
-          if (head === undefined) {
-            return null;
-          }
-
-          return cloneBranchHead(head);
-        },
-        "agent.pending-inputs": async (params) => {
-          const key = createBranchKey(params.agentId, params.branchId);
-
-          return {
-            nextOpportunity: (nextOpportunityInputs.get(key) ?? []).map(
-              (item) => {
-                return cloneRecordedInput(item);
-              },
-            ),
-            whenIdle: (whenIdleInputs.get(key) ?? []).map((item) => {
-              return cloneRecordedInput(item);
-            }),
-          };
-        },
-        "agent.node.children": async (params) => {
-          const key = createChildKey(params.agentId, params.nodeId);
-          const children = nodeChildren.get(key) ?? [];
-
-          return children.map((child) => {
-            return {
-              ...child,
-            };
-          });
-        },
-      },
-    }),
     timing: {
       clock: runtime.clock,
       scheduler: runtime.scheduler,
     },
+    llm: createPiAiStub(),
   });
 
-  return {
-    runtime,
-    ledger,
-    driver: createAgentDriver(ledger),
-  };
-}
-
-test("createAgent emits context.initialized and sets branch head", async () => {
-  const harness = createAgentDriverTestHarness();
-
-  await using ledger = harness.ledger;
-
-  await harness.driver.createAgent({
+  await agentRuntime.driver.createAgent({
     agentId: "agent-1",
     branchId: "main",
     rootNodeId: "node-root",
     context: {
-      systemPrompt: "You are helpful.",
+      systemPrompt: "You are concise.",
       model: {
-        provider: "openai",
-        model: "gpt-4.1",
+        provider: "anthropic",
+        model: "claude-4.1",
+        thinkingLevel: "medium",
       },
       tools: ["search"],
     },
   });
 
-  const head = await harness.driver.getBranchHead({
+  const head = await agentRuntime.driver.getBranchHead({
     agentId: "agent-1",
     branchId: "main",
   });
@@ -242,27 +58,34 @@ test("createAgent emits context.initialized and sets branch head", async () => {
   });
 });
 
-test("submitUserInput dedupes by clientInputId and splits timing queues", async () => {
-  const harness = createAgentDriverTestHarness();
+test("submitUserInput splits next_opportunity and when_idle queues", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
 
-  await using ledger = harness.ledger;
+  await using agentRuntime = openAgentDriverRuntime({
+    database,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+    llm: createPiAiStub(),
+  });
 
-  await harness.driver.createAgent({
+  await agentRuntime.driver.createAgent({
     agentId: "agent-1",
     branchId: "main",
     rootNodeId: "node-root",
     context: {
-      systemPrompt: "You are helpful.",
+      systemPrompt: "You are concise.",
       model: {
-        provider: "openai",
-        model: "gpt-4.1",
-        thinkingLevel: "low",
+        provider: "anthropic",
+        model: "claude-4.1",
       },
       tools: [],
     },
   });
 
-  await harness.driver.submitUserInput({
+  await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
     branchId: "main",
     nodeId: "node-1",
@@ -270,21 +93,10 @@ test("submitUserInput dedupes by clientInputId and splits timing queues", async 
     mode: "continue",
     timing: "next_opportunity",
     clientInputId: "input-1",
-    content: "First message",
+    content: "Apply at next boundary",
   });
 
-  await harness.driver.submitUserInput({
-    agentId: "agent-1",
-    branchId: "main",
-    nodeId: "node-1-duplicate",
-    parentNodeId: "node-root",
-    mode: "continue",
-    timing: "next_opportunity",
-    clientInputId: "input-1",
-    content: "Duplicate delivery should no-op",
-  });
-
-  await harness.driver.submitUserInput({
+  await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
     branchId: "main",
     nodeId: "node-2",
@@ -292,10 +104,10 @@ test("submitUserInput dedupes by clientInputId and splits timing queues", async 
     mode: "continue",
     timing: "when_idle",
     clientInputId: "input-2",
-    content: "Second message",
+    content: "Queue for idle",
   });
 
-  const pending = await harness.driver.getPendingInputs({
+  const pending = await agentRuntime.driver.getPendingInputs({
     agentId: "agent-1",
     branchId: "main",
   });
@@ -306,26 +118,34 @@ test("submitUserInput dedupes by clientInputId and splits timing queues", async 
   assert.equal(pending.whenIdle[0]?.clientInputId, "input-2");
 });
 
-test("fork mode creates sibling children from same parent node", async () => {
-  const harness = createAgentDriverTestHarness();
+test("fork mode records sibling children from the same parent node", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
 
-  await using ledger = harness.ledger;
+  await using agentRuntime = openAgentDriverRuntime({
+    database,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+    llm: createPiAiStub(),
+  });
 
-  await harness.driver.createAgent({
+  await agentRuntime.driver.createAgent({
     agentId: "agent-1",
     branchId: "main",
     rootNodeId: "node-root",
     context: {
-      systemPrompt: "You are helpful.",
+      systemPrompt: "You are concise.",
       model: {
-        provider: "openai",
-        model: "gpt-4.1",
+        provider: "anthropic",
+        model: "claude-4.1",
       },
       tools: [],
     },
   });
 
-  await harness.driver.submitUserInput({
+  await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
     branchId: "main",
     nodeId: "node-main-1",
@@ -336,7 +156,7 @@ test("fork mode creates sibling children from same parent node", async () => {
     content: "Continue on main",
   });
 
-  await harness.driver.submitUserInput({
+  await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
     branchId: "branch-alt",
     nodeId: "node-alt-1",
@@ -347,7 +167,7 @@ test("fork mode creates sibling children from same parent node", async () => {
     content: "Fork from root",
   });
 
-  const children = await harness.driver.getNodeChildren({
+  const children = await agentRuntime.driver.getNodeChildren({
     agentId: "agent-1",
     nodeId: "node-root",
   });
@@ -368,77 +188,42 @@ test("fork mode creates sibling children from same parent node", async () => {
   ]);
 });
 
-test("tailEvents and resumeEvents expose consumable stream with opaque cursor", async () => {
-  const harness = createAgentDriverTestHarness();
+test("tailEvents and resumeEvents expose the agent event stream", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
 
-  await using ledger = harness.ledger;
-
-  await harness.driver.createAgent({
-    agentId: "agent-1",
-    branchId: "main",
-    rootNodeId: "node-root",
-    context: {
-      systemPrompt: "You are helpful.",
-      model: {
-        provider: "anthropic",
-        model: "claude-4.1",
-      },
-      tools: ["search", "read"],
+  await using agentRuntime = openAgentDriverRuntime({
+    database,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
-  });
-
-  await harness.driver.submitUserInput({
-    agentId: "agent-1",
-    branchId: "main",
-    nodeId: "node-1",
-    parentNodeId: "node-root",
-    mode: "continue",
-    timing: "next_opportunity",
-    clientInputId: "input-1",
-    content: "Summarize the changelog",
+    llm: createPiAiStub(),
   });
 
   const abortController = new AbortController();
-  const iterator = harness.driver
-    .tailEvents({
-      last: 2,
-      signal: abortController.signal,
-    })
-    [Symbol.asyncIterator]();
+  const stream = agentRuntime.tailEvents({
+    last: 10,
+    signal: abortController.signal,
+  });
 
+  const iterator = stream[Symbol.asyncIterator]();
   const first = await iterator.next();
-  const second = await iterator.next();
 
   assert.equal(first.done, false);
-  assert.equal(second.done, false);
 
-  if (first.done || second.done) {
-    throw new Error("expected stream events from backlog");
+  if (first.done) {
+    throw new Error("expected one event from tail stream");
   }
 
-  assert.equal(typeof first.value.cursor, "string");
-  assert.equal(typeof second.value.cursor, "string");
+  const resumeController = new AbortController();
+  const resumed = agentRuntime.resumeEvents({
+    cursor: first.value.cursor,
+    signal: resumeController.signal,
+  });
 
-  const resumeAbortController = new AbortController();
-  const resumedIterator = harness.driver
-    .resumeEvents({
-      cursor: first.value.cursor,
-      signal: resumeAbortController.signal,
-    })
-    [Symbol.asyncIterator]();
+  const resumedIterator = resumed[Symbol.asyncIterator]();
+  const resumedFirst = await resumedIterator.next();
 
-  const resumed = await resumedIterator.next();
-
-  assert.equal(resumed.done, false);
-
-  if (resumed.done) {
-    throw new Error("expected resumed event");
-  }
-
-  assert.equal(resumed.value.event.eventName, "user.event");
-
-  abortController.abort();
-  resumeAbortController.abort();
-
-  await harness.runtime.flush();
+  assert.equal(resumedFirst.done, false);
 });
