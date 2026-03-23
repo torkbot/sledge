@@ -34,11 +34,13 @@ test("createAgent initializes a branch head and emits context event", async () =
     context: {
       systemPrompt: "You are concise.",
       model: {
+        api: "anthropic",
         provider: "anthropic",
-        model: "claude-4.1",
-        thinkingLevel: "medium",
+        id: "claude-sonnet-4-20250514",
       },
+      thinkingLevel: "medium",
       tools: ["search"],
+      messages: [],
     },
   });
 
@@ -77,10 +79,13 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
     context: {
       systemPrompt: "You are concise.",
       model: {
+        api: "anthropic",
         provider: "anthropic",
-        model: "claude-4.1",
+        id: "claude-sonnet-4-20250514",
       },
+      thinkingLevel: "off",
       tools: [],
+      messages: [],
     },
   });
 
@@ -127,10 +132,13 @@ test("fork mode records sibling children from the same parent node", async () =>
     context: {
       systemPrompt: "You are concise.",
       model: {
+        api: "anthropic",
         provider: "anthropic",
-        model: "claude-4.1",
+        id: "claude-sonnet-4-20250514",
       },
+      thinkingLevel: "off",
       tools: [],
+      messages: [],
     },
   });
 

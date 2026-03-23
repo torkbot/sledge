@@ -10,38 +10,45 @@ export const AgentInputTimingSchema = Type.Union([
 export type AgentInputTiming = Static<typeof AgentInputTimingSchema>;
 
 export const PiAiThinkingLevelSchema = Type.Union([
+  Type.Literal("off"),
+  Type.Literal("minimal"),
   Type.Literal("low"),
   Type.Literal("medium"),
   Type.Literal("high"),
+  Type.Literal("xhigh"),
 ]);
 
 /**
- * Anticipated model/provider contract for future pi-ai adapter integration.
+ * pi-ai model descriptor persisted in durable agent context.
+ *
+ * Mirrors the core fields exposed by pi-ai model instances.
  */
 export const PiAiModelConfigSchema = Type.Object({
+  api: Type.String(),
   provider: Type.String(),
-  model: Type.String(),
-  thinkingLevel: Type.Optional(PiAiThinkingLevelSchema),
+  id: Type.String(),
 });
 
 export type PiAiModelConfig = Static<typeof PiAiModelConfigSchema>;
 
-export const ConversationMessageSchema = Type.Object({
+export const AgentMessageSchema = Type.Object({
   role: Type.Union([
     Type.Literal("system"),
     Type.Literal("user"),
     Type.Literal("assistant"),
+    Type.Literal("toolResult"),
   ]),
-  content: Type.String(),
+  content: Type.Unknown(),
 });
 
-export type ConversationMessage = Static<typeof ConversationMessageSchema>;
+export type AgentMessage = Static<typeof AgentMessageSchema>;
 
 export const AgentContextSchema = Type.Object({
   systemPrompt: Type.String(),
   model: PiAiModelConfigSchema,
+  thinkingLevel: PiAiThinkingLevelSchema,
   tools: Type.Array(Type.String()),
-  initialConversation: Type.Optional(Type.Array(ConversationMessageSchema)),
+  messages: Type.Array(AgentMessageSchema),
 });
 
 export type AgentContext = Static<typeof AgentContextSchema>;

@@ -43,11 +43,13 @@ const created = await driver.createAgent({
   context: {
     systemPrompt: "You are concise and careful.",
     model: {
+      api: "anthropic",
       provider: "anthropic",
-      model: "claude-4.1",
-      thinkingLevel: "medium",
+      id: "claude-sonnet-4-20250514",
     },
+    thinkingLevel: "medium",
     tools: ["search", "read_file"],
+    messages: [],
   },
 });
 
@@ -96,8 +98,10 @@ The test suite is intentionally written as a guiding-light specification for the
 
 The context contract already models pi-ai-facing metadata:
 
+- `context.model.api`
 - `context.model.provider`
-- `context.model.model`
-- `context.model.thinkingLevel`
+- `context.model.id`
+- `context.thinkingLevel`
+- `context.messages`
 
 This keeps agent setup aligned with future pi-ai-backed model invocation while the orchestration handler is implemented later.
