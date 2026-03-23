@@ -7,8 +7,10 @@ Prioritize correctness, legibility, and operational predictability over convenie
 ## Design principles
 
 - Keep public APIs small, semantic, and transport-agnostic.
+- An API that allows correctness-by-construction is always better than alternatives.
+- A delightful API is one that will actually get used.
 - Avoid leaking storage internals into API contracts.
-- Prefer one clear way to do a thing; avoid overlapping capabilities.
+- Prefer one clear way to do a thing; avoid overlapping capabilities. MECE is the goal.
 - Favor clean refactors and breaking changes over preserving flawed abstractions.
 
 ## Correctness expectations
@@ -17,6 +19,7 @@ Prioritize correctness, legibility, and operational predictability over convenie
 - Preserve transactional integrity between event append, projection, and work materialization.
 - Design cancellation and restart behavior explicitly; no silent hangs.
 - Keep read/write semantics deterministic and well-scoped.
+- A timeout / retry is a sign that we're failing. We _will_ need timers here and there but they should be the exception, not the solution.
 
 ## Validation and typing
 
@@ -25,6 +28,7 @@ Prioritize correctness, legibility, and operational predictability over convenie
 - Use strict TypeScript.
 - Avoid `any`; use `unknown` for untrusted values and thrown errors.
 - Minimize type casts; use them only when unavoidable and local.
+- Tests should be MECE. Identify classes of edge cases and cover these with deterministic, high-quality tests.
 
 ## Node/TypeScript conventions
 
@@ -39,6 +43,7 @@ Prioritize correctness, legibility, and operational predictability over convenie
 - Add intent comments for non-obvious invariants/trade-offs.
 - Avoid comments tied to PR/discussion history.
 - Avoid conditional object spread for optionals; use explicit assignment/branches.
+- Avoid speculative optionality. Avoid speculative complexity. Focus on the _immediate_ need without losing sight of the long-term vision.
 
 ## Quality gates
 
