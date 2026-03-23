@@ -5,6 +5,10 @@
   "type": "module",
   "description": "A SQLite-backed event and work engine that stays consistent across retries, restarts, and failures.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/torkbot/sledge"
+  },
   "publishConfig": {
     "access": "public"
   },
