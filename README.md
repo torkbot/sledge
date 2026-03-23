@@ -283,4 +283,6 @@ node --run lint
 - The package is published as compiled JavaScript in `dist/` (with `.d.ts` types).
 - Source remains strict TypeScript in `src/`.
 - `prepublishOnly` runs `node --run build` automatically.
+- Publishing uses GitHub Actions OIDC trusted publishing (`.github/workflows/release.yml`), so no long-lived npm token is required.
+- Configure npm trusted publishing for `@torkbot/sledge` to trust this repository/workflow before first publish.
 - Node version is pinned via `engines.node` because runtime code uses explicit resource management (`using` / `await using`).

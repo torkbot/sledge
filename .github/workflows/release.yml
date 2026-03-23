@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish to npm (requires NPM_TOKEN)
+        description: Publish to npm via GitHub OIDC trusted publishing
         type: boolean
         required: true
         default: false
@@ -101,5 +101,3 @@ jobs:
 
       - name: Publish package
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
