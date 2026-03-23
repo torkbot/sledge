@@ -43,26 +43,69 @@ type AgentNodeChildrenQueryResult = Static<
   typeof AgentNodeChildrenQueryResultSchema
 >;
 
+/**
+ * Create-agent command.
+ *
+ * `clientRequestId` is caller-provided idempotency identity for this create
+ * request. Retry the same create call with the same id to avoid duplicate
+ * agent initialization events.
+ */
 export type CreateAgentInput = {
+  /**
+   * Optional logical agent identity from the caller.
+   *
+   * If omitted, the runtime allocates a durable agent id.
+   */
   readonly agentId?: string;
+
+  /**
+   * Idempotency identity for this create request from the calling client.
+   */
   readonly clientRequestId: string;
+
+  /**
+   * Initial immutable context for this agent.
+   */
   readonly context: AgentContext;
 };
 
+/**
+ * Runtime-assigned identifiers for the initialized agent root.
+ */
 export type CreateAgentResult = {
   readonly agentId: string;
   readonly branchId: string;
   readonly nodeId: string;
 };
 
+/**
+ * Submit one user input intent for an existing agent.
+ */
 export type SubmitUserInput = {
+  /** Logical agent identity. */
   readonly agentId: string;
+
+  /** Scheduling policy for when this input should be consumed. */
   readonly timing: AgentInputTiming;
+
+  /**
+   * Caller-provided idempotency identity for this user input.
+   */
   readonly clientInputId: string;
+
+  /** User text payload. */
   readonly content: string;
+
+  /**
+   * Optional explicit fork anchor. If set, runtime records this input against
+   * a new branch lineage rooted from `forkFromNodeId`.
+   */
   readonly forkFromNodeId?: string;
 };
 
+/**
+ * Runtime-assigned placement metadata for the recorded input node.
+ */
 export type SubmitUserInputResult = {
   readonly agentId: string;
   readonly branchId: string;
@@ -70,24 +113,56 @@ export type SubmitUserInputResult = {
   readonly parentNodeId: string;
 };
 
+/**
+ * Public, user-facing driver for a durable ledger-backed agent runtime.
+ *
+ * Callers submit intent; runtime owns graph topology identifiers.
+ */
 export type AgentDriver = {
+  /**
+   * Create a new agent root context event.
+   */
   createAgent(input: CreateAgentInput): Promise<CreateAgentResult>;
+
+  /**
+   * Record one user input intent for later orchestration.
+   */
   submitUserInput(input: SubmitUserInput): Promise<SubmitUserInputResult>;
+
+  /**
+   * Read the latest branch head. Defaults branch to `main` when omitted.
+   */
   getBranchHead(input: {
     readonly agentId: string;
     readonly branchId?: string;
   }): Promise<AgentBranchHeadQueryResult>;
+
+  /**
+   * Read pending inputs split by timing queue. Defaults branch to `main`.
+   */
   getPendingInputs(input: {
     readonly agentId: string;
     readonly branchId?: string;
   }): Promise<AgentPendingInputsQueryResult>;
+
+  /**
+   * List child nodes for one parent node.
+   */
   getNodeChildren(
     input: AgentNodeChildrenQueryParams,
   ): Promise<AgentNodeChildrenQueryResult>;
+
+  /**
+   * Tail event stream with opaque resume cursor emission.
+   */
   tailEvents(input: {
     readonly last: number;
     readonly signal: AbortSignal;
   }): AsyncIterable<LedgerStreamEvent<AgentDriverEvents>>;
+
+  /**
+   * Resume event stream from a previously persisted opaque cursor.
+   */
   resumeEvents(input: {
     readonly cursor: LedgerCursor;
     readonly signal: AbortSignal;
