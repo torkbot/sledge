@@ -46,9 +46,9 @@ type AgentNodeChildrenQueryResult = Static<
 /**
  * Create-agent command.
  *
- * `clientRequestId` is caller-provided idempotency identity for this create
- * request. Retry the same create call with the same id to avoid duplicate
- * agent initialization events.
+ * `idempotencyKey` is caller-provided dedupe identity for this create request.
+ * Retry the same create call with the same key to avoid duplicate agent
+ * initialization events.
  */
 export type CreateAgentInput = {
   /**
@@ -59,9 +59,12 @@ export type CreateAgentInput = {
   readonly agentId?: string;
 
   /**
-   * Idempotency identity for this create request from the calling client.
+   * Optional idempotency key for create retries.
+   *
+   * When omitted, create is still accepted but retries are not deduplicated by
+   * caller identity.
    */
-  readonly clientRequestId: string;
+  readonly idempotencyKey?: string;
 
   /**
    * Initial immutable context for this agent.
@@ -178,6 +181,18 @@ export function createAgentDriver(
       const branchId = DEFAULT_BRANCH_ID;
       const nodeId = randomUUID();
 
+      let emitOptions:
+        | {
+            readonly dedupeKey?: string;
+          }
+        | undefined;
+
+      if (input.idempotencyKey !== undefined) {
+        emitOptions = {
+          dedupeKey: `agent:${agentId}:create:${input.idempotencyKey}`,
+        };
+      }
+
       await ledger.emit(
         "agent.event",
         {
@@ -188,9 +203,7 @@ export function createAgentDriver(
           parentNodeId: null,
           context: input.context,
         },
-        {
-          dedupeKey: `agent:${agentId}:create:${input.clientRequestId}`,
-        },
+        emitOptions,
       );
 
       return {

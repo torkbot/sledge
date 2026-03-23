@@ -30,7 +30,7 @@ test("createAgent initializes a branch head and emits context event", async () =
 
   const created = await agentRuntime.driver.createAgent({
     agentId: "agent-1",
-    clientRequestId: "create-1",
+    idempotencyKey: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -74,7 +74,6 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
 
   await agentRuntime.driver.createAgent({
     agentId: "agent-1",
-    clientRequestId: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -124,7 +123,7 @@ test("fork mode records sibling children from the same parent node", async () =>
 
   const created = await agentRuntime.driver.createAgent({
     agentId: "agent-1",
-    clientRequestId: "create-1",
+    idempotencyKey: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {

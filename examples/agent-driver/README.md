@@ -39,7 +39,7 @@ const driver = createAgentDriver(ledger);
 
 const created = await driver.createAgent({
   agentId: "agent:1", // optional; omitted => runtime allocates one
-  clientRequestId: "create:001", // caller-side idempotency key for create
+  idempotencyKey: "create:001", // caller-side idempotency key for create
   context: {
     systemPrompt: "You are concise and careful.",
     model: {
