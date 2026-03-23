@@ -11,6 +11,8 @@ The driver exposes one user input concept with timing semantics:
 - `next_opportunity`: flush all pending inputs of this class at the next model/tool boundary
 - `when_idle`: enqueue and consume one item per idle transition
 
+Graph topology identifiers (`branchId`, `nodeId`, `parentNodeId`) are runtime-owned. Callers submit intent; the runtime chooses durable node lineage details.
+
 These are intentionally separate timing queues:
 
 1. `next_opportunity` buffer drains fully on the next eligible opportunity.
@@ -35,10 +37,9 @@ The public API surface in `api.ts` is designed for application code:
 ```ts
 const driver = createAgentDriver(ledger);
 
-await driver.createAgent({
-  agentId: "agent:1",
-  branchId: "main",
-  rootNodeId: "node:root",
+const created = await driver.createAgent({
+  agentId: "agent:1", // optional; omitted => runtime allocates one
+  clientRequestId: "create:001",
   context: {
     systemPrompt: "You are concise and careful.",
     model: {
@@ -51,14 +52,19 @@ await driver.createAgent({
 });
 
 await driver.submitUserInput({
-  agentId: "agent:1",
-  branchId: "main",
-  nodeId: "node:2",
-  parentNodeId: "node:root",
-  mode: "continue",
+  agentId: created.agentId,
   timing: "next_opportunity",
   clientInputId: "input:001",
   content: "Draft a release note from the changelog.",
+});
+
+// Explicit fork-from-history intent:
+await driver.submitUserInput({
+  agentId: created.agentId,
+  timing: "when_idle",
+  clientInputId: "input:002",
+  content: "Try a different angle",
+  forkFromNodeId: created.nodeId,
 });
 ```
 
@@ -78,8 +84,8 @@ All events include `agentId`, branch identity, and graph parent references (`nod
 
 The scaffold defines query contracts for common app reads:
 
-- `agent.branch.head`: latest node for an `(agentId, branchId)`
-- `agent.pending-inputs`: pending `next_opportunity` and `when_idle` inputs for a branch
+- `agent.branch.head`: latest node for an `(agentId, branchId)` (driver defaults branch to `main`)
+- `agent.pending-inputs`: pending `next_opportunity` and `when_idle` inputs for a branch (driver defaults branch to `main`)
 - `agent.node.children`: children for a given `(agentId, nodeId)`
 
 ## Current status

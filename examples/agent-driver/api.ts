@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { Static } from "@sinclair/typebox";
 
 import type {
@@ -14,12 +16,13 @@ import {
   AgentPendingInputsQueryResultSchema,
 } from "./contracts.ts";
 import type {
-  AgentBranchMode,
   AgentContext,
   AgentDriverEvents,
   AgentDriverQueries,
   AgentInputTiming,
 } from "./contracts.ts";
+
+const DEFAULT_BRANCH_ID = "main";
 
 type AgentBranchHeadQueryParams = Static<
   typeof AgentBranchHeadQueryParamsSchema
@@ -41,32 +44,43 @@ type AgentNodeChildrenQueryResult = Static<
 >;
 
 export type CreateAgentInput = {
+  readonly agentId?: string;
+  readonly clientRequestId: string;
+  readonly context: AgentContext;
+};
+
+export type CreateAgentResult = {
   readonly agentId: string;
   readonly branchId: string;
-  readonly rootNodeId: string;
-  readonly context: AgentContext;
+  readonly nodeId: string;
 };
 
 export type SubmitUserInput = {
   readonly agentId: string;
-  readonly branchId: string;
-  readonly nodeId: string;
-  readonly parentNodeId: string;
-  readonly mode: AgentBranchMode;
   readonly timing: AgentInputTiming;
   readonly clientInputId: string;
   readonly content: string;
+  readonly forkFromNodeId?: string;
+};
+
+export type SubmitUserInputResult = {
+  readonly agentId: string;
+  readonly branchId: string;
+  readonly nodeId: string;
+  readonly parentNodeId: string;
 };
 
 export type AgentDriver = {
-  createAgent(input: CreateAgentInput): Promise<void>;
-  submitUserInput(input: SubmitUserInput): Promise<void>;
-  getBranchHead(
-    input: AgentBranchHeadQueryParams,
-  ): Promise<AgentBranchHeadQueryResult>;
-  getPendingInputs(
-    input: AgentPendingInputsQueryParams,
-  ): Promise<AgentPendingInputsQueryResult>;
+  createAgent(input: CreateAgentInput): Promise<CreateAgentResult>;
+  submitUserInput(input: SubmitUserInput): Promise<SubmitUserInputResult>;
+  getBranchHead(input: {
+    readonly agentId: string;
+    readonly branchId?: string;
+  }): Promise<AgentBranchHeadQueryResult>;
+  getPendingInputs(input: {
+    readonly agentId: string;
+    readonly branchId?: string;
+  }): Promise<AgentPendingInputsQueryResult>;
   getNodeChildren(
     input: AgentNodeChildrenQueryParams,
   ): Promise<AgentNodeChildrenQueryResult>;
@@ -85,45 +99,88 @@ export function createAgentDriver(
 ): AgentDriver {
   return {
     createAgent: async (input) => {
+      const agentId = input.agentId ?? randomUUID();
+      const branchId = DEFAULT_BRANCH_ID;
+      const nodeId = randomUUID();
+
       await ledger.emit(
         "agent.event",
         {
           kind: "context.initialized",
-          agentId: input.agentId,
-          branchId: input.branchId,
-          nodeId: input.rootNodeId,
+          agentId,
+          branchId,
+          nodeId,
           parentNodeId: null,
           context: input.context,
         },
         {
-          dedupeKey: `agent:${input.agentId}:node:${input.rootNodeId}`,
+          dedupeKey: `agent:${agentId}:create:${input.clientRequestId}`,
         },
       );
+
+      return {
+        agentId,
+        branchId,
+        nodeId,
+      };
     },
     submitUserInput: async (input) => {
+      const branchId = DEFAULT_BRANCH_ID;
+      const nodeId = randomUUID();
+
+      let parentNodeId = input.forkFromNodeId;
+
+      if (parentNodeId === undefined) {
+        const head = await ledger.query("agent.branch.head", {
+          agentId: input.agentId,
+          branchId,
+        });
+
+        if (head === null) {
+          throw new Error(
+            `cannot submit input for unknown agent branch: ${input.agentId}/${branchId}`,
+          );
+        }
+
+        parentNodeId = head.nodeId;
+      }
+
       await ledger.emit(
         "user.event",
         {
           kind: "input.recorded",
           agentId: input.agentId,
-          branchId: input.branchId,
-          nodeId: input.nodeId,
-          parentNodeId: input.parentNodeId,
-          mode: input.mode,
+          branchId,
+          nodeId,
+          parentNodeId,
           timing: input.timing,
           clientInputId: input.clientInputId,
           content: input.content,
+          forkFromNodeId: input.forkFromNodeId,
         },
         {
           dedupeKey: `agent:${input.agentId}:input:${input.clientInputId}`,
         },
       );
+
+      return {
+        agentId: input.agentId,
+        branchId,
+        nodeId,
+        parentNodeId,
+      };
     },
     getBranchHead: async (input) => {
-      return await ledger.query("agent.branch.head", input);
+      return await ledger.query("agent.branch.head", {
+        agentId: input.agentId,
+        branchId: input.branchId ?? DEFAULT_BRANCH_ID,
+      });
     },
     getPendingInputs: async (input) => {
-      return await ledger.query("agent.pending-inputs", input);
+      return await ledger.query("agent.pending-inputs", {
+        agentId: input.agentId,
+        branchId: input.branchId ?? DEFAULT_BRANCH_ID,
+      });
     },
     getNodeChildren: async (input) => {
       return await ledger.query("agent.node.children", input);

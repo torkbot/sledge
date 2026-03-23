@@ -2,13 +2,6 @@ import { Type, type Static } from "@sinclair/typebox";
 
 import type { QuerySchema } from "../../src/ledger/ledger.ts";
 
-export const AgentBranchModeSchema = Type.Union([
-  Type.Literal("continue"),
-  Type.Literal("fork"),
-]);
-
-export type AgentBranchMode = Static<typeof AgentBranchModeSchema>;
-
 export const AgentInputTimingSchema = Type.Union([
   Type.Literal("next_opportunity"),
   Type.Literal("when_idle"),
@@ -96,10 +89,10 @@ export const UserInputRecordedEventSchema = Type.Object({
   branchId: Type.String(),
   nodeId: Type.String(),
   parentNodeId: Type.String(),
-  mode: AgentBranchModeSchema,
   timing: AgentInputTimingSchema,
   clientInputId: Type.String(),
   content: Type.String(),
+  forkFromNodeId: Type.Optional(Type.String()),
 });
 
 export type UserInputRecordedEvent = Static<

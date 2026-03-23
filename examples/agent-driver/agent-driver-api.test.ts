@@ -28,10 +28,9 @@ test("createAgent initializes a branch head and emits context event", async () =
     llm: createPiAiStub(),
   });
 
-  await agentRuntime.driver.createAgent({
+  const created = await agentRuntime.driver.createAgent({
     agentId: "agent-1",
-    branchId: "main",
-    rootNodeId: "node-root",
+    clientRequestId: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -43,15 +42,17 @@ test("createAgent initializes a branch head and emits context event", async () =
     },
   });
 
+  assert.equal(created.agentId, "agent-1");
+  assert.equal(created.branchId, "main");
+
   const head = await agentRuntime.driver.getBranchHead({
     agentId: "agent-1",
-    branchId: "main",
   });
 
   assert.deepEqual(head, {
     agentId: "agent-1",
-    branchId: "main",
-    nodeId: "node-root",
+    branchId: created.branchId,
+    nodeId: created.nodeId,
     parentNodeId: null,
     eventName: "agent.event",
     eventKind: "context.initialized",
@@ -73,8 +74,7 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
 
   await agentRuntime.driver.createAgent({
     agentId: "agent-1",
-    branchId: "main",
-    rootNodeId: "node-root",
+    clientRequestId: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -87,10 +87,6 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
 
   await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
-    branchId: "main",
-    nodeId: "node-1",
-    parentNodeId: "node-root",
-    mode: "continue",
     timing: "next_opportunity",
     clientInputId: "input-1",
     content: "Apply at next boundary",
@@ -98,10 +94,6 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
 
   await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
-    branchId: "main",
-    nodeId: "node-2",
-    parentNodeId: "node-1",
-    mode: "continue",
     timing: "when_idle",
     clientInputId: "input-2",
     content: "Queue for idle",
@@ -109,7 +101,6 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
 
   const pending = await agentRuntime.driver.getPendingInputs({
     agentId: "agent-1",
-    branchId: "main",
   });
 
   assert.equal(pending.nextOpportunity.length, 1);
@@ -131,10 +122,9 @@ test("fork mode records sibling children from the same parent node", async () =>
     llm: createPiAiStub(),
   });
 
-  await agentRuntime.driver.createAgent({
+  const created = await agentRuntime.driver.createAgent({
     agentId: "agent-1",
-    branchId: "main",
-    rootNodeId: "node-root",
+    clientRequestId: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -145,43 +135,36 @@ test("fork mode records sibling children from the same parent node", async () =>
     },
   });
 
-  await agentRuntime.driver.submitUserInput({
+  const continued = await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
-    branchId: "main",
-    nodeId: "node-main-1",
-    parentNodeId: "node-root",
-    mode: "continue",
     timing: "next_opportunity",
     clientInputId: "input-main-1",
     content: "Continue on main",
   });
 
-  await agentRuntime.driver.submitUserInput({
+  const forked = await agentRuntime.driver.submitUserInput({
     agentId: "agent-1",
-    branchId: "branch-alt",
-    nodeId: "node-alt-1",
-    parentNodeId: "node-root",
-    mode: "fork",
     timing: "next_opportunity",
     clientInputId: "input-alt-1",
     content: "Fork from root",
+    forkFromNodeId: created.nodeId,
   });
 
   const children = await agentRuntime.driver.getNodeChildren({
     agentId: "agent-1",
-    nodeId: "node-root",
+    nodeId: created.nodeId,
   });
 
   assert.deepEqual(children, [
     {
-      branchId: "main",
-      nodeId: "node-main-1",
+      branchId: created.branchId,
+      nodeId: continued.nodeId,
       eventName: "user.event",
       eventKind: "input.recorded",
     },
     {
-      branchId: "branch-alt",
-      nodeId: "node-alt-1",
+      branchId: created.branchId,
+      nodeId: forked.nodeId,
       eventName: "user.event",
       eventKind: "input.recorded",
     },
