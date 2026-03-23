@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0
+
 * Add event tailing and resume APIs for external consumers
 
     You can now consume ledger events as a stream using `tailEvents({ last, signal })` and continue later with `resumeEvents({ cursor, signal })`. This makes it practical to build and maintain read models in separate processes (including browser and worker clients) without replaying from the beginning each time.
