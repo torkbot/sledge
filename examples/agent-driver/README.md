@@ -89,6 +89,14 @@ The scaffold defines query contracts for common app reads:
 - `agent.pending-inputs`: pending `next_opportunity` and `when_idle` inputs for a branch (driver defaults branch to `main`)
 - `agent.node.children`: children for a given `(agentId, nodeId)`
 
+## Operational convention
+
+This design assumes a **single active writer runtime** per backing ledger database.
+
+If you run multiple concurrent writers against the same database, behavior may still be correct in many cases due to SQLite transaction semantics, but latency, contention, and scheduling behavior are no longer predictable by this example contract.
+
+In short: single-writer is the convention; YMMV if you break it.
+
 ## Current status
 
 The test suite is intentionally written as a guiding-light specification for the real runtime and is expected to fail until the durable model + `agent.advance` handler are implemented.

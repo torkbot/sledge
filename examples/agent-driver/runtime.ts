@@ -22,6 +22,12 @@ export interface PiAiGateway {
   }>;
 }
 
+/**
+ * Input dependencies for opening the agent runtime.
+ *
+ * Operational convention: run one active writer runtime per database.
+ * This example does not enforce writer leasing.
+ */
 export type OpenAgentDriverRuntimeInput = {
   readonly database: Database.Database;
   readonly timing: LedgerTiming;
