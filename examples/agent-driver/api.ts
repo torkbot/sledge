@@ -10,6 +10,8 @@ import type {
 import {
   AgentBranchHeadQueryParamsSchema,
   AgentBranchHeadQueryResultSchema,
+  AgentMessagesQueryParamsSchema,
+  AgentMessagesQueryResultSchema,
   AgentNodeChildrenQueryParamsSchema,
   AgentNodeChildrenQueryResultSchema,
   AgentPendingInputsQueryParamsSchema,
@@ -42,6 +44,8 @@ type AgentNodeChildrenQueryParams = Static<
 type AgentNodeChildrenQueryResult = Static<
   typeof AgentNodeChildrenQueryResultSchema
 >;
+type AgentMessagesQueryParams = Static<typeof AgentMessagesQueryParamsSchema>;
+type AgentMessagesQueryResult = Static<typeof AgentMessagesQueryResultSchema>;
 
 /**
  * One-shot agent initialization command.
@@ -69,7 +73,13 @@ export type InitializeAgentResult = {
 export type SubmitUserInput = {
   readonly agentId: string;
   readonly timing: AgentInputTiming;
-  readonly clientInputId: string;
+
+  /**
+   * Idempotency key for this user input command. Re-submit the same key on
+   * retries to prevent duplicate recorded inputs.
+   */
+  readonly idempotencyKey: string;
+
   readonly content: string;
   readonly forkFromNodeId?: string;
 };
@@ -125,6 +135,14 @@ export type AgentDriver = {
   getNodeChildren(
     input: AgentNodeChildrenQueryParams,
   ): Promise<AgentNodeChildrenQueryResult>;
+
+  /**
+   * Read current agent messages from the active branch snapshot query.
+   */
+  getMessages(input: {
+    readonly agentId: string;
+    readonly branchId?: string;
+  }): Promise<AgentMessagesQueryResult>;
 
   /**
    * Tail event stream with opaque resume cursor emission.
@@ -211,12 +229,12 @@ export function createAgentDriver(
           nodeId,
           parentNodeId,
           timing: input.timing,
-          clientInputId: input.clientInputId,
+          idempotencyKey: input.idempotencyKey,
           content: input.content,
           forkFromNodeId: input.forkFromNodeId,
         },
         {
-          dedupeKey: `agent:${input.agentId}:input:${input.clientInputId}`,
+          dedupeKey: `agent:${input.agentId}:input:${input.idempotencyKey}`,
         },
       );
 
@@ -241,6 +259,12 @@ export function createAgentDriver(
     },
     getNodeChildren: async (input) => {
       return await ledger.query("agent.node.children", input);
+    },
+    getMessages: async (input) => {
+      return await ledger.query("agent.messages", {
+        agentId: input.agentId,
+        branchId: input.branchId ?? DEFAULT_BRANCH_ID,
+      });
     },
     tailEvents: (input) => {
       return ledger.tailEvents(input);

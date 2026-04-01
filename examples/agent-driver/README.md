@@ -21,7 +21,15 @@ const created = await driver.initializeAgent({
       id: "claude-sonnet-4-20250514",
     },
     thinkingLevel: "medium",
-    tools: ["search", "read_file"],
+    tools: [
+      {
+        name: "search",
+        label: "Search",
+        description: "Search internal docs",
+        inputSchemaJson:
+          '{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}',
+      },
+    ],
     messages: [],
   },
 });
@@ -29,7 +37,7 @@ const created = await driver.initializeAgent({
 await driver.submitUserInput({
   agentId: created.agentId,
   timing: "next_opportunity",
-  clientInputId: "input:001",
+  idempotencyKey: "input:001",
   content: "Draft a release note from the changelog.",
 });
 
@@ -37,10 +45,16 @@ await driver.submitUserInput({
 await driver.submitUserInput({
   agentId: created.agentId,
   timing: "when_idle",
-  clientInputId: "input:002",
+  idempotencyKey: "input:002",
   content: "Try a different angle.",
   forkFromNodeId: created.nodeId,
 });
+
+const transcript = await driver.getMessages({
+  agentId: created.agentId,
+});
+
+console.log(transcript.messages);
 ```
 
 ---
@@ -89,6 +103,7 @@ The runtime is modeled as durable events + queries, not hidden in-memory state. 
 - `getBranchHead(...)`
 - `getPendingInputs(...)`
 - `getNodeChildren(...)`
+- `getMessages(...)`
 - `tailEvents(...)`
 - `resumeEvents(...)`
 
@@ -137,6 +152,29 @@ Persisted context tracks key pi-ai model inputs:
 - `context.messages`
 
 This keeps the orchestration model aligned with pi-ai loop execution requirements.
+
+## Tool hookup pattern
+
+An agent with tools should wire durable tool definitions to concrete runtime handlers.
+
+At runtime boundary (`openAgentDriverRuntime(...)`), provide handlers keyed by tool name. The orchestration layer resolves durable tool calls against this registry during `agent.advance`.
+
+```ts
+const runtime = openAgentDriverRuntime({
+  database,
+  timing,
+  llm,
+  toolHandlers: {
+    search: async ({ query, signal }) => {
+      return {
+        content: [{ type: "text", text: `result for: ${query}` }],
+      };
+    },
+  },
+});
+```
+
+If a tool is declared in context but has no runtime handler, the call should fail predictably and be materialized as tool error events.
 
 ---
 

@@ -43,11 +43,20 @@ export const AgentMessageSchema = Type.Object({
 
 export type AgentMessage = Static<typeof AgentMessageSchema>;
 
+export const AgentToolDefinitionSchema = Type.Object({
+  name: Type.String(),
+  label: Type.String(),
+  description: Type.String(),
+  inputSchemaJson: Type.String(),
+});
+
+export type AgentToolDefinition = Static<typeof AgentToolDefinitionSchema>;
+
 export const AgentContextSchema = Type.Object({
   systemPrompt: Type.String(),
   model: PiAiModelConfigSchema,
   thinkingLevel: PiAiThinkingLevelSchema,
-  tools: Type.Array(Type.String()),
+  tools: Type.Array(AgentToolDefinitionSchema),
   messages: Type.Array(AgentMessageSchema),
 });
 
@@ -97,7 +106,7 @@ export const UserInputRecordedEventSchema = Type.Object({
   nodeId: Type.String(),
   parentNodeId: Type.String(),
   timing: AgentInputTimingSchema,
-  clientInputId: Type.String(),
+  idempotencyKey: Type.String(),
   content: Type.String(),
   forkFromNodeId: Type.Optional(Type.String()),
 });
@@ -188,10 +197,29 @@ export const AgentNodeChildrenQuerySchema: QuerySchema<
   result: AgentNodeChildrenQueryResultSchema,
 };
 
+export const AgentMessagesQueryParamsSchema = Type.Object({
+  agentId: Type.String(),
+  branchId: Type.String(),
+});
+
+export const AgentMessagesQueryResultSchema = Type.Object({
+  headNodeId: Type.String(),
+  messages: Type.Array(AgentMessageSchema),
+});
+
+export const AgentMessagesQuerySchema: QuerySchema<
+  typeof AgentMessagesQueryParamsSchema,
+  typeof AgentMessagesQueryResultSchema
+> = {
+  params: AgentMessagesQueryParamsSchema,
+  result: AgentMessagesQueryResultSchema,
+};
+
 export const AgentDriverQuerySchemas = {
   "agent.branch.head": AgentBranchHeadQuerySchema,
   "agent.pending-inputs": AgentPendingInputsQuerySchema,
   "agent.node.children": AgentNodeChildrenQuerySchema,
+  "agent.messages": AgentMessagesQuerySchema,
 } as const;
 
 export type AgentDriverQueries = typeof AgentDriverQuerySchemas;

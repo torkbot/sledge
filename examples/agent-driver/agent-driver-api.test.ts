@@ -26,6 +26,7 @@ test("initializeAgent initializes a branch head and emits context event", async 
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
+    toolHandlers: {},
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -38,7 +39,15 @@ test("initializeAgent initializes a branch head and emits context event", async 
         id: "claude-sonnet-4-20250514",
       },
       thinkingLevel: "medium",
-      tools: ["search"],
+      tools: [
+        {
+          name: "search",
+          label: "Search",
+          description: "Search documentation",
+          inputSchemaJson:
+            '{"type":"object","properties":{"query":{"type":"string"}}}',
+        },
+      ],
       messages: [],
     },
   });
@@ -71,6 +80,7 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
+    toolHandlers: {},
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -91,14 +101,14 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
   await agentRuntime.driver.submitUserInput({
     agentId: created.agentId,
     timing: "next_opportunity",
-    clientInputId: "input-1",
+    idempotencyKey: "input-1",
     content: "Apply at next boundary",
   });
 
   await agentRuntime.driver.submitUserInput({
     agentId: created.agentId,
     timing: "when_idle",
-    clientInputId: "input-2",
+    idempotencyKey: "input-2",
     content: "Queue for idle",
   });
 
@@ -107,9 +117,9 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
   });
 
   assert.equal(pending.nextOpportunity.length, 1);
-  assert.equal(pending.nextOpportunity[0]?.clientInputId, "input-1");
+  assert.equal(pending.nextOpportunity[0]?.idempotencyKey, "input-1");
   assert.equal(pending.whenIdle.length, 1);
-  assert.equal(pending.whenIdle[0]?.clientInputId, "input-2");
+  assert.equal(pending.whenIdle[0]?.idempotencyKey, "input-2");
 });
 
 test("fork mode records sibling children from the same parent node", async () => {
@@ -123,6 +133,7 @@ test("fork mode records sibling children from the same parent node", async () =>
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
+    toolHandlers: {},
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -143,14 +154,14 @@ test("fork mode records sibling children from the same parent node", async () =>
   const continued = await agentRuntime.driver.submitUserInput({
     agentId: created.agentId,
     timing: "next_opportunity",
-    clientInputId: "input-main-1",
+    idempotencyKey: "input-main-1",
     content: "Continue on main",
   });
 
   const forked = await agentRuntime.driver.submitUserInput({
     agentId: created.agentId,
     timing: "next_opportunity",
-    clientInputId: "input-alt-1",
+    idempotencyKey: "input-alt-1",
     content: "Fork from root",
     forkFromNodeId: created.nodeId,
   });
@@ -187,6 +198,7 @@ test("tailEvents and resumeEvents expose the agent event stream", async () => {
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
+    toolHandlers: {},
   });
 
   const abortController = new AbortController();

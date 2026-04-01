@@ -22,6 +22,15 @@ export interface PiAiGateway {
   }>;
 }
 
+export interface AgentToolHandlers {
+  readonly [toolName: string]: (input: {
+    readonly params: unknown;
+    readonly signal: AbortSignal;
+  }) => Promise<{
+    readonly content: unknown;
+  }>;
+}
+
 /**
  * Input dependencies for opening the agent runtime.
  *
@@ -32,6 +41,7 @@ export type OpenAgentDriverRuntimeInput = {
   readonly database: Database.Database;
   readonly timing: LedgerTiming;
   readonly llm: PiAiGateway;
+  readonly toolHandlers: AgentToolHandlers;
 };
 
 export type AgentDriverRuntime = AsyncDisposable & {
