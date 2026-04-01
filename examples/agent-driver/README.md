@@ -1,38 +1,12 @@
 # Agent driver example (sledge-backed)
 
-This example specifies a **production-oriented, ledger-backed agent design** on top of sledge.
+A durable, ledger-backed agent model built on top of `@torkbot/sledge`.
 
-It defines a user-facing driver API, durable event/query contracts, and operational conventions for running agents against a sledge ledger.
+This example is for teams that want explicit control over agent orchestration state, event history, and replay/resume behavior while integrating with `pi-ai` model execution.
 
-## Why this shape
+---
 
-The driver exposes one user input concept with timing semantics:
-
-- `next_opportunity`: flush all pending inputs of this class at the next model/tool boundary
-- `when_idle`: enqueue and consume one item per idle transition
-
-`agentId` is caller-owned domain identity. Graph topology identifiers (`branchId`, `nodeId`, `parentNodeId`) are runtime-owned. Callers submit intent; the runtime chooses durable lineage details.
-
-These are intentionally separate timing queues:
-
-1. `next_opportunity` buffer drains fully on the next eligible opportunity.
-2. `when_idle` queue drains one item each time the agent reaches idle.
-
-A `next_opportunity` input is never blocked behind queued `when_idle` items.
-
-## Public API experience
-
-The public API surface in `api.ts` is designed for application code:
-
-- `initializeAgent(...)`
-- `submitUserInput(...)`
-- `getBranchHead(...)`
-- `getPendingInputs(...)`
-- `getNodeChildren(...)`
-- `tailEvents(...)`
-- `resumeEvents(...)`
-
-### Example usage
+## Quick usage
 
 ```ts
 const driver = createAgentDriver(ledger);
@@ -59,47 +33,102 @@ await driver.submitUserInput({
   content: "Draft a release note from the changelog.",
 });
 
-// Explicit fork-from-history intent:
+// Explicit fork from historical node:
 await driver.submitUserInput({
   agentId: created.agentId,
   timing: "when_idle",
   clientInputId: "input:002",
-  content: "Try a different angle",
+  content: "Try a different angle.",
   forkFromNodeId: created.nodeId,
 });
 ```
 
-## Event contracts users can consume
+---
 
-Consumers can project external state by reading `tailEvents`/`resumeEvents`:
+## Key design decisions
+
+### 1) Caller owns `agentId`; runtime owns graph topology
+
+- Caller must provide durable domain identity (`agentId`) at initialization.
+- Runtime owns lineage/node details (`branchId`, `nodeId`, `parentNodeId`).
+
+This keeps API intent-focused and prevents callers from constructing invalid graph topology.
+
+### 2) One-shot initialization
+
+`initializeAgent({ agentId, context })` is one-shot for that identity.
+
+- First initialize creates root context node.
+- Re-initialize for existing identity should fail predictably.
+
+This avoids ambiguous "ensure then maybe set context" races.
+
+### 3) One user input concept, two timing policies
+
+`submitUserInput(...)` supports:
+
+- `next_opportunity`: flush all pending inputs of this class at next eligible model/tool boundary
+- `when_idle`: queue FIFO and consume one input per idle transition
+
+`next_opportunity` is never blocked behind `when_idle` backlog.
+
+### 4) Forking is explicit and local
+
+Forking is expressed by `forkFromNodeId` on input submission. This is explicit, auditable, and tied to a concrete historical anchor.
+
+### 5) Event-first architecture
+
+The runtime is modeled as durable events + queries, not hidden in-memory state. External consumers can tail and resume from opaque cursors.
+
+---
+
+## User-facing API surface
+
+- `initializeAgent(...)`
+- `submitUserInput(...)`
+- `getBranchHead(...)`
+- `getPendingInputs(...)`
+- `getNodeChildren(...)`
+- `tailEvents(...)`
+- `resumeEvents(...)`
+
+---
+
+## Event contracts consumers can tail/resume
 
 - `agent.event`
   - `context.initialized`
-  - `turn.state.updated` (planned lifecycle event scaffold)
+  - `turn.state.updated`
 - `user.event`
   - `input.recorded`
 
-All events include `agentId`, branch identity, and graph parent references (`nodeId` + `parentNodeId`) for branch/fork reconstruction.
+All events include:
 
-## Query contracts users can consume
+- `agentId`
+- `branchId`
+- `nodeId`
+- `parentNodeId`
 
-The scaffold defines query contracts for common app reads:
+This supports deterministic graph reconstruction and branch introspection.
 
-- `agent.branch.head`: latest node for an `(agentId, branchId)` (driver defaults branch to `main`)
-- `agent.pending-inputs`: pending `next_opportunity` and `when_idle` inputs for a branch (driver defaults branch to `main`)
-- `agent.node.children`: children for a given `(agentId, nodeId)`
+---
 
-## Operational convention
+## Query contracts consumers can use
 
-This design assumes a **single active writer runtime** per backing ledger database.
+- `agent.branch.head`
+  - latest node for `(agentId, branchId)`
+  - driver defaults branch to `main`
+- `agent.pending-inputs`
+  - pending `next_opportunity` and `when_idle` buffers for branch
+  - driver defaults branch to `main`
+- `agent.node.children`
+  - child nodes for `(agentId, nodeId)`
 
-If you run multiple concurrent writers against the same database, behavior may still be correct in many cases due to SQLite transaction semantics, but latency, contention, and scheduling behavior are no longer predictable by this example contract.
-
-In short: single-writer is the convention; YMMV if you break it.
+---
 
 ## pi-ai alignment
 
-The context contract already models pi-ai-facing metadata:
+Persisted context tracks key pi-ai model inputs:
 
 - `context.model.api`
 - `context.model.provider`
@@ -107,4 +136,12 @@ The context contract already models pi-ai-facing metadata:
 - `context.thinkingLevel`
 - `context.messages`
 
-This keeps agent setup aligned with pi-ai-backed model invocation.
+This keeps the orchestration model aligned with pi-ai loop execution requirements.
+
+---
+
+## Operational convention
+
+Run one active writer runtime per backing ledger database.
+
+SQLite will still serialize write transactions under contention, but this example's behavior and performance assumptions are based on single-writer operation.
