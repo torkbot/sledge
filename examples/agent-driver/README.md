@@ -11,7 +11,7 @@ The driver exposes one user input concept with timing semantics:
 - `next_opportunity`: flush all pending inputs of this class at the next model/tool boundary
 - `when_idle`: enqueue and consume one item per idle transition
 
-Graph topology identifiers (`branchId`, `nodeId`, `parentNodeId`) are runtime-owned. Callers submit intent; the runtime chooses durable node lineage details.
+`agentId` is caller-owned domain identity. Graph topology identifiers (`branchId`, `nodeId`, `parentNodeId`) are runtime-owned. Callers submit intent; the runtime chooses durable lineage details.
 
 These are intentionally separate timing queues:
 
@@ -24,7 +24,7 @@ A `next_opportunity` input is never blocked behind queued `when_idle` items.
 
 The public API surface in `api.ts` is designed for application code:
 
-- `createAgent(...)`
+- `initializeAgent(...)`
 - `submitUserInput(...)`
 - `getBranchHead(...)`
 - `getPendingInputs(...)`
@@ -37,9 +37,8 @@ The public API surface in `api.ts` is designed for application code:
 ```ts
 const driver = createAgentDriver(ledger);
 
-const created = await driver.createAgent({
-  agentId: "agent:1", // optional; omitted => runtime allocates one
-  idempotencyKey: "create:001", // caller-side idempotency key for create
+const created = await driver.initializeAgent({
+  agentId: "agent:001",
   context: {
     systemPrompt: "You are concise and careful.",
     model: {

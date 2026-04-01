@@ -15,7 +15,7 @@ function createPiAiStub(): PiAiGateway {
   };
 }
 
-test("createAgent initializes a branch head and emits context event", async () => {
+test("initializeAgent initializes a branch head and emits context event", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
 
@@ -28,9 +28,8 @@ test("createAgent initializes a branch head and emits context event", async () =
     llm: createPiAiStub(),
   });
 
-  const created = await agentRuntime.driver.createAgent({
+  const created = await agentRuntime.driver.initializeAgent({
     agentId: "agent-1",
-    idempotencyKey: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -48,11 +47,11 @@ test("createAgent initializes a branch head and emits context event", async () =
   assert.equal(created.branchId, "main");
 
   const head = await agentRuntime.driver.getBranchHead({
-    agentId: "agent-1",
+    agentId: created.agentId,
   });
 
   assert.deepEqual(head, {
-    agentId: "agent-1",
+    agentId: created.agentId,
     branchId: created.branchId,
     nodeId: created.nodeId,
     parentNodeId: null,
@@ -74,7 +73,7 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
     llm: createPiAiStub(),
   });
 
-  await agentRuntime.driver.createAgent({
+  const created = await agentRuntime.driver.initializeAgent({
     agentId: "agent-1",
     context: {
       systemPrompt: "You are concise.",
@@ -90,21 +89,21 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
   });
 
   await agentRuntime.driver.submitUserInput({
-    agentId: "agent-1",
+    agentId: created.agentId,
     timing: "next_opportunity",
     clientInputId: "input-1",
     content: "Apply at next boundary",
   });
 
   await agentRuntime.driver.submitUserInput({
-    agentId: "agent-1",
+    agentId: created.agentId,
     timing: "when_idle",
     clientInputId: "input-2",
     content: "Queue for idle",
   });
 
   const pending = await agentRuntime.driver.getPendingInputs({
-    agentId: "agent-1",
+    agentId: created.agentId,
   });
 
   assert.equal(pending.nextOpportunity.length, 1);
@@ -126,9 +125,8 @@ test("fork mode records sibling children from the same parent node", async () =>
     llm: createPiAiStub(),
   });
 
-  const created = await agentRuntime.driver.createAgent({
+  const created = await agentRuntime.driver.initializeAgent({
     agentId: "agent-1",
-    idempotencyKey: "create-1",
     context: {
       systemPrompt: "You are concise.",
       model: {
@@ -143,14 +141,14 @@ test("fork mode records sibling children from the same parent node", async () =>
   });
 
   const continued = await agentRuntime.driver.submitUserInput({
-    agentId: "agent-1",
+    agentId: created.agentId,
     timing: "next_opportunity",
     clientInputId: "input-main-1",
     content: "Continue on main",
   });
 
   const forked = await agentRuntime.driver.submitUserInput({
-    agentId: "agent-1",
+    agentId: created.agentId,
     timing: "next_opportunity",
     clientInputId: "input-alt-1",
     content: "Fork from root",
@@ -158,7 +156,7 @@ test("fork mode records sibling children from the same parent node", async () =>
   });
 
   const children = await agentRuntime.driver.getNodeChildren({
-    agentId: "agent-1",
+    agentId: created.agentId,
     nodeId: created.nodeId,
   });
 

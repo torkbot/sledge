@@ -44,38 +44,20 @@ type AgentNodeChildrenQueryResult = Static<
 >;
 
 /**
- * Create-agent command.
+ * One-shot agent initialization command.
  *
- * `idempotencyKey` is caller-provided dedupe identity for this create request.
- * Retry the same create call with the same key to avoid duplicate agent
- * initialization events.
+ * `agentId` is caller-provided domain identity. Runtime must reject
+ * initialization if this identity already exists.
  */
-export type CreateAgentInput = {
-  /**
-   * Optional logical agent identity from the caller.
-   *
-   * If omitted, the runtime allocates a durable agent id.
-   */
-  readonly agentId?: string;
-
-  /**
-   * Optional idempotency key for create retries.
-   *
-   * When omitted, create is still accepted but retries are not deduplicated by
-   * caller identity.
-   */
-  readonly idempotencyKey?: string;
-
-  /**
-   * Initial immutable context for this agent.
-   */
+export type InitializeAgentInput = {
+  readonly agentId: string;
   readonly context: AgentContext;
 };
 
 /**
- * Runtime-assigned identifiers for the initialized agent root.
+ * Runtime-assigned identifiers for the initialized agent root node.
  */
-export type CreateAgentResult = {
+export type InitializeAgentResult = {
   readonly agentId: string;
   readonly branchId: string;
   readonly nodeId: string;
@@ -85,24 +67,10 @@ export type CreateAgentResult = {
  * Submit one user input intent for an existing agent.
  */
 export type SubmitUserInput = {
-  /** Logical agent identity. */
   readonly agentId: string;
-
-  /** Scheduling policy for when this input should be consumed. */
   readonly timing: AgentInputTiming;
-
-  /**
-   * Caller-provided idempotency identity for this user input.
-   */
   readonly clientInputId: string;
-
-  /** User text payload. */
   readonly content: string;
-
-  /**
-   * Optional explicit fork anchor. If set, runtime records this input against
-   * a new branch lineage rooted from `forkFromNodeId`.
-   */
   readonly forkFromNodeId?: string;
 };
 
@@ -119,13 +87,16 @@ export type SubmitUserInputResult = {
 /**
  * Public, user-facing driver for a durable ledger-backed agent runtime.
  *
- * Callers submit intent; runtime owns graph topology identifiers.
+ * Callers own logical `agentId` identity. Runtime owns graph topology
+ * identifiers (`branchId`, `nodeId`, `parentNodeId`).
  */
 export type AgentDriver = {
   /**
-   * Create a new agent root context event.
+   * Initialize an agent identity exactly once.
+   *
+   * Should fail predictably if the agent already exists.
    */
-  createAgent(input: CreateAgentInput): Promise<CreateAgentResult>;
+  initializeAgent(input: InitializeAgentInput): Promise<InitializeAgentResult>;
 
   /**
    * Record one user input intent for later orchestration.
@@ -176,38 +147,36 @@ export function createAgentDriver(
   ledger: Ledger<AgentDriverEvents, AgentDriverQueries>,
 ): AgentDriver {
   return {
-    createAgent: async (input) => {
-      const agentId = input.agentId ?? randomUUID();
+    initializeAgent: async (input) => {
       const branchId = DEFAULT_BRANCH_ID;
-      const nodeId = randomUUID();
+      const existing = await ledger.query("agent.branch.head", {
+        agentId: input.agentId,
+        branchId,
+      });
 
-      let emitOptions:
-        | {
-            readonly dedupeKey?: string;
-          }
-        | undefined;
-
-      if (input.idempotencyKey !== undefined) {
-        emitOptions = {
-          dedupeKey: `agent:${agentId}:create:${input.idempotencyKey}`,
-        };
+      if (existing !== null) {
+        throw new Error(`agent already initialized: ${input.agentId}`);
       }
+
+      const nodeId = randomUUID();
 
       await ledger.emit(
         "agent.event",
         {
           kind: "context.initialized",
-          agentId,
+          agentId: input.agentId,
           branchId,
           nodeId,
           parentNodeId: null,
           context: input.context,
         },
-        emitOptions,
+        {
+          dedupeKey: `agent:${input.agentId}:init`,
+        },
       );
 
       return {
-        agentId,
+        agentId: input.agentId,
         branchId,
         nodeId,
       };
