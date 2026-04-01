@@ -2,7 +2,7 @@
 
 This example specifies a **production-oriented, ledger-backed agent design** on top of sledge.
 
-The implementation is intentionally staged: we lock API contracts and behavioral tests first, then implement the durable ledger model and internal `agent.advance` orchestration to satisfy those tests.
+It defines a user-facing driver API, durable event/query contracts, and operational conventions for running agents against a sledge ledger.
 
 ## Why this shape
 
@@ -97,11 +97,7 @@ If you run multiple concurrent writers against the same database, behavior may s
 
 In short: single-writer is the convention; YMMV if you break it.
 
-## Current status
-
-The test suite is intentionally written as a guiding-light specification for the real runtime and is expected to fail until the durable model + `agent.advance` handler are implemented.
-
-## pi-ai anticipation
+## pi-ai alignment
 
 The context contract already models pi-ai-facing metadata:
 
@@ -111,4 +107,4 @@ The context contract already models pi-ai-facing metadata:
 - `context.thinkingLevel`
 - `context.messages`
 
-This keeps agent setup aligned with future pi-ai-backed model invocation while the orchestration handler is implemented later.
+This keeps agent setup aligned with pi-ai-backed model invocation.
