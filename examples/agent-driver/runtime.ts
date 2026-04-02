@@ -21,6 +21,7 @@ import {
   AGENT_NODE_EXISTS_QUERY_NAME,
   AGENT_PENDING_INPUTS_QUERY_NAME,
   AGENT_RUNTIME_STATE_QUERY_NAME,
+  AGENT_TURN_QUERY_NAME,
   AgentDriverEventSchemas,
   AgentDriverQuerySchemas,
   USER_EVENT_NAME,
@@ -132,6 +133,32 @@ const DeletePendingInputsProjectionSchema = Type.Object({
   inputNodeIds: Type.Array(Type.String()),
 });
 
+const TurnRequestedProjectionSchema = Type.Object({
+  agentId: Type.String(),
+  turnId: Type.String(),
+  requestNodeId: Type.String(),
+});
+
+const TurnCompletedProjectionSchema = Type.Object({
+  agentId: Type.String(),
+  turnId: Type.String(),
+  completionNodeId: Type.String(),
+  outputText: Type.String(),
+});
+
+const TurnFailedProjectionSchema = Type.Object({
+  agentId: Type.String(),
+  turnId: Type.String(),
+  failureNodeId: Type.String(),
+  error: Type.String(),
+});
+
+const AppendAssistantMessageProjectionSchema = Type.Object({
+  agentId: Type.String(),
+  headNodeId: Type.String(),
+  outputText: Type.String(),
+});
+
 export const AGENT_ADVANCE_QUEUE_NAME = "agent.advance" as const;
 export const AGENT_RUN_MODEL_QUEUE_NAME = "agent.run-model" as const;
 
@@ -149,7 +176,11 @@ const UPSERT_HEAD_INDEXER_NAME = "upsertHead" as const;
 const WRITE_CHILD_INDEXER_NAME = "writeChild" as const;
 const WRITE_PENDING_INPUT_INDEXER_NAME = "writePendingInput" as const;
 const DELETE_PENDING_INPUTS_INDEXER_NAME = "deletePendingInputs" as const;
+const UPSERT_TURN_REQUESTED_INDEXER_NAME = "upsertTurnRequested" as const;
+const MARK_TURN_COMPLETED_INDEXER_NAME = "markTurnCompleted" as const;
+const MARK_TURN_FAILED_INDEXER_NAME = "markTurnFailed" as const;
 const UPSERT_MESSAGES_INDEXER_NAME = "upsertMessages" as const;
+const APPEND_ASSISTANT_MESSAGE_INDEXER_NAME = "appendAssistantMessage" as const;
 const UPSERT_RUNTIME_STATE_INDEXER_NAME = "upsertRuntimeState" as const;
 
 const AgentMessagesArraySchema = Type.Array(
@@ -217,6 +248,20 @@ const AgentRuntimeStateRowSchema = Type.Object({
   when_idle_count: Type.Number(),
 });
 
+const AgentTurnRowSchema = Type.Object({
+  agent_id: Type.String(),
+  turn_id: Type.String(),
+  request_node_id: Type.String(),
+  status: Type.Union([
+    Type.Literal("requested"),
+    Type.Literal("completed"),
+    Type.Literal("failed"),
+  ]),
+  last_node_id: Type.String(),
+  output_text: Type.Union([Type.Null(), Type.String()]),
+  error_text: Type.Union([Type.Null(), Type.String()]),
+});
+
 function decodeRow<const TRowSchema extends TSchema>(
   schema: TRowSchema,
   row: unknown,
@@ -239,6 +284,24 @@ function decodeJsonWithSchema<const TJsonSchema extends TSchema>(
   }
 
   return Value.Decode(schema, parsed);
+}
+
+function summarizeMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  return JSON.stringify(content);
+}
+
+function buildModelPrompt(messages: readonly { content: unknown }[]): string {
+  if (messages.length === 0) {
+    return "";
+  }
+
+  return messages
+    .map((message) => summarizeMessageContent(message.content))
+    .join("\n\n");
 }
 
 export function openAgentDriverRuntime(
@@ -293,6 +356,17 @@ export function openAgentDriverRuntime(
       has_messages INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS agent_turns (
+      agent_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      request_node_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      last_node_id TEXT NOT NULL,
+      output_text TEXT,
+      error_text TEXT,
+      PRIMARY KEY (agent_id, turn_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_agent_nodes_by_agent ON agent_nodes(agent_id, node_id);
     CREATE INDEX IF NOT EXISTS idx_agent_pending_inputs_by_agent ON agent_pending_inputs(agent_id, node_id);
     CREATE INDEX IF NOT EXISTS idx_agent_children_by_parent ON agent_children(agent_id, parent_node_id, node_id);
@@ -310,7 +384,12 @@ export function openAgentDriverRuntime(
       [WRITE_CHILD_INDEXER_NAME]: AgentChildProjectionSchema,
       [WRITE_PENDING_INPUT_INDEXER_NAME]: UserInputRecordedEventSchema,
       [DELETE_PENDING_INPUTS_INDEXER_NAME]: DeletePendingInputsProjectionSchema,
+      [UPSERT_TURN_REQUESTED_INDEXER_NAME]: TurnRequestedProjectionSchema,
+      [MARK_TURN_COMPLETED_INDEXER_NAME]: TurnCompletedProjectionSchema,
+      [MARK_TURN_FAILED_INDEXER_NAME]: TurnFailedProjectionSchema,
       [UPSERT_MESSAGES_INDEXER_NAME]: AgentMessagesProjectionSchema,
+      [APPEND_ASSISTANT_MESSAGE_INDEXER_NAME]:
+        AppendAssistantMessageProjectionSchema,
       [UPSERT_RUNTIME_STATE_INDEXER_NAME]: AgentRuntimeStateProjectionSchema,
     },
     queries: AgentDriverQuerySchemas,
@@ -369,6 +448,44 @@ export function openAgentDriverRuntime(
           await actions.index(DELETE_PENDING_INPUTS_INDEXER_NAME, {
             agentId: event.payload.agentId,
             inputNodeIds: event.payload.inputNodeIds,
+          });
+        }
+
+        if (event.payload.kind === "turn.model.requested") {
+          await actions.index(UPSERT_TURN_REQUESTED_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            turnId: event.payload.turnId,
+            requestNodeId: event.payload.nodeId,
+          });
+        }
+
+        if (event.payload.kind === "turn.model.completed") {
+          await actions.index(MARK_TURN_COMPLETED_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            turnId: event.payload.turnId,
+            completionNodeId: event.payload.nodeId,
+            outputText: event.payload.outputText,
+          });
+
+          await actions.index(APPEND_ASSISTANT_MESSAGE_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            headNodeId: event.payload.nodeId,
+            outputText: event.payload.outputText,
+          });
+
+          await actions.index(UPSERT_RUNTIME_STATE_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            phase: null,
+            hasMessages: true,
+          });
+        }
+
+        if (event.payload.kind === "turn.model.failed") {
+          await actions.index(MARK_TURN_FAILED_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            turnId: event.payload.turnId,
+            failureNodeId: event.payload.nodeId,
+            error: event.payload.error,
           });
         }
       });
@@ -441,16 +558,120 @@ export function openAgentDriverRuntime(
         return execution.outcome;
       });
 
-      builder.handle(AGENT_RUN_MODEL_QUEUE_NAME, async ({ work }) => {
-        // TODO: model/tool I/O execution lives here.
-        // Intentionally stubbed for now; this queue is already wired so
-        // agent.advance can schedule model work in a production-like flow.
-        void work;
+      builder.handle(
+        AGENT_RUN_MODEL_QUEUE_NAME,
+        async ({ work, lease, actions }) => {
+          const runtimeState = await actions.query(
+            AGENT_RUNTIME_STATE_QUERY_NAME,
+            {
+              agentId: work.payload.agentId,
+            },
+          );
 
-        return {
-          outcome: "ack",
-        } as const;
-      });
+          if (!runtimeState.exists) {
+            return {
+              outcome: "dead_letter",
+              error: `model run requested for unknown agent: ${work.payload.agentId}`,
+            } as const;
+          }
+
+          if (runtimeState.phase !== "model_running") {
+            // Stale delivery or already transitioned; safe no-op.
+            return {
+              outcome: "ack",
+            } as const;
+          }
+
+          const turn = await actions.query(AGENT_TURN_QUERY_NAME, {
+            agentId: work.payload.agentId,
+            turnId: work.payload.turnId,
+          });
+
+          if (turn === null) {
+            return {
+              outcome: "dead_letter",
+              error: `model run requested for missing turn: ${work.payload.agentId}/${work.payload.turnId}`,
+            } as const;
+          }
+
+          if (turn.status === "completed") {
+            return {
+              outcome: "ack",
+            } as const;
+          }
+
+          if (turn.status === "failed") {
+            return {
+              outcome: "dead_letter",
+              error: `model run requested for failed turn: ${work.payload.agentId}/${work.payload.turnId}`,
+            } as const;
+          }
+
+          const transcript = await actions.query(AGENT_MESSAGES_QUERY_NAME, {
+            agentId: work.payload.agentId,
+          });
+
+          const prompt = buildModelPrompt(transcript.messages);
+
+          try {
+            await using hold = lease.hold();
+
+            const completion = await input.llm.runTurn({
+              agentId: work.payload.agentId,
+              prompt,
+              signal: hold.signal,
+            });
+
+            const completionNodeId = `agent-event/${work.workId}/model-completed`;
+
+            actions.emit(
+              AGENT_EVENT_NAME,
+              {
+                kind: "turn.model.completed",
+                agentId: work.payload.agentId,
+                nodeId: completionNodeId,
+                parentNodeId: turn.requestNodeId,
+                turnId: work.payload.turnId,
+                outputText: completion.outputText,
+              },
+              {
+                dedupeKey: `agent:${work.payload.agentId}:run-model:${work.workId}:completed`,
+              },
+            );
+
+            return {
+              outcome: "ack",
+            } as const;
+          } catch (error: unknown) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : "unknown error while running model turn";
+
+            const failureNodeId = `agent-event/${work.workId}/model-failed`;
+
+            actions.emit(
+              AGENT_EVENT_NAME,
+              {
+                kind: "turn.model.failed",
+                agentId: work.payload.agentId,
+                nodeId: failureNodeId,
+                parentNodeId: turn.requestNodeId,
+                turnId: work.payload.turnId,
+                error: message,
+              },
+              {
+                dedupeKey: `agent:${work.payload.agentId}:run-model:${work.workId}:failed`,
+              },
+            );
+
+            return {
+              outcome: "retry",
+              error: message,
+            } as const;
+          }
+        },
+      );
     },
   });
 
@@ -538,6 +759,48 @@ export function openAgentDriverRuntime(
             deleteByNodeId.run(row.agentId, inputNodeId);
           }
         },
+        upsertTurnRequested: async (row) => {
+          input.database
+            .prepare(
+              `INSERT INTO agent_turns
+                 (agent_id, turn_id, request_node_id, status, last_node_id, output_text, error_text)
+               VALUES (?, ?, ?, 'requested', ?, NULL, NULL)
+               ON CONFLICT(agent_id, turn_id)
+               DO UPDATE SET
+                 request_node_id = excluded.request_node_id,
+                 status = 'requested',
+                 last_node_id = excluded.last_node_id,
+                 output_text = NULL,
+                 error_text = NULL`,
+            )
+            .run(row.agentId, row.turnId, row.requestNodeId, row.requestNodeId);
+        },
+        markTurnCompleted: async (row) => {
+          input.database
+            .prepare(
+              `UPDATE agent_turns
+               SET status = 'completed',
+                   last_node_id = ?,
+                   output_text = ?,
+                   error_text = NULL
+               WHERE agent_id = ?
+                 AND turn_id = ?`,
+            )
+            .run(row.completionNodeId, row.outputText, row.agentId, row.turnId);
+        },
+        markTurnFailed: async (row) => {
+          input.database
+            .prepare(
+              `UPDATE agent_turns
+               SET status = 'failed',
+                   last_node_id = ?,
+                   output_text = NULL,
+                   error_text = ?
+               WHERE agent_id = ?
+                 AND turn_id = ?`,
+            )
+            .run(row.failureNodeId, row.error, row.agentId, row.turnId);
+        },
         upsertMessages: async (row) => {
           input.database
             .prepare(
@@ -549,6 +812,42 @@ export function openAgentDriverRuntime(
                  messages_json = excluded.messages_json`,
             )
             .run(row.agentId, row.headNodeId, row.messagesJson);
+        },
+        appendAssistantMessage: async (row) => {
+          const existing = input.database
+            .prepare(
+              `SELECT messages_json
+               FROM agent_messages
+               WHERE agent_id = ?`,
+            )
+            .get(row.agentId) as { messages_json: string } | undefined;
+
+          const currentMessages =
+            existing === undefined
+              ? []
+              : decodeJsonWithSchema(
+                  existing.messages_json,
+                  AgentMessagesArraySchema,
+                );
+
+          const nextMessages = [
+            ...currentMessages,
+            {
+              role: "assistant",
+              content: row.outputText,
+            },
+          ];
+
+          input.database
+            .prepare(
+              `INSERT INTO agent_messages (agent_id, head_node_id, messages_json)
+               VALUES (?, ?, ?)
+               ON CONFLICT(agent_id)
+               DO UPDATE SET
+                 head_node_id = excluded.head_node_id,
+                 messages_json = excluded.messages_json`,
+            )
+            .run(row.agentId, row.headNodeId, JSON.stringify(nextMessages));
         },
         upsertRuntimeState: async (row) => {
           input.database
@@ -778,6 +1077,42 @@ export function openAgentDriverRuntime(
               nextOpportunityCount: row.next_opportunity_count,
               whenIdleCount: row.when_idle_count,
               hasMessages: row.has_messages === 1,
+            },
+          );
+        },
+        [AGENT_TURN_QUERY_NAME]: async (params) => {
+          const rawRow = input.database
+            .prepare(
+              `SELECT
+                 agent_id,
+                 turn_id,
+                 request_node_id,
+                 status,
+                 last_node_id,
+                 output_text,
+                 error_text
+               FROM agent_turns
+               WHERE agent_id = ?
+                 AND turn_id = ?`,
+            )
+            .get(params.agentId, params.turnId);
+
+          if (rawRow === undefined) {
+            return null;
+          }
+
+          const row = decodeRow(AgentTurnRowSchema, rawRow);
+
+          return Value.Decode(
+            AgentDriverQuerySchemas[AGENT_TURN_QUERY_NAME].result,
+            {
+              agentId: row.agent_id,
+              turnId: row.turn_id,
+              requestNodeId: row.request_node_id,
+              status: row.status,
+              lastNodeId: row.last_node_id,
+              outputText: row.output_text ?? undefined,
+              error: row.error_text ?? undefined,
             },
           );
         },

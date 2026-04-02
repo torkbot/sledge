@@ -94,11 +94,31 @@ export const AgentTurnModelRequestedEventSchema = Type.Object({
   turnId: Type.String(),
 });
 
+export const AgentTurnModelCompletedEventSchema = Type.Object({
+  kind: Type.Literal("turn.model.completed"),
+  agentId: Type.String(),
+  nodeId: Type.String(),
+  parentNodeId: Type.String(),
+  turnId: Type.String(),
+  outputText: Type.String(),
+});
+
+export const AgentTurnModelFailedEventSchema = Type.Object({
+  kind: Type.Literal("turn.model.failed"),
+  agentId: Type.String(),
+  nodeId: Type.String(),
+  parentNodeId: Type.String(),
+  turnId: Type.String(),
+  error: Type.String(),
+});
+
 export const AgentEventSchema = Type.Union([
   AgentContextInitializedEventSchema,
   AgentTurnStateUpdatedEventSchema,
   AgentInputBatchClaimedEventSchema,
   AgentTurnModelRequestedEventSchema,
+  AgentTurnModelCompletedEventSchema,
+  AgentTurnModelFailedEventSchema,
 ]);
 
 export const UserInputRecordedEventSchema = Type.Object({
@@ -252,12 +272,43 @@ export const AgentRuntimeStateQuerySchema: QuerySchema<
   result: AgentRuntimeStateQueryResultSchema,
 };
 
+export const AgentTurnQueryParamsSchema = Type.Object({
+  agentId: Type.String(),
+  turnId: Type.String(),
+});
+
+export const AgentTurnQueryResultSchema = Type.Union([
+  Type.Null(),
+  Type.Object({
+    agentId: Type.String(),
+    turnId: Type.String(),
+    requestNodeId: Type.String(),
+    status: Type.Union([
+      Type.Literal("requested"),
+      Type.Literal("completed"),
+      Type.Literal("failed"),
+    ]),
+    lastNodeId: Type.String(),
+    outputText: Type.Optional(Type.String()),
+    error: Type.Optional(Type.String()),
+  }),
+]);
+
+export const AgentTurnQuerySchema: QuerySchema<
+  typeof AgentTurnQueryParamsSchema,
+  typeof AgentTurnQueryResultSchema
+> = {
+  params: AgentTurnQueryParamsSchema,
+  result: AgentTurnQueryResultSchema,
+};
+
 export const AGENT_HEAD_QUERY_NAME = "agent.head" as const;
 export const AGENT_PENDING_INPUTS_QUERY_NAME = "agent.pending-inputs" as const;
 export const AGENT_NODE_CHILDREN_QUERY_NAME = "agent.node.children" as const;
 export const AGENT_MESSAGES_QUERY_NAME = "agent.messages" as const;
 export const AGENT_NODE_EXISTS_QUERY_NAME = "agent.node.exists" as const;
 export const AGENT_RUNTIME_STATE_QUERY_NAME = "agent.runtime-state" as const;
+export const AGENT_TURN_QUERY_NAME = "agent.turn" as const;
 
 export const AgentDriverQuerySchemas = {
   [AGENT_HEAD_QUERY_NAME]: AgentHeadQuerySchema,
@@ -266,6 +317,7 @@ export const AgentDriverQuerySchemas = {
   [AGENT_MESSAGES_QUERY_NAME]: AgentMessagesQuerySchema,
   [AGENT_NODE_EXISTS_QUERY_NAME]: AgentNodeExistsQuerySchema,
   [AGENT_RUNTIME_STATE_QUERY_NAME]: AgentRuntimeStateQuerySchema,
+  [AGENT_TURN_QUERY_NAME]: AgentTurnQuerySchema,
 } as const;
 
 export type AgentDriverQueries = typeof AgentDriverQuerySchemas;
