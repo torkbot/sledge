@@ -8,6 +8,12 @@ import type {
   LedgerStreamEvent,
 } from "../../src/ledger/ledger.ts";
 import {
+  AGENT_EVENT_NAME,
+  AGENT_HEAD_QUERY_NAME,
+  AGENT_MESSAGES_QUERY_NAME,
+  AGENT_NODE_CHILDREN_QUERY_NAME,
+  AGENT_NODE_EXISTS_QUERY_NAME,
+  AGENT_PENDING_INPUTS_QUERY_NAME,
   AgentHeadQueryParamsSchema,
   AgentHeadQueryResultSchema,
   AgentMessagesQueryParamsSchema,
@@ -16,6 +22,7 @@ import {
   AgentNodeChildrenQueryResultSchema,
   AgentPendingInputsQueryParamsSchema,
   AgentPendingInputsQueryResultSchema,
+  USER_EVENT_NAME,
 } from "./contracts.ts";
 import type {
   AgentContext,
@@ -94,7 +101,7 @@ export function createAgentDriver(
 ): AgentDriver {
   return {
     initializeAgent: async (input) => {
-      const existing = await ledger.query("agent.head", {
+      const existing = await ledger.query(AGENT_HEAD_QUERY_NAME, {
         agentId: input.agentId,
       });
 
@@ -105,7 +112,7 @@ export function createAgentDriver(
       const nodeId = randomUUID();
 
       await ledger.emit(
-        "agent.event",
+        AGENT_EVENT_NAME,
         {
           kind: "context.initialized",
           agentId: input.agentId,
@@ -129,7 +136,7 @@ export function createAgentDriver(
       let parentNodeId = input.forkFromNodeId;
 
       if (parentNodeId === undefined) {
-        const head = await ledger.query("agent.head", {
+        const head = await ledger.query(AGENT_HEAD_QUERY_NAME, {
           agentId: input.agentId,
         });
 
@@ -141,7 +148,7 @@ export function createAgentDriver(
 
         parentNodeId = head.nodeId;
       } else {
-        const parentExists = await ledger.query("agent.node.exists", {
+        const parentExists = await ledger.query(AGENT_NODE_EXISTS_QUERY_NAME, {
           agentId: input.agentId,
           nodeId: parentNodeId,
         });
@@ -154,7 +161,7 @@ export function createAgentDriver(
       }
 
       await ledger.emit(
-        "user.event",
+        USER_EVENT_NAME,
         {
           kind: "input.recorded",
           agentId: input.agentId,
@@ -177,16 +184,16 @@ export function createAgentDriver(
       };
     },
     getHead: async (input) => {
-      return await ledger.query("agent.head", input);
+      return await ledger.query(AGENT_HEAD_QUERY_NAME, input);
     },
     getPendingInputs: async (input) => {
-      return await ledger.query("agent.pending-inputs", input);
+      return await ledger.query(AGENT_PENDING_INPUTS_QUERY_NAME, input);
     },
     getNodeChildren: async (input) => {
-      return await ledger.query("agent.node.children", input);
+      return await ledger.query(AGENT_NODE_CHILDREN_QUERY_NAME, input);
     },
     getMessages: async (input) => {
-      return await ledger.query("agent.messages", input);
+      return await ledger.query(AGENT_MESSAGES_QUERY_NAME, input);
     },
     tailEvents: (input) => {
       return ledger.tailEvents(input);

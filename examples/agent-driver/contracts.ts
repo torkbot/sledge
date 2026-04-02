@@ -99,9 +99,12 @@ export type UserInputRecordedEvent = Static<
 
 export const UserEventSchema = Type.Union([UserInputRecordedEventSchema]);
 
+export const AGENT_EVENT_NAME = "agent.event" as const;
+export const USER_EVENT_NAME = "user.event" as const;
+
 export const AgentDriverEventSchemas = {
-  "agent.event": AgentEventSchema,
-  "user.event": UserEventSchema,
+  [AGENT_EVENT_NAME]: AgentEventSchema,
+  [USER_EVENT_NAME]: UserEventSchema,
 } as const;
 
 export type AgentDriverEvents = typeof AgentDriverEventSchemas;
@@ -205,12 +208,18 @@ export const AgentNodeExistsQuerySchema: QuerySchema<
   result: AgentNodeExistsQueryResultSchema,
 };
 
+export const AGENT_HEAD_QUERY_NAME = "agent.head" as const;
+export const AGENT_PENDING_INPUTS_QUERY_NAME = "agent.pending-inputs" as const;
+export const AGENT_NODE_CHILDREN_QUERY_NAME = "agent.node.children" as const;
+export const AGENT_MESSAGES_QUERY_NAME = "agent.messages" as const;
+export const AGENT_NODE_EXISTS_QUERY_NAME = "agent.node.exists" as const;
+
 export const AgentDriverQuerySchemas = {
-  "agent.head": AgentHeadQuerySchema,
-  "agent.pending-inputs": AgentPendingInputsQuerySchema,
-  "agent.node.children": AgentNodeChildrenQuerySchema,
-  "agent.messages": AgentMessagesQuerySchema,
-  "agent.node.exists": AgentNodeExistsQuerySchema,
+  [AGENT_HEAD_QUERY_NAME]: AgentHeadQuerySchema,
+  [AGENT_PENDING_INPUTS_QUERY_NAME]: AgentPendingInputsQuerySchema,
+  [AGENT_NODE_CHILDREN_QUERY_NAME]: AgentNodeChildrenQuerySchema,
+  [AGENT_MESSAGES_QUERY_NAME]: AgentMessagesQuerySchema,
+  [AGENT_NODE_EXISTS_QUERY_NAME]: AgentNodeExistsQuerySchema,
 } as const;
 
 export type AgentDriverQueries = typeof AgentDriverQuerySchemas;

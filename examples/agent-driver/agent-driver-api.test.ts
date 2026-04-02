@@ -197,6 +197,28 @@ test("tailEvents and resumeEvents expose the agent event stream", async () => {
     toolHandlers: {},
   });
 
+  const created = await agentRuntime.driver.initializeAgent({
+    agentId: "agent-1",
+    context: {
+      systemPrompt: "You are concise.",
+      model: {
+        api: "anthropic",
+        provider: "anthropic",
+        id: "claude-sonnet-4-20250514",
+      },
+      thinkingLevel: "off",
+      tools: [],
+      messages: [],
+    },
+  });
+
+  await agentRuntime.driver.submitUserInput({
+    agentId: created.agentId,
+    timing: "next_opportunity",
+    idempotencyKey: "input-stream-1",
+    content: "hello stream",
+  });
+
   const abortController = new AbortController();
   const stream = agentRuntime.tailEvents({
     last: 10,
