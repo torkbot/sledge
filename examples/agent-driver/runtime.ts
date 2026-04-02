@@ -12,6 +12,7 @@ import type {
   LedgerStreamEvent,
 } from "../../src/ledger/ledger.ts";
 import { createAgentDriver, type AgentDriver } from "./api.ts";
+import { executeAgentAdvanceScaffold } from "./agent-advance.ts";
 import {
   AGENT_EVENT_NAME,
   AGENT_HEAD_QUERY_NAME,
@@ -228,63 +229,6 @@ function decodeJsonWithSchema<const TJsonSchema extends TSchema>(
   return Value.Decode(schema, parsed);
 }
 
-type AgentAdvanceRecoveryState = Static<
-  (typeof AgentDriverQuerySchemas)[typeof AGENT_RUNTIME_STATE_QUERY_NAME]["result"]
->;
-
-type AgentAdvanceTodo = {
-  readonly shouldFlushNextOpportunity: boolean;
-  readonly shouldConsumeWhenIdle: boolean;
-  readonly hasTranscript: boolean;
-};
-
-type AgentAdvanceDecision =
-  | { readonly kind: "dead_letter"; readonly error: string }
-  | { readonly kind: "noop"; readonly reason: string };
-
-function deriveAdvanceTodo(input: {
-  readonly state: AgentAdvanceRecoveryState;
-}): AgentAdvanceTodo {
-  return {
-    shouldFlushNextOpportunity: input.state.nextOpportunityCount > 0,
-    shouldConsumeWhenIdle:
-      input.state.phase === "idle" && input.state.whenIdleCount > 0,
-    hasTranscript: input.state.hasMessages,
-  };
-}
-
-function decideAgentAdvance(input: {
-  readonly agentId: string;
-  readonly state: AgentAdvanceRecoveryState;
-  readonly todo: AgentAdvanceTodo;
-}): AgentAdvanceDecision {
-  if (!input.state.exists) {
-    return {
-      kind: "dead_letter",
-      error: `advance requested for unknown agent: ${input.agentId}`,
-    };
-  }
-
-  if (input.todo.shouldFlushNextOpportunity) {
-    return {
-      kind: "noop",
-      reason: "next_opportunity dispatch scaffolded but not implemented yet",
-    };
-  }
-
-  if (input.todo.shouldConsumeWhenIdle) {
-    return {
-      kind: "noop",
-      reason: "when_idle dispatch scaffolded but not implemented yet",
-    };
-  }
-
-  return {
-    kind: "noop",
-    reason: "no pending work",
-  };
-}
-
 export function openAgentDriverRuntime(
   input: OpenAgentDriverRuntimeInput,
 ): AgentDriverRuntime {
@@ -450,41 +394,14 @@ export function openAgentDriverRuntime(
       });
 
       builder.handle(AGENT_ADVANCE_QUEUE_NAME, async ({ work, actions }) => {
-        const agentId = work.payload.agentId;
-
-        // Recover normalized runtime state in one query.
-        const state = await actions.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
-          agentId,
+        return await executeAgentAdvanceScaffold({
+          agentId: work.payload.agentId,
+          loadState: async ({ agentId }) => {
+            return await actions.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
+              agentId,
+            });
+          },
         });
-
-        const todo = deriveAdvanceTodo({
-          state,
-        });
-
-        const decision = decideAgentAdvance({
-          agentId,
-          state,
-          todo,
-        });
-
-        switch (decision.kind) {
-          case "dead_letter":
-            return {
-              outcome: "dead_letter",
-              error: decision.error,
-            } as const;
-          case "noop":
-            // Transition dispatcher scaffold.
-            // Future branches:
-            // - start_turn_from_next_opportunity
-            // - start_turn_from_when_idle
-            // - finalize_completed_turn
-            // - handle_failed_turn
-            void decision.reason;
-            return {
-              outcome: "ack",
-            } as const;
-        }
       });
     },
   });
