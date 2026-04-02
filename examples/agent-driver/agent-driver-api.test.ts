@@ -1,5 +1,5 @@
-import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import assert from "node:assert/strict";
 import test from "node:test";
 
 import { VirtualRuntimeHarness } from "../../src/runtime/virtual-runtime.ts";
@@ -201,6 +201,66 @@ test("fork mode records sibling children from the same parent node", async () =>
       eventKind: "input.recorded",
     },
   ]);
+});
+
+test("waitForIdle resolves immediately when agent is idle", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  await using agentRuntime = openAgentDriverRuntime({
+    database,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+    llm: createPiAiStub(),
+    toolHandlers: {},
+  });
+
+  const created = await agentRuntime.driver.initializeAgent({
+    agentId: "agent-1",
+    context: {
+      systemPrompt: "You are concise.",
+      model: {
+        api: "anthropic",
+        provider: "anthropic",
+        id: "claude-sonnet-4-20250514",
+      },
+      thinkingLevel: "off",
+      tools: [],
+      messages: [],
+    },
+  });
+
+  const controller = new AbortController();
+  await agentRuntime.driver.waitForIdle({
+    agentId: created.agentId,
+    signal: controller.signal,
+  });
+});
+
+test("waitForIdle rejects unknown agents", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  await using agentRuntime = openAgentDriverRuntime({
+    database,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+    llm: createPiAiStub(),
+    toolHandlers: {},
+  });
+
+  const controller = new AbortController();
+  await assert.rejects(
+    agentRuntime.driver.waitForIdle({
+      agentId: "missing-agent",
+      signal: controller.signal,
+    }),
+    /cannot wait for unknown agent: missing-agent/,
+  );
 });
 
 test("tailEvents and resumeEvents expose the agent event stream", async () => {

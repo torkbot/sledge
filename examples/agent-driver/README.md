@@ -104,6 +104,8 @@ The runtime is modeled as durable events + queries, not hidden in-memory state. 
 - `getPendingInputs(...)`
 - `getNodeChildren(...)`
 - `getMessages(...)`
+- `getRuntimeState(...)`
+- `waitForIdle(...)`
 - `tailEvents(...)`
 - `resumeEvents(...)`
 

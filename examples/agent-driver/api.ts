@@ -98,6 +98,10 @@ export type AgentDriver = {
   getRuntimeState(
     input: AgentRuntimeStateQueryParams,
   ): Promise<AgentRuntimeStateQueryResult>;
+  waitForIdle(input: {
+    readonly agentId: string;
+    readonly signal: AbortSignal;
+  }): Promise<void>;
   tailEvents(input: {
     readonly last: number;
     readonly signal: AbortSignal;
@@ -209,6 +213,44 @@ export function createAgentDriver(
     },
     getRuntimeState: async (input) => {
       return await ledger.query(AGENT_RUNTIME_STATE_QUERY_NAME, input);
+    },
+    waitForIdle: async (input) => {
+      const initial = await ledger.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
+        agentId: input.agentId,
+      });
+
+      if (!initial.exists) {
+        throw new Error(`cannot wait for unknown agent: ${input.agentId}`);
+      }
+
+      if (initial.phase === "idle") {
+        return;
+      }
+
+      const stream = ledger.tailEvents({
+        last: 0,
+        signal: input.signal,
+      });
+
+      for await (const item of stream) {
+        const payload = item.event.payload;
+
+        if (payload.agentId !== input.agentId) {
+          continue;
+        }
+
+        const state = await ledger.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
+          agentId: input.agentId,
+        });
+
+        if (!state.exists) {
+          throw new Error(`agent disappeared while waiting: ${input.agentId}`);
+        }
+
+        if (state.phase === "idle") {
+          return;
+        }
+      }
     },
     tailEvents: (input) => {
       return ledger.tailEvents(input);
