@@ -77,9 +77,28 @@ export const AgentTurnStateUpdatedEventSchema = Type.Object({
   ]),
 });
 
+export const AgentInputBatchClaimedEventSchema = Type.Object({
+  kind: Type.Literal("input.batch.claimed"),
+  agentId: Type.String(),
+  nodeId: Type.String(),
+  parentNodeId: Type.String(),
+  turnId: Type.String(),
+  inputNodeIds: Type.Array(Type.String()),
+});
+
+export const AgentTurnModelRequestedEventSchema = Type.Object({
+  kind: Type.Literal("turn.model.requested"),
+  agentId: Type.String(),
+  nodeId: Type.String(),
+  parentNodeId: Type.String(),
+  turnId: Type.String(),
+});
+
 export const AgentEventSchema = Type.Union([
   AgentContextInitializedEventSchema,
   AgentTurnStateUpdatedEventSchema,
+  AgentInputBatchClaimedEventSchema,
+  AgentTurnModelRequestedEventSchema,
 ]);
 
 export const UserInputRecordedEventSchema = Type.Object({

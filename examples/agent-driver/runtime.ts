@@ -127,16 +127,28 @@ const AgentRuntimeStateProjectionSchema = Type.Object({
   hasMessages: Type.Union([Type.Null(), Type.Boolean()]),
 });
 
+const DeletePendingInputsProjectionSchema = Type.Object({
+  agentId: Type.String(),
+  inputNodeIds: Type.Array(Type.String()),
+});
+
 export const AGENT_ADVANCE_QUEUE_NAME = "agent.advance" as const;
+export const AGENT_RUN_MODEL_QUEUE_NAME = "agent.run-model" as const;
 
 const AgentAdvanceQueueSchema = Type.Object({
   agentId: Type.String(),
+});
+
+const AgentRunModelQueueSchema = Type.Object({
+  agentId: Type.String(),
+  turnId: Type.String(),
 });
 
 const WRITE_NODE_INDEXER_NAME = "writeNode" as const;
 const UPSERT_HEAD_INDEXER_NAME = "upsertHead" as const;
 const WRITE_CHILD_INDEXER_NAME = "writeChild" as const;
 const WRITE_PENDING_INPUT_INDEXER_NAME = "writePendingInput" as const;
+const DELETE_PENDING_INPUTS_INDEXER_NAME = "deletePendingInputs" as const;
 const UPSERT_MESSAGES_INDEXER_NAME = "upsertMessages" as const;
 const UPSERT_RUNTIME_STATE_INDEXER_NAME = "upsertRuntimeState" as const;
 
@@ -290,12 +302,14 @@ export function openAgentDriverRuntime(
     events: AgentDriverEventSchemas,
     queues: {
       [AGENT_ADVANCE_QUEUE_NAME]: AgentAdvanceQueueSchema,
+      [AGENT_RUN_MODEL_QUEUE_NAME]: AgentRunModelQueueSchema,
     },
     indexers: {
       [WRITE_NODE_INDEXER_NAME]: AgentNodeProjectionSchema,
       [UPSERT_HEAD_INDEXER_NAME]: AgentHeadProjectionSchema,
       [WRITE_CHILD_INDEXER_NAME]: AgentChildProjectionSchema,
       [WRITE_PENDING_INPUT_INDEXER_NAME]: UserInputRecordedEventSchema,
+      [DELETE_PENDING_INPUTS_INDEXER_NAME]: DeletePendingInputsProjectionSchema,
       [UPSERT_MESSAGES_INDEXER_NAME]: AgentMessagesProjectionSchema,
       [UPSERT_RUNTIME_STATE_INDEXER_NAME]: AgentRuntimeStateProjectionSchema,
     },
@@ -350,6 +364,13 @@ export function openAgentDriverRuntime(
             hasMessages: null,
           });
         }
+
+        if (event.payload.kind === "input.batch.claimed") {
+          await actions.index(DELETE_PENDING_INPUTS_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            inputNodeIds: event.payload.inputNodeIds,
+          });
+        }
       });
 
       builder.project(USER_EVENT_NAME, async ({ event, actions }) => {
@@ -385,6 +406,13 @@ export function openAgentDriverRuntime(
         actions.enqueue(AGENT_ADVANCE_QUEUE_NAME, {
           agentId: event.payload.agentId,
         });
+
+        if (event.payload.kind === "turn.model.requested") {
+          actions.enqueue(AGENT_RUN_MODEL_QUEUE_NAME, {
+            agentId: event.payload.agentId,
+            turnId: event.payload.turnId,
+          });
+        }
       });
 
       builder.materialize(USER_EVENT_NAME, ({ event, actions }) => {
@@ -400,18 +428,28 @@ export function openAgentDriverRuntime(
 
         const execution = executeAgentAdvance({
           agentId: work.payload.agentId,
+          workId: work.workId,
           state,
         });
 
-        // Transition dispatcher scaffold.
-        // Future branches:
-        // - start_turn_from_next_opportunity
-        // - start_turn_from_when_idle
-        // - finalize_completed_turn
-        // - handle_failed_turn
-        void execution.transition;
+        for (const effect of execution.effects) {
+          actions.emit(effect.eventName, effect.payload, {
+            dedupeKey: effect.dedupeKey,
+          });
+        }
 
         return execution.outcome;
+      });
+
+      builder.handle(AGENT_RUN_MODEL_QUEUE_NAME, async ({ work }) => {
+        // TODO: model/tool I/O execution lives here.
+        // Intentionally stubbed for now; this queue is already wired so
+        // agent.advance can schedule model work in a production-like flow.
+        void work;
+
+        return {
+          outcome: "ack",
+        } as const;
       });
     },
   });
@@ -488,6 +526,17 @@ export function openAgentDriverRuntime(
               payload.content,
               payload.forkFromNodeId ?? null,
             );
+        },
+        deletePendingInputs: async (row) => {
+          const deleteByNodeId = input.database.prepare(
+            `DELETE FROM agent_pending_inputs
+             WHERE agent_id = ?
+               AND node_id = ?`,
+          );
+
+          for (const inputNodeId of row.inputNodeIds) {
+            deleteByNodeId.run(row.agentId, inputNodeId);
+          }
         },
         upsertMessages: async (row) => {
           input.database

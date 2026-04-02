@@ -60,8 +60,6 @@ test("decideAgentAdvance dead-letters unknown agent", () => {
   const state = makeState({
     exists: false,
     headNodeId: null,
-    nextOpportunityCount: 1,
-    whenIdleCount: 1,
   });
 
   const decision = decideAgentAdvance({
@@ -73,6 +71,23 @@ test("decideAgentAdvance dead-letters unknown agent", () => {
   assert.deepEqual(decision, {
     kind: "dead_letter_unknown_agent",
     error: "advance requested for unknown agent: missing-agent",
+  });
+});
+
+test("decideAgentAdvance dead-letters agent with missing head", () => {
+  const state = makeState({
+    headNodeId: null,
+  });
+
+  const decision = decideAgentAdvance({
+    agentId: "agent-1",
+    state,
+    todo: deriveAgentAdvanceTodo({ state }),
+  });
+
+  assert.deepEqual(decision, {
+    kind: "dead_letter_missing_head",
+    error: "advance requested for agent with missing head: agent-1",
   });
 });
 
@@ -184,21 +199,63 @@ test("decideAgentAdvance awaits in-flight turn when running and no queued input"
   });
 });
 
-test("executeAgentAdvance returns transition, todo, and ack outcome", () => {
+test("executeAgentAdvance creates durable emit effects for next_opportunity start", () => {
   const execution = executeAgentAdvance({
     agentId: "agent-1",
+    workId: 42,
     state: makeState({
+      headNodeId: "head-1",
       nextOpportunityCount: 1,
       hasMessages: true,
     }),
   });
 
-  assert.equal(execution.todo.shouldFlushNextOpportunity, true);
-  assert.equal(execution.todo.hasTranscript, true);
-  assert.deepEqual(execution.transition, {
-    kind: "start_turn_from_next_opportunity",
-    reason: "idle with next_opportunity backlog",
+  assert.equal(execution.transition.kind, "start_turn_from_next_opportunity");
+  assert.equal(execution.effects.length, 3);
+
+  const claim = execution.effects[0];
+  assert.deepEqual(claim, {
+    kind: "emit",
+    eventName: "agent.event",
+    payload: {
+      kind: "input.batch.claimed",
+      agentId: "agent-1",
+      nodeId: "agent-event/42/claim",
+      parentNodeId: "head-1",
+      turnId: "turn/agent-1/42",
+      inputNodeIds: ["claim/next/42"],
+    },
+    dedupeKey: "agent:agent-1:advance:42:claim",
   });
+
+  const phase = execution.effects[1];
+  assert.deepEqual(phase, {
+    kind: "emit",
+    eventName: "agent.event",
+    payload: {
+      kind: "turn.state.updated",
+      agentId: "agent-1",
+      nodeId: "agent-event/42/phase-model-running",
+      parentNodeId: "agent-event/42/claim",
+      phase: "model_running",
+    },
+    dedupeKey: "agent:agent-1:advance:42:phase:model_running",
+  });
+
+  const requestModel = execution.effects[2];
+  assert.deepEqual(requestModel, {
+    kind: "emit",
+    eventName: "agent.event",
+    payload: {
+      kind: "turn.model.requested",
+      agentId: "agent-1",
+      nodeId: "agent-event/42/request-model",
+      parentNodeId: "agent-event/42/phase-model-running",
+      turnId: "turn/agent-1/42",
+    },
+    dedupeKey: "agent:agent-1:advance:42:request-model",
+  });
+
   assert.deepEqual(execution.outcome, {
     outcome: "ack",
   });
@@ -207,12 +264,14 @@ test("executeAgentAdvance returns transition, todo, and ack outcome", () => {
 test("executeAgentAdvance maps unknown agent to dead_letter outcome", () => {
   const execution = executeAgentAdvance({
     agentId: "missing-agent",
+    workId: 999,
     state: makeState({
       exists: false,
       headNodeId: null,
     }),
   });
 
+  assert.equal(execution.effects.length, 0);
   assert.deepEqual(execution.transition, {
     kind: "dead_letter_unknown_agent",
     error: "advance requested for unknown agent: missing-agent",
