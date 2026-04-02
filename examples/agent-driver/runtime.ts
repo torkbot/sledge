@@ -13,6 +13,7 @@ import type {
 } from "../../src/ledger/ledger.ts";
 import { createAgentDriver, type AgentDriver } from "./api.ts";
 import { executeAgentAdvance } from "./agent-advance.ts";
+import { executeAgentRunModel, toImmediateOutcome } from "./agent-run-model.ts";
 import {
   AGENT_EVENT_NAME,
   AGENT_HEAD_QUERY_NAME,
@@ -286,24 +287,6 @@ function decodeJsonWithSchema<const TJsonSchema extends TSchema>(
   return Value.Decode(schema, parsed);
 }
 
-function summarizeMessageContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  return JSON.stringify(content);
-}
-
-function buildModelPrompt(messages: readonly { content: unknown }[]): string {
-  if (messages.length === 0) {
-    return "";
-  }
-
-  return messages
-    .map((message) => summarizeMessageContent(message.content))
-    .join("\n\n");
-}
-
 export function openAgentDriverRuntime(
   input: OpenAgentDriverRuntimeInput,
 ): AgentDriverRuntime {
@@ -568,57 +551,42 @@ export function openAgentDriverRuntime(
             },
           );
 
-          if (!runtimeState.exists) {
-            return {
-              outcome: "dead_letter",
-              error: `model run requested for unknown agent: ${work.payload.agentId}`,
-            } as const;
-          }
-
-          if (runtimeState.phase !== "model_running") {
-            // Stale delivery or already transitioned; safe no-op.
-            return {
-              outcome: "ack",
-            } as const;
-          }
-
           const turn = await actions.query(AGENT_TURN_QUERY_NAME, {
             agentId: work.payload.agentId,
             turnId: work.payload.turnId,
           });
 
-          if (turn === null) {
-            return {
-              outcome: "dead_letter",
-              error: `model run requested for missing turn: ${work.payload.agentId}/${work.payload.turnId}`,
-            } as const;
-          }
-
-          if (turn.status === "completed") {
-            return {
-              outcome: "ack",
-            } as const;
-          }
-
-          if (turn.status === "failed") {
-            return {
-              outcome: "dead_letter",
-              error: `model run requested for failed turn: ${work.payload.agentId}/${work.payload.turnId}`,
-            } as const;
-          }
-
           const transcript = await actions.query(AGENT_MESSAGES_QUERY_NAME, {
             agentId: work.payload.agentId,
           });
 
-          const prompt = buildModelPrompt(transcript.messages);
+          const execution = executeAgentRunModel({
+            agentId: work.payload.agentId,
+            turnId: work.payload.turnId,
+            runtimeState,
+            turn,
+            transcript,
+          });
+
+          const immediateOutcome = toImmediateOutcome(execution.decision);
+
+          if (immediateOutcome !== null) {
+            return immediateOutcome;
+          }
+
+          if (turn === null || execution.prompt === null) {
+            return {
+              outcome: "dead_letter",
+              error: `run-model invariant violation: ${work.payload.agentId}/${work.payload.turnId}`,
+            } as const;
+          }
 
           try {
             await using hold = lease.hold();
 
             const completion = await input.llm.runTurn({
               agentId: work.payload.agentId,
-              prompt,
+              prompt: execution.prompt,
               signal: hold.signal,
             });
 
