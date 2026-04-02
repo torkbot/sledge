@@ -84,18 +84,16 @@ test("decideAgentAdvance chooses when_idle branch only when idle", () => {
   });
 });
 
-test("executeAgentAdvance maps noop decision to ack", async () => {
-  const outcome = await executeAgentAdvance({
+test("executeAgentAdvance maps noop decision to ack", () => {
+  const outcome = executeAgentAdvance({
     agentId: "agent-1",
-    loadState: async () => {
-      return {
-        exists: true,
-        phase: "idle",
-        headNodeId: "n1",
-        nextOpportunityCount: 0,
-        whenIdleCount: 0,
-        hasMessages: false,
-      };
+    state: {
+      exists: true,
+      phase: "idle",
+      headNodeId: "n1",
+      nextOpportunityCount: 0,
+      whenIdleCount: 0,
+      hasMessages: false,
     },
   });
 

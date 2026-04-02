@@ -79,23 +79,17 @@ export function toQueueOutcome(
   }
 }
 
-export async function executeAgentAdvance(input: {
+export function executeAgentAdvance(input: {
   readonly agentId: string;
-  readonly loadState: (input: {
-    readonly agentId: string;
-  }) => Promise<AgentAdvanceRecoveryState>;
-}): Promise<QueueHandlerOutcome> {
-  const state = await input.loadState({
-    agentId: input.agentId,
-  });
-
+  readonly state: AgentAdvanceRecoveryState;
+}): QueueHandlerOutcome {
   const todo = deriveAgentAdvanceTodo({
-    state,
+    state: input.state,
   });
 
   const decision = decideAgentAdvance({
     agentId: input.agentId,
-    state,
+    state: input.state,
     todo,
   });
 

@@ -394,13 +394,13 @@ export function openAgentDriverRuntime(
       });
 
       builder.handle(AGENT_ADVANCE_QUEUE_NAME, async ({ work, actions }) => {
-        return await executeAgentAdvance({
+        const state = await actions.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
           agentId: work.payload.agentId,
-          loadState: async ({ agentId }) => {
-            return await actions.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
-              agentId,
-            });
-          },
+        });
+
+        return executeAgentAdvance({
+          agentId: work.payload.agentId,
+          state,
         });
       });
     },
