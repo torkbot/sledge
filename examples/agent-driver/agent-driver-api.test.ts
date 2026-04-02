@@ -265,3 +265,71 @@ test("tailEvents and resumeEvents expose the agent event stream", async () => {
 
   assert.equal(resumedFirst.done, false);
 });
+
+test(
+  "agent runs end-to-end turn lifecycle in-ledger",
+  {
+    skip: "guiding-light: waiting on true claimed input ids + turn completion->idle transition",
+  },
+  async () => {
+    const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+    const database = new Database(":memory:");
+
+    await using agentRuntime = openAgentDriverRuntime({
+      database,
+      timing: {
+        clock: runtime.clock,
+        scheduler: runtime.scheduler,
+      },
+      llm: createPiAiStub(),
+      toolHandlers: {},
+    });
+
+    const created = await agentRuntime.driver.initializeAgent({
+      agentId: "agent-1",
+      context: {
+        systemPrompt: "You are concise.",
+        model: {
+          api: "anthropic",
+          provider: "anthropic",
+          id: "claude-sonnet-4-20250514",
+        },
+        thinkingLevel: "off",
+        tools: [],
+        messages: [
+          {
+            role: "user",
+            content: "hello",
+          },
+        ],
+      },
+    });
+
+    await agentRuntime.driver.submitUserInput({
+      agentId: created.agentId,
+      timing: "next_opportunity",
+      idempotencyKey: "input-e2e-1",
+      content: "answer this",
+    });
+
+    const messages = await agentRuntime.driver.getMessages({
+      agentId: created.agentId,
+    });
+
+    assert.equal(messages.messages.at(-1)?.role, "assistant");
+    assert.equal(messages.messages.at(-1)?.content, "stub");
+
+    const pending = await agentRuntime.driver.getPendingInputs({
+      agentId: created.agentId,
+    });
+
+    assert.equal(pending.nextOpportunity.length, 0);
+    assert.equal(pending.whenIdle.length, 0);
+
+    const runtimeState = await agentRuntime.driver.getRuntimeState({
+      agentId: created.agentId,
+    });
+
+    assert.equal(runtimeState.phase, "idle");
+  },
+);
