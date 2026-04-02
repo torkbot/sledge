@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { Type } from "@sinclair/typebox";
+import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 
 import { createBetterSqliteLedger } from "../../src/ledger/better-sqlite3-ledger.ts";
@@ -138,10 +138,58 @@ const AgentMessagesArraySchema = Type.Array(
   }),
 );
 
-function decodeJsonWithSchema<TSchema>(
+const AgentHeadRowSchema = Type.Object({
+  agent_id: Type.String(),
+  node_id: Type.String(),
+  parent_node_id: Type.Union([Type.Null(), Type.String()]),
+  event_name: Type.Union([
+    Type.Literal(AGENT_EVENT_NAME),
+    Type.Literal(USER_EVENT_NAME),
+  ]),
+  event_kind: Type.String(),
+});
+
+const PendingInputRowSchema = Type.Object({
+  node_id: Type.String(),
+  parent_node_id: Type.String(),
+  timing: Type.Union([
+    Type.Literal("next_opportunity"),
+    Type.Literal("when_idle"),
+  ]),
+  idempotency_key: Type.String(),
+  content: Type.String(),
+  fork_from_node_id: Type.Union([Type.Null(), Type.String()]),
+});
+
+const AgentChildRowSchema = Type.Object({
+  node_id: Type.String(),
+  event_name: Type.Union([
+    Type.Literal(AGENT_EVENT_NAME),
+    Type.Literal(USER_EVENT_NAME),
+  ]),
+  event_kind: Type.String(),
+});
+
+const AgentMessagesRowSchema = Type.Object({
+  head_node_id: Type.String(),
+  messages_json: Type.String(),
+});
+
+const AgentNodeExistsRowSchema = Type.Object({
+  node_id: Type.String(),
+});
+
+function decodeRow<const TRowSchema extends TSchema>(
+  schema: TRowSchema,
+  row: unknown,
+): Static<TRowSchema> {
+  return Value.Decode(schema, row);
+}
+
+function decodeJsonWithSchema<const TJsonSchema extends TSchema>(
   value: string,
-  schema: TSchema,
-): unknown {
+  schema: TJsonSchema,
+): Static<TJsonSchema> {
   let parsed: unknown;
 
   try {
@@ -152,7 +200,7 @@ function decodeJsonWithSchema<TSchema>(
     });
   }
 
-  return Value.Decode(schema as never, parsed);
+  return Value.Decode(schema, parsed);
 }
 
 export function openAgentDriverRuntime(
@@ -399,7 +447,7 @@ export function openAgentDriverRuntime(
       },
       queries: {
         [AGENT_HEAD_QUERY_NAME]: async (params) => {
-          const row = input.database
+          const rawRow = input.database
             .prepare(
               `SELECT
                  agent_id,
@@ -410,23 +458,27 @@ export function openAgentDriverRuntime(
                FROM agent_heads
                WHERE agent_id = ?`,
             )
-            .get(params.agentId) as Record<string, unknown> | undefined;
+            .get(params.agentId);
 
-          if (row === undefined) {
+          if (rawRow === undefined) {
             return null;
           }
 
-          return {
-            agentId: String(row.agent_id),
-            nodeId: String(row.node_id),
-            parentNodeId:
-              row.parent_node_id === null ? null : String(row.parent_node_id),
-            eventName: String(row.event_name),
-            eventKind: String(row.event_kind),
-          };
+          const row = decodeRow(AgentHeadRowSchema, rawRow);
+
+          return Value.Decode(
+            AgentDriverQuerySchemas[AGENT_HEAD_QUERY_NAME].result,
+            {
+              agentId: row.agent_id,
+              nodeId: row.node_id,
+              parentNodeId: row.parent_node_id,
+              eventName: row.event_name,
+              eventKind: row.event_kind,
+            },
+          );
         },
         [AGENT_PENDING_INPUTS_QUERY_NAME]: async (params) => {
-          const rows = input.database
+          const rawRows = input.database
             .prepare(
               `SELECT
                  node_id,
@@ -439,25 +491,24 @@ export function openAgentDriverRuntime(
                WHERE agent_id = ?
                ORDER BY rowid ASC`,
             )
-            .all(params.agentId) as Record<string, unknown>[];
+            .all(params.agentId);
 
-          const nextOpportunity: unknown[] = [];
-          const whenIdle: unknown[] = [];
+          const nextOpportunity: Static<typeof UserInputRecordedEventSchema>[] =
+            [];
+          const whenIdle: Static<typeof UserInputRecordedEventSchema>[] = [];
 
-          for (const row of rows) {
-            const item = {
+          for (const rawRow of rawRows) {
+            const row = decodeRow(PendingInputRowSchema, rawRow);
+            const item = Value.Decode(UserInputRecordedEventSchema, {
               kind: "input.recorded",
               agentId: params.agentId,
-              nodeId: String(row.node_id),
-              parentNodeId: String(row.parent_node_id),
-              timing: String(row.timing),
-              idempotencyKey: String(row.idempotency_key),
-              content: String(row.content),
-              forkFromNodeId:
-                row.fork_from_node_id === null
-                  ? undefined
-                  : String(row.fork_from_node_id),
-            };
+              nodeId: row.node_id,
+              parentNodeId: row.parent_node_id,
+              timing: row.timing,
+              idempotencyKey: row.idempotency_key,
+              content: row.content,
+              forkFromNodeId: row.fork_from_node_id ?? undefined,
+            });
 
             if (row.timing === "next_opportunity") {
               nextOpportunity.push(item);
@@ -466,13 +517,16 @@ export function openAgentDriverRuntime(
             }
           }
 
-          return {
-            nextOpportunity,
-            whenIdle,
-          };
+          return Value.Decode(
+            AgentDriverQuerySchemas[AGENT_PENDING_INPUTS_QUERY_NAME].result,
+            {
+              nextOpportunity,
+              whenIdle,
+            },
+          );
         },
         [AGENT_NODE_CHILDREN_QUERY_NAME]: async (params) => {
-          const rows = input.database
+          const rawRows = input.database
             .prepare(
               `SELECT
                  node_id,
@@ -483,18 +537,25 @@ export function openAgentDriverRuntime(
                  AND parent_node_id = ?
                ORDER BY rowid ASC`,
             )
-            .all(params.agentId, params.nodeId) as Record<string, unknown>[];
+            .all(params.agentId, params.nodeId);
 
-          return rows.map((row) => {
+          const children = rawRows.map((rawRow) => {
+            const row = decodeRow(AgentChildRowSchema, rawRow);
+
             return {
-              nodeId: String(row.node_id),
-              eventName: String(row.event_name),
-              eventKind: String(row.event_kind),
+              nodeId: row.node_id,
+              eventName: row.event_name,
+              eventKind: row.event_kind,
             };
           });
+
+          return Value.Decode(
+            AgentDriverQuerySchemas[AGENT_NODE_CHILDREN_QUERY_NAME].result,
+            children,
+          );
         },
         [AGENT_MESSAGES_QUERY_NAME]: async (params) => {
-          const row = input.database
+          const rawRow = input.database
             .prepare(
               `SELECT
                  head_node_id,
@@ -502,22 +563,27 @@ export function openAgentDriverRuntime(
                FROM agent_messages
                WHERE agent_id = ?`,
             )
-            .get(params.agentId) as Record<string, unknown> | undefined;
+            .get(params.agentId);
 
-          if (row === undefined) {
+          if (rawRow === undefined) {
             throw new Error(`messages not found for agent: ${params.agentId}`);
           }
 
-          return {
-            headNodeId: String(row.head_node_id),
-            messages: decodeJsonWithSchema(
-              String(row.messages_json),
-              AgentMessagesArraySchema,
-            ),
-          };
+          const row = decodeRow(AgentMessagesRowSchema, rawRow);
+
+          return Value.Decode(
+            AgentDriverQuerySchemas[AGENT_MESSAGES_QUERY_NAME].result,
+            {
+              headNodeId: row.head_node_id,
+              messages: decodeJsonWithSchema(
+                row.messages_json,
+                AgentMessagesArraySchema,
+              ),
+            },
+          );
         },
         [AGENT_NODE_EXISTS_QUERY_NAME]: async (params) => {
-          const row = input.database
+          const rawRow = input.database
             .prepare(
               `SELECT node_id
                FROM agent_nodes
@@ -527,7 +593,13 @@ export function openAgentDriverRuntime(
             )
             .get(params.agentId, params.nodeId);
 
-          return row !== undefined;
+          if (rawRow === undefined) {
+            return false;
+          }
+
+          decodeRow(AgentNodeExistsRowSchema, rawRow);
+
+          return true;
         },
       },
     }),
