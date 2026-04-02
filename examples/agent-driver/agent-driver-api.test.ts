@@ -26,7 +26,7 @@ test("initializeAgent initializes agent head and emits context event", async () 
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
-    toolHandlers: {},
+    toolBindings: [],
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -44,8 +44,10 @@ test("initializeAgent initializes agent head and emits context event", async () 
           name: "search",
           label: "Search",
           description: "Search documentation",
-          inputSchemaJson:
-            '{"type":"object","properties":{"query":{"type":"string"}}}',
+          parametersSchema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+          },
         },
       ],
       messages: [],
@@ -91,7 +93,7 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
-    toolHandlers: {},
+    toolBindings: [],
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -151,7 +153,7 @@ test("fork mode records sibling children from the same parent node", async () =>
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
-    toolHandlers: {},
+    toolBindings: [],
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -214,7 +216,7 @@ test("waitForIdle resolves immediately when agent is idle", async () => {
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
-    toolHandlers: {},
+    toolBindings: [],
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -250,7 +252,7 @@ test("waitForIdle rejects unknown agents", async () => {
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
-    toolHandlers: {},
+    toolBindings: [],
   });
 
   const controller = new AbortController();
@@ -274,7 +276,7 @@ test("tailEvents and resumeEvents expose the agent event stream", async () => {
       scheduler: runtime.scheduler,
     },
     llm: createPiAiStub(),
-    toolHandlers: {},
+    toolBindings: [],
   });
 
   const created = await agentRuntime.driver.initializeAgent({
@@ -342,7 +344,7 @@ test(
         scheduler: runtime.scheduler,
       },
       llm: createPiAiStub(),
-      toolHandlers: {},
+      toolBindings: [],
     });
 
     const created = await agentRuntime.driver.initializeAgent({
@@ -382,12 +384,12 @@ test(
       agentId: created.agentId,
     });
 
-    assert.equal(messages.messages.at(-1)?.role, "assistant");
-    assert.equal(messages.messages.at(-1)?.content, "stub");
-
     const pending = await agentRuntime.driver.getPendingInputs({
       agentId: created.agentId,
     });
+
+    assert.equal(messages.messages.at(-1)?.role, "assistant");
+    assert.equal(messages.messages.at(-1)?.content, "stub");
 
     assert.equal(pending.nextOpportunity.length, 0);
     assert.equal(pending.whenIdle.length, 0);

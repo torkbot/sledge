@@ -14,6 +14,7 @@ import type {
 import { createAgentDriver, type AgentDriver } from "./api.ts";
 import { executeAgentAdvance } from "./agent-advance.ts";
 import { executeAgentRunModel, toImmediateOutcome } from "./agent-run-model.ts";
+import { createToolBindingResolver, type BoundAgentTool } from "./tools.ts";
 import {
   AGENT_EVENT_NAME,
   AGENT_HEAD_QUERY_NAME,
@@ -43,15 +44,6 @@ export interface PiAiGateway {
   }>;
 }
 
-export interface AgentToolHandlers {
-  readonly [toolName: string]: (input: {
-    readonly params: unknown;
-    readonly signal: AbortSignal;
-  }) => Promise<{
-    readonly content: unknown;
-  }>;
-}
-
 /**
  * Input dependencies for opening the agent runtime.
  *
@@ -62,7 +54,7 @@ export type OpenAgentDriverRuntimeInput = {
   readonly database: Database.Database;
   readonly timing: LedgerTiming;
   readonly llm: PiAiGateway;
-  readonly toolHandlers: AgentToolHandlers;
+  readonly toolBindings: readonly BoundAgentTool[];
 };
 
 export type AgentDriverRuntime = AsyncDisposable & {
@@ -355,6 +347,10 @@ export function openAgentDriverRuntime(
     CREATE INDEX IF NOT EXISTS idx_agent_children_by_parent ON agent_children(agent_id, parent_node_id, node_id);
   `);
 
+  const resolveToolBinding = createToolBindingResolver({
+    boundTools: input.toolBindings,
+  });
+
   const model = defineLedgerModel({
     events: AgentDriverEventSchemas,
     queues: {
@@ -580,6 +576,11 @@ export function openAgentDriverRuntime(
               error: `run-model invariant violation: ${work.payload.agentId}/${work.payload.turnId}`,
             } as const;
           }
+
+          // Tool call execution is not wired yet in this example. When the model
+          // output includes tool calls, resolve handlers through this registry.
+          // Unbound tools must produce deterministic tool error messages.
+          void resolveToolBinding;
 
           try {
             await using hold = lease.hold();

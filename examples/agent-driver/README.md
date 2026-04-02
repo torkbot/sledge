@@ -26,8 +26,13 @@ const created = await driver.initializeAgent({
         name: "search",
         label: "Search",
         description: "Search internal docs",
-        inputSchemaJson:
-          '{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}',
+        parametersSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+          },
+          required: ["query"],
+        },
       },
     ],
     messages: [],
@@ -156,26 +161,54 @@ This keeps the orchestration model aligned with pi-ai loop execution requirement
 
 ## Tool hookup pattern
 
-An agent with tools should wire durable tool definitions to concrete runtime handlers.
+Use a two-phase tool model:
 
-At runtime boundary (`openAgentDriverRuntime(...)`), provide handlers keyed by tool name. The orchestration layer resolves durable tool calls against this registry during `agent.advance`.
+1. **Register tool metadata + parameters schema** (for durable context and model-facing tool contracts).
+2. **Bind runtime handlers** (for executable side effects).
 
 ```ts
+import { Type } from "@sinclair/typebox";
+import {
+  bindAgentTool,
+  createAgentContextWithRegisteredTools,
+  registerAgentTool,
+} from "./tools.ts";
+
+const searchTool = registerAgentTool({
+  name: "search",
+  label: "Search",
+  description: "Search internal docs",
+  parametersSchema: Type.Object({
+    query: Type.String(),
+  }),
+});
+
+const context = createAgentContextWithRegisteredTools({
+  systemPrompt: "You are concise and careful.",
+  model,
+  thinkingLevel: "medium",
+  messages: [],
+  tools: [searchTool],
+});
+
 const runtime = openAgentDriverRuntime({
   database,
   timing,
   llm,
-  toolHandlers: {
-    search: async ({ query, signal }) => {
-      return {
-        content: [{ type: "text", text: `result for: ${query}` }],
-      };
-    },
-  },
+  toolBindings: [
+    bindAgentTool({
+      tool: searchTool,
+      execute: async ({ params, signal }) => {
+        return {
+          content: [{ type: "text", text: `result for: ${params.query}` }],
+        };
+      },
+    }),
+  ],
 });
 ```
 
-If a tool is declared in context but has no runtime handler, the call should fail predictably and be materialized as tool error events.
+Handlers are strongly typed from the TypeBox parameters schema. If a tool is registered but unbound at runtime, execution should return a deterministic tool error response.
 
 ---
 

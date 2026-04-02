@@ -38,11 +38,13 @@ export const AgentMessageSchema = Type.Object({
 
 export type AgentMessage = Static<typeof AgentMessageSchema>;
 
+const JsonObjectSchema = Type.Object({}, { additionalProperties: true });
+
 export const AgentToolDefinitionSchema = Type.Object({
   name: Type.String(),
   label: Type.String(),
   description: Type.String(),
-  inputSchemaJson: Type.String(),
+  parametersSchema: JsonObjectSchema,
 });
 
 export type AgentToolDefinition = Static<typeof AgentToolDefinitionSchema>;
