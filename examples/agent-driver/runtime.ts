@@ -19,6 +19,7 @@ import {
   AGENT_NODE_CHILDREN_QUERY_NAME,
   AGENT_NODE_EXISTS_QUERY_NAME,
   AGENT_PENDING_INPUTS_QUERY_NAME,
+  AGENT_RUNTIME_STATE_QUERY_NAME,
   AgentDriverEventSchemas,
   AgentDriverQuerySchemas,
   USER_EVENT_NAME,
@@ -114,6 +115,17 @@ const AgentMessagesProjectionSchema = Type.Object({
   messagesJson: Type.String(),
 });
 
+const AgentRuntimeStateProjectionSchema = Type.Object({
+  agentId: Type.String(),
+  phase: Type.Union([
+    Type.Null(),
+    Type.Literal("idle"),
+    Type.Literal("model_running"),
+    Type.Literal("tools_running"),
+  ]),
+  hasMessages: Type.Union([Type.Null(), Type.Boolean()]),
+});
+
 export const AGENT_ADVANCE_QUEUE_NAME = "agent.advance" as const;
 
 const AgentAdvanceQueueSchema = Type.Object({
@@ -125,6 +137,7 @@ const UPSERT_HEAD_INDEXER_NAME = "upsertHead" as const;
 const WRITE_CHILD_INDEXER_NAME = "writeChild" as const;
 const WRITE_PENDING_INPUT_INDEXER_NAME = "writePendingInput" as const;
 const UPSERT_MESSAGES_INDEXER_NAME = "upsertMessages" as const;
+const UPSERT_RUNTIME_STATE_INDEXER_NAME = "upsertRuntimeState" as const;
 
 const AgentMessagesArraySchema = Type.Array(
   Type.Object({
@@ -179,6 +192,18 @@ const AgentNodeExistsRowSchema = Type.Object({
   node_id: Type.String(),
 });
 
+const AgentRuntimeStateRowSchema = Type.Object({
+  head_node_id: Type.Union([Type.Null(), Type.String()]),
+  phase: Type.Union([
+    Type.Literal("idle"),
+    Type.Literal("model_running"),
+    Type.Literal("tools_running"),
+  ]),
+  has_messages: Type.Integer({ minimum: 0, maximum: 1 }),
+  next_opportunity_count: Type.Number(),
+  when_idle_count: Type.Number(),
+});
+
 function decodeRow<const TRowSchema extends TSchema>(
   schema: TRowSchema,
   row: unknown,
@@ -201,6 +226,63 @@ function decodeJsonWithSchema<const TJsonSchema extends TSchema>(
   }
 
   return Value.Decode(schema, parsed);
+}
+
+type AgentAdvanceRecoveryState = Static<
+  (typeof AgentDriverQuerySchemas)[typeof AGENT_RUNTIME_STATE_QUERY_NAME]["result"]
+>;
+
+type AgentAdvanceTodo = {
+  readonly shouldFlushNextOpportunity: boolean;
+  readonly shouldConsumeWhenIdle: boolean;
+  readonly hasTranscript: boolean;
+};
+
+type AgentAdvanceDecision =
+  | { readonly kind: "dead_letter"; readonly error: string }
+  | { readonly kind: "noop"; readonly reason: string };
+
+function deriveAdvanceTodo(input: {
+  readonly state: AgentAdvanceRecoveryState;
+}): AgentAdvanceTodo {
+  return {
+    shouldFlushNextOpportunity: input.state.nextOpportunityCount > 0,
+    shouldConsumeWhenIdle:
+      input.state.phase === "idle" && input.state.whenIdleCount > 0,
+    hasTranscript: input.state.hasMessages,
+  };
+}
+
+function decideAgentAdvance(input: {
+  readonly agentId: string;
+  readonly state: AgentAdvanceRecoveryState;
+  readonly todo: AgentAdvanceTodo;
+}): AgentAdvanceDecision {
+  if (!input.state.exists) {
+    return {
+      kind: "dead_letter",
+      error: `advance requested for unknown agent: ${input.agentId}`,
+    };
+  }
+
+  if (input.todo.shouldFlushNextOpportunity) {
+    return {
+      kind: "noop",
+      reason: "next_opportunity dispatch scaffolded but not implemented yet",
+    };
+  }
+
+  if (input.todo.shouldConsumeWhenIdle) {
+    return {
+      kind: "noop",
+      reason: "when_idle dispatch scaffolded but not implemented yet",
+    };
+  }
+
+  return {
+    kind: "noop",
+    reason: "no pending work",
+  };
 }
 
 export function openAgentDriverRuntime(
@@ -249,6 +331,12 @@ export function openAgentDriverRuntime(
       messages_json TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS agent_runtime_state (
+      agent_id TEXT PRIMARY KEY,
+      phase TEXT NOT NULL,
+      has_messages INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_agent_nodes_by_agent ON agent_nodes(agent_id, node_id);
     CREATE INDEX IF NOT EXISTS idx_agent_pending_inputs_by_agent ON agent_pending_inputs(agent_id, node_id);
     CREATE INDEX IF NOT EXISTS idx_agent_children_by_parent ON agent_children(agent_id, parent_node_id, node_id);
@@ -265,6 +353,7 @@ export function openAgentDriverRuntime(
       [WRITE_CHILD_INDEXER_NAME]: AgentChildProjectionSchema,
       [WRITE_PENDING_INPUT_INDEXER_NAME]: UserInputRecordedEventSchema,
       [UPSERT_MESSAGES_INDEXER_NAME]: AgentMessagesProjectionSchema,
+      [UPSERT_RUNTIME_STATE_INDEXER_NAME]: AgentRuntimeStateProjectionSchema,
     },
     queries: AgentDriverQuerySchemas,
     register(builder) {
@@ -301,6 +390,20 @@ export function openAgentDriverRuntime(
             agentId: event.payload.agentId,
             headNodeId: event.payload.nodeId,
             messagesJson: JSON.stringify(event.payload.context.messages),
+          });
+
+          await actions.index(UPSERT_RUNTIME_STATE_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            phase: "idle",
+            hasMessages: event.payload.context.messages.length > 0,
+          });
+        }
+
+        if (event.payload.kind === "turn.state.updated") {
+          await actions.index(UPSERT_RUNTIME_STATE_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            phase: event.payload.phase,
+            hasMessages: null,
           });
         }
       });
@@ -349,61 +452,39 @@ export function openAgentDriverRuntime(
       builder.handle(AGENT_ADVANCE_QUEUE_NAME, async ({ work, actions }) => {
         const agentId = work.payload.agentId;
 
-        // 1) Recover durable state for this agent from query surfaces.
-        const head = await actions.query(AGENT_HEAD_QUERY_NAME, {
+        // Recover normalized runtime state in one query.
+        const state = await actions.query(AGENT_RUNTIME_STATE_QUERY_NAME, {
           agentId,
         });
 
-        if (head === null) {
-          return {
-            outcome: "dead_letter",
-            error: `advance requested for unknown agent: ${agentId}`,
-          } as const;
+        const todo = deriveAdvanceTodo({
+          state,
+        });
+
+        const decision = decideAgentAdvance({
+          agentId,
+          state,
+          todo,
+        });
+
+        switch (decision.kind) {
+          case "dead_letter":
+            return {
+              outcome: "dead_letter",
+              error: decision.error,
+            } as const;
+          case "noop":
+            // Transition dispatcher scaffold.
+            // Future branches:
+            // - start_turn_from_next_opportunity
+            // - start_turn_from_when_idle
+            // - finalize_completed_turn
+            // - handle_failed_turn
+            void decision.reason;
+            return {
+              outcome: "ack",
+            } as const;
         }
-
-        const pendingInputs = await actions.query(
-          AGENT_PENDING_INPUTS_QUERY_NAME,
-          {
-            agentId,
-          },
-        );
-
-        const transcript = await actions.query(AGENT_MESSAGES_QUERY_NAME, {
-          agentId,
-        });
-
-        // 2) Derive current phase + actionable work from recovered state.
-        // NOTE: head query currently does not include turn phase metadata.
-        // We will add a dedicated runtime-state query (e.g. idle/model/tools)
-        // before implementing when_idle consumption semantics.
-        const isIdle = false;
-
-        const nextOpportunityInputs = pendingInputs.nextOpportunity;
-        const whenIdleInputs = pendingInputs.whenIdle;
-
-        const todo = {
-          shouldFlushNextOpportunity: nextOpportunityInputs.length > 0,
-          shouldConsumeWhenIdle: isIdle && whenIdleInputs.length > 0,
-          hasTranscript: transcript.messages.length > 0,
-        };
-
-        // 3) Transition scaffold (to be implemented).
-        // - If shouldFlushNextOpportunity: append user messages to transcript,
-        //   clear consumed pending rows, and request next model turn.
-        // - Else if shouldConsumeWhenIdle: consume one when_idle input,
-        //   append to transcript, and request next model turn.
-        // - Else: no-op ack.
-        //
-        // Model invocation path (future):
-        // - call input.llm.runTurn(...)
-        // - emit assistant/tool lifecycle events
-        // - resolve tool calls via input.toolHandlers
-        // - append tool results and re-enqueue advance as needed
-        void todo;
-
-        return {
-          outcome: "ack",
-        } as const;
       });
     },
   });
@@ -492,6 +573,25 @@ export function openAgentDriverRuntime(
                  messages_json = excluded.messages_json`,
             )
             .run(row.agentId, row.headNodeId, row.messagesJson);
+        },
+        upsertRuntimeState: async (row) => {
+          input.database
+            .prepare(
+              `INSERT INTO agent_runtime_state (agent_id, phase, has_messages)
+               VALUES (?, COALESCE(?, 'idle'), COALESCE(?, 0))
+               ON CONFLICT(agent_id)
+               DO UPDATE SET
+                 phase = COALESCE(excluded.phase, agent_runtime_state.phase),
+                 has_messages = COALESCE(
+                   excluded.has_messages,
+                   agent_runtime_state.has_messages
+                 )`,
+            )
+            .run(
+              row.agentId,
+              row.phase,
+              row.hasMessages === null ? null : row.hasMessages ? 1 : 0,
+            );
         },
       },
       queries: {
@@ -649,6 +749,61 @@ export function openAgentDriverRuntime(
           decodeRow(AgentNodeExistsRowSchema, rawRow);
 
           return true;
+        },
+        [AGENT_RUNTIME_STATE_QUERY_NAME]: async (params) => {
+          const rawRow = input.database
+            .prepare(
+              `SELECT
+                 h.node_id AS head_node_id,
+                 COALESCE(rs.phase, 'idle') AS phase,
+                 COALESCE(rs.has_messages, 0) AS has_messages,
+                 SUM(
+                   CASE
+                     WHEN p.timing = 'next_opportunity' THEN 1
+                     ELSE 0
+                   END
+                 ) AS next_opportunity_count,
+                 SUM(
+                   CASE
+                     WHEN p.timing = 'when_idle' THEN 1
+                     ELSE 0
+                   END
+                 ) AS when_idle_count
+               FROM agent_heads h
+               LEFT JOIN agent_runtime_state rs ON rs.agent_id = h.agent_id
+               LEFT JOIN agent_pending_inputs p ON p.agent_id = h.agent_id
+               WHERE h.agent_id = ?
+               GROUP BY h.node_id, rs.phase, rs.has_messages`,
+            )
+            .get(params.agentId);
+
+          if (rawRow === undefined) {
+            return Value.Decode(
+              AgentDriverQuerySchemas[AGENT_RUNTIME_STATE_QUERY_NAME].result,
+              {
+                exists: false,
+                phase: "idle",
+                headNodeId: null,
+                nextOpportunityCount: 0,
+                whenIdleCount: 0,
+                hasMessages: false,
+              },
+            );
+          }
+
+          const row = decodeRow(AgentRuntimeStateRowSchema, rawRow);
+
+          return Value.Decode(
+            AgentDriverQuerySchemas[AGENT_RUNTIME_STATE_QUERY_NAME].result,
+            {
+              exists: true,
+              phase: row.phase,
+              headNodeId: row.head_node_id,
+              nextOpportunityCount: row.next_opportunity_count,
+              whenIdleCount: row.when_idle_count,
+              hasMessages: row.has_messages === 1,
+            },
+          );
         },
       },
     }),

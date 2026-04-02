@@ -208,11 +208,37 @@ export const AgentNodeExistsQuerySchema: QuerySchema<
   result: AgentNodeExistsQueryResultSchema,
 };
 
+export const AgentRuntimeStateQueryParamsSchema = Type.Object({
+  agentId: Type.String(),
+});
+
+export const AgentRuntimeStateQueryResultSchema = Type.Object({
+  exists: Type.Boolean(),
+  phase: Type.Union([
+    Type.Literal("idle"),
+    Type.Literal("model_running"),
+    Type.Literal("tools_running"),
+  ]),
+  headNodeId: Type.Union([Type.Null(), Type.String()]),
+  nextOpportunityCount: Type.Number(),
+  whenIdleCount: Type.Number(),
+  hasMessages: Type.Boolean(),
+});
+
+export const AgentRuntimeStateQuerySchema: QuerySchema<
+  typeof AgentRuntimeStateQueryParamsSchema,
+  typeof AgentRuntimeStateQueryResultSchema
+> = {
+  params: AgentRuntimeStateQueryParamsSchema,
+  result: AgentRuntimeStateQueryResultSchema,
+};
+
 export const AGENT_HEAD_QUERY_NAME = "agent.head" as const;
 export const AGENT_PENDING_INPUTS_QUERY_NAME = "agent.pending-inputs" as const;
 export const AGENT_NODE_CHILDREN_QUERY_NAME = "agent.node.children" as const;
 export const AGENT_MESSAGES_QUERY_NAME = "agent.messages" as const;
 export const AGENT_NODE_EXISTS_QUERY_NAME = "agent.node.exists" as const;
+export const AGENT_RUNTIME_STATE_QUERY_NAME = "agent.runtime-state" as const;
 
 export const AgentDriverQuerySchemas = {
   [AGENT_HEAD_QUERY_NAME]: AgentHeadQuerySchema,
@@ -220,6 +246,7 @@ export const AgentDriverQuerySchemas = {
   [AGENT_NODE_CHILDREN_QUERY_NAME]: AgentNodeChildrenQuerySchema,
   [AGENT_MESSAGES_QUERY_NAME]: AgentMessagesQuerySchema,
   [AGENT_NODE_EXISTS_QUERY_NAME]: AgentNodeExistsQuerySchema,
+  [AGENT_RUNTIME_STATE_QUERY_NAME]: AgentRuntimeStateQuerySchema,
 } as const;
 
 export type AgentDriverQueries = typeof AgentDriverQuerySchemas;

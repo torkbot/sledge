@@ -14,6 +14,7 @@ import {
   AGENT_NODE_CHILDREN_QUERY_NAME,
   AGENT_NODE_EXISTS_QUERY_NAME,
   AGENT_PENDING_INPUTS_QUERY_NAME,
+  AGENT_RUNTIME_STATE_QUERY_NAME,
   AgentHeadQueryParamsSchema,
   AgentHeadQueryResultSchema,
   AgentMessagesQueryParamsSchema,
@@ -22,6 +23,8 @@ import {
   AgentNodeChildrenQueryResultSchema,
   AgentPendingInputsQueryParamsSchema,
   AgentPendingInputsQueryResultSchema,
+  AgentRuntimeStateQueryParamsSchema,
+  AgentRuntimeStateQueryResultSchema,
   USER_EVENT_NAME,
 } from "./contracts.ts";
 import type {
@@ -47,6 +50,12 @@ type AgentNodeChildrenQueryResult = Static<
 >;
 type AgentMessagesQueryParams = Static<typeof AgentMessagesQueryParamsSchema>;
 type AgentMessagesQueryResult = Static<typeof AgentMessagesQueryResultSchema>;
+type AgentRuntimeStateQueryParams = Static<
+  typeof AgentRuntimeStateQueryParamsSchema
+>;
+type AgentRuntimeStateQueryResult = Static<
+  typeof AgentRuntimeStateQueryResultSchema
+>;
 
 export type InitializeAgentInput = {
   readonly agentId: string;
@@ -86,6 +95,9 @@ export type AgentDriver = {
   getMessages(
     input: AgentMessagesQueryParams,
   ): Promise<AgentMessagesQueryResult>;
+  getRuntimeState(
+    input: AgentRuntimeStateQueryParams,
+  ): Promise<AgentRuntimeStateQueryResult>;
   tailEvents(input: {
     readonly last: number;
     readonly signal: AbortSignal;
@@ -194,6 +206,9 @@ export function createAgentDriver(
     },
     getMessages: async (input) => {
       return await ledger.query(AGENT_MESSAGES_QUERY_NAME, input);
+    },
+    getRuntimeState: async (input) => {
+      return await ledger.query(AGENT_RUNTIME_STATE_QUERY_NAME, input);
     },
     tailEvents: (input) => {
       return ledger.tailEvents(input);

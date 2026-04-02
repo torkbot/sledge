@@ -65,6 +65,19 @@ test("initializeAgent initializes agent head and emits context event", async () 
     eventName: "agent.event",
     eventKind: "context.initialized",
   });
+
+  const runtimeState = await agentRuntime.driver.getRuntimeState({
+    agentId: created.agentId,
+  });
+
+  assert.deepEqual(runtimeState, {
+    exists: true,
+    phase: "idle",
+    headNodeId: created.nodeId,
+    nextOpportunityCount: 0,
+    whenIdleCount: 0,
+    hasMessages: false,
+  });
 });
 
 test("submitUserInput splits next_opportunity and when_idle queues", async () => {
@@ -118,6 +131,13 @@ test("submitUserInput splits next_opportunity and when_idle queues", async () =>
   assert.equal(pending.nextOpportunity[0]?.idempotencyKey, "input-1");
   assert.equal(pending.whenIdle.length, 1);
   assert.equal(pending.whenIdle[0]?.idempotencyKey, "input-2");
+
+  const runtimeState = await agentRuntime.driver.getRuntimeState({
+    agentId: created.agentId,
+  });
+
+  assert.equal(runtimeState.nextOpportunityCount, 1);
+  assert.equal(runtimeState.whenIdleCount, 1);
 });
 
 test("fork mode records sibling children from the same parent node", async () => {
