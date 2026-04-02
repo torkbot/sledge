@@ -372,6 +372,12 @@ test(
       content: "answer this",
     });
 
+    const waitController = new AbortController();
+    await agentRuntime.driver.waitForIdle({
+      agentId: created.agentId,
+      signal: waitController.signal,
+    });
+
     const messages = await agentRuntime.driver.getMessages({
       agentId: created.agentId,
     });
