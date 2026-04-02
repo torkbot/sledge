@@ -346,12 +346,61 @@ export function openAgentDriverRuntime(
         });
       });
 
-      builder.handle(AGENT_ADVANCE_QUEUE_NAME, async () => {
-        // TODO: Implement durable orchestrator transitions:
-        // - next_opportunity flush behavior
-        // - when_idle queue semantics
-        // - pi-ai turn execution
-        // - tool fan-out / join / timeout handling
+      builder.handle(AGENT_ADVANCE_QUEUE_NAME, async ({ work, actions }) => {
+        const agentId = work.payload.agentId;
+
+        // 1) Recover durable state for this agent from query surfaces.
+        const head = await actions.query(AGENT_HEAD_QUERY_NAME, {
+          agentId,
+        });
+
+        if (head === null) {
+          return {
+            outcome: "dead_letter",
+            error: `advance requested for unknown agent: ${agentId}`,
+          } as const;
+        }
+
+        const pendingInputs = await actions.query(
+          AGENT_PENDING_INPUTS_QUERY_NAME,
+          {
+            agentId,
+          },
+        );
+
+        const transcript = await actions.query(AGENT_MESSAGES_QUERY_NAME, {
+          agentId,
+        });
+
+        // 2) Derive current phase + actionable work from recovered state.
+        // NOTE: head query currently does not include turn phase metadata.
+        // We will add a dedicated runtime-state query (e.g. idle/model/tools)
+        // before implementing when_idle consumption semantics.
+        const isIdle = false;
+
+        const nextOpportunityInputs = pendingInputs.nextOpportunity;
+        const whenIdleInputs = pendingInputs.whenIdle;
+
+        const todo = {
+          shouldFlushNextOpportunity: nextOpportunityInputs.length > 0,
+          shouldConsumeWhenIdle: isIdle && whenIdleInputs.length > 0,
+          hasTranscript: transcript.messages.length > 0,
+        };
+
+        // 3) Transition scaffold (to be implemented).
+        // - If shouldFlushNextOpportunity: append user messages to transcript,
+        //   clear consumed pending rows, and request next model turn.
+        // - Else if shouldConsumeWhenIdle: consume one when_idle input,
+        //   append to transcript, and request next model turn.
+        // - Else: no-op ack.
+        //
+        // Model invocation path (future):
+        // - call input.llm.runTurn(...)
+        // - emit assistant/tool lifecycle events
+        // - resolve tool calls via input.toolHandlers
+        // - append tool results and re-enqueue advance as needed
+        void todo;
+
         return {
           outcome: "ack",
         } as const;
