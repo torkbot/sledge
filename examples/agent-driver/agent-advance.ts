@@ -110,6 +110,10 @@ export function decideAgentAdvance(input: {
   };
 }
 
+function assertNever(value: never): never {
+  throw new Error(`unhandled transition: ${JSON.stringify(value)}`);
+}
+
 export function toQueueOutcome(
   transition: AgentAdvanceTransition,
 ): QueueHandlerOutcome {
@@ -119,10 +123,17 @@ export function toQueueOutcome(
         outcome: "dead_letter",
         error: transition.error,
       };
-    default:
+    case "start_turn_from_next_opportunity":
+    case "start_turn_from_when_idle":
+    case "await_turn_boundary_with_next_opportunity":
+    case "await_idle_for_when_idle":
+    case "await_in_flight_turn":
+    case "noop_no_pending_work":
       return {
         outcome: "ack",
       };
+    default:
+      return assertNever(transition);
   }
 }
 
