@@ -88,7 +88,7 @@ This avoids ambiguous "ensure then maybe set context" races.
 
 ### 4) Forking is explicit and local
 
-Forking is expressed by `forkFromNodeId` on input submission. This is explicit, auditable, and tied to a concrete historical anchor.
+Forking is expressed by `forkFromNodeId` on input submission. This is explicit, auditable, and tied to a concrete historical anchor. The runtime validates that the parent node exists for the same agent before recording the forked input.
 
 ### 5) Event-first architecture
 

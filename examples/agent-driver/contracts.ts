@@ -190,11 +190,27 @@ export const AgentMessagesQuerySchema: QuerySchema<
   result: AgentMessagesQueryResultSchema,
 };
 
+export const AgentNodeExistsQueryParamsSchema = Type.Object({
+  agentId: Type.String(),
+  nodeId: Type.String(),
+});
+
+export const AgentNodeExistsQueryResultSchema = Type.Boolean();
+
+export const AgentNodeExistsQuerySchema: QuerySchema<
+  typeof AgentNodeExistsQueryParamsSchema,
+  typeof AgentNodeExistsQueryResultSchema
+> = {
+  params: AgentNodeExistsQueryParamsSchema,
+  result: AgentNodeExistsQueryResultSchema,
+};
+
 export const AgentDriverQuerySchemas = {
   "agent.head": AgentHeadQuerySchema,
   "agent.pending-inputs": AgentPendingInputsQuerySchema,
   "agent.node.children": AgentNodeChildrenQuerySchema,
   "agent.messages": AgentMessagesQuerySchema,
+  "agent.node.exists": AgentNodeExistsQuerySchema,
 } as const;
 
 export type AgentDriverQueries = typeof AgentDriverQuerySchemas;

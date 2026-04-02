@@ -140,6 +140,17 @@ export function createAgentDriver(
         }
 
         parentNodeId = head.nodeId;
+      } else {
+        const parentExists = await ledger.query("agent.node.exists", {
+          agentId: input.agentId,
+          nodeId: parentNodeId,
+        });
+
+        if (!parentExists) {
+          throw new Error(
+            `cannot fork from missing parent node: ${input.agentId}/${parentNodeId}`,
+          );
+        }
       }
 
       await ledger.emit(
