@@ -12,7 +12,7 @@ import type {
   LedgerStreamEvent,
 } from "../../src/ledger/ledger.ts";
 import { createAgentDriver, type AgentDriver } from "./api.ts";
-import { executeAgentAdvanceScaffold } from "./agent-advance.ts";
+import { executeAgentAdvance } from "./agent-advance.ts";
 import {
   AGENT_EVENT_NAME,
   AGENT_HEAD_QUERY_NAME,
@@ -394,7 +394,7 @@ export function openAgentDriverRuntime(
       });
 
       builder.handle(AGENT_ADVANCE_QUEUE_NAME, async ({ work, actions }) => {
-        return await executeAgentAdvanceScaffold({
+        return await executeAgentAdvance({
           agentId: work.payload.agentId,
           loadState: async ({ agentId }) => {
             return await actions.query(AGENT_RUNTIME_STATE_QUERY_NAME, {

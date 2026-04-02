@@ -46,14 +46,14 @@ export function decideAgentAdvance(input: {
   if (input.todo.shouldFlushNextOpportunity) {
     return {
       kind: "noop",
-      reason: "next_opportunity dispatch scaffolded but not implemented yet",
+      reason: "next_opportunity dispatch not implemented yet",
     };
   }
 
   if (input.todo.shouldConsumeWhenIdle) {
     return {
       kind: "noop",
-      reason: "when_idle dispatch scaffolded but not implemented yet",
+      reason: "when_idle dispatch not implemented yet",
     };
   }
 
@@ -79,7 +79,7 @@ export function toQueueOutcome(
   }
 }
 
-export async function executeAgentAdvanceScaffold(input: {
+export async function executeAgentAdvance(input: {
   readonly agentId: string;
   readonly loadState: (input: {
     readonly agentId: string;

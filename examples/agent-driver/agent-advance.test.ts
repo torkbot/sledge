@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   decideAgentAdvance,
   deriveAgentAdvanceTodo,
-  executeAgentAdvanceScaffold,
+  executeAgentAdvance,
 } from "./agent-advance.ts";
 
 test("decideAgentAdvance dead-letters unknown agent", () => {
@@ -53,7 +53,7 @@ test("decideAgentAdvance chooses next_opportunity branch when available", () => 
 
   assert.deepEqual(decision, {
     kind: "noop",
-    reason: "next_opportunity dispatch scaffolded but not implemented yet",
+    reason: "next_opportunity dispatch not implemented yet",
   });
 });
 
@@ -84,8 +84,8 @@ test("decideAgentAdvance chooses when_idle branch only when idle", () => {
   });
 });
 
-test("executeAgentAdvanceScaffold maps noop decision to ack", async () => {
-  const outcome = await executeAgentAdvanceScaffold({
+test("executeAgentAdvance maps noop decision to ack", async () => {
+  const outcome = await executeAgentAdvance({
     agentId: "agent-1",
     loadState: async () => {
       return {
