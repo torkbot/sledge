@@ -16,9 +16,35 @@ export type AgentAdvanceTodo = {
   readonly hasTranscript: boolean;
 };
 
-export type AgentAdvanceDecision =
-  | { readonly kind: "dead_letter"; readonly error: string }
-  | { readonly kind: "noop"; readonly reason: string };
+export type AgentAdvanceTransition =
+  | {
+      readonly kind: "dead_letter_unknown_agent";
+      readonly error: string;
+    }
+  | {
+      readonly kind: "start_turn_from_next_opportunity";
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "start_turn_from_when_idle";
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "await_turn_boundary_with_next_opportunity";
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "await_idle_for_when_idle";
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "await_in_flight_turn";
+      readonly reason: string;
+    }
+  | {
+      readonly kind: "noop_no_pending_work";
+      readonly reason: string;
+    };
 
 export function deriveAgentAdvanceTodo(input: {
   readonly state: AgentAdvanceRecoveryState;
@@ -35,63 +61,94 @@ export function decideAgentAdvance(input: {
   readonly agentId: string;
   readonly state: AgentAdvanceRecoveryState;
   readonly todo: AgentAdvanceTodo;
-}): AgentAdvanceDecision {
+}): AgentAdvanceTransition {
   if (!input.state.exists) {
     return {
-      kind: "dead_letter",
+      kind: "dead_letter_unknown_agent",
       error: `advance requested for unknown agent: ${input.agentId}`,
+    };
+  }
+
+  if (input.state.phase === "idle") {
+    if (input.todo.shouldFlushNextOpportunity) {
+      return {
+        kind: "start_turn_from_next_opportunity",
+        reason: "idle with next_opportunity backlog",
+      };
+    }
+
+    if (input.todo.shouldConsumeWhenIdle) {
+      return {
+        kind: "start_turn_from_when_idle",
+        reason: "idle with when_idle backlog",
+      };
+    }
+
+    return {
+      kind: "noop_no_pending_work",
+      reason: "idle with no pending input",
     };
   }
 
   if (input.todo.shouldFlushNextOpportunity) {
     return {
-      kind: "noop",
-      reason: "next_opportunity dispatch not implemented yet",
+      kind: "await_turn_boundary_with_next_opportunity",
+      reason: "turn is in-flight; next_opportunity queued",
     };
   }
 
-  if (input.todo.shouldConsumeWhenIdle) {
+  if (input.state.whenIdleCount > 0) {
     return {
-      kind: "noop",
-      reason: "when_idle dispatch not implemented yet",
+      kind: "await_idle_for_when_idle",
+      reason: "turn is in-flight; when_idle queued",
     };
   }
 
   return {
-    kind: "noop",
-    reason: "no pending work",
+    kind: "await_in_flight_turn",
+    reason: "turn in-flight with no queued input",
   };
 }
 
 export function toQueueOutcome(
-  decision: AgentAdvanceDecision,
+  transition: AgentAdvanceTransition,
 ): QueueHandlerOutcome {
-  switch (decision.kind) {
-    case "dead_letter":
+  switch (transition.kind) {
+    case "dead_letter_unknown_agent":
       return {
         outcome: "dead_letter",
-        error: decision.error,
+        error: transition.error,
       };
-    case "noop":
+    default:
       return {
         outcome: "ack",
       };
   }
 }
 
+export type AgentAdvanceExecution = {
+  readonly todo: AgentAdvanceTodo;
+  readonly transition: AgentAdvanceTransition;
+  readonly outcome: QueueHandlerOutcome;
+};
+
 export function executeAgentAdvance(input: {
   readonly agentId: string;
   readonly state: AgentAdvanceRecoveryState;
-}): QueueHandlerOutcome {
+}): AgentAdvanceExecution {
   const todo = deriveAgentAdvanceTodo({
     state: input.state,
   });
 
-  const decision = decideAgentAdvance({
+  const transition = decideAgentAdvance({
     agentId: input.agentId,
     state: input.state,
     todo,
   });
 
-  return toQueueOutcome(decision);
+  return {
+    todo,
+    transition,
+    outcome: toQueueOutcome(transition),
+  };
 }

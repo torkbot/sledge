@@ -56,7 +56,7 @@ test("deriveAgentAdvanceTodo only consumes when_idle when phase is idle", () => 
   assert.equal(runningTodo.shouldConsumeWhenIdle, false);
 });
 
-test("decideAgentAdvance dead-letters unknown agent even when todo has work", () => {
+test("decideAgentAdvance dead-letters unknown agent", () => {
   const state = makeState({
     exists: false,
     headNodeId: null,
@@ -71,12 +71,12 @@ test("decideAgentAdvance dead-letters unknown agent even when todo has work", ()
   });
 
   assert.deepEqual(decision, {
-    kind: "dead_letter",
+    kind: "dead_letter_unknown_agent",
     error: "advance requested for unknown agent: missing-agent",
   });
 });
 
-test("decideAgentAdvance prioritizes next_opportunity over when_idle", () => {
+test("decideAgentAdvance starts turn from next_opportunity when idle", () => {
   const state = makeState({
     nextOpportunityCount: 3,
     whenIdleCount: 2,
@@ -89,12 +89,12 @@ test("decideAgentAdvance prioritizes next_opportunity over when_idle", () => {
   });
 
   assert.deepEqual(decision, {
-    kind: "noop",
-    reason: "next_opportunity dispatch not implemented yet",
+    kind: "start_turn_from_next_opportunity",
+    reason: "idle with next_opportunity backlog",
   });
 });
 
-test("decideAgentAdvance selects when_idle branch when idle and no next_opportunity", () => {
+test("decideAgentAdvance starts turn from when_idle when idle and no next_opportunity", () => {
   const state = makeState({
     nextOpportunityCount: 0,
     whenIdleCount: 1,
@@ -107,16 +107,50 @@ test("decideAgentAdvance selects when_idle branch when idle and no next_opportun
   });
 
   assert.deepEqual(decision, {
-    kind: "noop",
-    reason: "when_idle dispatch not implemented yet",
+    kind: "start_turn_from_when_idle",
+    reason: "idle with when_idle backlog",
   });
 });
 
-test("decideAgentAdvance returns no pending work when running and only when_idle exists", () => {
+test("decideAgentAdvance returns idle/noop when no pending input", () => {
+  const state = makeState();
+
+  const decision = decideAgentAdvance({
+    agentId: "agent-1",
+    state,
+    todo: deriveAgentAdvanceTodo({ state }),
+  });
+
+  assert.deepEqual(decision, {
+    kind: "noop_no_pending_work",
+    reason: "idle with no pending input",
+  });
+});
+
+test("decideAgentAdvance awaits turn boundary when running and next_opportunity exists", () => {
+  const state = makeState({
+    phase: "model_running",
+    nextOpportunityCount: 1,
+    whenIdleCount: 1,
+  });
+
+  const decision = decideAgentAdvance({
+    agentId: "agent-1",
+    state,
+    todo: deriveAgentAdvanceTodo({ state }),
+  });
+
+  assert.deepEqual(decision, {
+    kind: "await_turn_boundary_with_next_opportunity",
+    reason: "turn is in-flight; next_opportunity queued",
+  });
+});
+
+test("decideAgentAdvance awaits idle when running and only when_idle exists", () => {
   const state = makeState({
     phase: "tools_running",
     nextOpportunityCount: 0,
-    whenIdleCount: 1,
+    whenIdleCount: 2,
   });
 
   const decision = decideAgentAdvance({
@@ -126,24 +160,52 @@ test("decideAgentAdvance returns no pending work when running and only when_idle
   });
 
   assert.deepEqual(decision, {
-    kind: "noop",
-    reason: "no pending work",
+    kind: "await_idle_for_when_idle",
+    reason: "turn is in-flight; when_idle queued",
   });
 });
 
-test("executeAgentAdvance maps noop decision to ack", () => {
-  const outcome = executeAgentAdvance({
-    agentId: "agent-1",
-    state: makeState(),
+test("decideAgentAdvance awaits in-flight turn when running and no queued input", () => {
+  const state = makeState({
+    phase: "tools_running",
+    nextOpportunityCount: 0,
+    whenIdleCount: 0,
   });
 
-  assert.deepEqual(outcome, {
+  const decision = decideAgentAdvance({
+    agentId: "agent-1",
+    state,
+    todo: deriveAgentAdvanceTodo({ state }),
+  });
+
+  assert.deepEqual(decision, {
+    kind: "await_in_flight_turn",
+    reason: "turn in-flight with no queued input",
+  });
+});
+
+test("executeAgentAdvance returns transition, todo, and ack outcome", () => {
+  const execution = executeAgentAdvance({
+    agentId: "agent-1",
+    state: makeState({
+      nextOpportunityCount: 1,
+      hasMessages: true,
+    }),
+  });
+
+  assert.equal(execution.todo.shouldFlushNextOpportunity, true);
+  assert.equal(execution.todo.hasTranscript, true);
+  assert.deepEqual(execution.transition, {
+    kind: "start_turn_from_next_opportunity",
+    reason: "idle with next_opportunity backlog",
+  });
+  assert.deepEqual(execution.outcome, {
     outcome: "ack",
   });
 });
 
-test("executeAgentAdvance maps unknown-agent decision to dead_letter outcome", () => {
-  const outcome = executeAgentAdvance({
+test("executeAgentAdvance maps unknown agent to dead_letter outcome", () => {
+  const execution = executeAgentAdvance({
     agentId: "missing-agent",
     state: makeState({
       exists: false,
@@ -151,7 +213,11 @@ test("executeAgentAdvance maps unknown-agent decision to dead_letter outcome", (
     }),
   });
 
-  assert.deepEqual(outcome, {
+  assert.deepEqual(execution.transition, {
+    kind: "dead_letter_unknown_agent",
+    error: "advance requested for unknown agent: missing-agent",
+  });
+  assert.deepEqual(execution.outcome, {
     outcome: "dead_letter",
     error: "advance requested for unknown agent: missing-agent",
   });

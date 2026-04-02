@@ -398,10 +398,20 @@ export function openAgentDriverRuntime(
           agentId: work.payload.agentId,
         });
 
-        return executeAgentAdvance({
+        const execution = executeAgentAdvance({
           agentId: work.payload.agentId,
           state,
         });
+
+        // Transition dispatcher scaffold.
+        // Future branches:
+        // - start_turn_from_next_opportunity
+        // - start_turn_from_when_idle
+        // - finalize_completed_turn
+        // - handle_failed_turn
+        void execution.transition;
+
+        return execution.outcome;
       });
     },
   });
