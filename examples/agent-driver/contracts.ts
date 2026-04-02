@@ -18,11 +18,6 @@ export const PiAiThinkingLevelSchema = Type.Union([
   Type.Literal("xhigh"),
 ]);
 
-/**
- * pi-ai model descriptor persisted in durable agent context.
- *
- * Mirrors the core fields exposed by pi-ai model instances.
- */
 export const PiAiModelConfigSchema = Type.Object({
   api: Type.String(),
   provider: Type.String(),
@@ -65,20 +60,14 @@ export type AgentContext = Static<typeof AgentContextSchema>;
 export const AgentContextInitializedEventSchema = Type.Object({
   kind: Type.Literal("context.initialized"),
   agentId: Type.String(),
-  branchId: Type.String(),
   nodeId: Type.String(),
   parentNodeId: Type.Null(),
   context: AgentContextSchema,
 });
 
-export type AgentContextInitializedEvent = Static<
-  typeof AgentContextInitializedEventSchema
->;
-
 export const AgentTurnStateUpdatedEventSchema = Type.Object({
   kind: Type.Literal("turn.state.updated"),
   agentId: Type.String(),
-  branchId: Type.String(),
   nodeId: Type.String(),
   parentNodeId: Type.String(),
   phase: Type.Union([
@@ -88,21 +77,14 @@ export const AgentTurnStateUpdatedEventSchema = Type.Object({
   ]),
 });
 
-export type AgentTurnStateUpdatedEvent = Static<
-  typeof AgentTurnStateUpdatedEventSchema
->;
-
 export const AgentEventSchema = Type.Union([
   AgentContextInitializedEventSchema,
   AgentTurnStateUpdatedEventSchema,
 ]);
 
-export type AgentEvent = Static<typeof AgentEventSchema>;
-
 export const UserInputRecordedEventSchema = Type.Object({
   kind: Type.Literal("input.recorded"),
   agentId: Type.String(),
-  branchId: Type.String(),
   nodeId: Type.String(),
   parentNodeId: Type.String(),
   timing: AgentInputTimingSchema,
@@ -117,8 +99,6 @@ export type UserInputRecordedEvent = Static<
 
 export const UserEventSchema = Type.Union([UserInputRecordedEventSchema]);
 
-export type UserEvent = Static<typeof UserEventSchema>;
-
 export const AgentDriverEventSchemas = {
   "agent.event": AgentEventSchema,
   "user.event": UserEventSchema,
@@ -126,16 +106,14 @@ export const AgentDriverEventSchemas = {
 
 export type AgentDriverEvents = typeof AgentDriverEventSchemas;
 
-export const AgentBranchHeadQueryParamsSchema = Type.Object({
+export const AgentHeadQueryParamsSchema = Type.Object({
   agentId: Type.String(),
-  branchId: Type.String(),
 });
 
-export const AgentBranchHeadQueryResultSchema = Type.Union([
+export const AgentHeadQueryResultSchema = Type.Union([
   Type.Null(),
   Type.Object({
     agentId: Type.String(),
-    branchId: Type.String(),
     nodeId: Type.String(),
     parentNodeId: Type.Union([Type.Null(), Type.String()]),
     eventName: Type.Union([
@@ -146,17 +124,16 @@ export const AgentBranchHeadQueryResultSchema = Type.Union([
   }),
 ]);
 
-export const AgentBranchHeadQuerySchema: QuerySchema<
-  typeof AgentBranchHeadQueryParamsSchema,
-  typeof AgentBranchHeadQueryResultSchema
+export const AgentHeadQuerySchema: QuerySchema<
+  typeof AgentHeadQueryParamsSchema,
+  typeof AgentHeadQueryResultSchema
 > = {
-  params: AgentBranchHeadQueryParamsSchema,
-  result: AgentBranchHeadQueryResultSchema,
+  params: AgentHeadQueryParamsSchema,
+  result: AgentHeadQueryResultSchema,
 };
 
 export const AgentPendingInputsQueryParamsSchema = Type.Object({
   agentId: Type.String(),
-  branchId: Type.String(),
 });
 
 export const AgentPendingInputsQueryResultSchema = Type.Object({
@@ -179,7 +156,6 @@ export const AgentNodeChildrenQueryParamsSchema = Type.Object({
 
 export const AgentNodeChildrenQueryResultSchema = Type.Array(
   Type.Object({
-    branchId: Type.String(),
     nodeId: Type.String(),
     eventName: Type.Union([
       Type.Literal("agent.event"),
@@ -199,7 +175,6 @@ export const AgentNodeChildrenQuerySchema: QuerySchema<
 
 export const AgentMessagesQueryParamsSchema = Type.Object({
   agentId: Type.String(),
-  branchId: Type.String(),
 });
 
 export const AgentMessagesQueryResultSchema = Type.Object({
@@ -216,7 +191,7 @@ export const AgentMessagesQuerySchema: QuerySchema<
 };
 
 export const AgentDriverQuerySchemas = {
-  "agent.branch.head": AgentBranchHeadQuerySchema,
+  "agent.head": AgentHeadQuerySchema,
   "agent.pending-inputs": AgentPendingInputsQuerySchema,
   "agent.node.children": AgentNodeChildrenQuerySchema,
   "agent.messages": AgentMessagesQuerySchema,

@@ -15,7 +15,7 @@ function createPiAiStub(): PiAiGateway {
   };
 }
 
-test("initializeAgent initializes a branch head and emits context event", async () => {
+test("initializeAgent initializes agent head and emits context event", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
 
@@ -53,15 +53,13 @@ test("initializeAgent initializes a branch head and emits context event", async 
   });
 
   assert.equal(created.agentId, "agent-1");
-  assert.equal(created.branchId, "main");
 
-  const head = await agentRuntime.driver.getBranchHead({
+  const head = await agentRuntime.driver.getHead({
     agentId: created.agentId,
   });
 
   assert.deepEqual(head, {
     agentId: created.agentId,
-    branchId: created.branchId,
     nodeId: created.nodeId,
     parentNodeId: null,
     eventName: "agent.event",
@@ -173,13 +171,11 @@ test("fork mode records sibling children from the same parent node", async () =>
 
   assert.deepEqual(children, [
     {
-      branchId: created.branchId,
       nodeId: continued.nodeId,
       eventName: "user.event",
       eventKind: "input.recorded",
     },
     {
-      branchId: created.branchId,
       nodeId: forked.nodeId,
       eventName: "user.event",
       eventKind: "input.recorded",

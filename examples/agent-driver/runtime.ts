@@ -14,7 +14,6 @@ import type { AgentDriverEvents } from "./contracts.ts";
 export interface PiAiGateway {
   runTurn(input: {
     readonly agentId: string;
-    readonly branchId: string;
     readonly prompt: string;
     readonly signal: AbortSignal;
   }): Promise<{

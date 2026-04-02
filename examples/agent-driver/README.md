@@ -64,7 +64,7 @@ console.log(transcript.messages);
 ### 1) Caller owns `agentId`; runtime owns graph topology
 
 - Caller must provide durable domain identity (`agentId`) at initialization.
-- Runtime owns lineage/node details (`branchId`, `nodeId`, `parentNodeId`).
+- Runtime owns node topology details (`nodeId`, `parentNodeId`).
 
 This keeps API intent-focused and prevents callers from constructing invalid graph topology.
 
@@ -100,7 +100,7 @@ The runtime is modeled as durable events + queries, not hidden in-memory state. 
 
 - `initializeAgent(...)`
 - `submitUserInput(...)`
-- `getBranchHead(...)`
+- `getHead(...)`
 - `getPendingInputs(...)`
 - `getNodeChildren(...)`
 - `getMessages(...)`
@@ -120,24 +120,23 @@ The runtime is modeled as durable events + queries, not hidden in-memory state. 
 All events include:
 
 - `agentId`
-- `branchId`
 - `nodeId`
 - `parentNodeId`
 
-This supports deterministic graph reconstruction and branch introspection.
+This supports deterministic graph reconstruction and fork introspection.
 
 ---
 
 ## Query contracts consumers can use
 
-- `agent.branch.head`
-  - latest node for `(agentId, branchId)`
-  - driver defaults branch to `main`
+- `agent.head`
+  - latest node for `agentId`
 - `agent.pending-inputs`
-  - pending `next_opportunity` and `when_idle` buffers for branch
-  - driver defaults branch to `main`
+  - pending `next_opportunity` and `when_idle` buffers for agent
 - `agent.node.children`
   - child nodes for `(agentId, nodeId)`
+- `agent.messages`
+  - current message transcript snapshot for agent
 
 ---
 
