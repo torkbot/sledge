@@ -3,21 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { VirtualRuntimeHarness } from "../../src/runtime/virtual-runtime.ts";
-import {
-  openAgentDriverRuntime,
-  type AgentDriverRuntime,
-  type PiAiGateway,
-} from "./runtime.ts";
-
-function createPiAiStub(): PiAiGateway {
-  return {
-    runTurn: async () => {
-      return {
-        outputText: "stub",
-      };
-    },
-  };
-}
+import { openAgentDriverRuntime, type AgentDriverRuntime } from "./runtime.ts";
 
 function createContext() {
   return {
@@ -43,8 +29,6 @@ function createOpenedRuntime(): AgentDriverRuntime {
       clock: runtime.clock,
       scheduler: runtime.scheduler,
     },
-    llm: createPiAiStub(),
-    toolBindings: [],
   });
 }
 
@@ -311,10 +295,10 @@ function runAgentDriverContractSuite(suiteName: string): void {
       content: "hello stream",
     });
 
-    const tailSignal = new AbortController().signal;
+    const tailController = new AbortController();
     const stream = runtime.driver.tailEvents({
       last: 10,
-      signal: tailSignal,
+      signal: tailController.signal,
     });
 
     const iterator = stream[Symbol.asyncIterator]();
@@ -326,16 +310,21 @@ function runAgentDriverContractSuite(suiteName: string): void {
       throw new Error("expected one event from tail stream");
     }
 
-    const resumeSignal = new AbortController().signal;
+    const resumeController = new AbortController();
     const resumed = runtime.driver.resumeEvents({
       cursor: first.value.cursor,
-      signal: resumeSignal,
+      signal: resumeController.signal,
     });
 
     const resumedIterator = resumed[Symbol.asyncIterator]();
     const resumedFirst = await resumedIterator.next();
 
     assert.equal(resumedFirst.done, false);
+
+    await resumedIterator.return?.();
+    await iterator.return?.();
+    resumeController.abort();
+    tailController.abort();
   });
 
   test(

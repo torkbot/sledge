@@ -194,18 +194,23 @@ const context = createAgentContextWithRegisteredTools({
 const runtime = openAgentDriverRuntime({
   database,
   timing,
-  llm,
-  toolBindings: [
-    bindAgentTool({
-      tool: searchTool,
-      execute: async ({ params, signal }) => {
-        return {
-          content: [{ type: "text", text: `result for: ${params.query}` }],
-        };
-      },
-    }),
-  ],
 });
+
+// Non-deterministic side subscribes to I/O requests and reports results.
+for await (const item of runtime.io.tailRequests({
+  last: 0,
+  signal,
+})) {
+  if (item.request.kind === "model.request") {
+    await runtime.io.reportResult({
+      kind: "model.completed",
+      agentId: item.request.agentId,
+      turnId: item.request.turnId,
+      requestId: item.request.requestId,
+      outputText: "result text",
+    });
+  }
+}
 ```
 
 Handlers are strongly typed from the TypeBox parameters schema. If a tool is registered but unbound at runtime, execution should return a deterministic tool error response.

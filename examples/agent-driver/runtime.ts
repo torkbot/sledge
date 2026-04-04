@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type Database from "better-sqlite3";
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
@@ -13,8 +15,7 @@ import type {
 } from "../../src/ledger/ledger.ts";
 import { createAgentDriver, type AgentDriver } from "./api.ts";
 import { executeAgentAdvance } from "./agent-advance.ts";
-import { executeAgentRunModel, toImmediateOutcome } from "./agent-run-model.ts";
-import { createToolBindingResolver, type BoundAgentTool } from "./tools.ts";
+import type { AgentIoPort, AgentIoRequest, AgentIoResult } from "./io-seam.ts";
 import {
   AGENT_EVENT_NAME,
   AGENT_HEAD_QUERY_NAME,
@@ -32,19 +33,6 @@ import {
 } from "./contracts.ts";
 
 /**
- * Minimal pi-ai contract we expect to integrate with from the orchestrator.
- */
-export interface PiAiGateway {
-  runTurn(input: {
-    readonly agentId: string;
-    readonly prompt: string;
-    readonly signal: AbortSignal;
-  }): Promise<{
-    readonly outputText: string;
-  }>;
-}
-
-/**
  * Input dependencies for opening the agent runtime.
  *
  * Operational convention: run one active writer runtime per database.
@@ -53,12 +41,11 @@ export interface PiAiGateway {
 export type OpenAgentDriverRuntimeInput = {
   readonly database: Database.Database;
   readonly timing: LedgerTiming;
-  readonly llm: PiAiGateway;
-  readonly toolBindings: readonly BoundAgentTool[];
 };
 
 export type AgentDriverRuntime = AsyncDisposable & {
   readonly driver: AgentDriver;
+  readonly io: AgentIoPort;
   tailEvents(input: {
     readonly last: number;
     readonly signal: AbortSignal;
@@ -153,15 +140,9 @@ const AppendAssistantMessageProjectionSchema = Type.Object({
 });
 
 export const AGENT_ADVANCE_QUEUE_NAME = "agent.advance" as const;
-export const AGENT_RUN_MODEL_QUEUE_NAME = "agent.run-model" as const;
 
 const AgentAdvanceQueueSchema = Type.Object({
   agentId: Type.String(),
-});
-
-const AgentRunModelQueueSchema = Type.Object({
-  agentId: Type.String(),
-  turnId: Type.String(),
 });
 
 const WRITE_NODE_INDEXER_NAME = "writeNode" as const;
@@ -279,6 +260,47 @@ function decodeJsonWithSchema<const TJsonSchema extends TSchema>(
   return Value.Decode(schema, parsed);
 }
 
+function toIoRequest(
+  event: LedgerStreamEvent<AgentDriverEvents>,
+): AgentIoRequest | null {
+  if (event.event.eventName !== AGENT_EVENT_NAME) {
+    return null;
+  }
+
+  const payload = event.event.payload;
+
+  if (payload.kind !== "turn.model.requested") {
+    return null;
+  }
+
+  return {
+    kind: "model.request",
+    agentId: payload.agentId,
+    turnId: payload.turnId,
+    requestId: payload.nodeId,
+  };
+}
+
+async function* mapIoRequests(input: {
+  readonly events: AsyncIterable<LedgerStreamEvent<AgentDriverEvents>>;
+}): AsyncIterable<{
+  readonly request: AgentIoRequest;
+  readonly cursor: LedgerCursor;
+}> {
+  for await (const event of input.events) {
+    const request = toIoRequest(event);
+
+    if (request === null) {
+      continue;
+    }
+
+    yield {
+      request,
+      cursor: event.cursor,
+    };
+  }
+}
+
 export function openAgentDriverRuntime(
   input: OpenAgentDriverRuntimeInput,
 ): AgentDriverRuntime {
@@ -347,15 +369,10 @@ export function openAgentDriverRuntime(
     CREATE INDEX IF NOT EXISTS idx_agent_children_by_parent ON agent_children(agent_id, parent_node_id, node_id);
   `);
 
-  const resolveToolBinding = createToolBindingResolver({
-    boundTools: input.toolBindings,
-  });
-
   const model = defineLedgerModel({
     events: AgentDriverEventSchemas,
     queues: {
       [AGENT_ADVANCE_QUEUE_NAME]: AgentAdvanceQueueSchema,
-      [AGENT_RUN_MODEL_QUEUE_NAME]: AgentRunModelQueueSchema,
     },
     indexers: {
       [WRITE_NODE_INDEXER_NAME]: AgentNodeProjectionSchema,
@@ -454,7 +471,7 @@ export function openAgentDriverRuntime(
 
           await actions.index(UPSERT_RUNTIME_STATE_INDEXER_NAME, {
             agentId: event.payload.agentId,
-            phase: null,
+            phase: "idle",
             hasMessages: true,
           });
         }
@@ -465,6 +482,12 @@ export function openAgentDriverRuntime(
             turnId: event.payload.turnId,
             failureNodeId: event.payload.nodeId,
             error: event.payload.error,
+          });
+
+          await actions.index(UPSERT_RUNTIME_STATE_INDEXER_NAME, {
+            agentId: event.payload.agentId,
+            phase: "idle",
+            hasMessages: null,
           });
         }
       });
@@ -502,13 +525,6 @@ export function openAgentDriverRuntime(
         actions.enqueue(AGENT_ADVANCE_QUEUE_NAME, {
           agentId: event.payload.agentId,
         });
-
-        if (event.payload.kind === "turn.model.requested") {
-          actions.enqueue(AGENT_RUN_MODEL_QUEUE_NAME, {
-            agentId: event.payload.agentId,
-            turnId: event.payload.turnId,
-          });
-        }
       });
 
       builder.materialize(USER_EVENT_NAME, ({ event, actions }) => {
@@ -536,111 +552,6 @@ export function openAgentDriverRuntime(
 
         return execution.outcome;
       });
-
-      builder.handle(
-        AGENT_RUN_MODEL_QUEUE_NAME,
-        async ({ work, lease, actions }) => {
-          const runtimeState = await actions.query(
-            AGENT_RUNTIME_STATE_QUERY_NAME,
-            {
-              agentId: work.payload.agentId,
-            },
-          );
-
-          const turn = await actions.query(AGENT_TURN_QUERY_NAME, {
-            agentId: work.payload.agentId,
-            turnId: work.payload.turnId,
-          });
-
-          const transcript = await actions.query(AGENT_MESSAGES_QUERY_NAME, {
-            agentId: work.payload.agentId,
-          });
-
-          const execution = executeAgentRunModel({
-            agentId: work.payload.agentId,
-            turnId: work.payload.turnId,
-            runtimeState,
-            turn,
-            transcript,
-          });
-
-          const immediateOutcome = toImmediateOutcome(execution.decision);
-
-          if (immediateOutcome !== null) {
-            return immediateOutcome;
-          }
-
-          if (turn === null || execution.prompt === null) {
-            return {
-              outcome: "dead_letter",
-              error: `run-model invariant violation: ${work.payload.agentId}/${work.payload.turnId}`,
-            } as const;
-          }
-
-          // Tool call execution is not wired yet in this example. When the model
-          // output includes tool calls, resolve handlers through this registry.
-          // Unbound tools must produce deterministic tool error messages.
-          void resolveToolBinding;
-
-          try {
-            await using hold = lease.hold();
-
-            const completion = await input.llm.runTurn({
-              agentId: work.payload.agentId,
-              prompt: execution.prompt,
-              signal: hold.signal,
-            });
-
-            const completionNodeId = `agent-event/${work.workId}/model-completed`;
-
-            actions.emit(
-              AGENT_EVENT_NAME,
-              {
-                kind: "turn.model.completed",
-                agentId: work.payload.agentId,
-                nodeId: completionNodeId,
-                parentNodeId: turn.requestNodeId,
-                turnId: work.payload.turnId,
-                outputText: completion.outputText,
-              },
-              {
-                dedupeKey: `agent:${work.payload.agentId}:run-model:${work.workId}:completed`,
-              },
-            );
-
-            return {
-              outcome: "ack",
-            } as const;
-          } catch (error: unknown) {
-            const message =
-              error instanceof Error
-                ? error.message
-                : "unknown error while running model turn";
-
-            const failureNodeId = `agent-event/${work.workId}/model-failed`;
-
-            actions.emit(
-              AGENT_EVENT_NAME,
-              {
-                kind: "turn.model.failed",
-                agentId: work.payload.agentId,
-                nodeId: failureNodeId,
-                parentNodeId: turn.requestNodeId,
-                turnId: work.payload.turnId,
-                error: message,
-              },
-              {
-                dedupeKey: `agent:${work.payload.agentId}:run-model:${work.workId}:failed`,
-              },
-            );
-
-            return {
-              outcome: "retry",
-              error: message,
-            } as const;
-          }
-        },
-      );
     },
   });
 
@@ -1092,8 +1003,63 @@ export function openAgentDriverRuntime(
 
   const driver = createAgentDriver(ledger);
 
+  const io: AgentIoPort = {
+    tailRequests: (streamInput) => {
+      return mapIoRequests({
+        events: driver.tailEvents(streamInput),
+      });
+    },
+    resumeRequests: (streamInput) => {
+      return mapIoRequests({
+        events: driver.resumeEvents(streamInput),
+      });
+    },
+    reportResult: async (result: AgentIoResult) => {
+      if (result.kind === "model.completed") {
+        await ledger.emit(
+          AGENT_EVENT_NAME,
+          {
+            kind: "turn.model.completed",
+            agentId: result.agentId,
+            nodeId: randomUUID(),
+            parentNodeId: result.requestId,
+            turnId: result.turnId,
+            outputText: result.outputText,
+          },
+          {
+            dedupeKey: `agent:${result.agentId}:io-result:${result.requestId}:completed`,
+          },
+        );
+
+        return;
+      }
+
+      if (result.kind === "model.failed") {
+        await ledger.emit(
+          AGENT_EVENT_NAME,
+          {
+            kind: "turn.model.failed",
+            agentId: result.agentId,
+            nodeId: randomUUID(),
+            parentNodeId: result.requestId,
+            turnId: result.turnId,
+            error: result.error,
+          },
+          {
+            dedupeKey: `agent:${result.agentId}:io-result:${result.requestId}:failed`,
+          },
+        );
+
+        return;
+      }
+
+      throw new Error(`unsupported io result kind: ${result.kind}`);
+    },
+  };
+
   return {
     driver,
+    io,
     tailEvents: (streamInput) => {
       return driver.tailEvents(streamInput);
     },
