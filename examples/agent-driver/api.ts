@@ -232,6 +232,23 @@ export function createAgentDriver(
         signal: input.signal,
       });
 
+      // Close query->subscribe race: state may have become idle between
+      // the initial query and stream attachment.
+      const afterSubscribe = await ledger.query(
+        AGENT_RUNTIME_STATE_QUERY_NAME,
+        {
+          agentId: input.agentId,
+        },
+      );
+
+      if (!afterSubscribe.exists) {
+        throw new Error(`agent disappeared while waiting: ${input.agentId}`);
+      }
+
+      if (afterSubscribe.phase === "idle") {
+        return;
+      }
+
       for await (const item of stream) {
         const payload = item.event.payload;
 
