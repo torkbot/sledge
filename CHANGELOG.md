@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+* Add an agent-driver example scaffold with typed public API, event/query contracts, and stream/query tests
+
+    This documents a user-facing approach for driving an agent on top of sledge (including `tailEvents`/`resumeEvents` consumption) before implementing full orchestration.
+
 ## 0.2.0
 
 * Add event tailing and resume APIs for external consumers

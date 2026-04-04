@@ -50,9 +50,9 @@
   ],
   "scripts": {
     "build": "rm -rf dist && tsc --project tsconfig.build.json --pretty",
-    "test": "node --test src/**/*.test.ts",
+    "test": "node --test src/**/*.test.ts examples/**/*.test.ts",
     "typecheck": "tsc --noEmit --pretty",
-    "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/**/*.ts",
+    "lint": "prettier -c README.md examples/**/*.md package.json tsconfig.json tsconfig.build.json src/**/*.ts examples/**/*.ts",
     "prepublishOnly": "node --run build"
   },
   "dependencies": {
