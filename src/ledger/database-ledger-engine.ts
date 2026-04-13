@@ -19,6 +19,7 @@ import type {
   QueueHandlerOutcome,
   QueueWorkItem,
   SignalMaterializerFunction,
+  SignalObserverFunction,
   SignalQueueActions,
   SignalQueueHandlerFunction,
   WorkLease,
@@ -143,7 +144,7 @@ export function createDatabaseLedger<
     TSignals,
     TSignalQueues
   >,
-): Ledger<TEvents, TQueries> {
+): Ledger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
     boundModel: input.boundModel,
     timing: input.timing,
@@ -451,7 +452,7 @@ function openDatabaseLedgerEngine<
     TIndexers,
     TQueries
   >,
-): Ledger<TEvents, TQueries> {
+): Ledger<TEvents, TQueries, TSignals> {
   const builder = new RuntimeBuilder<
     TEvents,
     TSignals,
@@ -502,6 +503,8 @@ function openDatabaseLedgerEngine<
   const leaseExpiryTasks = new Map<string, { cancel(): void }>();
   const leaseHeartbeatTasks = new Map<string, { cancel(): void }>();
   const eventWaiters = new Set<() => void>();
+  type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
+  const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
 
   let mutationTail: Promise<void> = Promise.resolve();
@@ -842,6 +845,7 @@ function openDatabaseLedgerEngine<
   ): Promise<{
     eventId: number;
     created: boolean;
+    event: EventEnvelope<TSignals, keyof TSignals> | null;
   }> {
     const signalName = signalInput.signalName as keyof TSignals;
     const signalSchema = model.signals[signalName];
@@ -909,6 +913,7 @@ function openDatabaseLedgerEngine<
       return {
         eventId,
         created: false,
+        event: null,
       };
     }
 
@@ -995,6 +1000,7 @@ function openDatabaseLedgerEngine<
     return {
       eventId,
       created,
+      event: envelope,
     };
   }
 
@@ -1067,6 +1073,32 @@ function openDatabaseLedgerEngine<
 
     for (const waiter of waiters) {
       waiter();
+    }
+  }
+
+  function notifySignalObservers(
+    events: readonly EventEnvelope<TSignals, keyof TSignals>[],
+  ): void {
+    for (const event of events) {
+      const observers = signalObserversByName.get(String(event.eventName));
+
+      if (observers === undefined) {
+        continue;
+      }
+
+      for (const observer of [...observers.values()]) {
+        queueMicrotask(() => {
+          if (!observers.has(observer)) {
+            return;
+          }
+
+          try {
+            void Promise.resolve(observer(event)).catch(() => undefined);
+          } catch {
+            // Signal observation is live and best-effort.
+          }
+        });
+      }
     }
   }
 
@@ -1726,12 +1758,12 @@ function openDatabaseLedgerEngine<
       if (active === undefined) {
         return {
           durableEvents: 0,
-          signals: 0,
+          signalEvents: [],
         };
       }
 
       let createdDurableCount = 0;
-      let createdSignalCount = 0;
+      const createdSignalEvents: EventEnvelope<TSignals, keyof TSignals>[] = [];
 
       for (const stagedEvent of stagedEvents) {
         const appended = await appendEventInTransaction(stagedEvent);
@@ -1744,8 +1776,8 @@ function openDatabaseLedgerEngine<
       for (const stagedSignal of stagedSignals) {
         const appended = await appendSignalInTransaction(stagedSignal);
 
-        if (appended.created) {
-          createdSignalCount += 1;
+        if (appended.event !== null) {
+          createdSignalEvents.push(appended.event);
         }
       }
 
@@ -1821,7 +1853,7 @@ function openDatabaseLedgerEngine<
 
       return {
         durableEvents: createdDurableCount,
-        signals: createdSignalCount,
+        signalEvents: createdSignalEvents,
       };
     });
 
@@ -1834,6 +1866,8 @@ function openDatabaseLedgerEngine<
     if (emitted.durableEvents > 0) {
       notifyEventWaiters();
     }
+
+    notifySignalObservers(emitted.signalEvents);
 
     scheduleDispatchAt(clock.nowMs());
   }
@@ -1866,6 +1900,7 @@ function openDatabaseLedgerEngine<
     }
 
     leaseAbortControllers.clear();
+    signalObserversByName.clear();
 
     await Promise.allSettled(inFlight);
 
@@ -1885,7 +1920,7 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  const ledger: Ledger<TEvents, TQueries> = {
+  const ledger: Ledger<TEvents, TQueries, TSignals> = {
     emit: async (eventName, event, options) => {
       await startup;
 
@@ -1924,6 +1959,37 @@ function openDatabaseLedgerEngine<
       const decodedResult = Value.Decode(schema.result, rawResult);
 
       return decodedResult as never;
+    },
+    onSignal: (signalName, observer) => {
+      const signalSchema = model.signals[signalName as keyof TSignals];
+
+      if (signalSchema === undefined) {
+        throw new Error(`unknown signal name: ${String(signalName)}`);
+      }
+
+      const key = String(signalName);
+      const storedObserver = observer as SignalObserver;
+      const observers = signalObserversByName.get(key) ?? new Set();
+
+      observers.add(storedObserver);
+      signalObserversByName.set(key, observers);
+
+      let disposed = false;
+
+      return {
+        [Symbol.dispose]: () => {
+          if (disposed) {
+            return;
+          }
+
+          disposed = true;
+          observers.delete(storedObserver);
+
+          if (observers.size === 0) {
+            signalObserversByName.delete(key);
+          }
+        },
+      };
     },
     tailEvents: ({ last, signal }) => {
       if (!Number.isInteger(last) || last < 0) {

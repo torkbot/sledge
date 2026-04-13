@@ -4,7 +4,7 @@
 
 - Add signals for transient handler-local orchestration
 
-  Models can now define `signals` and `signalQueues`. Durable handlers can emit signals with `actions.emitSignal(...)`; signals can materialize signal work with `builder.materializeSignal(...)`; and signal work is handled with `builder.handleSignal(...)`. Signals are hidden from durable event tail/resume streams and are pruned after their signal work acks.
+  Models can now define `signals` and `signalQueues`. Durable handlers can emit signals with `actions.emitSignal(...)`; signals can materialize signal work with `builder.materializeSignal(...)`; and signal work is handled with `builder.handleSignal(...)`. Signals can be observed live with `ledger.onSignal(...)`, which returns a disposable subscription handle. Durable event consumers remain durable-only.
 
 ## 0.2.0
 

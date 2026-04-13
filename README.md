@@ -199,7 +199,7 @@ Use a signal when a handler needs to create short-lived follow-up work.
 
 For example, a response handler might need to publish a “response started” notice. If the process crashes before the notice is published, sledge should retry it. After it is published, the notice does not need to stay in event history.
 
-Signals are only emitted from normal queue handlers with `actions.emitSignal(...)`. A signal can create `signalQueues`, but it cannot write indexes and does not appear in `tailEvents(...)` or `resumeEvents(...)`.
+Signals are only emitted from normal queue handlers with `actions.emitSignal(...)`. A signal can create `signalQueues`, but it cannot write indexes.
 
 ```ts
 const model = defineLedgerModel({
@@ -259,7 +259,17 @@ const model = defineLedgerModel({
 });
 ```
 
-Sledge keeps a signal while its work is pending or retrying. When that work acks, sledge deletes the signal and the completed signal work in the same transaction. Signal `dedupeKey` values are active only while the signal row exists.
+Sledge keeps a signal while its work is pending or retrying. When the work acks, sledge deletes the signal and the completed signal work in the same transaction. Signal `dedupeKey` values are active only while the signal row exists.
+
+You can also watch signals live:
+
+```ts
+using notices = ledger.onSignal("response.notice", (signal) => {
+  socket.send(signal.payload.message);
+});
+```
+
+This is a live notification only. It does not have a cursor, and sledge does not retry observer callbacks. For work that must be retried before cleanup, use a `signalQueue`.
 
 ## Dedupe and idempotency
 

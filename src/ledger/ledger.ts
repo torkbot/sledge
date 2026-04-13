@@ -383,9 +383,19 @@ export type LedgerStreamEvent<
   readonly cursor: LedgerCursor;
 };
 
+export interface SignalSubscription {
+  [Symbol.dispose](): void;
+}
+
+export type SignalObserverFunction<
+  TSignals extends Record<string, TSchema>,
+  TSignalName extends keyof TSignals = keyof TSignals,
+> = (signal: EventEnvelope<TSignals, TSignalName>) => void | Promise<void>;
+
 export interface Ledger<
   TEvents extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQuerySchema>,
+  TSignals extends Record<string, TSchema> = {},
 > extends AsyncDisposable {
   emit<const TEventName extends keyof TEvents>(
     eventName: TEventName,
@@ -397,6 +407,11 @@ export interface Ledger<
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>>;
+
+  onSignal<const TSignalName extends keyof TSignals>(
+    signalName: TSignalName,
+    observer: SignalObserverFunction<TSignals, TSignalName>,
+  ): SignalSubscription;
 
   tailEvents(input: {
     readonly last: number;
@@ -583,7 +598,7 @@ export interface LedgerEngineFactory {
     readonly maxInFlight?: number;
     readonly maxBusyRetries?: number;
     readonly maxBusyRetryDelayMs?: number;
-  }): Ledger<TEvents, TQueries>;
+  }): Ledger<TEvents, TQueries, TSignals>;
 }
 
 export function createLedger<
@@ -609,7 +624,7 @@ export function createLedger<
   readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
-}): Ledger<TEvents, TQueries> {
+}): Ledger<TEvents, TQueries, TSignals> {
   return input.engineFactory.openLedger({
     boundModel: input.boundModel,
     timing: input.timing,

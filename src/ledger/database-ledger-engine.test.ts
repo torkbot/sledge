@@ -370,8 +370,16 @@ test("signals materialize signal work and are pruned after ack", async () => {
     },
   });
 
+  const observedSignals: Array<{ id: number; seq: number }> = [];
+  const signalSubscription = ledger.onSignal("response.delta", (signal) => {
+    observedSignals.push(signal.payload);
+  });
+
   await ledger.emit("response.generate", { id: 1 });
   await waitFor(runtime, () => broadcasts === 1);
+  await waitFor(runtime, () => observedSignals.length === 1);
+
+  assert.deepEqual(observedSignals, [{ id: 1, seq: 1 }]);
 
   assert.equal(
     readCount(
@@ -395,6 +403,11 @@ test("signals materialize signal work and are pruned after ack", async () => {
 
   const first = await nextWithTimeout(iterator);
   assert.equal(first.done, false);
+
+  if (first.done) {
+    throw new Error("expected durable event");
+  }
+
   assert.equal(first.value.event.eventName, "response.generate");
   const next = iterator.next();
   assert.equal(await settlesWithin(next, 20), false);
@@ -417,8 +430,11 @@ test("signals materialize signal work and are pruned after ack", async () => {
     );
   });
 
+  signalSubscription[Symbol.dispose]();
+
   await ledger.emit("response.generate", { id: 1 });
   await waitFor(runtime, () => broadcasts === 2);
+  assert.equal(observedSignals.length, 1);
 });
 
 test("signal retry keeps signal event until signal work acks", async () => {

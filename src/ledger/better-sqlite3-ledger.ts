@@ -57,7 +57,7 @@ export function createBetterSqliteLedger<
     TSignals,
     TSignalQueues
   >,
-): Ledger<TEvents, TQueries> {
+): Ledger<TEvents, TQueries, TSignals> {
   const sharedInput: CreateDatabaseLedgerInput<
     TEvents,
     TQueues,
