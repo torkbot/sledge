@@ -259,7 +259,7 @@ const model = defineLedgerModel({
 });
 ```
 
-Sledge keeps a signal while its work is pending or retrying. When the work acks, sledge deletes the signal and the completed signal work in the same transaction. Signal `dedupeKey` values are active only while the signal row exists.
+Sledge keeps a signal while its work is pending or retrying. When the work acks, sledge deletes the signal and the completed signal work in the same transaction. `dedupeKey` values are shared across durable events and signals, so they must be globally unique while any matching row exists.
 
 You can also watch signals live:
 

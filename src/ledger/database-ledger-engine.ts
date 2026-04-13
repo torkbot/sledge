@@ -903,7 +903,7 @@ function openDatabaseLedgerEngine<
 
         if (existing === undefined) {
           throw new Error(
-            `dedupe conflict resolved without durable winner for key ${signalInput.dedupeKey}`,
+            `dedupe conflict resolved without existing winner for key ${signalInput.dedupeKey}`,
           );
         }
 
