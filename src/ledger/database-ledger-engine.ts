@@ -550,13 +550,15 @@ function openDatabaseLedgerEngine<
   })();
 
   async function ensureColumn(
-    tableName: string,
-    columnName: string,
+    tableName: "events" | "work",
+    columnName: "signal",
     definition: string,
   ): Promise<void> {
-    const rows = await database
-      .prepare(`PRAGMA table_info(${tableName})`)
-      .all();
+    let rows: readonly StorageRow[] = [];
+    await withBusyRetry(async () => {
+      rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
+    });
+
     const hasColumn = rows.some((row) => {
       return decodeRow(row, TableInfoRowSchema).name === columnName;
     });
