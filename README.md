@@ -20,6 +20,7 @@ Use `@torkbot/sledge` when you want:
 - **Transactional flow:** append event -> project -> materialize work in one transaction
 - **Lease-based execution** for queue handlers
 - **Idempotent producer retries** via `dedupeKey`
+- **Signals** for short-lived work created inside queue handlers
 - **Configurable contention behavior** (`maxBusyRetries`, `maxBusyRetryDelayMs`)
 
 ## Example use-cases
@@ -149,7 +150,9 @@ await ledger.close();
 You define contracts, not implementation details:
 
 - `events`: facts appended to the event stream
+- `signals`: short-lived records emitted from queue handlers
 - `queues`: durable work payloads
+- `signalQueues`: work payloads materialized from signals
 - `indexers`: projection write contracts
 - `queries`: projection read contracts
 - `register(builder)`: orchestration glue
@@ -182,6 +185,81 @@ Queue handlers must return one of:
 - `{ outcome: "dead_letter", error }`
 
 If a handler throws, the runtime treats it as a retry.
+
+Signal queue handlers return only:
+
+- `{ outcome: "ack" }`
+- `{ outcome: "retry", error, retryAtMs? }`
+
+Signals do not dead-letter in the public handler contract.
+
+## Signals
+
+Use a signal when a handler needs to create short-lived follow-up work.
+
+For example, a response handler might need to publish a “response started” notice. If the process crashes before the notice is published, sledge should retry it. After it is published, the notice does not need to stay in event history.
+
+Signals are only emitted from normal queue handlers with `actions.emitSignal(...)`. A signal can create `signalQueues`, but it cannot write indexes and does not appear in `tailEvents(...)` or `resumeEvents(...)`.
+
+```ts
+const model = defineLedgerModel({
+  events: {
+    "response.requested": Type.Object({
+      responseId: Type.String(),
+    }),
+  },
+  signals: {
+    "response.notice": Type.Object({
+      responseId: Type.String(),
+      message: Type.String(),
+    }),
+  },
+  queues: {
+    "response.generate": Type.Object({
+      responseId: Type.String(),
+    }),
+  },
+  signalQueues: {
+    "response.notice.publish": Type.Object({
+      responseId: Type.String(),
+      message: Type.String(),
+    }),
+  },
+  indexers: {},
+  queries: {},
+  register(builder) {
+    builder.materialize("response.requested", ({ event, actions }) => {
+      actions.enqueue("response.generate", {
+        responseId: event.payload.responseId,
+      });
+    });
+
+    builder.handle("response.generate", async ({ work, actions }) => {
+      actions.emitSignal("response.notice", {
+        responseId: work.payload.responseId,
+        message: "response started",
+      });
+
+      return { outcome: "ack" } as const;
+    });
+
+    builder.materializeSignal("response.notice", ({ event, actions }) => {
+      actions.enqueueSignal("response.notice.publish", {
+        responseId: event.payload.responseId,
+        message: event.payload.message,
+      });
+    });
+
+    builder.handleSignal("response.notice.publish", async ({ work }) => {
+      await notifier.publish(work.payload);
+
+      return { outcome: "ack" } as const;
+    });
+  },
+});
+```
+
+Sledge keeps a signal while its work is pending or retrying. When that work acks, sledge deletes the signal and the completed signal work in the same transaction. Signal `dedupeKey` values are active only while the signal row exists.
 
 ## Dedupe and idempotency
 
