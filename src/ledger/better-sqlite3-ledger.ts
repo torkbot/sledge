@@ -21,9 +21,18 @@ type CreateBetterSqliteLedgerInput<
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, AnyIndexerDef>,
   TQueries extends Record<string, AnyQueryDef>,
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
 > = {
   readonly database: Database.Database;
-  readonly boundModel: BoundLedgerModel<TEvents, TQueues, TIndexers, TQueries>;
+  readonly boundModel: BoundLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
   readonly timing: LedgerTiming;
   readonly leaseMs?: number;
   readonly defaultRetryDelayMs?: number;
@@ -37,14 +46,25 @@ export function createBetterSqliteLedger<
   const TQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, AnyIndexerDef>,
   const TQueries extends Record<string, AnyQueryDef>,
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
 >(
-  input: CreateBetterSqliteLedgerInput<TEvents, TQueues, TIndexers, TQueries>,
-): Ledger<TEvents, TQueries> {
+  input: CreateBetterSqliteLedgerInput<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >,
+): Ledger<TEvents, TQueries, TSignals> {
   const sharedInput: CreateDatabaseLedgerInput<
     TEvents,
     TQueues,
     TIndexers,
-    TQueries
+    TQueries,
+    TSignals,
+    TSignalQueues
   > = {
     database: wrapBetterSqliteDatabase(input.database),
     boundModel: input.boundModel,

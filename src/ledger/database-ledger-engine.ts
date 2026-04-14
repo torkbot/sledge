@@ -18,6 +18,10 @@ import type {
   QueueHandlerFunction,
   QueueHandlerOutcome,
   QueueWorkItem,
+  SignalMaterializerFunction,
+  SignalObserverFunction,
+  SignalQueueActions,
+  SignalQueueHandlerFunction,
   WorkLease,
   LeaseHold,
 } from "./ledger.ts";
@@ -31,6 +35,7 @@ type PersistedWorkLease = {
   readonly payloadJson: string;
   readonly sourceEventId: number;
   readonly attempt: number;
+  readonly signal: boolean;
   readonly leaseId: string;
   readonly leaseAcquiredAtMs: number;
   readonly leaseExpiresAtMs: number;
@@ -38,6 +43,14 @@ type PersistedWorkLease = {
 
 type AppendEventInput = {
   readonly eventName: string;
+  readonly payload: unknown;
+  readonly nowMs: number;
+  readonly dedupeKey?: string;
+  readonly causationEventId: number | null;
+};
+
+type AppendSignalInput = {
+  readonly signalName: string;
   readonly payload: unknown;
   readonly nowMs: number;
   readonly dedupeKey?: string;
@@ -67,11 +80,20 @@ export interface StorageDatabase {
 
 type OpenDatabaseLedgerEngineInput<
   TEvents extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, AnyIndexerDef>,
   TQueries extends Record<string, AnyQueryDef>,
 > = {
-  readonly boundModel: BoundLedgerModel<TEvents, TQueues, TIndexers, TQueries>;
+  readonly boundModel: BoundLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
   readonly timing: LedgerTiming;
   readonly database: StorageDatabase;
   readonly leaseMs?: number;
@@ -86,9 +108,18 @@ export type CreateDatabaseLedgerInput<
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, AnyIndexerDef>,
   TQueries extends Record<string, AnyQueryDef>,
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
 > = {
   readonly database: StorageDatabase;
-  readonly boundModel: BoundLedgerModel<TEvents, TQueues, TIndexers, TQueries>;
+  readonly boundModel: BoundLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
   readonly timing: LedgerTiming;
   readonly leaseMs?: number;
   readonly defaultRetryDelayMs?: number;
@@ -102,9 +133,18 @@ export function createDatabaseLedger<
   const TQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, AnyIndexerDef>,
   const TQueries extends Record<string, AnyQueryDef>,
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
 >(
-  input: CreateDatabaseLedgerInput<TEvents, TQueues, TIndexers, TQueries>,
-): Ledger<TEvents, TQueries> {
+  input: CreateDatabaseLedgerInput<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >,
+): Ledger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
     boundModel: input.boundModel,
     timing: input.timing,
@@ -119,10 +159,19 @@ export function createDatabaseLedger<
 
 class RuntimeBuilder<
   TEvents extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, AnyIndexerDef>,
   TQueries extends Record<string, AnyQueryDef>,
-> implements LedgerBuilder<TEvents, TQueues, TIndexers, TQueries> {
+> implements LedgerBuilder<
+  TEvents,
+  TQueues,
+  TIndexers,
+  TQueries,
+  TSignals,
+  TSignalQueues
+> {
   readonly projectorsByEvent = new Map<
     string,
     ProjectorFunction<any, any, any>[]
@@ -131,9 +180,17 @@ class RuntimeBuilder<
     string,
     MaterializerFunction<any, any, any>[]
   >();
+  readonly materializersBySignal = new Map<
+    string,
+    SignalMaterializerFunction<any, any, any>[]
+  >();
   readonly handlersByQueue = new Map<
     string,
-    QueueHandlerFunction<any, any, any, any>
+    QueueHandlerFunction<any, any, any, any, any>
+  >();
+  readonly signalHandlersByQueue = new Map<
+    string,
+    SignalQueueHandlerFunction<any, any, any>
   >();
 
   project<const TEventName extends keyof TEvents>(
@@ -160,9 +217,31 @@ class RuntimeBuilder<
     return this;
   }
 
+  materializeSignal<const TSignalName extends keyof TSignals>(
+    signalName: TSignalName,
+    materializer: SignalMaterializerFunction<
+      TSignals,
+      TSignalName,
+      TSignalQueues
+    >,
+  ): this {
+    const key = String(signalName);
+    const existing = this.materializersBySignal.get(key) ?? [];
+    existing.push(materializer as SignalMaterializerFunction<any, any, any>);
+    this.materializersBySignal.set(key, existing);
+
+    return this;
+  }
+
   handle<const TQueueName extends keyof TQueues>(
     queueName: TQueueName,
-    handler: QueueHandlerFunction<TEvents, TQueues, TQueueName, TQueries>,
+    handler: QueueHandlerFunction<
+      TEvents,
+      TQueues,
+      TQueueName,
+      TQueries,
+      TSignals
+    >,
   ): this {
     const key = String(queueName);
 
@@ -172,7 +251,29 @@ class RuntimeBuilder<
 
     this.handlersByQueue.set(
       key,
-      handler as QueueHandlerFunction<any, any, any, any>,
+      handler as QueueHandlerFunction<any, any, any, any, any>,
+    );
+
+    return this;
+  }
+
+  handleSignal<const TSignalQueueName extends keyof TSignalQueues>(
+    queueName: TSignalQueueName,
+    handler: SignalQueueHandlerFunction<
+      TSignalQueues,
+      TSignalQueueName,
+      TQueries
+    >,
+  ): this {
+    const key = String(queueName);
+
+    if (this.signalHandlersByQueue.has(key)) {
+      throw new Error(`duplicate signal queue handler registration: ${key}`);
+    }
+
+    this.signalHandlersByQueue.set(
+      key,
+      handler as SignalQueueHandlerFunction<any, any, any>,
     );
 
     return this;
@@ -201,6 +302,14 @@ function isSqliteBusyError(error: unknown): boolean {
   }
 
   return error.message.includes("SQLITE_BUSY");
+}
+
+function isDuplicateColumnError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.message.includes("duplicate column");
 }
 
 function computeBusyRetryDelayMs(attempt: number, maxDelayMs: number): number {
@@ -264,6 +373,10 @@ const EventIdRowSchema = Type.Object({
   event_id: Type.Number(),
 });
 
+const TableInfoRowSchema = Type.Object({
+  name: Type.String(),
+});
+
 const AvailableAtRowSchema = Type.Object({
   available_at_ms: Type.Number(),
 });
@@ -277,6 +390,7 @@ const ClaimedWorkRowSchema = Type.Object({
   queue_name: Type.String(),
   payload_json: Type.String(),
   source_event_id: Type.Number(),
+  signal: Type.Number(),
   attempt: Type.Number(),
   lease_id: Type.Union([Type.Null(), Type.String()]),
   lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
@@ -324,13 +438,29 @@ function readEventEnvelopeFromRow<
 
 function openDatabaseLedgerEngine<
   const TEvents extends Record<string, TSchema>,
+  const TSignals extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
+  const TSignalQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, AnyIndexerDef>,
   const TQueries extends Record<string, AnyQueryDef>,
 >(
-  input: OpenDatabaseLedgerEngineInput<TEvents, TQueues, TIndexers, TQueries>,
-): Ledger<TEvents, TQueries> {
-  const builder = new RuntimeBuilder<TEvents, TQueues, TIndexers, TQueries>();
+  input: OpenDatabaseLedgerEngineInput<
+    TEvents,
+    TSignals,
+    TQueues,
+    TSignalQueues,
+    TIndexers,
+    TQueries
+  >,
+): Ledger<TEvents, TQueries, TSignals> {
+  const builder = new RuntimeBuilder<
+    TEvents,
+    TSignals,
+    TQueues,
+    TSignalQueues,
+    TIndexers,
+    TQueries
+  >();
 
   const clock = input.timing.clock;
   const scheduler = input.timing.scheduler;
@@ -373,6 +503,8 @@ function openDatabaseLedgerEngine<
   const leaseExpiryTasks = new Map<string, { cancel(): void }>();
   const leaseHeartbeatTasks = new Map<string, { cancel(): void }>();
   const eventWaiters = new Set<() => void>();
+  type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
+  const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
 
   let mutationTail: Promise<void> = Promise.resolve();
@@ -386,7 +518,8 @@ function openDatabaseLedgerEngine<
         event_name TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         causation_event_id INTEGER,
-        dedupe_key TEXT UNIQUE
+        dedupe_key TEXT UNIQUE,
+        signal INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS work (
@@ -394,6 +527,7 @@ function openDatabaseLedgerEngine<
         queue_name TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         source_event_id INTEGER NOT NULL,
+        signal INTEGER NOT NULL DEFAULT 0,
         attempt INTEGER NOT NULL DEFAULT 0,
         available_at_ms INTEGER NOT NULL,
         dead INTEGER NOT NULL DEFAULT 0,
@@ -408,9 +542,45 @@ function openDatabaseLedgerEngine<
     `);
     });
 
+    await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
+    await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+
     await releaseExpiredLeases();
     await scheduleNextDispatchFromStore();
   })();
+
+  async function ensureColumn(
+    tableName: "events" | "work",
+    columnName: "signal",
+    definition: string,
+  ): Promise<void> {
+    let rows: readonly StorageRow[] = [];
+    await withBusyRetry(async () => {
+      rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
+    });
+
+    const hasColumn = rows.some((row) => {
+      return decodeRow(row, TableInfoRowSchema).name === columnName;
+    });
+
+    if (hasColumn) {
+      return;
+    }
+
+    try {
+      await withBusyRetry(async () => {
+        await database.exec(
+          `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
+        );
+      });
+    } catch (error: unknown) {
+      if (isDuplicateColumnError(error)) {
+        return;
+      }
+
+      throw error;
+    }
+  }
 
   function runSerialized<T>(run: () => Promise<T>): Promise<T> {
     const operation = mutationTail.then(run, run);
@@ -481,6 +651,19 @@ function openDatabaseLedgerEngine<
     return Value.Decode(schema, payload);
   }
 
+  function decodeSignalPayload<const TSignalName extends keyof TSignals>(
+    signalName: TSignalName,
+    payload: unknown,
+  ): Static<TSignals[TSignalName]> {
+    const schema = model.signals[signalName];
+
+    if (schema === undefined) {
+      throw new Error(`unknown signal name: ${String(signalName)}`);
+    }
+
+    return Value.Decode(schema, payload);
+  }
+
   async function appendEventInTransaction(
     eventInput: AppendEventInput,
   ): Promise<{
@@ -505,8 +688,8 @@ function openDatabaseLedgerEngine<
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key)
-           VALUES (?, ?, ?, ?, NULL)`,
+          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
+           VALUES (?, ?, ?, ?, NULL, 0)`,
         )
         .run(
           eventInput.nowMs,
@@ -520,8 +703,8 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key)
-           VALUES (?, ?, ?, ?, ?)
+          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
+           VALUES (?, ?, ?, ?, ?, 0)
            ON CONFLICT(dedupe_key) DO NOTHING`,
         )
         .run(
@@ -634,6 +817,7 @@ function openDatabaseLedgerEngine<
               queue_name,
               payload_json,
               source_event_id,
+              signal,
               attempt,
               available_at_ms,
               dead,
@@ -641,7 +825,7 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
           )
           .run(
             work.queueName,
@@ -655,6 +839,170 @@ function openDatabaseLedgerEngine<
     return {
       eventId,
       created,
+    };
+  }
+
+  async function appendSignalInTransaction(
+    signalInput: AppendSignalInput,
+  ): Promise<{
+    eventId: number;
+    created: boolean;
+    event: EventEnvelope<TSignals, keyof TSignals> | null;
+  }> {
+    const signalName = signalInput.signalName as keyof TSignals;
+    const signalSchema = model.signals[signalName];
+
+    if (signalSchema === undefined) {
+      throw new Error(`unknown signal name: ${signalInput.signalName}`);
+    }
+
+    const decodedPayload = decodeSignalPayload(signalName, signalInput.payload);
+    const encodedPayload = Value.Encode(signalSchema, decodedPayload);
+    const payloadJson = JSON.stringify(encodedPayload);
+
+    let created = false;
+    let eventId = 0;
+
+    if (signalInput.dedupeKey === undefined) {
+      const eventInsert = await database
+        .prepare(
+          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
+           VALUES (?, ?, ?, ?, NULL, 1)`,
+        )
+        .run(
+          signalInput.nowMs,
+          signalInput.signalName,
+          payloadJson,
+          signalInput.causationEventId,
+        );
+
+      created = true;
+      eventId = Number(eventInsert.lastInsertRowid);
+    } else {
+      const eventInsert = await database
+        .prepare(
+          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
+           VALUES (?, ?, ?, ?, ?, 1)
+           ON CONFLICT(dedupe_key) DO NOTHING`,
+        )
+        .run(
+          signalInput.nowMs,
+          signalInput.signalName,
+          payloadJson,
+          signalInput.causationEventId,
+          signalInput.dedupeKey,
+        );
+
+      if (eventInsert.changes > 0) {
+        created = true;
+        eventId = Number(eventInsert.lastInsertRowid);
+      } else {
+        const existing = await database
+          .prepare(`SELECT event_id FROM events WHERE dedupe_key = ?`)
+          .get(signalInput.dedupeKey);
+
+        if (existing === undefined) {
+          throw new Error(
+            `dedupe conflict resolved without existing winner for key ${signalInput.dedupeKey}`,
+          );
+        }
+
+        eventId = decodeRow(existing, EventIdRowSchema).event_id;
+      }
+    }
+
+    if (!created) {
+      return {
+        eventId,
+        created: false,
+        event: null,
+      };
+    }
+
+    const envelope: EventEnvelope<TSignals, keyof TSignals> = {
+      eventId,
+      tsMs: signalInput.nowMs,
+      eventName: signalName,
+      payload: decodedPayload,
+      causationEventId: signalInput.causationEventId,
+      dedupeKey: signalInput.dedupeKey ?? null,
+    };
+
+    const materializers =
+      builder.materializersBySignal.get(signalInput.signalName) ?? [];
+    let queuedCount = 0;
+
+    for (const materializer of materializers) {
+      const queued: {
+        queueName: string;
+        payload: unknown;
+        availableAtMs: number;
+      }[] = [];
+
+      await materializer({
+        event: envelope,
+        actions: {
+          enqueueSignal: (queueName, payload, options) => {
+            const queueSchema =
+              model.signalQueues[queueName as keyof TSignalQueues];
+
+            if (queueSchema === undefined) {
+              throw new Error(`unknown signal queue: ${String(queueName)}`);
+            }
+
+            const decodedQueuePayload = Value.Decode(queueSchema, payload);
+            const encodedQueuePayload = Value.Encode(
+              queueSchema,
+              decodedQueuePayload,
+            );
+
+            queued.push({
+              queueName: String(queueName),
+              payload: encodedQueuePayload,
+              availableAtMs: options?.availableAtMs ?? signalInput.nowMs,
+            });
+          },
+        },
+      });
+
+      for (const work of queued) {
+        await database
+          .prepare(
+            `INSERT INTO work (
+              queue_name,
+              payload_json,
+              source_event_id,
+              signal,
+              attempt,
+              available_at_ms,
+              dead,
+              lease_id,
+              lease_acquired_at_ms,
+              lease_expires_at_ms,
+              last_error
+            ) VALUES (?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+          )
+          .run(
+            work.queueName,
+            JSON.stringify(work.payload),
+            eventId,
+            work.availableAtMs,
+          );
+
+        queuedCount += 1;
+      }
+    }
+
+    if (queuedCount === 0) {
+      await database
+        .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
+        .run(eventId);
+    }
+
+    return {
+      eventId,
+      created,
+      event: envelope,
     };
   }
 
@@ -730,6 +1078,32 @@ function openDatabaseLedgerEngine<
     }
   }
 
+  function notifySignalObservers(
+    events: readonly EventEnvelope<TSignals, keyof TSignals>[],
+  ): void {
+    for (const event of events) {
+      const observers = signalObserversByName.get(String(event.eventName));
+
+      if (observers === undefined) {
+        continue;
+      }
+
+      for (const observer of [...observers.values()]) {
+        queueMicrotask(() => {
+          if (!observers.has(observer)) {
+            return;
+          }
+
+          try {
+            void Promise.resolve(observer(event)).catch(() => undefined);
+          } catch {
+            // Signal observation is live and best-effort.
+          }
+        });
+      }
+    }
+  }
+
   async function waitForEventAppend(input: {
     readonly signal: AbortSignal;
     readonly observedAppendSequence: number;
@@ -792,7 +1166,8 @@ function openDatabaseLedgerEngine<
              causation_event_id,
              dedupe_key
            FROM events
-           WHERE event_id > ?
+           WHERE signal = 0
+             AND event_id > ?
            ORDER BY event_id ASC
            LIMIT ?`,
         )
@@ -820,6 +1195,7 @@ function openDatabaseLedgerEngine<
              causation_event_id,
              dedupe_key
            FROM events
+           WHERE signal = 0
            ORDER BY event_id DESC
            LIMIT ?`,
         )
@@ -841,6 +1217,7 @@ function openDatabaseLedgerEngine<
         .prepare(
           `SELECT event_id
            FROM events
+           WHERE signal = 0
            ORDER BY event_id DESC
            LIMIT 1`,
         )
@@ -996,6 +1373,7 @@ function openDatabaseLedgerEngine<
             queue_name,
             payload_json,
             source_event_id,
+            signal,
             attempt,
             lease_id,
             lease_acquired_at_ms,
@@ -1027,6 +1405,7 @@ function openDatabaseLedgerEngine<
         queueName: decodedClaimed.queue_name,
         payloadJson: decodedClaimed.payload_json,
         sourceEventId: decodedClaimed.source_event_id,
+        signal: decodedClaimed.signal === 1,
         attempt: decodedClaimed.attempt,
         leaseId,
         leaseAcquiredAtMs: decodedClaimed.lease_acquired_at_ms,
@@ -1072,7 +1451,9 @@ function openDatabaseLedgerEngine<
         return;
       }
 
-      const handler = builder.handlersByQueue.get(claimed.queueName);
+      const handler = claimed.signal
+        ? builder.signalHandlersByQueue.get(claimed.queueName)
+        : builder.handlersByQueue.get(claimed.queueName);
 
       if (handler === undefined) {
         await runInTransaction(async () => {
@@ -1089,7 +1470,7 @@ function openDatabaseLedgerEngine<
                  AND lease_id = ?`,
             )
             .run(
-              `no handler for queue ${claimed.queueName}`,
+              `no handler for ${claimed.signal ? "signal " : ""}queue ${claimed.queueName}`,
               claimed.workId,
               claimed.leaseId,
             );
@@ -1109,7 +1490,9 @@ function openDatabaseLedgerEngine<
 
   async function processClaimedWork(
     claimed: PersistedWorkLease,
-    handler: QueueHandlerFunction<any, any, any, any>,
+    handler:
+      | QueueHandlerFunction<any, any, any, any, any>
+      | SignalQueueHandlerFunction<any, any, any>,
   ): Promise<void> {
     const leaseAbortController = new AbortController();
     leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
@@ -1224,7 +1607,9 @@ function openDatabaseLedgerEngine<
       clearLeaseHeartbeat();
     };
 
-    const queueSchema = model.queues[claimed.queueName as keyof TQueues];
+    const queueSchema = claimed.signal
+      ? model.signalQueues[claimed.queueName as keyof TSignalQueues]
+      : model.queues[claimed.queueName as keyof TQueues];
 
     if (queueSchema === undefined) {
       throw new Error(`unknown queue schema for ${claimed.queueName}`);
@@ -1284,12 +1669,22 @@ function openDatabaseLedgerEngine<
     };
 
     const stagedEvents: AppendEventInput[] = [];
+    const stagedSignals: AppendSignalInput[] = [];
 
-    const actions: QueueActions<any, any> = {
+    const actions: QueueActions<any, any, any> = {
       emit: (eventName, event, options) => {
         stagedEvents.push({
           eventName: String(eventName),
           payload: event,
+          nowMs: clock.nowMs(),
+          dedupeKey: options?.dedupeKey,
+          causationEventId: claimed.sourceEventId,
+        });
+      },
+      emitSignal: (signalName, signal, options) => {
+        stagedSignals.push({
+          signalName: String(signalName),
+          payload: signal,
           nowMs: clock.nowMs(),
           dedupeKey: options?.dedupeKey,
           causationEventId: claimed.sourceEventId,
@@ -1315,14 +1710,28 @@ function openDatabaseLedgerEngine<
       },
     };
 
+    const signalActions: SignalQueueActions<any> = {
+      query: actions.query,
+    };
+
     let outcome: QueueHandlerOutcome;
 
     try {
-      outcome = await handler({
-        work,
-        lease,
-        actions,
-      });
+      if (claimed.signal) {
+        outcome = await (handler as SignalQueueHandlerFunction<any, any, any>)({
+          work,
+          lease,
+          actions: signalActions,
+        });
+      } else {
+        outcome = await (
+          handler as QueueHandlerFunction<any, any, any, any, any>
+        )({
+          work,
+          lease,
+          actions,
+        });
+      }
     } catch (error: unknown) {
       outcome = {
         outcome: "retry",
@@ -1330,7 +1739,14 @@ function openDatabaseLedgerEngine<
       };
     }
 
-    const emittedEvents = await runInTransaction(async () => {
+    if (claimed.signal && outcome.outcome === "dead_letter") {
+      outcome = {
+        outcome: "retry",
+        error: "signal queue handlers cannot dead-letter",
+      };
+    }
+
+    const emitted = await runInTransaction(async () => {
       const active = await database
         .prepare(
           `SELECT work_id
@@ -1342,16 +1758,28 @@ function openDatabaseLedgerEngine<
         .get(claimed.workId, claimed.leaseId);
 
       if (active === undefined) {
-        return 0;
+        return {
+          durableEvents: 0,
+          signalEvents: [],
+        };
       }
 
-      let createdCount = 0;
+      let createdDurableCount = 0;
+      const createdSignalEvents: EventEnvelope<TSignals, keyof TSignals>[] = [];
 
       for (const stagedEvent of stagedEvents) {
         const appended = await appendEventInTransaction(stagedEvent);
 
         if (appended.created) {
-          createdCount += 1;
+          createdDurableCount += 1;
+        }
+      }
+
+      for (const stagedSignal of stagedSignals) {
+        const appended = await appendSignalInTransaction(stagedSignal);
+
+        if (appended.event !== null) {
+          createdSignalEvents.push(appended.event);
         }
       }
 
@@ -1365,6 +1793,24 @@ function openDatabaseLedgerEngine<
                  AND dead = 0`,
             )
             .run(claimed.workId, claimed.leaseId);
+
+          if (claimed.signal) {
+            const remainingSignalWork = await database
+              .prepare(
+                `SELECT work_id
+                 FROM work
+                 WHERE source_event_id = ?
+                   AND signal = 1
+                 LIMIT 1`,
+              )
+              .get(claimed.sourceEventId);
+
+            if (remainingSignalWork === undefined) {
+              await database
+                .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
+                .run(claimed.sourceEventId);
+            }
+          }
           break;
 
         case "retry":
@@ -1407,7 +1853,10 @@ function openDatabaseLedgerEngine<
           break;
       }
 
-      return createdCount;
+      return {
+        durableEvents: createdDurableCount,
+        signalEvents: createdSignalEvents,
+      };
     });
 
     stopLeaseHeartbeat();
@@ -1416,9 +1865,11 @@ function openDatabaseLedgerEngine<
     leaseExpiryTasks.delete(claimed.leaseId);
     leaseAbortControllers.delete(claimed.leaseId);
 
-    if (emittedEvents > 0) {
+    if (emitted.durableEvents > 0) {
       notifyEventWaiters();
     }
+
+    notifySignalObservers(emitted.signalEvents);
 
     scheduleDispatchAt(clock.nowMs());
   }
@@ -1451,6 +1902,7 @@ function openDatabaseLedgerEngine<
     }
 
     leaseAbortControllers.clear();
+    signalObserversByName.clear();
 
     await Promise.allSettled(inFlight);
 
@@ -1470,7 +1922,7 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  const ledger: Ledger<TEvents, TQueries> = {
+  const ledger: Ledger<TEvents, TQueries, TSignals> = {
     emit: async (eventName, event, options) => {
       await startup;
 
@@ -1509,6 +1961,37 @@ function openDatabaseLedgerEngine<
       const decodedResult = Value.Decode(schema.result, rawResult);
 
       return decodedResult as never;
+    },
+    onSignal: (signalName, observer) => {
+      const signalSchema = model.signals[signalName as keyof TSignals];
+
+      if (signalSchema === undefined) {
+        throw new Error(`unknown signal name: ${String(signalName)}`);
+      }
+
+      const key = String(signalName);
+      const storedObserver = observer as SignalObserver;
+      const observers = signalObserversByName.get(key) ?? new Set();
+
+      observers.add(storedObserver);
+      signalObserversByName.set(key, observers);
+
+      let disposed = false;
+
+      return {
+        [Symbol.dispose]: () => {
+          if (disposed) {
+            return;
+          }
+
+          disposed = true;
+          observers.delete(storedObserver);
+
+          if (observers.size === 0) {
+            signalObserversByName.delete(key);
+          }
+        },
+      };
     },
     tailEvents: ({ last, signal }) => {
       if (!Number.isInteger(last) || last < 0) {

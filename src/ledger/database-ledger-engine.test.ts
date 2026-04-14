@@ -261,6 +261,299 @@ test("deduped emit does not replay projections or materialization", async () => 
   }
 });
 
+function readCount(database: Database.Database, sql: string): number {
+  const row = database.prepare(sql).get();
+
+  if (typeof row !== "object" || row === null || Array.isArray(row)) {
+    throw new Error("expected count row object");
+  }
+
+  const total = (row as Record<string, unknown>)["total"];
+
+  if (typeof total !== "number") {
+    throw new Error("expected numeric count");
+  }
+
+  return total;
+}
+
+test("signals materialize signal work and are pruned after ack", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  let broadcasts = 0;
+  let holdSignal = true;
+  let releaseSignal!: () => void;
+  const signalGate = new Promise<void>((resolve) => {
+    releaseSignal = resolve;
+  });
+
+  const model = defineLedgerModel({
+    events: {
+      "response.generate": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    signals: {
+      "response.delta": Type.Object({
+        id: Type.Number(),
+        seq: Type.Number(),
+      }),
+    },
+    queues: {
+      "response.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    signalQueues: {
+      "delta.broadcast": Type.Object({
+        id: Type.Number(),
+        seq: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register(builder) {
+      builder.materialize("response.generate", ({ event, actions }) => {
+        actions.enqueue("response.run", {
+          id: event.payload.id,
+        });
+      });
+
+      builder.handle("response.run", async ({ work, actions }) => {
+        actions.emitSignal(
+          "response.delta",
+          {
+            id: work.payload.id,
+            seq: 1,
+          },
+          {
+            dedupeKey: `response-delta:${work.payload.id}:1`,
+          },
+        );
+
+        return {
+          outcome: "ack",
+        } as const;
+      });
+
+      builder.materializeSignal("response.delta", ({ event, actions }) => {
+        actions.enqueueSignal("delta.broadcast", {
+          id: event.payload.id,
+          seq: event.payload.seq,
+        });
+      });
+
+      builder.handleSignal("delta.broadcast", async () => {
+        broadcasts += 1;
+
+        if (holdSignal) {
+          await signalGate;
+        }
+
+        return {
+          outcome: "ack",
+        } as const;
+      });
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  const observedSignals: Array<{ id: number; seq: number }> = [];
+  const signalSubscription = ledger.onSignal("response.delta", (signal) => {
+    observedSignals.push(signal.payload);
+  });
+
+  await ledger.emit("response.generate", { id: 1 });
+  await waitFor(runtime, () => broadcasts === 1);
+  await waitFor(runtime, () => observedSignals.length === 1);
+
+  assert.deepEqual(observedSignals, [{ id: 1, seq: 1 }]);
+
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+    ),
+    1,
+  );
+  assert.equal(
+    readCount(database, `SELECT COUNT(*) as total FROM work WHERE signal = 1`),
+    1,
+  );
+
+  const controller = new AbortController();
+  const iterator = ledger
+    .tailEvents({
+      last: 10,
+      signal: controller.signal,
+    })
+    [Symbol.asyncIterator]();
+
+  const first = await nextWithTimeout(iterator);
+  assert.equal(first.done, false);
+
+  if (first.done) {
+    throw new Error("expected durable event");
+  }
+
+  assert.equal(first.value.event.eventName, "response.generate");
+  const next = iterator.next();
+  assert.equal(await settlesWithin(next, 20), false);
+  controller.abort();
+  await iterator.return?.();
+
+  holdSignal = false;
+  releaseSignal();
+
+  await waitFor(runtime, () => {
+    return (
+      readCount(
+        database,
+        `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+      ) === 0 &&
+      readCount(
+        database,
+        `SELECT COUNT(*) as total FROM work WHERE signal = 1`,
+      ) === 0
+    );
+  });
+
+  signalSubscription[Symbol.dispose]();
+
+  await ledger.emit("response.generate", { id: 1 });
+  await waitFor(runtime, () => broadcasts === 2);
+  assert.equal(observedSignals.length, 1);
+});
+
+test("signal retry keeps signal event until signal work acks", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  let attempts = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "response.generate": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    signals: {
+      "response.delta": Type.Object({
+        id: Type.Number(),
+        seq: Type.Number(),
+      }),
+    },
+    queues: {
+      "response.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    signalQueues: {
+      "delta.broadcast": Type.Object({
+        id: Type.Number(),
+        seq: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register(builder) {
+      builder.materialize("response.generate", ({ event, actions }) => {
+        actions.enqueue("response.run", {
+          id: event.payload.id,
+        });
+      });
+
+      builder.handle("response.run", async ({ work, actions }) => {
+        actions.emitSignal("response.delta", {
+          id: work.payload.id,
+          seq: 1,
+        });
+
+        return {
+          outcome: "ack",
+        } as const;
+      });
+
+      builder.materializeSignal("response.delta", ({ event, actions }) => {
+        actions.enqueueSignal("delta.broadcast", {
+          id: event.payload.id,
+          seq: event.payload.seq,
+        });
+      });
+
+      builder.handleSignal("delta.broadcast", async () => {
+        attempts += 1;
+
+        if (attempts === 1) {
+          return {
+            outcome: "retry",
+            error: "retry once",
+            retryAtMs: runtime.nowMs() + 100,
+          } as const;
+        }
+
+        return {
+          outcome: "ack",
+        } as const;
+      });
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("response.generate", { id: 1 });
+  await waitFor(runtime, () => attempts === 1);
+
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+    ),
+    1,
+  );
+  assert.equal(
+    readCount(database, `SELECT COUNT(*) as total FROM work WHERE signal = 1`),
+    1,
+  );
+
+  await runtime.advanceByMs(100);
+  await waitFor(runtime, () => attempts === 2);
+  await waitFor(runtime, () => {
+    return (
+      readCount(
+        database,
+        `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+      ) === 0 &&
+      readCount(
+        database,
+        `SELECT COUNT(*) as total FROM work WHERE signal = 1`,
+      ) === 0
+    );
+  });
+});
+
 function createBusyTestModel() {
   return defineLedgerModel({
     events: {
