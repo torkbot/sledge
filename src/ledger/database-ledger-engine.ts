@@ -12,14 +12,14 @@ import type {
   LedgerTiming,
   QuerySchema,
   QueueActions,
+  QueueHandlerControl,
   QueueHandlerFunction,
-  QueueHandlerOutcome,
   QueueWorkItem,
   SignalObserverFunction,
   SignalQueueActions,
+  SignalQueueHandlerControl,
   SignalQueueHandlerFunction,
   WorkLease,
-  LeaseHold,
 } from "./ledger.ts";
 
 type AnyIndexerDef = TSchema;
@@ -162,6 +162,41 @@ function parseJson<T>(value: string, context: string): T {
     });
   }
 }
+
+function describeUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+class RetryRequested {
+  readonly error: string;
+  readonly retryAtMs?: number;
+
+  constructor(error: unknown, retryAtMs?: number) {
+    this.error = describeUnknownError(error);
+    this.retryAtMs = retryAtMs;
+  }
+}
+
+class DeadLetterRequested {
+  readonly error: string;
+
+  constructor(error: unknown) {
+    this.error = describeUnknownError(error);
+  }
+}
+
+type HandlerDisposition =
+  | { readonly kind: "ack" }
+  | {
+      readonly kind: "retry";
+      readonly error: string;
+      readonly retryAtMs?: number;
+    }
+  | { readonly kind: "dead_letter"; readonly error: string };
 
 function isSqliteBusyError(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -1342,7 +1377,6 @@ function openDatabaseLedgerEngine<
     leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
 
     let currentLeaseExpiresAtMs = claimed.leaseExpiresAtMs;
-    let activeLeaseHolds = 0;
 
     const clearLeaseHeartbeat = (): void => {
       leaseHeartbeatTasks.get(claimed.leaseId)?.cancel();
@@ -1419,8 +1453,6 @@ function openDatabaseLedgerEngine<
       scheduleLeaseExpiry();
     };
 
-    scheduleLeaseExpiry();
-
     const startLeaseHeartbeat = (): void => {
       if (leaseHeartbeatTasks.has(claimed.leaseId)) {
         return;
@@ -1447,275 +1479,279 @@ function openDatabaseLedgerEngine<
       });
     };
 
-    const stopLeaseHeartbeat = (): void => {
-      clearLeaseHeartbeat();
-    };
-
-    const queueSchema = claimed.signal
-      ? model.signalQueues[claimed.queueName as keyof TSignalQueues]
-      : model.queues[claimed.queueName as keyof TQueues];
-
-    if (queueSchema === undefined) {
-      throw new Error(`unknown queue schema for ${claimed.queueName}`);
-    }
-
-    const decodedPayload = Value.Decode(
-      queueSchema,
-      parseJson(claimed.payloadJson, "work.payload_json"),
-    );
-
-    const work: QueueWorkItem<any, any> = {
-      workId: claimed.workId,
-      queueName: claimed.queueName,
-      payload: decodedPayload,
-      attempt: claimed.attempt,
-      sourceEventId: claimed.sourceEventId,
-    };
-
-    const lease: WorkLease<any, any> = {
-      workId: claimed.workId,
-      queueName: claimed.queueName,
-      sourceEventId: claimed.sourceEventId,
-      attempt: claimed.attempt,
-      leaseId: claimed.leaseId,
-      leaseAcquiredAtMs: claimed.leaseAcquiredAtMs,
-      leaseExpiresAtMs: claimed.leaseExpiresAtMs,
-      signal: leaseAbortController.signal,
-      hold: () => {
-        if (leaseAbortController.signal.aborted) {
-          throw new Error("cannot hold aborted lease");
-        }
-
-        activeLeaseHolds += 1;
-
-        if (activeLeaseHolds === 1) {
-          startLeaseHeartbeat();
-        }
-
-        let disposed = false;
-
-        return {
-          signal: leaseAbortController.signal,
-          [Symbol.asyncDispose]: async () => {
-            if (disposed) {
-              return;
-            }
-
-            disposed = true;
-            activeLeaseHolds = Math.max(0, activeLeaseHolds - 1);
-
-            if (activeLeaseHolds === 0) {
-              stopLeaseHeartbeat();
-            }
-          },
-        } satisfies LeaseHold;
-      },
-    };
-
-    const stagedEvents: AppendEventInput[] = [];
-    const stagedSignals: AppendSignalInput[] = [];
-
-    const actions: QueueActions<any, any, any> = {
-      emit: (eventName, event, options) => {
-        stagedEvents.push({
-          eventName: String(eventName),
-          payload: event,
-          nowMs: clock.nowMs(),
-          dedupeKey: options?.dedupeKey,
-          causationEventId: claimed.sourceEventId,
-        });
-      },
-      emitSignal: (signalName, signal, options) => {
-        stagedSignals.push({
-          signalName: String(signalName),
-          payload: signal,
-          nowMs: clock.nowMs(),
-          dedupeKey: options?.dedupeKey,
-          causationEventId: claimed.sourceEventId,
-        });
-      },
-      query: async (queryName, params) => {
-        const schema = model.queries[queryName as keyof TQueries];
-        const implementation =
-          implementations.queries?.[queryName as keyof TQueries];
-
-        if (schema === undefined || implementation === undefined) {
-          throw new Error(`unknown query: ${String(queryName)}`);
-        }
-
-        const decodedParams = Value.Decode(schema.params, params);
-        const encodedParams = Value.Encode(schema.params, decodedParams);
-        const canonicalParams = Value.Decode(schema.params, encodedParams);
-
-        const rawResult = await implementation(canonicalParams as never);
-        const decodedResult = Value.Decode(schema.result, rawResult);
-
-        return decodedResult as never;
-      },
-    };
-
-    const signalActions: SignalQueueActions<any> = {
-      query: actions.query,
-    };
-
-    let outcome: QueueHandlerOutcome;
+    scheduleLeaseExpiry();
+    startLeaseHeartbeat();
 
     try {
-      if (claimed.signal) {
-        outcome = await (handler as SignalQueueHandlerFunction<any, any, any>)({
-          work,
-          lease,
-          actions: signalActions,
-        });
-      } else {
-        outcome = await (
-          handler as QueueHandlerFunction<any, any, any, any, any>
-        )({
-          work,
-          lease,
-          actions,
-        });
+      const queueSchema = claimed.signal
+        ? model.signalQueues[claimed.queueName as keyof TSignalQueues]
+        : model.queues[claimed.queueName as keyof TQueues];
+
+      if (queueSchema === undefined) {
+        throw new Error(`unknown queue schema for ${claimed.queueName}`);
       }
-    } catch (error: unknown) {
-      outcome = {
-        outcome: "retry",
-        error: error instanceof Error ? error.message : String(error),
+
+      const decodedPayload = Value.Decode(
+        queueSchema,
+        parseJson(claimed.payloadJson, "work.payload_json"),
+      );
+
+      const work: QueueWorkItem<any, any> = {
+        workId: claimed.workId,
+        queueName: claimed.queueName,
+        payload: decodedPayload,
+        attempt: claimed.attempt,
+        sourceEventId: claimed.sourceEventId,
       };
-    }
 
-    if (claimed.signal && outcome.outcome === "dead_letter") {
-      outcome = {
-        outcome: "retry",
-        error: "signal queue handlers cannot dead-letter",
+      const lease: WorkLease<any, any> = {
+        workId: claimed.workId,
+        queueName: claimed.queueName,
+        sourceEventId: claimed.sourceEventId,
+        attempt: claimed.attempt,
+        leaseId: claimed.leaseId,
+        leaseAcquiredAtMs: claimed.leaseAcquiredAtMs,
+        leaseExpiresAtMs: claimed.leaseExpiresAtMs,
+        signal: leaseAbortController.signal,
       };
-    }
 
-    const emitted = await runInTransaction(async () => {
-      const active = await database
-        .prepare(
-          `SELECT work_id
-           FROM work
-           WHERE work_id = ?
-             AND lease_id = ?
-             AND dead = 0`,
-        )
-        .get(claimed.workId, claimed.leaseId);
+      const stagedEvents: AppendEventInput[] = [];
+      const stagedSignals: AppendSignalInput[] = [];
 
-      if (active === undefined) {
-        return {
-          durableEvents: 0,
-          signalEvents: [],
+      const actions: QueueActions<any, any, any> = {
+        emit: (eventName, event, options) => {
+          stagedEvents.push({
+            eventName: String(eventName),
+            payload: event,
+            nowMs: clock.nowMs(),
+            dedupeKey: options?.dedupeKey,
+            causationEventId: claimed.sourceEventId,
+          });
+        },
+        emitSignal: (signalName, signal, options) => {
+          stagedSignals.push({
+            signalName: String(signalName),
+            payload: signal,
+            nowMs: clock.nowMs(),
+            dedupeKey: options?.dedupeKey,
+            causationEventId: claimed.sourceEventId,
+          });
+        },
+        query: async (queryName, params) => {
+          const schema = model.queries[queryName as keyof TQueries];
+          const implementation =
+            implementations.queries?.[queryName as keyof TQueries];
+
+          if (schema === undefined || implementation === undefined) {
+            throw new Error(`unknown query: ${String(queryName)}`);
+          }
+
+          const decodedParams = Value.Decode(schema.params, params);
+          const encodedParams = Value.Encode(schema.params, decodedParams);
+          const canonicalParams = Value.Decode(schema.params, encodedParams);
+
+          const rawResult = await implementation(canonicalParams as never);
+          const decodedResult = Value.Decode(schema.result, rawResult);
+
+          return decodedResult as never;
+        },
+      };
+
+      const signalActions: SignalQueueActions<any> = {
+        query: actions.query,
+      };
+
+      const queueControl: QueueHandlerControl = {
+        retry: (error, options) => {
+          throw new RetryRequested(error, options?.retryAtMs);
+        },
+        deadLetter: (error) => {
+          throw new DeadLetterRequested(error);
+        },
+      };
+
+      const signalQueueControl: SignalQueueHandlerControl = {
+        retry: (error, options) => {
+          throw new RetryRequested(error, options?.retryAtMs);
+        },
+      };
+
+      let disposition: HandlerDisposition = {
+        kind: "ack",
+      };
+
+      try {
+        if (claimed.signal) {
+          await (handler as SignalQueueHandlerFunction<any, any, any>)({
+            work,
+            lease,
+            actions: signalActions,
+            control: signalQueueControl,
+          });
+        } else {
+          await (handler as QueueHandlerFunction<any, any, any, any, any>)({
+            work,
+            lease,
+            actions,
+            control: queueControl,
+          });
+        }
+      } catch (error: unknown) {
+        if (error instanceof RetryRequested) {
+          disposition = {
+            kind: "retry",
+            error: error.error,
+            retryAtMs: error.retryAtMs,
+          };
+        } else if (error instanceof DeadLetterRequested) {
+          disposition = {
+            kind: "dead_letter",
+            error: error.error,
+          };
+        } else {
+          disposition = {
+            kind: "retry",
+            error: describeUnknownError(error),
+          };
+        }
+      }
+
+      if (claimed.signal && disposition.kind === "dead_letter") {
+        disposition = {
+          kind: "retry",
+          error: "signal queue handlers cannot dead-letter",
         };
       }
 
-      let createdDurableCount = 0;
-      const createdSignalEvents: EventEnvelope<TSignals, keyof TSignals>[] = [];
+      const emitted = await runInTransaction(async () => {
+        const active = await database
+          .prepare(
+            `SELECT work_id
+             FROM work
+             WHERE work_id = ?
+               AND lease_id = ?
+               AND dead = 0`,
+          )
+          .get(claimed.workId, claimed.leaseId);
 
-      for (const stagedEvent of stagedEvents) {
-        const appended = await appendEventInTransaction(stagedEvent);
-
-        if (appended.created) {
-          createdDurableCount += 1;
+        if (active === undefined) {
+          return {
+            durableEvents: 0,
+            signalEvents: [],
+          };
         }
-      }
 
-      for (const stagedSignal of stagedSignals) {
-        const appended = await appendSignalInTransaction(stagedSignal);
+        let createdDurableCount = 0;
+        const createdSignalEvents: EventEnvelope<TSignals, keyof TSignals>[] =
+          [];
 
-        if (appended.event !== null) {
-          createdSignalEvents.push(appended.event);
-        }
-      }
+        for (const stagedEvent of stagedEvents) {
+          const appended = await appendEventInTransaction(stagedEvent);
 
-      switch (outcome.outcome) {
-        case "ack":
-          await database
-            .prepare(
-              `DELETE FROM work
-               WHERE work_id = ?
-                 AND lease_id = ?
-                 AND dead = 0`,
-            )
-            .run(claimed.workId, claimed.leaseId);
-
-          if (claimed.signal) {
-            const remainingSignalWork = await database
-              .prepare(
-                `SELECT work_id
-                 FROM work
-                 WHERE source_event_id = ?
-                   AND signal = 1
-                 LIMIT 1`,
-              )
-              .get(claimed.sourceEventId);
-
-            if (remainingSignalWork === undefined) {
-              await database
-                .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
-                .run(claimed.sourceEventId);
-            }
+          if (appended.created) {
+            createdDurableCount += 1;
           }
-          break;
+        }
 
-        case "retry":
-          await database
-            .prepare(
-              `UPDATE work
-               SET
-                 available_at_ms = ?,
-                 lease_id = NULL,
-                 lease_acquired_at_ms = NULL,
-                 lease_expires_at_ms = NULL,
-                 last_error = ?
-               WHERE work_id = ?
-                 AND lease_id = ?
-                 AND dead = 0`,
-            )
-            .run(
-              outcome.retryAtMs ?? clock.nowMs() + defaultRetryDelayMs,
-              outcome.error,
-              claimed.workId,
-              claimed.leaseId,
-            );
-          break;
+        for (const stagedSignal of stagedSignals) {
+          const appended = await appendSignalInTransaction(stagedSignal);
 
-        case "dead_letter":
-          await database
-            .prepare(
-              `UPDATE work
-               SET
-                 dead = 1,
-                 lease_id = NULL,
-                 lease_acquired_at_ms = NULL,
-                 lease_expires_at_ms = NULL,
-                 last_error = ?
-               WHERE work_id = ?
-                 AND lease_id = ?
-                 AND dead = 0`,
-            )
-            .run(outcome.error, claimed.workId, claimed.leaseId);
-          break;
+          if (appended.event !== null) {
+            createdSignalEvents.push(appended.event);
+          }
+        }
+
+        switch (disposition.kind) {
+          case "ack":
+            await database
+              .prepare(
+                `DELETE FROM work
+                 WHERE work_id = ?
+                   AND lease_id = ?
+                   AND dead = 0`,
+              )
+              .run(claimed.workId, claimed.leaseId);
+
+            if (claimed.signal) {
+              const remainingSignalWork = await database
+                .prepare(
+                  `SELECT work_id
+                   FROM work
+                   WHERE source_event_id = ?
+                     AND signal = 1
+                   LIMIT 1`,
+                )
+                .get(claimed.sourceEventId);
+
+              if (remainingSignalWork === undefined) {
+                await database
+                  .prepare(
+                    `DELETE FROM events WHERE event_id = ? AND signal = 1`,
+                  )
+                  .run(claimed.sourceEventId);
+              }
+            }
+            break;
+
+          case "retry":
+            await database
+              .prepare(
+                `UPDATE work
+                 SET
+                   available_at_ms = ?,
+                   lease_id = NULL,
+                   lease_acquired_at_ms = NULL,
+                   lease_expires_at_ms = NULL,
+                   last_error = ?
+                 WHERE work_id = ?
+                   AND lease_id = ?
+                   AND dead = 0`,
+              )
+              .run(
+                disposition.retryAtMs ?? clock.nowMs() + defaultRetryDelayMs,
+                disposition.error,
+                claimed.workId,
+                claimed.leaseId,
+              );
+            break;
+
+          case "dead_letter":
+            await database
+              .prepare(
+                `UPDATE work
+                 SET
+                   dead = 1,
+                   lease_id = NULL,
+                   lease_acquired_at_ms = NULL,
+                   lease_expires_at_ms = NULL,
+                   last_error = ?
+                 WHERE work_id = ?
+                   AND lease_id = ?
+                   AND dead = 0`,
+              )
+              .run(disposition.error, claimed.workId, claimed.leaseId);
+            break;
+        }
+
+        return {
+          durableEvents: createdDurableCount,
+          signalEvents: createdSignalEvents,
+        };
+      });
+
+      if (emitted.durableEvents > 0) {
+        notifyEventWaiters();
       }
 
-      return {
-        durableEvents: createdDurableCount,
-        signalEvents: createdSignalEvents,
-      };
-    });
+      notifySignalObservers(emitted.signalEvents);
 
-    stopLeaseHeartbeat();
-
-    leaseExpiryTasks.get(claimed.leaseId)?.cancel();
-    leaseExpiryTasks.delete(claimed.leaseId);
-    leaseAbortControllers.delete(claimed.leaseId);
-
-    if (emitted.durableEvents > 0) {
-      notifyEventWaiters();
+      scheduleDispatchAt(clock.nowMs());
+    } finally {
+      clearLeaseHeartbeat();
+      leaseExpiryTasks.get(claimed.leaseId)?.cancel();
+      leaseExpiryTasks.delete(claimed.leaseId);
+      leaseAbortControllers.delete(claimed.leaseId);
     }
-
-    notifySignalObservers(emitted.signalEvents);
-
-    scheduleDispatchAt(clock.nowMs());
   }
 
   async function close(): Promise<void> {

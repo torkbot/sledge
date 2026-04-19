@@ -2,11 +2,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type {
-  Ledger,
-  QueueHandlerOutcome,
-  RegisterFunction,
-} from "./ledger.ts";
+import type { Ledger, RegisterFunction } from "./ledger.ts";
 export const MessageReceivedSchema = Type.Object({
   type: Type.Literal("message.received"),
   text: Type.String(),
@@ -141,8 +137,7 @@ export type LedgerContractDecisionMode =
   | "retry_once"
   | "dead_letter"
   | "throw_once"
-  | "block_until_abort"
-  | "hold_lease_until_abort";
+  | "block_until_abort";
 
 export type LedgerContractHarness = {
   readonly ledger: Ledger<any, any>;
@@ -220,7 +215,7 @@ export function registerLedgerContractModel(input: {
       },
     },
     queues: {
-      "evaluate.message": async ({ work, lease, actions }) => {
+      "evaluate.message": async ({ work, lease, actions, control }) => {
         actions.emit("decision.attempted", {
           type: "decision.attempted",
           sourceEventId: work.sourceEventId,
@@ -241,18 +236,13 @@ export function registerLedgerContractModel(input: {
                 dedupeKey: `intent:${work.sourceEventId}`,
               },
             );
-
-            return {
-              outcome: "ack",
-            } satisfies QueueHandlerOutcome;
+            return;
 
           case "retry_once":
             if (work.attempt === 1) {
-              return {
-                outcome: "retry",
-                error: "retry once",
+              return control.retry("retry once", {
                 retryAtMs: input.nowMs() + 100,
-              } satisfies QueueHandlerOutcome;
+              });
             }
 
             actions.emit(
@@ -265,16 +255,10 @@ export function registerLedgerContractModel(input: {
                 dedupeKey: `intent:${work.sourceEventId}`,
               },
             );
-
-            return {
-              outcome: "ack",
-            } satisfies QueueHandlerOutcome;
+            return;
 
           case "dead_letter":
-            return {
-              outcome: "dead_letter",
-              error: "configured dead letter",
-            } satisfies QueueHandlerOutcome;
+            return control.deadLetter("configured dead letter");
 
           case "throw_once":
             if (work.attempt === 1) {
@@ -291,10 +275,7 @@ export function registerLedgerContractModel(input: {
                 dedupeKey: `intent:${work.sourceEventId}`,
               },
             );
-
-            return {
-              outcome: "ack",
-            } satisfies QueueHandlerOutcome;
+            return;
 
           case "block_until_abort": {
             if (!lease.signal.aborted) {
@@ -308,32 +289,9 @@ export function registerLedgerContractModel(input: {
               });
             }
 
-            return {
-              outcome: "retry",
-              error: "aborted",
+            return control.retry("aborted", {
               retryAtMs: input.nowMs(),
-            } satisfies QueueHandlerOutcome;
-          }
-
-          case "hold_lease_until_abort": {
-            await using hold = lease.hold();
-
-            if (!lease.signal.aborted) {
-              await new Promise<void>((resolve) => {
-                const onAbort = () => {
-                  lease.signal.removeEventListener("abort", onAbort);
-                  resolve();
-                };
-
-                lease.signal.addEventListener("abort", onAbort);
-              });
-            }
-
-            return {
-              outcome: "retry",
-              error: "aborted",
-              retryAtMs: input.nowMs(),
-            } satisfies QueueHandlerOutcome;
+            });
           }
         }
       },
@@ -342,10 +300,6 @@ export function registerLedgerContractModel(input: {
           type: "dispatch.completed",
           sourceEventId: work.payload.sourceEventId,
         });
-
-        return {
-          outcome: "ack",
-        } satisfies QueueHandlerOutcome;
       },
     },
   };
@@ -784,10 +738,10 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
-      "lease hold keeps long-running handler alive past lease TTL",
+      "long-running handler lease is renewed automatically",
       async () => {
         await withHarness(input.create, async (harness) => {
-          harness.setDecisionMode("hold_lease_until_abort");
+          harness.setDecisionMode("block_until_abort");
 
           await harness.ledger.emit("message.received", {
             type: "message.received",

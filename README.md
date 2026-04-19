@@ -104,8 +104,6 @@ const registeredModel = registerLedgerModel(definedModel, {
     "welcome-email.send": async ({ work }) => {
       // call provider here
       console.log("sending welcome email", work.payload.email);
-
-      return { outcome: "ack" } as const;
     },
   },
 });
@@ -181,22 +179,15 @@ The runtime exposes:
 
 ---
 
-## Handler outcomes
+## Handler behavior
 
-Queue handlers must return one of:
+Queue and signal queue handlers implicitly ack on normal return.
 
-- `{ outcome: "ack" }`
-- `{ outcome: "retry", error, retryAtMs? }`
-- `{ outcome: "dead_letter", error }`
-
-If a handler throws, the runtime treats it as a retry.
-
-Signal queue handlers return only:
-
-- `{ outcome: "ack" }`
-- `{ outcome: "retry", error, retryAtMs? }`
-
-Signals do not dead-letter in the public handler contract.
+- Return (or resolve) => ack
+- Throw => retry using default retry delay
+- Use `control.retry(error, { retryAtMs? })` for explicit retry timing
+- Durable queue handlers may call `control.deadLetter(error)`
+- Signal queue handlers do not support dead-letter
 
 ## Signals
 
@@ -248,8 +239,6 @@ const model = registerLedgerModel(definedModel, {
         responseId: work.payload.responseId,
         message: "response started",
       });
-
-      return { outcome: "ack" } as const;
     },
   },
   signals: {
@@ -263,8 +252,6 @@ const model = registerLedgerModel(definedModel, {
   signalQueues: {
     "response.notice.publish": async ({ work }) => {
       await notifier.publish(work.payload);
-
-      return { outcome: "ack" } as const;
     },
   },
 });
@@ -332,17 +319,18 @@ Cursor values are opaque by contract. Persist and reuse them as-is.
 
 ## Long-running handlers
 
-For long operations, keep the lease alive while working:
+Long-running handlers are automatically lease-renewed for the full handler duration.
+
+Use `lease.signal` for cooperative cancellation on shutdown/restart:
 
 ```ts
 register: {
   queues: {
     "some.queue": async ({ lease }) => {
-      await using hold = lease.hold();
-
-      // long-running async work
-
-      return { outcome: "ack" } as const;
+      while (!lease.signal.aborted) {
+        // long-running async work
+        break;
+      }
     },
   },
 };

@@ -198,10 +198,6 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
 
           active -= 1;
           completed += 1;
-
-          return {
-            outcome: "ack",
-          } as const;
         },
       },
     },
@@ -293,10 +289,6 @@ test("deduped emit does not replay projections or materialization", async () => 
       queues: {
         "message.process": async () => {
           processed += 1;
-
-          return {
-            outcome: "ack",
-          } as const;
         },
       },
     },
@@ -421,10 +413,6 @@ test("signals materialize signal work and are pruned after ack", async () => {
               dedupeKey: `response-delta:${work.payload.id}:1`,
             },
           );
-
-          return {
-            outcome: "ack",
-          } as const;
         },
       },
       signals: {
@@ -442,10 +430,6 @@ test("signals materialize signal work and are pruned after ack", async () => {
           if (holdSignal) {
             await signalGate;
           }
-
-          return {
-            outcome: "ack",
-          } as const;
         },
       },
     },
@@ -575,10 +559,6 @@ test("signal retry keeps signal event until signal work acks", async () => {
             id: work.payload.id,
             seq: 1,
           });
-
-          return {
-            outcome: "ack",
-          } as const;
         },
       },
       signals: {
@@ -590,20 +570,14 @@ test("signal retry keeps signal event until signal work acks", async () => {
         },
       },
       signalQueues: {
-        "delta.broadcast": async () => {
+        "delta.broadcast": async ({ control }) => {
           attempts += 1;
 
           if (attempts === 1) {
-            return {
-              outcome: "retry",
-              error: "retry once",
+            return control.retry("retry once", {
               retryAtMs: runtime.nowMs() + 100,
-            } as const;
+            });
           }
-
-          return {
-            outcome: "ack",
-          } as const;
         },
       },
     },

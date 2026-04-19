@@ -74,15 +74,6 @@ export type QueueWorkItem<
 /**
  * Queue work lease metadata for one active work attempt.
  */
-export interface LeaseHold extends AsyncDisposable {
-  /**
-   * Cancellation signal for the held lease. This aliases the parent lease
-   * signal so call sites can thread `leaseHold.signal` and make the hold scope
-   * visibly meaningful in code.
-   */
-  readonly signal: AbortSignal;
-}
-
 export interface WorkLease<
   TQueues extends Record<string, TSchema>,
   TQueueName extends keyof TQueues,
@@ -95,15 +86,6 @@ export interface WorkLease<
   readonly leaseAcquiredAtMs: number;
   readonly leaseExpiresAtMs: number;
   readonly signal: AbortSignal;
-
-  /**
-   * Hold and actively renew this lease until the returned scope is disposed.
-   *
-   * Handlers should use `await using` for long-running operations (LLM streams,
-   * external API calls, etc.) to prevent lease expiry while still allowing
-   * cooperative cancellation through `signal`.
-   */
-  hold(): LeaseHold;
 }
 
 /**
@@ -174,28 +156,24 @@ export interface ProjectionActions<TIndexers extends Record<string, TSchema>> {
   ): Promise<void>;
 }
 
-/**
- * Explicit completion result for one queue work attempt.
- */
-export type QueueHandlerOutcome =
-  | { readonly outcome: "ack" }
-  | {
-      readonly outcome: "retry";
-      readonly error: string;
-      readonly retryAtMs?: number;
-    }
-  | { readonly outcome: "dead_letter"; readonly error: string };
+export type QueueHandlerRetryOptions = {
+  readonly retryAtMs?: number;
+};
 
 /**
- * Explicit completion result for one signal queue work attempt.
+ * Explicit queue control methods for non-default outcomes.
  */
-export type SignalQueueHandlerOutcome =
-  | { readonly outcome: "ack" }
-  | {
-      readonly outcome: "retry";
-      readonly error: string;
-      readonly retryAtMs?: number;
-    };
+export interface QueueHandlerControl {
+  retry(error: unknown, options?: QueueHandlerRetryOptions): never;
+  deadLetter(error: unknown): never;
+}
+
+/**
+ * Explicit signal queue control methods for non-default outcomes.
+ */
+export interface SignalQueueHandlerControl {
+  retry(error: unknown, options?: QueueHandlerRetryOptions): never;
+}
 
 /**
  * Ledger model definition surface.
@@ -269,7 +247,8 @@ export type QueueHandlerFunction<
   readonly work: QueueWorkItem<TQueues, TQueueName>;
   readonly lease: WorkLease<TQueues, TQueueName>;
   readonly actions: QueueActions<TEvents, TQueries, TSignals>;
-}) => QueueHandlerOutcome | Promise<QueueHandlerOutcome>;
+  readonly control: QueueHandlerControl;
+}) => void | Promise<void>;
 
 /**
  * Signal queue work handler function.
@@ -282,7 +261,8 @@ export type SignalQueueHandlerFunction<
   readonly work: QueueWorkItem<TSignalQueues, TSignalQueueName>;
   readonly lease: WorkLease<TSignalQueues, TSignalQueueName>;
   readonly actions: SignalQueueActions<TQueries>;
-}) => SignalQueueHandlerOutcome | Promise<SignalQueueHandlerOutcome>;
+  readonly control: SignalQueueHandlerControl;
+}) => void | Promise<void>;
 
 /**
  * Declarative model registration keyed by event/queue names.

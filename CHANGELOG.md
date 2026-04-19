@@ -6,6 +6,10 @@
 
   `register` now accepts an object with optional `events`, `signals`, `queues`, and `signalQueues` maps. Event registration handlers now own both projection (`actions.index(...)`) and durable work materialization (`actions.enqueue(...)`) for each event. This removes the previous builder-style API (`project`, `materialize`, `materializeSignal`, `handle`, `handleSignal`) and enforces one handler per key.
 
+- Simplify queue handler completion semantics and remove explicit lease-hold API
+
+  Queue and signal queue handlers now implicitly ack on normal return. Throwing retries with default timing. Explicit non-default outcomes now use control methods (`control.retry(...)`, `control.deadLetter(...)`) instead of returning a discriminated outcome union. Lease renewal is now automatic for the full handler duration and `lease.hold()` has been removed.
+
 ## 0.3.0
 
 - Add signals for transient handler-local orchestration
