@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Simplify model registration to a single typed object keyed by event/signal/queue names
+
+  `register` now accepts an object with optional `events`, `signals`, `queues`, and `signalQueues` maps. Event registration handlers now own both projection (`actions.index(...)`) and durable work materialization (`actions.enqueue(...)`) for each event. This removes the previous builder-style API (`project`, `materialize`, `materializeSignal`, `handle`, `handleSignal`) and enforces one handler per key.
+
 ## 0.3.0
 
 - Add signals for transient handler-local orchestration

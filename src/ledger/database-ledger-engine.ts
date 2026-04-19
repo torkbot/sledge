@@ -7,18 +7,14 @@ import type {
   BoundLedgerModel,
   EventEnvelope,
   Ledger,
-  LedgerBuilder,
   LedgerCursor,
   LedgerStreamEvent,
   LedgerTiming,
-  MaterializerFunction,
-  ProjectorFunction,
   QuerySchema,
   QueueActions,
   QueueHandlerFunction,
   QueueHandlerOutcome,
   QueueWorkItem,
-  SignalMaterializerFunction,
   SignalObserverFunction,
   SignalQueueActions,
   SignalQueueHandlerFunction,
@@ -155,129 +151,6 @@ export function createDatabaseLedger<
     maxBusyRetries: input.maxBusyRetries,
     maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   });
-}
-
-class RuntimeBuilder<
-  TEvents extends Record<string, TSchema>,
-  TSignals extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
-  TIndexers extends Record<string, AnyIndexerDef>,
-  TQueries extends Record<string, AnyQueryDef>,
-> implements LedgerBuilder<
-  TEvents,
-  TQueues,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> {
-  readonly projectorsByEvent = new Map<
-    string,
-    ProjectorFunction<any, any, any>[]
-  >();
-  readonly materializersByEvent = new Map<
-    string,
-    MaterializerFunction<any, any, any>[]
-  >();
-  readonly materializersBySignal = new Map<
-    string,
-    SignalMaterializerFunction<any, any, any>[]
-  >();
-  readonly handlersByQueue = new Map<
-    string,
-    QueueHandlerFunction<any, any, any, any, any>
-  >();
-  readonly signalHandlersByQueue = new Map<
-    string,
-    SignalQueueHandlerFunction<any, any, any>
-  >();
-
-  project<const TEventName extends keyof TEvents>(
-    eventName: TEventName,
-    projector: ProjectorFunction<TEvents, TEventName, TIndexers>,
-  ): this {
-    const key = String(eventName);
-    const existing = this.projectorsByEvent.get(key) ?? [];
-    existing.push(projector as ProjectorFunction<any, any, any>);
-    this.projectorsByEvent.set(key, existing);
-
-    return this;
-  }
-
-  materialize<const TEventName extends keyof TEvents>(
-    eventName: TEventName,
-    materializer: MaterializerFunction<TEvents, TEventName, TQueues>,
-  ): this {
-    const key = String(eventName);
-    const existing = this.materializersByEvent.get(key) ?? [];
-    existing.push(materializer as MaterializerFunction<any, any, any>);
-    this.materializersByEvent.set(key, existing);
-
-    return this;
-  }
-
-  materializeSignal<const TSignalName extends keyof TSignals>(
-    signalName: TSignalName,
-    materializer: SignalMaterializerFunction<
-      TSignals,
-      TSignalName,
-      TSignalQueues
-    >,
-  ): this {
-    const key = String(signalName);
-    const existing = this.materializersBySignal.get(key) ?? [];
-    existing.push(materializer as SignalMaterializerFunction<any, any, any>);
-    this.materializersBySignal.set(key, existing);
-
-    return this;
-  }
-
-  handle<const TQueueName extends keyof TQueues>(
-    queueName: TQueueName,
-    handler: QueueHandlerFunction<
-      TEvents,
-      TQueues,
-      TQueueName,
-      TQueries,
-      TSignals
-    >,
-  ): this {
-    const key = String(queueName);
-
-    if (this.handlersByQueue.has(key)) {
-      throw new Error(`duplicate queue handler registration: ${key}`);
-    }
-
-    this.handlersByQueue.set(
-      key,
-      handler as QueueHandlerFunction<any, any, any, any, any>,
-    );
-
-    return this;
-  }
-
-  handleSignal<const TSignalQueueName extends keyof TSignalQueues>(
-    queueName: TSignalQueueName,
-    handler: SignalQueueHandlerFunction<
-      TSignalQueues,
-      TSignalQueueName,
-      TQueries
-    >,
-  ): this {
-    const key = String(queueName);
-
-    if (this.signalHandlersByQueue.has(key)) {
-      throw new Error(`duplicate signal queue handler registration: ${key}`);
-    }
-
-    this.signalHandlersByQueue.set(
-      key,
-      handler as SignalQueueHandlerFunction<any, any, any>,
-    );
-
-    return this;
-  }
 }
 
 function parseJson<T>(value: string, context: string): T {
@@ -453,23 +326,12 @@ function openDatabaseLedgerEngine<
     TQueries
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
-  const builder = new RuntimeBuilder<
-    TEvents,
-    TSignals,
-    TQueues,
-    TSignalQueues,
-    TIndexers,
-    TQueries
-  >();
-
   const clock = input.timing.clock;
   const scheduler = input.timing.scheduler;
   const database = input.database;
   const model = input.boundModel.model;
   const implementations = input.boundModel.implementations;
-  const register = input.boundModel.register;
-
-  register(builder);
+  const registration = input.boundModel.register;
   const leaseMs = input.leaseMs ?? 1_000;
   const defaultRetryDelayMs = input.defaultRetryDelayMs ?? 1_000;
   const maxInFlight = input.maxInFlight ?? 16;
@@ -749,17 +611,21 @@ function openDatabaseLedgerEngine<
       dedupeKey: eventInput.dedupeKey ?? null,
     };
 
-    const projectors =
-      builder.projectorsByEvent.get(eventInput.eventName) ?? [];
+    const eventHandler = registration.events?.[eventName];
+    const queued: {
+      queueName: string;
+      payload: unknown;
+      availableAtMs: number;
+    }[] = [];
 
-    for (const projector of projectors) {
-      await projector({
+    if (eventHandler !== undefined) {
+      await eventHandler({
         event: envelope,
         actions: {
           index: async (indexName, indexInput) => {
             const schema = model.indexers[indexName as keyof TIndexers];
             const implementation =
-              implementations.indexers[indexName as keyof TIndexers];
+              implementations.indexers?.[indexName as keyof TIndexers];
 
             if (schema === undefined || implementation === undefined) {
               throw new Error(`unknown indexer: ${String(indexName)}`);
@@ -771,23 +637,6 @@ function openDatabaseLedgerEngine<
 
             await implementation(canonicalInput as never);
           },
-        },
-      });
-    }
-
-    const materializers =
-      builder.materializersByEvent.get(eventInput.eventName) ?? [];
-
-    for (const materializer of materializers) {
-      const queued: {
-        queueName: string;
-        payload: unknown;
-        availableAtMs: number;
-      }[] = [];
-
-      await materializer({
-        event: envelope,
-        actions: {
           enqueue: (queueName, payload, options) => {
             const queueSchema = model.queues[queueName as keyof TQueues];
 
@@ -809,11 +658,12 @@ function openDatabaseLedgerEngine<
           },
         },
       });
+    }
 
-      for (const work of queued) {
-        await database
-          .prepare(
-            `INSERT INTO work (
+    for (const work of queued) {
+      await database
+        .prepare(
+          `INSERT INTO work (
               queue_name,
               payload_json,
               source_event_id,
@@ -826,14 +676,13 @@ function openDatabaseLedgerEngine<
               lease_expires_at_ms,
               last_error
             ) VALUES (?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
-          )
-          .run(
-            work.queueName,
-            JSON.stringify(work.payload),
-            eventId,
-            work.availableAtMs,
-          );
-      }
+        )
+        .run(
+          work.queueName,
+          JSON.stringify(work.payload),
+          eventId,
+          work.availableAtMs,
+        );
     }
 
     return {
@@ -928,18 +777,15 @@ function openDatabaseLedgerEngine<
       dedupeKey: signalInput.dedupeKey ?? null,
     };
 
-    const materializers =
-      builder.materializersBySignal.get(signalInput.signalName) ?? [];
-    let queuedCount = 0;
+    const signalHandler = registration.signals?.[signalName];
+    const queued: {
+      queueName: string;
+      payload: unknown;
+      availableAtMs: number;
+    }[] = [];
 
-    for (const materializer of materializers) {
-      const queued: {
-        queueName: string;
-        payload: unknown;
-        availableAtMs: number;
-      }[] = [];
-
-      await materializer({
+    if (signalHandler !== undefined) {
+      await signalHandler({
         event: envelope,
         actions: {
           enqueueSignal: (queueName, payload, options) => {
@@ -964,11 +810,12 @@ function openDatabaseLedgerEngine<
           },
         },
       });
+    }
 
-      for (const work of queued) {
-        await database
-          .prepare(
-            `INSERT INTO work (
+    for (const work of queued) {
+      await database
+        .prepare(
+          `INSERT INTO work (
               queue_name,
               payload_json,
               source_event_id,
@@ -981,19 +828,16 @@ function openDatabaseLedgerEngine<
               lease_expires_at_ms,
               last_error
             ) VALUES (?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
-          )
-          .run(
-            work.queueName,
-            JSON.stringify(work.payload),
-            eventId,
-            work.availableAtMs,
-          );
-
-        queuedCount += 1;
-      }
+        )
+        .run(
+          work.queueName,
+          JSON.stringify(work.payload),
+          eventId,
+          work.availableAtMs,
+        );
     }
 
-    if (queuedCount === 0) {
+    if (queued.length === 0) {
       await database
         .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
         .run(eventId);
@@ -1452,8 +1296,8 @@ function openDatabaseLedgerEngine<
       }
 
       const handler = claimed.signal
-        ? builder.signalHandlersByQueue.get(claimed.queueName)
-        : builder.handlersByQueue.get(claimed.queueName);
+        ? registration.signalQueues?.[claimed.queueName as keyof TSignalQueues]
+        : registration.queues?.[claimed.queueName as keyof TQueues];
 
       if (handler === undefined) {
         await runInTransaction(async () => {
@@ -1693,7 +1537,7 @@ function openDatabaseLedgerEngine<
       query: async (queryName, params) => {
         const schema = model.queries[queryName as keyof TQueries];
         const implementation =
-          implementations.queries[queryName as keyof TQueries];
+          implementations.queries?.[queryName as keyof TQueries];
 
         if (schema === undefined || implementation === undefined) {
           throw new Error(`unknown query: ${String(queryName)}`);
@@ -1947,7 +1791,7 @@ function openDatabaseLedgerEngine<
 
       const schema = model.queries[queryName as keyof TQueries];
       const implementation =
-        implementations.queries[queryName as keyof TQueries];
+        implementations.queries?.[queryName as keyof TQueries];
 
       if (schema === undefined || implementation === undefined) {
         throw new Error(`unknown query: ${String(queryName)}`);

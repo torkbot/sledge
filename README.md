@@ -39,14 +39,18 @@ Use `@torkbot/sledge` when you want:
 import Database from "better-sqlite3";
 import { Type } from "@sinclair/typebox";
 
-import { defineLedgerModel } from "@torkbot/sledge/ledger";
+import {
+  bindLedgerModel,
+  defineLedgerModel,
+  registerLedgerModel,
+} from "@torkbot/sledge/ledger";
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
   NodeRuntimeScheduler,
   SystemRuntimeClock,
 } from "@torkbot/sledge/runtime/node-runtime";
 
-const model = defineLedgerModel({
+const definedModel = defineLedgerModel({
   events: {
     "user.created": Type.Object({
       userId: Type.String(),
@@ -80,31 +84,29 @@ const model = defineLedgerModel({
       ]),
     },
   },
+});
 
-  register(builder) {
-    // Event -> projection
-    builder.project("user.created", async ({ event, actions }) => {
+const registeredModel = registerLedgerModel(definedModel, {
+  events: {
+    "user.created": async ({ event, actions }) => {
       await actions.index("upsertUser", {
         userId: event.payload.userId,
         email: event.payload.email,
       });
-    });
 
-    // Event -> queued work
-    builder.materialize("user.created", ({ event, actions }) => {
       actions.enqueue("welcome-email.send", {
         userId: event.payload.userId,
         email: event.payload.email,
       });
-    });
-
-    // Queue handler
-    builder.handle("welcome-email.send", async ({ work }) => {
+    },
+  },
+  queues: {
+    "welcome-email.send": async ({ work }) => {
       // call provider here
       console.log("sending welcome email", work.payload.email);
 
       return { outcome: "ack" } as const;
-    });
+    },
   },
 });
 
@@ -114,9 +116,9 @@ const scheduler = new NodeRuntimeScheduler();
 
 const ledger = createBetterSqliteLedger({
   database: db,
-  boundModel: model.bind({
+  boundModel: bindLedgerModel(registeredModel, {
     indexers: {
-      upsertUser: async (input) => {
+      upsertUser: async () => {
         // Write to your own projection table(s)
       },
     },
@@ -155,13 +157,16 @@ You define contracts, not implementation details:
 - `signalQueues`: work payloads materialized from signals
 - `indexers`: projection write contracts
 - `queries`: projection read contracts
-- `register(builder)`: orchestration glue
 
-### 2) `model.bind(...)`
+### 2) `registerLedgerModel(...)`
+
+You attach orchestration handlers keyed by event/signal/queue names.
+
+### 3) `bindLedgerModel(...)`
 
 You provide concrete implementations for indexers and queries.
 
-### 3) `create*Ledger(...)`
+### 4) `create*Ledger(...)`
 
 You choose backend adapter and start the runtime:
 
@@ -202,7 +207,7 @@ For example, a response handler might need to publish a “response started” n
 Signals are only emitted from normal queue handlers with `actions.emitSignal(...)`. A signal can create `signalQueues`, but it cannot write indexes.
 
 ```ts
-const model = defineLedgerModel({
+const definedModel = defineLedgerModel({
   events: {
     "response.requested": Type.Object({
       responseId: Type.String(),
@@ -227,34 +232,40 @@ const model = defineLedgerModel({
   },
   indexers: {},
   queries: {},
-  register(builder) {
-    builder.materialize("response.requested", ({ event, actions }) => {
+});
+
+const model = registerLedgerModel(definedModel, {
+  events: {
+    "response.requested": ({ event, actions }) => {
       actions.enqueue("response.generate", {
         responseId: event.payload.responseId,
       });
-    });
-
-    builder.handle("response.generate", async ({ work, actions }) => {
+    },
+  },
+  queues: {
+    "response.generate": async ({ work, actions }) => {
       actions.emitSignal("response.notice", {
         responseId: work.payload.responseId,
         message: "response started",
       });
 
       return { outcome: "ack" } as const;
-    });
-
-    builder.materializeSignal("response.notice", ({ event, actions }) => {
+    },
+  },
+  signals: {
+    "response.notice": ({ event, actions }) => {
       actions.enqueueSignal("response.notice.publish", {
         responseId: event.payload.responseId,
         message: event.payload.message,
       });
-    });
-
-    builder.handleSignal("response.notice.publish", async ({ work }) => {
+    },
+  },
+  signalQueues: {
+    "response.notice.publish": async ({ work }) => {
       await notifier.publish(work.payload);
 
       return { outcome: "ack" } as const;
-    });
+    },
   },
 });
 ```
@@ -324,13 +335,17 @@ Cursor values are opaque by contract. Persist and reuse them as-is.
 For long operations, keep the lease alive while working:
 
 ```ts
-builder.handle("some.queue", async ({ lease }) => {
-  await using hold = lease.hold();
+register: {
+  queues: {
+    "some.queue": async ({ lease }) => {
+      await using hold = lease.hold();
 
-  // long-running async work
+      // long-running async work
 
-  return { outcome: "ack" } as const;
-});
+      return { outcome: "ack" } as const;
+    },
+  },
+};
 ```
 
 ## Runtime tuning knobs

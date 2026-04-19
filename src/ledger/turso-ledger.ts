@@ -1,17 +1,17 @@
-import type { Database } from "@tursodatabase/database";
 import type { TSchema } from "@sinclair/typebox";
+import type { Database } from "@tursodatabase/database";
 
-import type {
-  Ledger,
-  BoundLedgerModel,
-  LedgerTiming,
-  QuerySchema,
-} from "./ledger.ts";
 import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
 } from "./database-ledger-engine.ts";
+import type {
+  BoundLedgerModel,
+  Ledger,
+  LedgerTiming,
+  QuerySchema,
+} from "./ledger.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -44,8 +44,8 @@ type CreateTursoLedgerInput<
 export function createTursoLedger<
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
-  const TIndexers extends Record<string, AnyIndexerDef>,
-  const TQueries extends Record<string, AnyQueryDef>,
+  const TIndexers extends Record<string, AnyIndexerDef> = {},
+  const TQueries extends Record<string, AnyQueryDef> = {},
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
 >(
