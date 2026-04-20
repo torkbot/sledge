@@ -160,6 +160,8 @@ You define contracts, not implementation details:
 
 You attach orchestration handlers keyed by event/signal/queue names.
 
+Event handlers can `index`, `enqueue`, and `query`.
+
 ### 3) `bindLedgerModel(...)`
 
 You provide concrete implementations for indexers and queries.

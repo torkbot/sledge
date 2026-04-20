@@ -10,6 +10,10 @@
 
   Queue and signal queue handlers now implicitly ack on normal return. Throwing retries with default timing. Explicit non-default outcomes now use control methods (`control.retry(...)`, `control.deadLetter(...)`) instead of returning a discriminated outcome union. Lease renewal is now automatic for the full handler duration and `lease.hold()` has been removed.
 
+- Add query access to event registration handlers
+
+  Event handlers can now call `actions.query(...)` in addition to `actions.index(...)` and `actions.enqueue(...)`, enabling event-time branching based on read-side state.
+
 ## 0.3.0
 
 - Add signals for transient handler-local orchestration

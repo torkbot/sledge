@@ -203,6 +203,7 @@ export type EventHandlerFunction<
   TEventName extends keyof TEvents,
   TIndexers extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
 > = (input: {
   readonly event: EventEnvelope<TEvents, TEventName>;
   readonly actions: ProjectionActions<TIndexers> & {
@@ -211,6 +212,10 @@ export type EventHandlerFunction<
       payload: Static<TQueues[TQueueName]>,
       options?: EnqueueOptions,
     ) => void;
+    readonly query: <const TQueryName extends keyof TQueries>(
+      queryName: TQueryName,
+      params: Static<TQueries[TQueryName]["params"]>,
+    ) => Promise<Static<TQueries[TQueryName]["result"]>>;
   };
 }) => void | Promise<void>;
 
@@ -280,7 +285,8 @@ export type RegisterFunction<
       TEvents,
       TEventName,
       TIndexers,
-      TQueues
+      TQueues,
+      TQueries
     >;
   };
   readonly signals?: {

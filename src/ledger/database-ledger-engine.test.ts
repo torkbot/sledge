@@ -341,6 +341,82 @@ test("deduped emit does not replay projections or materialization", async () => 
   }
 });
 
+test("event handlers can query to drive enqueue decisions", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let enabled = false;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {
+      "config.enabled": {
+        params: Type.Object({}),
+        result: Type.Boolean(),
+      },
+    },
+    register: {
+      events: {
+        "job.requested": async ({ event, actions }) => {
+          if (!(await actions.query("config.enabled", {}))) {
+            return;
+          }
+
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": async () => {},
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        "config.enabled": async () => enabled,
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await runtime.flush();
+
+  assert.equal(
+    readCount(database, "SELECT COUNT(*) AS total FROM work"),
+    0,
+    "no work should enqueue when query returns false",
+  );
+
+  enabled = true;
+
+  await ledger.emit("job.requested", { id: 2 });
+  await runtime.flush();
+
+  assert.equal(
+    readCount(database, "SELECT COUNT(*) AS total FROM work"),
+    1,
+    "work should enqueue when query returns true",
+  );
+});
+
 function readCount(database: Database.Database, sql: string): number {
   const row = database.prepare(sql).get();
 

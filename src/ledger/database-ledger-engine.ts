@@ -561,6 +561,27 @@ function openDatabaseLedgerEngine<
     return Value.Decode(schema, payload);
   }
 
+  async function runQuery<const TQueryName extends keyof TQueries>(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<Static<TQueries[TQueryName]["result"]>> {
+    const schema = model.queries[queryName];
+    const implementation = implementations.queries?.[queryName];
+
+    if (schema === undefined || implementation === undefined) {
+      throw new Error(`unknown query: ${String(queryName)}`);
+    }
+
+    const decodedParams = Value.Decode(schema.params, params);
+    const encodedParams = Value.Encode(schema.params, decodedParams);
+    const canonicalParams = Value.Decode(schema.params, encodedParams);
+
+    const rawResult = await implementation(canonicalParams as never);
+    const decodedResult = Value.Decode(schema.result, rawResult);
+
+    return decodedResult as never;
+  }
+
   async function appendEventInTransaction(
     eventInput: AppendEventInput,
   ): Promise<{
@@ -690,6 +711,9 @@ function openDatabaseLedgerEngine<
               payload: encodedQueuePayload,
               availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
             });
+          },
+          query: async (queryName, params) => {
+            return await runQuery(queryName, params);
           },
         },
       });
@@ -1538,22 +1562,7 @@ function openDatabaseLedgerEngine<
           });
         },
         query: async (queryName, params) => {
-          const schema = model.queries[queryName as keyof TQueries];
-          const implementation =
-            implementations.queries?.[queryName as keyof TQueries];
-
-          if (schema === undefined || implementation === undefined) {
-            throw new Error(`unknown query: ${String(queryName)}`);
-          }
-
-          const decodedParams = Value.Decode(schema.params, params);
-          const encodedParams = Value.Encode(schema.params, decodedParams);
-          const canonicalParams = Value.Decode(schema.params, encodedParams);
-
-          const rawResult = await implementation(canonicalParams as never);
-          const decodedResult = Value.Decode(schema.result, rawResult);
-
-          return decodedResult as never;
+          return await runQuery(queryName as keyof TQueries, params as never);
         },
       };
 
@@ -1824,23 +1833,7 @@ function openDatabaseLedgerEngine<
     },
     query: async (queryName, params) => {
       await startup;
-
-      const schema = model.queries[queryName as keyof TQueries];
-      const implementation =
-        implementations.queries?.[queryName as keyof TQueries];
-
-      if (schema === undefined || implementation === undefined) {
-        throw new Error(`unknown query: ${String(queryName)}`);
-      }
-
-      const decodedParams = Value.Decode(schema.params, params);
-      const encodedParams = Value.Encode(schema.params, decodedParams);
-      const canonicalParams = Value.Decode(schema.params, encodedParams);
-
-      const rawResult = await implementation(canonicalParams as never);
-      const decodedResult = Value.Decode(schema.result, rawResult);
-
-      return decodedResult as never;
+      return await runQuery(queryName, params);
     },
     onSignal: (signalName, observer) => {
       const signalSchema = model.signals[signalName as keyof TSignals];

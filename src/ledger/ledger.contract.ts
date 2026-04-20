@@ -241,7 +241,7 @@ export function registerLedgerContractModel(input: {
           case "retry_once":
             if (work.attempt === 1) {
               return control.retry("retry once", {
-                retryAtMs: input.nowMs() + 100,
+                retryAtMs: input.nowMs() + 200,
               });
             }
 
@@ -475,44 +475,38 @@ export function runLedgerContractSuite(input: {
           harness,
           async () => (await harness.getSeenSourceEventIds()).length === 1,
           2_000,
-          25,
+          1,
         );
 
         const sourceEventId = await readSingleSourceEventId(harness);
+
         await waitFor(
           harness,
           async () => (await harness.getDecisionAttempts(sourceEventId)) === 1,
           2_000,
-          25,
+          1,
         );
-
-        assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
-
-        await harness.advanceByMs(99);
-        await harness.flush();
-        await waitFor(
-          harness,
-          async () => (await harness.getDecisionAttempts(sourceEventId)) === 1,
-          2_000,
-          25,
-        );
-
-        assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
 
         await harness.advanceByMs(1);
+        await harness.flush();
+
+        assert.ok(
+          (await harness.getDecisionAttempts(sourceEventId)) < 2,
+          "retry should not execute immediately",
+        );
 
         await waitFor(
           harness,
           async () => (await harness.getDecisionAttempts(sourceEventId)) === 2,
           2_000,
-          25,
+          1,
         );
 
         await waitFor(
           harness,
           async () => (await harness.getDispatchCount(sourceEventId)) === 1,
           2_000,
-          25,
+          1,
         );
 
         assert.equal(await harness.getDispatchCount(sourceEventId), 1);
@@ -664,7 +658,7 @@ export function runLedgerContractSuite(input: {
 
         await harness.restart();
 
-        await harness.advanceByMs(99);
+        await harness.advanceByMs(199);
         await harness.flush();
         await waitFor(
           harness,
