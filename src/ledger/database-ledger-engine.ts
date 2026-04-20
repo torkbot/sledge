@@ -566,10 +566,15 @@ function openDatabaseLedgerEngine<
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
     const schema = model.queries[queryName];
+
+    if (schema === undefined) {
+      throw new Error(`unknown query: ${String(queryName)}`);
+    }
+
     const implementation = implementations.queries?.[queryName];
 
-    if (schema === undefined || implementation === undefined) {
-      throw new Error(`unknown query: ${String(queryName)}`);
+    if (implementation === undefined) {
+      throw new Error(`missing query implementation: ${String(queryName)}`);
     }
 
     const decodedParams = Value.Decode(schema.params, params);
@@ -1535,7 +1540,9 @@ function openDatabaseLedgerEngine<
         attempt: claimed.attempt,
         leaseId: claimed.leaseId,
         leaseAcquiredAtMs: claimed.leaseAcquiredAtMs,
-        leaseExpiresAtMs: claimed.leaseExpiresAtMs,
+        get leaseExpiresAtMs() {
+          return currentLeaseExpiresAtMs;
+        },
         signal: leaseAbortController.signal,
       };
 
