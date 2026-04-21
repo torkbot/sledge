@@ -685,11 +685,18 @@ function openDatabaseLedgerEngine<
         actions: {
           index: async (indexName, indexInput) => {
             const schema = model.indexers[indexName as keyof TIndexers];
+
+            if (schema === undefined) {
+              throw new Error(`unknown indexer: ${String(indexName)}`);
+            }
+
             const implementation =
               implementations.indexers?.[indexName as keyof TIndexers];
 
-            if (schema === undefined || implementation === undefined) {
-              throw new Error(`unknown indexer: ${String(indexName)}`);
+            if (implementation === undefined) {
+              throw new Error(
+                `missing indexer implementation: ${String(indexName)}`,
+              );
             }
 
             const decodedInput = Value.Decode(schema, indexInput);
