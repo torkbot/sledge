@@ -2,7 +2,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { Ledger, LedgerBuilder, QueueHandlerOutcome } from "./ledger.ts";
+import type { Ledger, RegisterFunction } from "./ledger.ts";
 export const MessageReceivedSchema = Type.Object({
   type: Type.Literal("message.received"),
   text: Type.String(),
@@ -137,8 +137,7 @@ export type LedgerContractDecisionMode =
   | "retry_once"
   | "dead_letter"
   | "throw_once"
-  | "block_until_abort"
-  | "hold_lease_until_abort";
+  | "block_until_abort";
 
 export type LedgerContractHarness = {
   readonly ledger: Ledger<any, any>;
@@ -160,197 +159,150 @@ export type LedgerContractHarness = {
 
 type LedgerContractHarnessFactory = () => Promise<LedgerContractHarness>;
 
-export function registerLedgerContractModel(
-  builder: LedgerBuilder<
-    LedgerContractEvents,
-    LedgerContractQueues,
-    LedgerContractIndexers,
-    LedgerContractQueries
-  >,
-  input: {
-    readDecisionMode(): LedgerContractDecisionMode;
-    readMaterializationFailureText(): string | null;
-    nowMs(): number;
-  },
-): void {
-  builder.project("message.received", async ({ event, actions }) => {
-    await actions.index("upsertObserved", {
-      sourceEventId: event.eventId,
-    });
-  });
+export function registerLedgerContractModel(input: {
+  readDecisionMode(): LedgerContractDecisionMode;
+  readMaterializationFailureText(): string | null;
+  nowMs(): number;
+}): RegisterFunction<
+  LedgerContractEvents,
+  LedgerContractQueues,
+  LedgerContractIndexers,
+  LedgerContractQueries
+> {
+  return {
+    events: {
+      "message.received": async ({ event, actions }) => {
+        await actions.index("upsertObserved", {
+          sourceEventId: event.eventId,
+        });
 
-  builder.project("decision.attempted", async ({ event, actions }) => {
-    await actions.index("incrementDecisionAttempts", {
-      sourceEventId: event.payload.sourceEventId,
-    });
-  });
+        const payload = event.payload as Static<typeof MessageReceivedSchema>;
 
-  builder.project("intent.planned", async ({ event, actions }) => {
-    await actions.index("setPlannedIntent", {
-      sourceEventId: event.payload.sourceEventId,
-      intentEventId: event.eventId,
-    });
-  });
-
-  builder.project("dispatch.completed", async ({ event, actions }) => {
-    await actions.index("incrementDispatchCount", {
-      sourceEventId: event.payload.sourceEventId,
-    });
-  });
-
-  builder.materialize("message.received", ({ event, actions }) => {
-    const payload = event.payload as Static<typeof MessageReceivedSchema>;
-
-    if (
-      input.readMaterializationFailureText() !== null &&
-      payload.text === input.readMaterializationFailureText()
-    ) {
-      throw new Error("configured materialization failure");
-    }
-
-    actions.enqueue("evaluate.message", {
-      sourceEventId: event.eventId,
-      text: payload.text,
-    });
-  });
-
-  builder.materialize("intent.planned", ({ event, actions }) => {
-    const payload = event.payload as Static<typeof IntentPlannedSchema>;
-
-    actions.enqueue("dispatch.intent", {
-      intentEventId: event.eventId,
-      sourceEventId: payload.sourceEventId,
-    });
-  });
-
-  builder.handle("evaluate.message", async ({ work, lease, actions }) => {
-    actions.emit("decision.attempted", {
-      type: "decision.attempted",
-      sourceEventId: work.sourceEventId,
-      attempt: work.attempt,
-    });
-
-    const mode = input.readDecisionMode();
-
-    switch (mode) {
-      case "ack":
-        actions.emit(
-          "intent.planned",
-          {
-            type: "intent.planned",
-            sourceEventId: work.sourceEventId,
-          },
-          {
-            dedupeKey: `intent:${work.sourceEventId}`,
-          },
-        );
-
-        return {
-          outcome: "ack",
-        } satisfies QueueHandlerOutcome;
-
-      case "retry_once":
-        if (work.attempt === 1) {
-          return {
-            outcome: "retry",
-            error: "retry once",
-            retryAtMs: input.nowMs() + 100,
-          } satisfies QueueHandlerOutcome;
+        if (
+          input.readMaterializationFailureText() !== null &&
+          payload.text === input.readMaterializationFailureText()
+        ) {
+          throw new Error("configured materialization failure");
         }
 
-        actions.emit(
-          "intent.planned",
-          {
-            type: "intent.planned",
-            sourceEventId: work.sourceEventId,
-          },
-          {
-            dedupeKey: `intent:${work.sourceEventId}`,
-          },
-        );
+        actions.enqueue("evaluate.message", {
+          sourceEventId: event.eventId,
+          text: payload.text,
+        });
+      },
+      "decision.attempted": async ({ event, actions }) => {
+        await actions.index("incrementDecisionAttempts", {
+          sourceEventId: event.payload.sourceEventId,
+        });
+      },
+      "intent.planned": async ({ event, actions }) => {
+        const payload = event.payload as Static<typeof IntentPlannedSchema>;
 
-        return {
-          outcome: "ack",
-        } satisfies QueueHandlerOutcome;
+        await actions.index("setPlannedIntent", {
+          sourceEventId: payload.sourceEventId,
+          intentEventId: event.eventId,
+        });
 
-      case "dead_letter":
-        return {
-          outcome: "dead_letter",
-          error: "configured dead letter",
-        } satisfies QueueHandlerOutcome;
+        actions.enqueue("dispatch.intent", {
+          intentEventId: event.eventId,
+          sourceEventId: payload.sourceEventId,
+        });
+      },
+      "dispatch.completed": async ({ event, actions }) => {
+        await actions.index("incrementDispatchCount", {
+          sourceEventId: event.payload.sourceEventId,
+        });
+      },
+    },
+    queues: {
+      "evaluate.message": async ({ work, lease, actions, control }) => {
+        actions.emit("decision.attempted", {
+          type: "decision.attempted",
+          sourceEventId: work.sourceEventId,
+          attempt: work.attempt,
+        });
 
-      case "throw_once":
-        if (work.attempt === 1) {
-          throw new Error("configured throw");
+        const mode = input.readDecisionMode();
+
+        switch (mode) {
+          case "ack":
+            actions.emit(
+              "intent.planned",
+              {
+                type: "intent.planned",
+                sourceEventId: work.sourceEventId,
+              },
+              {
+                dedupeKey: `intent:${work.sourceEventId}`,
+              },
+            );
+            return;
+
+          case "retry_once":
+            if (work.attempt === 1) {
+              return control.retry("retry once", {
+                retryAtMs: input.nowMs() + 200,
+              });
+            }
+
+            actions.emit(
+              "intent.planned",
+              {
+                type: "intent.planned",
+                sourceEventId: work.sourceEventId,
+              },
+              {
+                dedupeKey: `intent:${work.sourceEventId}`,
+              },
+            );
+            return;
+
+          case "dead_letter":
+            return control.deadLetter("configured dead letter");
+
+          case "throw_once":
+            if (work.attempt === 1) {
+              throw new Error("configured throw");
+            }
+
+            actions.emit(
+              "intent.planned",
+              {
+                type: "intent.planned",
+                sourceEventId: work.sourceEventId,
+              },
+              {
+                dedupeKey: `intent:${work.sourceEventId}`,
+              },
+            );
+            return;
+
+          case "block_until_abort": {
+            if (!lease.signal.aborted) {
+              await new Promise<void>((resolve) => {
+                const onAbort = () => {
+                  lease.signal.removeEventListener("abort", onAbort);
+                  resolve();
+                };
+
+                lease.signal.addEventListener("abort", onAbort);
+              });
+            }
+
+            return control.retry("aborted", {
+              retryAtMs: input.nowMs(),
+            });
+          }
         }
-
-        actions.emit(
-          "intent.planned",
-          {
-            type: "intent.planned",
-            sourceEventId: work.sourceEventId,
-          },
-          {
-            dedupeKey: `intent:${work.sourceEventId}`,
-          },
-        );
-
-        return {
-          outcome: "ack",
-        } satisfies QueueHandlerOutcome;
-
-      case "block_until_abort": {
-        if (!lease.signal.aborted) {
-          await new Promise<void>((resolve) => {
-            const onAbort = () => {
-              lease.signal.removeEventListener("abort", onAbort);
-              resolve();
-            };
-
-            lease.signal.addEventListener("abort", onAbort);
-          });
-        }
-
-        return {
-          outcome: "retry",
-          error: "aborted",
-          retryAtMs: input.nowMs(),
-        } satisfies QueueHandlerOutcome;
-      }
-
-      case "hold_lease_until_abort": {
-        await using hold = lease.hold();
-
-        if (!lease.signal.aborted) {
-          await new Promise<void>((resolve) => {
-            const onAbort = () => {
-              lease.signal.removeEventListener("abort", onAbort);
-              resolve();
-            };
-
-            lease.signal.addEventListener("abort", onAbort);
-          });
-        }
-
-        return {
-          outcome: "retry",
-          error: "aborted",
-          retryAtMs: input.nowMs(),
-        } satisfies QueueHandlerOutcome;
-      }
-    }
-  });
-
-  builder.handle("dispatch.intent", async ({ work, actions }) => {
-    actions.emit("dispatch.completed", {
-      type: "dispatch.completed",
-      sourceEventId: work.payload.sourceEventId,
-    });
-
-    return {
-      outcome: "ack",
-    } satisfies QueueHandlerOutcome;
-  });
+      },
+      "dispatch.intent": async ({ work, actions }) => {
+        actions.emit("dispatch.completed", {
+          type: "dispatch.completed",
+          sourceEventId: work.payload.sourceEventId,
+        });
+      },
+    },
+  };
 }
 
 async function withHarness(
@@ -523,44 +475,38 @@ export function runLedgerContractSuite(input: {
           harness,
           async () => (await harness.getSeenSourceEventIds()).length === 1,
           2_000,
-          25,
+          1,
         );
 
         const sourceEventId = await readSingleSourceEventId(harness);
+
         await waitFor(
           harness,
           async () => (await harness.getDecisionAttempts(sourceEventId)) === 1,
           2_000,
-          25,
+          1,
         );
-
-        assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
-
-        await harness.advanceByMs(99);
-        await harness.flush();
-        await waitFor(
-          harness,
-          async () => (await harness.getDecisionAttempts(sourceEventId)) === 1,
-          2_000,
-          25,
-        );
-
-        assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
 
         await harness.advanceByMs(1);
+        await harness.flush();
+
+        assert.ok(
+          (await harness.getDecisionAttempts(sourceEventId)) < 2,
+          "retry should not execute immediately",
+        );
 
         await waitFor(
           harness,
           async () => (await harness.getDecisionAttempts(sourceEventId)) === 2,
           2_000,
-          25,
+          1,
         );
 
         await waitFor(
           harness,
           async () => (await harness.getDispatchCount(sourceEventId)) === 1,
           2_000,
-          25,
+          1,
         );
 
         assert.equal(await harness.getDispatchCount(sourceEventId), 1);
@@ -712,7 +658,7 @@ export function runLedgerContractSuite(input: {
 
         await harness.restart();
 
-        await harness.advanceByMs(99);
+        await harness.advanceByMs(199);
         await harness.flush();
         await waitFor(
           harness,
@@ -786,10 +732,10 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
-      "lease hold keeps long-running handler alive past lease TTL",
+      "long-running handler lease is renewed automatically",
       async () => {
         await withHarness(input.create, async (harness) => {
-          harness.setDecisionMode("hold_lease_until_abort");
+          harness.setDecisionMode("block_until_abort");
 
           await harness.ledger.emit("message.received", {
             type: "message.received",

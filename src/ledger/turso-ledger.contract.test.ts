@@ -11,7 +11,12 @@ import {
   type LedgerContractIndexers,
   type LedgerContractQueries,
 } from "./ledger.contract.ts";
-import { defineLedgerModel, type LedgerImplementations } from "./ledger.ts";
+import {
+  bindLedgerModel,
+  defineLedgerModel,
+  registerLedgerModel,
+  type LedgerImplementations,
+} from "./ledger.ts";
 
 runLedgerContractSuite({
   suiteName: "turso ledger contract",
@@ -120,18 +125,20 @@ runLedgerContractSuite({
         queues: ledgerContractModel.queues,
         indexers: ledgerContractModel.indexers,
         queries: ledgerContractModel.queries,
-        register: (builder) => {
-          registerLedgerContractModel(builder, {
-            readDecisionMode: () => decisionMode,
-            readMaterializationFailureText: () => materializationFailureText,
-            nowMs: () => runtime.nowMs(),
-          });
-        },
       });
+
+      const registeredModel = registerLedgerModel(
+        definedModel,
+        registerLedgerContractModel({
+          readDecisionMode: () => decisionMode,
+          readMaterializationFailureText: () => materializationFailureText,
+          nowMs: () => runtime.nowMs(),
+        }),
+      );
 
       return createTursoLedger({
         database: db,
-        boundModel: definedModel.bind(implementations),
+        boundModel: bindLedgerModel(registeredModel, implementations),
         timing: {
           clock: runtime.clock,
           scheduler: runtime.scheduler,

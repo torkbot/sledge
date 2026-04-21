@@ -43,7 +43,7 @@ export type QueryDefinition<
 > = QuerySchema<TParamsSchema, TResultSchema>;
 
 /**
- * Durable event envelope shared by projectors and materializers.
+ * Durable event envelope shared by event/signal registration handlers.
  */
 export type EventEnvelope<
   TEvents extends Record<string, TSchema>,
@@ -74,15 +74,6 @@ export type QueueWorkItem<
 /**
  * Queue work lease metadata for one active work attempt.
  */
-export interface LeaseHold extends AsyncDisposable {
-  /**
-   * Cancellation signal for the held lease. This aliases the parent lease
-   * signal so call sites can thread `leaseHold.signal` and make the hold scope
-   * visibly meaningful in code.
-   */
-  readonly signal: AbortSignal;
-}
-
 export interface WorkLease<
   TQueues extends Record<string, TSchema>,
   TQueueName extends keyof TQueues,
@@ -95,31 +86,22 @@ export interface WorkLease<
   readonly leaseAcquiredAtMs: number;
   readonly leaseExpiresAtMs: number;
   readonly signal: AbortSignal;
-
-  /**
-   * Hold and actively renew this lease until the returned scope is disposed.
-   *
-   * Handlers should use `await using` for long-running operations (LLM streams,
-   * external API calls, etc.) to prevent lease expiry while still allowing
-   * cooperative cancellation through `signal`.
-   */
-  hold(): LeaseHold;
 }
 
 /**
  * Runtime implementations bound to index and query schema contracts.
  */
 export type LedgerImplementations<
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
+  TIndexers extends Record<string, TSchema> = {},
+  TQueries extends Record<string, AnyQuerySchema> = {},
 > = {
-  readonly indexers: {
+  readonly indexers?: {
     readonly [TIndexName in keyof TIndexers]: (
       input: Static<TIndexers[TIndexName]>,
     ) => void | Promise<void>;
   };
 
-  readonly queries: {
+  readonly queries?: {
     readonly [TQueryName in keyof TQueries]: (
       params: Static<TQueries[TQueryName]["params"]>,
     ) => unknown | Promise<unknown>;
@@ -174,28 +156,24 @@ export interface ProjectionActions<TIndexers extends Record<string, TSchema>> {
   ): Promise<void>;
 }
 
-/**
- * Explicit completion result for one queue work attempt.
- */
-export type QueueHandlerOutcome =
-  | { readonly outcome: "ack" }
-  | {
-      readonly outcome: "retry";
-      readonly error: string;
-      readonly retryAtMs?: number;
-    }
-  | { readonly outcome: "dead_letter"; readonly error: string };
+export type QueueHandlerRetryOptions = {
+  readonly retryAtMs?: number;
+};
 
 /**
- * Explicit completion result for one signal queue work attempt.
+ * Explicit queue control methods for non-default outcomes.
  */
-export type SignalQueueHandlerOutcome =
-  | { readonly outcome: "ack" }
-  | {
-      readonly outcome: "retry";
-      readonly error: string;
-      readonly retryAtMs?: number;
-    };
+export interface QueueHandlerControl {
+  retry(error: unknown, options?: QueueHandlerRetryOptions): never;
+  deadLetter(error: unknown): never;
+}
+
+/**
+ * Explicit signal queue control methods for non-default outcomes.
+ */
+export interface SignalQueueHandlerControl {
+  retry(error: unknown, options?: QueueHandlerRetryOptions): never;
+}
 
 /**
  * Ledger model definition surface.
@@ -203,8 +181,8 @@ export type SignalQueueHandlerOutcome =
 export interface LedgerModel<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
+  TIndexers extends Record<string, TSchema> = {},
+  TQueries extends Record<string, AnyQuerySchema> = {},
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
 > {
@@ -217,27 +195,34 @@ export interface LedgerModel<
 }
 
 /**
- * Event->work materialization function.
+ * Event registration function. This is the single event-side orchestration
+ * hook and may both write projections and enqueue durable work.
  */
-export type MaterializerFunction<
+export type EventHandlerFunction<
   TEvents extends Record<string, TSchema>,
   TEventName extends keyof TEvents,
+  TIndexers extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
 > = (input: {
   readonly event: EventEnvelope<TEvents, TEventName>;
-  readonly actions: {
+  readonly actions: ProjectionActions<TIndexers> & {
     readonly enqueue: <const TQueueName extends keyof TQueues>(
       queueName: TQueueName,
       payload: Static<TQueues[TQueueName]>,
       options?: EnqueueOptions,
     ) => void;
+    readonly query: <const TQueryName extends keyof TQueries>(
+      queryName: TQueryName,
+      params: Static<TQueries[TQueryName]["params"]>,
+    ) => Promise<Static<TQueries[TQueryName]["result"]>>;
   };
 }) => void | Promise<void>;
 
 /**
- * Signal->signal work materialization function.
+ * Signal registration function for signal->signal-queue materialization.
  */
-export type SignalMaterializerFunction<
+export type SignalHandlerFunction<
   TSignals extends Record<string, TSchema>,
   TSignalName extends keyof TSignals,
   TSignalQueues extends Record<string, TSchema>,
@@ -255,18 +240,6 @@ export type SignalMaterializerFunction<
 }) => void | Promise<void>;
 
 /**
- * Event->index projection function.
- */
-export type ProjectorFunction<
-  TEvents extends Record<string, TSchema>,
-  TEventName extends keyof TEvents,
-  TIndexers extends Record<string, TSchema>,
-> = (input: {
-  readonly event: EventEnvelope<TEvents, TEventName>;
-  readonly actions: ProjectionActions<TIndexers>;
-}) => void | Promise<void>;
-
-/**
  * Queue work handler function.
  */
 export type QueueHandlerFunction<
@@ -279,7 +252,8 @@ export type QueueHandlerFunction<
   readonly work: QueueWorkItem<TQueues, TQueueName>;
   readonly lease: WorkLease<TQueues, TQueueName>;
   readonly actions: QueueActions<TEvents, TQueries, TSignals>;
-}) => QueueHandlerOutcome | Promise<QueueHandlerOutcome>;
+  readonly control: QueueHandlerControl;
+}) => void | Promise<void>;
 
 /**
  * Signal queue work handler function.
@@ -292,61 +266,11 @@ export type SignalQueueHandlerFunction<
   readonly work: QueueWorkItem<TSignalQueues, TSignalQueueName>;
   readonly lease: WorkLease<TSignalQueues, TSignalQueueName>;
   readonly actions: SignalQueueActions<TQueries>;
-}) => SignalQueueHandlerOutcome | Promise<SignalQueueHandlerOutcome>;
+  readonly control: SignalQueueHandlerControl;
+}) => void | Promise<void>;
 
 /**
- * Builder API used to register model behavior.
- */
-export interface LedgerBuilder<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema> = {},
-  TSignalQueues extends Record<string, TSchema> = {},
-> {
-  project<const TEventName extends keyof TEvents>(
-    eventName: TEventName,
-    projector: ProjectorFunction<TEvents, TEventName, TIndexers>,
-  ): this;
-
-  materialize<const TEventName extends keyof TEvents>(
-    eventName: TEventName,
-    materializer: MaterializerFunction<TEvents, TEventName, TQueues>,
-  ): this;
-
-  materializeSignal<const TSignalName extends keyof TSignals>(
-    signalName: TSignalName,
-    materializer: SignalMaterializerFunction<
-      TSignals,
-      TSignalName,
-      TSignalQueues
-    >,
-  ): this;
-
-  handle<const TQueueName extends keyof TQueues>(
-    queueName: TQueueName,
-    handler: QueueHandlerFunction<
-      TEvents,
-      TQueues,
-      TQueueName,
-      TQueries,
-      TSignals
-    >,
-  ): this;
-
-  handleSignal<const TSignalQueueName extends keyof TSignalQueues>(
-    queueName: TSignalQueueName,
-    handler: SignalQueueHandlerFunction<
-      TSignalQueues,
-      TSignalQueueName,
-      TQueries
-    >,
-  ): this;
-}
-
-/**
- * Registration callback used to define model behavior.
+ * Declarative model registration keyed by event/queue names.
  */
 export type RegisterFunction<
   TEvents extends Record<string, TSchema>,
@@ -355,17 +279,40 @@ export type RegisterFunction<
   TQueries extends Record<string, AnyQuerySchema>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
-> = (
-  builder: LedgerBuilder<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >,
-) => void;
-
+> = {
+  readonly events?: {
+    readonly [TEventName in keyof TEvents]?: EventHandlerFunction<
+      TEvents,
+      TEventName,
+      TIndexers,
+      TQueues,
+      TQueries
+    >;
+  };
+  readonly signals?: {
+    readonly [TSignalName in keyof TSignals]?: SignalHandlerFunction<
+      TSignals,
+      TSignalName,
+      TSignalQueues
+    >;
+  };
+  readonly queues?: {
+    readonly [TQueueName in keyof TQueues]?: QueueHandlerFunction<
+      TEvents,
+      TQueues,
+      TQueueName,
+      TQueries,
+      TSignals
+    >;
+  };
+  readonly signalQueues?: {
+    readonly [TSignalQueueName in keyof TSignalQueues]?: SignalQueueHandlerFunction<
+      TSignalQueues,
+      TSignalQueueName,
+      TQueries
+    >;
+  };
+};
 /**
  * Running ledger runtime surface.
  */
@@ -449,11 +396,55 @@ export type BusyRetryPolicy = {
   readonly maxBusyRetryDelayMs?: number;
 };
 
-export type BoundLedgerModel<
+export type DefinedLedgerModel<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQuerySchema>,
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
+> = {
+  readonly model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+};
+
+export type RegisteredLedgerModel<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema> = {},
+  TQueries extends Record<string, AnyQuerySchema> = {},
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
+> = {
+  readonly model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+  readonly register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+};
+
+export type BoundLedgerModel<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema> = {},
+  TQueries extends Record<string, AnyQuerySchema> = {},
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
@@ -476,48 +467,11 @@ export type BoundLedgerModel<
   readonly implementations: LedgerImplementations<TIndexers, TQueries>;
 };
 
-export type DefinedLedgerModel<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema> = {},
-  TSignalQueues extends Record<string, TSchema> = {},
-> = {
-  readonly model: LedgerModel<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >;
-  readonly register: RegisterFunction<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >;
-
-  bind(
-    implementations: LedgerImplementations<TIndexers, TQueries>,
-  ): BoundLedgerModel<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >;
-};
-
 export function defineLedgerModel<
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
-  const TIndexers extends Record<string, TSchema>,
-  const TQueries extends Record<string, AnyQuerySchema>,
+  const TIndexers extends Record<string, TSchema> = {},
+  const TQueries extends Record<string, AnyQuerySchema> = {},
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
 >(input: {
@@ -525,16 +479,8 @@ export function defineLedgerModel<
   readonly signals?: TSignals;
   readonly queues: TQueues;
   readonly signalQueues?: TSignalQueues;
-  readonly indexers: TIndexers;
-  readonly queries: TQueries;
-  readonly register: RegisterFunction<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >;
+  readonly indexers?: TIndexers;
+  readonly queries?: TQueries;
 }): DefinedLedgerModel<
   TEvents,
   TQueues,
@@ -555,20 +501,82 @@ export function defineLedgerModel<
     signals: input.signals ?? ({} as TSignals),
     queues: input.queues,
     signalQueues: input.signalQueues ?? ({} as TSignalQueues),
-    indexers: input.indexers,
-    queries: input.queries,
+    indexers: input.indexers ?? ({} as TIndexers),
+    queries: input.queries ?? ({} as TQueries),
   };
 
   return {
     model,
-    register: input.register,
-    bind: (implementations) => {
-      return {
-        model,
-        register: input.register,
-        implementations,
-      };
-    },
+  };
+}
+
+export function registerLedgerModel<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
+>(
+  model: DefinedLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >,
+  register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >,
+): RegisteredLedgerModel<
+  TEvents,
+  TQueues,
+  TIndexers,
+  TQueries,
+  TSignals,
+  TSignalQueues
+> {
+  return {
+    model: model.model,
+    register,
+  };
+}
+
+export function bindLedgerModel<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
+>(
+  model: RegisteredLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >,
+  implementations: LedgerImplementations<TIndexers, TQueries>,
+): BoundLedgerModel<
+  TEvents,
+  TQueues,
+  TIndexers,
+  TQueries,
+  TSignals,
+  TSignalQueues
+> {
+  return {
+    model: model.model,
+    register: model.register,
+    implementations,
   };
 }
 

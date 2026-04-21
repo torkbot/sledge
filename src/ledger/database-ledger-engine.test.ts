@@ -5,11 +5,95 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import test from "node:test";
-import { Type } from "@sinclair/typebox";
+import { Type, type TSchema } from "@sinclair/typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
-import { defineLedgerModel } from "./ledger.ts";
+import {
+  bindLedgerModel,
+  defineLedgerModel as defineStaticLedgerModel,
+  registerLedgerModel,
+  type BoundLedgerModel,
+  type LedgerImplementations,
+  type QuerySchema,
+  type RegisterFunction,
+  type RegisteredLedgerModel,
+} from "./ledger.ts";
+
+type LegacyRegisteredLedgerModel<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema> = {},
+  TQueries extends Record<string, QuerySchema<TSchema, TSchema>> = {},
+  TSignals extends Record<string, TSchema> = {},
+  TSignalQueues extends Record<string, TSchema> = {},
+> = RegisteredLedgerModel<
+  TEvents,
+  TQueues,
+  TIndexers,
+  TQueries,
+  TSignals,
+  TSignalQueues
+> & {
+  bind(
+    implementations: LedgerImplementations<TIndexers, TQueries>,
+  ): BoundLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+};
+
+function defineLedgerModel<
+  const TEvents extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema>,
+  const TIndexers extends Record<string, TSchema> = {},
+  const TQueries extends Record<string, QuerySchema<TSchema, TSchema>> = {},
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
+>(input: {
+  readonly events: TEvents;
+  readonly signals?: TSignals;
+  readonly queues: TQueues;
+  readonly signalQueues?: TSignalQueues;
+  readonly indexers?: TIndexers;
+  readonly queries?: TQueries;
+  readonly register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+}): LegacyRegisteredLedgerModel<
+  TEvents,
+  TQueues,
+  TIndexers,
+  TQueries,
+  TSignals,
+  TSignalQueues
+> {
+  const definedModel = defineStaticLedgerModel({
+    events: input.events,
+    signals: input.signals,
+    queues: input.queues,
+    signalQueues: input.signalQueues,
+    indexers: input.indexers,
+    queries: input.queries,
+  });
+  const registeredModel = registerLedgerModel(definedModel, input.register);
+
+  return {
+    ...registeredModel,
+    bind(implementations) {
+      return bindLedgerModel(registeredModel, implementations);
+    },
+  };
+}
 
 async function waitFor(
   runtime: VirtualRuntimeHarness,
@@ -95,28 +179,27 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
     },
     indexers: {},
     queries: {},
-    register(builder) {
-      builder.materialize("job.requested", ({ event, actions }) => {
-        actions.enqueue("job.run", {
-          id: event.payload.id,
-        });
-      });
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": async () => {
+          active += 1;
+          peak = Math.max(peak, active);
 
-      builder.handle("job.run", async () => {
-        active += 1;
-        peak = Math.max(peak, active);
+          await new Promise<void>((resolve) => {
+            releases.push(resolve);
+          });
 
-        await new Promise<void>((resolve) => {
-          releases.push(resolve);
-        });
-
-        active -= 1;
-        completed += 1;
-
-        return {
-          outcome: "ack",
-        } as const;
-      });
+          active -= 1;
+          completed += 1;
+        },
+      },
     },
   });
 
@@ -191,26 +274,23 @@ test("deduped emit does not replay projections or materialization", async () => 
       }),
     },
     queries: {},
-    register(builder) {
-      builder.project("message.received", async ({ event, actions }) => {
-        await actions.index("trackProjection", {
-          id: event.payload.id,
-        });
-      });
+    register: {
+      events: {
+        "message.received": async ({ event, actions }) => {
+          await actions.index("trackProjection", {
+            id: event.payload.id,
+          });
 
-      builder.materialize("message.received", ({ event, actions }) => {
-        actions.enqueue("message.process", {
-          id: event.payload.id,
-        });
-      });
-
-      builder.handle("message.process", async () => {
-        processed += 1;
-
-        return {
-          outcome: "ack",
-        } as const;
-      });
+          actions.enqueue("message.process", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "message.process": async () => {
+          processed += 1;
+        },
+      },
     },
   });
 
@@ -259,6 +339,82 @@ test("deduped emit does not replay projections or materialization", async () => 
       force: true,
     });
   }
+});
+
+test("event handlers can query to drive enqueue decisions", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let enabled = false;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {
+      "config.enabled": {
+        params: Type.Object({}),
+        result: Type.Boolean(),
+      },
+    },
+    register: {
+      events: {
+        "job.requested": async ({ event, actions }) => {
+          if (!(await actions.query("config.enabled", {}))) {
+            return;
+          }
+
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": async () => {},
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        "config.enabled": async () => enabled,
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await runtime.flush();
+
+  assert.equal(
+    readCount(database, "SELECT COUNT(*) AS total FROM work"),
+    0,
+    "no work should enqueue when query returns false",
+  );
+
+  enabled = true;
+
+  await ledger.emit("job.requested", { id: 2 });
+  await runtime.flush();
+
+  assert.equal(
+    readCount(database, "SELECT COUNT(*) AS total FROM work"),
+    1,
+    "work should enqueue when query returns true",
+  );
 });
 
 function readCount(database: Database.Database, sql: string): number {
@@ -313,48 +469,45 @@ test("signals materialize signal work and are pruned after ack", async () => {
     },
     indexers: {},
     queries: {},
-    register(builder) {
-      builder.materialize("response.generate", ({ event, actions }) => {
-        actions.enqueue("response.run", {
-          id: event.payload.id,
-        });
-      });
+    register: {
+      events: {
+        "response.generate": ({ event, actions }) => {
+          actions.enqueue("response.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "response.run": async ({ work, actions }) => {
+          actions.emitSignal(
+            "response.delta",
+            {
+              id: work.payload.id,
+              seq: 1,
+            },
+            {
+              dedupeKey: `response-delta:${work.payload.id}:1`,
+            },
+          );
+        },
+      },
+      signals: {
+        "response.delta": ({ event, actions }) => {
+          actions.enqueueSignal("delta.broadcast", {
+            id: event.payload.id,
+            seq: event.payload.seq,
+          });
+        },
+      },
+      signalQueues: {
+        "delta.broadcast": async () => {
+          broadcasts += 1;
 
-      builder.handle("response.run", async ({ work, actions }) => {
-        actions.emitSignal(
-          "response.delta",
-          {
-            id: work.payload.id,
-            seq: 1,
-          },
-          {
-            dedupeKey: `response-delta:${work.payload.id}:1`,
-          },
-        );
-
-        return {
-          outcome: "ack",
-        } as const;
-      });
-
-      builder.materializeSignal("response.delta", ({ event, actions }) => {
-        actions.enqueueSignal("delta.broadcast", {
-          id: event.payload.id,
-          seq: event.payload.seq,
-        });
-      });
-
-      builder.handleSignal("delta.broadcast", async () => {
-        broadcasts += 1;
-
-        if (holdSignal) {
-          await signalGate;
-        }
-
-        return {
-          outcome: "ack",
-        } as const;
-      });
+          if (holdSignal) {
+            await signalGate;
+          }
+        },
+      },
     },
   });
 
@@ -468,46 +621,41 @@ test("signal retry keeps signal event until signal work acks", async () => {
     },
     indexers: {},
     queries: {},
-    register(builder) {
-      builder.materialize("response.generate", ({ event, actions }) => {
-        actions.enqueue("response.run", {
-          id: event.payload.id,
-        });
-      });
+    register: {
+      events: {
+        "response.generate": ({ event, actions }) => {
+          actions.enqueue("response.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "response.run": async ({ work, actions }) => {
+          actions.emitSignal("response.delta", {
+            id: work.payload.id,
+            seq: 1,
+          });
+        },
+      },
+      signals: {
+        "response.delta": ({ event, actions }) => {
+          actions.enqueueSignal("delta.broadcast", {
+            id: event.payload.id,
+            seq: event.payload.seq,
+          });
+        },
+      },
+      signalQueues: {
+        "delta.broadcast": async ({ control }) => {
+          attempts += 1;
 
-      builder.handle("response.run", async ({ work, actions }) => {
-        actions.emitSignal("response.delta", {
-          id: work.payload.id,
-          seq: 1,
-        });
-
-        return {
-          outcome: "ack",
-        } as const;
-      });
-
-      builder.materializeSignal("response.delta", ({ event, actions }) => {
-        actions.enqueueSignal("delta.broadcast", {
-          id: event.payload.id,
-          seq: event.payload.seq,
-        });
-      });
-
-      builder.handleSignal("delta.broadcast", async () => {
-        attempts += 1;
-
-        if (attempts === 1) {
-          return {
-            outcome: "retry",
-            error: "retry once",
-            retryAtMs: runtime.nowMs() + 100,
-          } as const;
-        }
-
-        return {
-          outcome: "ack",
-        } as const;
-      });
+          if (attempts === 1) {
+            return control.retry("retry once", {
+              retryAtMs: runtime.nowMs() + 100,
+            });
+          }
+        },
+      },
     },
   });
 
@@ -564,7 +712,7 @@ function createBusyTestModel() {
     queues: {},
     indexers: {},
     queries: {},
-    register: () => {},
+    register: {},
   });
 }
 
@@ -717,13 +865,15 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
     queues: {},
     indexers: {},
     queries: {},
-    register(builder) {
-      builder.materialize("message.received", async () => {
-        materializerStarted = true;
-        await materializerGate;
+    register: {
+      events: {
+        "message.received": async () => {
+          materializerStarted = true;
+          await materializerGate;
 
-        throw new Error("materialization failure");
-      });
+          throw new Error("materialization failure");
+        },
+      },
     },
   });
 
@@ -781,7 +931,7 @@ test("tailEvents yields last N events then follows new events", async () => {
     queues: {},
     indexers: {},
     queries: {},
-    register: () => {},
+    register: {},
   });
 
   await using ledger = createBetterSqliteLedger({
@@ -855,7 +1005,7 @@ test("resumeEvents continues from opaque cursor", async () => {
     queues: {},
     indexers: {},
     queries: {},
-    register: () => {},
+    register: {},
   });
 
   await using ledger = createBetterSqliteLedger({
@@ -949,7 +1099,7 @@ test("tail iterator return stops stream without external abort", async () => {
     queues: {},
     indexers: {},
     queries: {},
-    register: () => {},
+    register: {},
   });
 
   await using ledger = createBetterSqliteLedger({
