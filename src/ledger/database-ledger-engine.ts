@@ -1554,7 +1554,6 @@ function openDatabaseLedgerEngine<
       };
 
       const stagedEvents: AppendEventInput[] = [];
-      const stagedSignals: AppendSignalInput[] = [];
 
       const actions: QueueActions<any, any, any> = {
         emit: (eventName, event, options) => {
@@ -1566,14 +1565,21 @@ function openDatabaseLedgerEngine<
             causationEventId: claimed.sourceEventId,
           });
         },
-        emitSignal: (signalName, signal, options) => {
-          stagedSignals.push({
-            signalName: String(signalName),
-            payload: signal,
-            nowMs: clock.nowMs(),
-            dedupeKey: options?.dedupeKey,
-            causationEventId: claimed.sourceEventId,
+        emitSignal: async (signalName, signal, options) => {
+          const appended = await runInTransaction(async () => {
+            return await appendSignalInTransaction({
+              signalName: String(signalName),
+              payload: signal,
+              nowMs: clock.nowMs(),
+              dedupeKey: options?.dedupeKey,
+              causationEventId: claimed.sourceEventId,
+            });
           });
+
+          if (appended.event !== null) {
+            notifySignalObservers([appended.event]);
+            scheduleDispatchAt(clock.nowMs());
+          }
         },
         query: async (queryName, params) => {
           return await runQuery(queryName as keyof TQueries, params as never);
@@ -1665,22 +1671,12 @@ function openDatabaseLedgerEngine<
         }
 
         let createdDurableCount = 0;
-        const createdSignalEvents: EventEnvelope<TSignals, keyof TSignals>[] =
-          [];
 
         for (const stagedEvent of stagedEvents) {
           const appended = await appendEventInTransaction(stagedEvent);
 
           if (appended.created) {
             createdDurableCount += 1;
-          }
-        }
-
-        for (const stagedSignal of stagedSignals) {
-          const appended = await appendSignalInTransaction(stagedSignal);
-
-          if (appended.event !== null) {
-            createdSignalEvents.push(appended.event);
           }
         }
 
@@ -1758,7 +1754,7 @@ function openDatabaseLedgerEngine<
 
         return {
           durableEvents: createdDurableCount,
-          signalEvents: createdSignalEvents,
+          signalEvents: [],
         };
       });
 

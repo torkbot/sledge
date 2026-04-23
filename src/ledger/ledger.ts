@@ -126,7 +126,7 @@ export interface QueueActions<
     signalName: TSignalName,
     signal: Static<TSignals[TSignalName]>,
     options?: EmitOptions,
-  ): void;
+  ): Promise<void>;
 
   query<const TQueryName extends keyof TQueries>(
     queryName: TQueryName,
