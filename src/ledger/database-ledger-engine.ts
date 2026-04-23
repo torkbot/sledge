@@ -1567,6 +1567,23 @@ function openDatabaseLedgerEngine<
         },
         emitSignal: async (signalName, signal, options) => {
           const appended = await runInTransaction(async () => {
+            const active = await database
+              .prepare(
+                `SELECT work_id
+                 FROM work
+                 WHERE work_id = ?
+                   AND lease_id = ?
+                   AND dead = 0`,
+              )
+              .get(claimed.workId, claimed.leaseId);
+
+            if (active === undefined) {
+              return {
+                event: null,
+                created: false,
+              };
+            }
+
             return await appendSignalInTransaction({
               signalName: String(signalName),
               payload: signal,
@@ -1666,7 +1683,6 @@ function openDatabaseLedgerEngine<
         if (active === undefined) {
           return {
             durableEvents: 0,
-            signalEvents: [],
           };
         }
 
@@ -1754,15 +1770,12 @@ function openDatabaseLedgerEngine<
 
         return {
           durableEvents: createdDurableCount,
-          signalEvents: [],
         };
       });
 
       if (emitted.durableEvents > 0) {
         notifyEventWaiters();
       }
-
-      notifySignalObservers(emitted.signalEvents);
 
       scheduleDispatchAt(clock.nowMs());
     } finally {
