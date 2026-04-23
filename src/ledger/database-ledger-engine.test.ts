@@ -479,7 +479,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
       },
       queues: {
         "response.run": async ({ work, actions }) => {
-          actions.emitSignal(
+          await actions.emitSignal(
             "response.delta",
             {
               id: work.payload.id,
@@ -590,6 +590,82 @@ test("signals materialize signal work and are pruned after ack", async () => {
   assert.equal(observedSignals.length, 1);
 });
 
+test("queue handlers publish signals immediately before handler completion", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const gate = Promise.withResolvers<void>();
+  let observerCount = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "response.generate": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    signals: {
+      "response.delta": Type.Object({
+        id: Type.Number(),
+        seq: Type.Number(),
+      }),
+    },
+    queues: {
+      "response.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    signalQueues: {},
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "response.generate": ({ event, actions }) => {
+          actions.enqueue("response.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "response.run": async ({ work, actions }) => {
+          await actions.emitSignal("response.delta", {
+            id: work.payload.id,
+            seq: 1,
+          });
+
+          await gate.promise;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  const subscription = ledger.onSignal("response.delta", () => {
+    observerCount += 1;
+  });
+
+  await ledger.emit("response.generate", { id: 1 });
+  await waitFor(runtime, () => observerCount === 1);
+
+  gate.resolve();
+  await waitFor(
+    runtime,
+    () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+  );
+
+  subscription[Symbol.dispose]();
+});
+
 test("signal retry keeps signal event until signal work acks", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
@@ -631,7 +707,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
       },
       queues: {
         "response.run": async ({ work, actions }) => {
-          actions.emitSignal("response.delta", {
+          await actions.emitSignal("response.delta", {
             id: work.payload.id,
             seq: 1,
           });
