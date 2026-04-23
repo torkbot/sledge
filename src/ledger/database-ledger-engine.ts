@@ -1566,32 +1566,44 @@ function openDatabaseLedgerEngine<
           });
         },
         emitSignal: async (signalName, signal, options) => {
-          const appended = await runInTransaction(async () => {
-            const active = await database
-              .prepare(
-                `SELECT work_id
-                 FROM work
-                 WHERE work_id = ?
-                   AND lease_id = ?
-                   AND dead = 0`,
-              )
-              .get(claimed.workId, claimed.leaseId);
+          type ImmediateSignalEmission = {
+            readonly created: boolean;
+            readonly event: EventEnvelope<TSignals, keyof TSignals> | null;
+          };
 
-            if (active === undefined) {
+          const appended = await runInTransaction(
+            async (): Promise<ImmediateSignalEmission> => {
+              const active = await database
+                .prepare(
+                  `SELECT work_id
+                   FROM work
+                   WHERE work_id = ?
+                     AND lease_id = ?
+                     AND dead = 0`,
+                )
+                .get(claimed.workId, claimed.leaseId);
+
+              if (active === undefined) {
+                return {
+                  created: false,
+                  event: null,
+                };
+              }
+
+              const result = await appendSignalInTransaction({
+                signalName: String(signalName),
+                payload: signal,
+                nowMs: clock.nowMs(),
+                dedupeKey: options?.dedupeKey,
+                causationEventId: claimed.sourceEventId,
+              });
+
               return {
-                event: null,
-                created: false,
+                created: result.created,
+                event: result.event,
               };
-            }
-
-            return await appendSignalInTransaction({
-              signalName: String(signalName),
-              payload: signal,
-              nowMs: clock.nowMs(),
-              dedupeKey: options?.dedupeKey,
-              causationEventId: claimed.sourceEventId,
-            });
-          });
+            },
+          );
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
