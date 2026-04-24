@@ -1,6 +1,6 @@
 {
   "name": "@torkbot/sledge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": false,
   "type": "module",
   "description": "A SQLite-backed event and work engine that stays consistent across retries, restarts, and failures.",
@@ -49,9 +49,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc --project tsconfig.build.json --pretty",
+    "build": "rm -rf dist && tsgo --project tsconfig.build.json --pretty",
     "test": "node --test src/**/*.test.ts",
-    "typecheck": "tsc --noEmit --pretty",
+    "typecheck": "tsgo --noEmit --pretty",
     "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/**/*.ts",
     "prepublishOnly": "node --run build"
   },
@@ -64,8 +64,8 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.12.0",
-    "prettier": "^3.8.1",
-    "typescript": "^5.9.3"
+    "@typescript/native-preview": "7.0.0-dev.20260423.1",
+    "prettier": "^3.8.1"
   },
   "engines": {
     "node": ">=24.0.0"
