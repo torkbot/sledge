@@ -1,6 +1,6 @@
 {
   "name": "@torkbot/sledge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": false,
   "type": "module",
   "description": "A SQLite-backed event and work engine that stays consistent across retries, restarts, and failures.",
@@ -56,10 +56,10 @@
     "prepublishOnly": "node --run build"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.48",
     "@tursodatabase/database": "^0.5.1",
     "better-sqlite3": "^12.6.2",
-    "sqids": "0.3.0"
+    "sqids": "0.3.0",
+    "typebox": "^1.1.33"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
