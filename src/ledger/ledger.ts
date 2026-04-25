@@ -1,4 +1,4 @@
-import type { Static, TSchema } from "@sinclair/typebox";
+import type { Static, TSchema } from "typebox";
 
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 

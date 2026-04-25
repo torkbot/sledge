@@ -37,7 +37,7 @@ Use `@torkbot/sledge` when you want:
 
 ```ts
 import Database from "better-sqlite3";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 import {
   bindLedgerModel,
@@ -50,6 +50,8 @@ import {
   SystemRuntimeClock,
 } from "@torkbot/sledge/runtime/node-runtime";
 
+// Sledge schemas should describe JSON-compatible values. TypeBox codecs that
+// transform between distinct runtime and storage domains are not supported.
 const definedModel = defineLedgerModel({
   events: {
     "user.created": Type.Object({
