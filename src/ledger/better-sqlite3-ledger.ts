@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { TSchema } from "@sinclair/typebox";
+import type { TSchema } from "typebox";
 
 import type {
   Ledger,
