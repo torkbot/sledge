@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0
+
 - Simplify model registration to a single typed object keyed by event/signal/queue names
 
   `register` now accepts an object with optional `events`, `signals`, `queues`, and `signalQueues` maps. Event registration handlers now own both projection (`actions.index(...)`) and durable work materialization (`actions.enqueue(...)`) for each event. This removes the previous builder-style API (`project`, `materialize`, `materializeSignal`, `handle`, `handleSignal`) and enforces one handler per key.
@@ -13,6 +15,14 @@
 - Add query access to event registration handlers
 
   Event handlers can now call `actions.query(...)` in addition to `actions.index(...)` and `actions.enqueue(...)`, enabling event-time branching based on read-side state.
+
+- Publish queue-emitted signals immediately while preserving lease ownership
+
+  `QueueActions.emitSignal(...)` now appends and notifies observers immediately in its own transaction instead of staging signal publication until the durable queue handler completes. Immediate publication is guarded by the active `(work_id, lease_id)` so stale or lost-lease handlers cannot publish signals.
+
+- Use TypeScript native preview for package typecheck and build
+
+  The package scripts now run `tsgo` from `@typescript/native-preview` for `typecheck` and `build`.
 
 ## 0.3.0
 
