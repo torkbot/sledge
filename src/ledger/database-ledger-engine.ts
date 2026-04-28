@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 
-import { Type, type Static, type TSchema } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
+import { Type, type Static, type TSchema } from "typebox";
+
+import { Value } from "typebox/value";
 import Sqids from "sqids";
 import type {
   BoundLedgerModel,
@@ -309,7 +310,17 @@ function decodeRow<const TSchemaDef extends TSchema>(
   row: StorageRow,
   schema: TSchemaDef,
 ): Static<TSchemaDef> {
-  return Value.Decode(schema, row);
+  return decodeValue(schema, row);
+}
+
+function decodeValue<const TSchemaDef extends TSchema>(
+  schema: TSchemaDef,
+  value: unknown,
+): Static<TSchemaDef> {
+  // Sledge schemas are JSON-compatible. TypeBox v1's Static is the encoded
+  // side for codec schemas, but distinct codec domains are intentionally not
+  // part of this API contract.
+  return Value.Decode(schema, value) as Static<TSchemaDef>;
 }
 
 function readEventEnvelopeFromRow<
@@ -329,7 +340,7 @@ function readEventEnvelopeFromRow<
     throw new Error(`unknown event name in event row: ${String(eventName)}`);
   }
 
-  const payload = Value.Decode(
+  const payload = decodeValue(
     eventSchema,
     parseJson(decodedRow.payload_json, "events.payload_json"),
   );
@@ -545,7 +556,7 @@ function openDatabaseLedgerEngine<
       throw new Error(`unknown event name: ${String(eventName)}`);
     }
 
-    return Value.Decode(schema, payload);
+    return decodeValue(schema, payload);
   }
 
   function decodeSignalPayload<const TSignalName extends keyof TSignals>(
@@ -558,7 +569,7 @@ function openDatabaseLedgerEngine<
       throw new Error(`unknown signal name: ${String(signalName)}`);
     }
 
-    return Value.Decode(schema, payload);
+    return decodeValue(schema, payload);
   }
 
   async function runQuery<const TQueryName extends keyof TQueries>(
@@ -577,12 +588,10 @@ function openDatabaseLedgerEngine<
       throw new Error(`missing query implementation: ${String(queryName)}`);
     }
 
-    const decodedParams = Value.Decode(schema.params, params);
-    const encodedParams = Value.Encode(schema.params, decodedParams);
-    const canonicalParams = Value.Decode(schema.params, encodedParams);
+    const decodedParams = decodeValue(schema.params, params);
 
-    const rawResult = await implementation(canonicalParams as never);
-    const decodedResult = Value.Decode(schema.result, rawResult);
+    const rawResult = await implementation(decodedParams as never);
+    const decodedResult = decodeValue(schema.result, rawResult);
 
     return decodedResult as never;
   }
@@ -594,16 +603,9 @@ function openDatabaseLedgerEngine<
     created: boolean;
   }> {
     const eventName = eventInput.eventName as keyof TEvents;
-    const eventSchema = model.events[eventName];
-
-    if (eventSchema === undefined) {
-      throw new Error(`unknown event name: ${eventInput.eventName}`);
-    }
-
     const decodedPayload = decodeEventPayload(eventName, eventInput.payload);
-    const encodedPayload = Value.Encode(eventSchema, decodedPayload);
 
-    const payloadJson = JSON.stringify(encodedPayload);
+    const payloadJson = JSON.stringify(decodedPayload);
 
     let created = false;
     let eventId = 0;
@@ -699,11 +701,9 @@ function openDatabaseLedgerEngine<
               );
             }
 
-            const decodedInput = Value.Decode(schema, indexInput);
-            const encodedInput = Value.Encode(schema, decodedInput);
-            const canonicalInput = Value.Decode(schema, encodedInput);
+            const decodedInput = decodeValue(schema, indexInput);
 
-            await implementation(canonicalInput as never);
+            await implementation(decodedInput as never);
           },
           enqueue: (queueName, payload, options) => {
             const queueSchema = model.queues[queueName as keyof TQueues];
@@ -712,15 +712,11 @@ function openDatabaseLedgerEngine<
               throw new Error(`unknown queue: ${String(queueName)}`);
             }
 
-            const decodedQueuePayload = Value.Decode(queueSchema, payload);
-            const encodedQueuePayload = Value.Encode(
-              queueSchema,
-              decodedQueuePayload,
-            );
+            const decodedQueuePayload = decodeValue(queueSchema, payload);
 
             queued.push({
               queueName: String(queueName),
-              payload: encodedQueuePayload,
+              payload: decodedQueuePayload,
               availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
             });
           },
@@ -770,15 +766,8 @@ function openDatabaseLedgerEngine<
     event: EventEnvelope<TSignals, keyof TSignals> | null;
   }> {
     const signalName = signalInput.signalName as keyof TSignals;
-    const signalSchema = model.signals[signalName];
-
-    if (signalSchema === undefined) {
-      throw new Error(`unknown signal name: ${signalInput.signalName}`);
-    }
-
     const decodedPayload = decodeSignalPayload(signalName, signalInput.payload);
-    const encodedPayload = Value.Encode(signalSchema, decodedPayload);
-    const payloadJson = JSON.stringify(encodedPayload);
+    const payloadJson = JSON.stringify(decodedPayload);
 
     let created = false;
     let eventId = 0;
@@ -867,15 +856,11 @@ function openDatabaseLedgerEngine<
               throw new Error(`unknown signal queue: ${String(queueName)}`);
             }
 
-            const decodedQueuePayload = Value.Decode(queueSchema, payload);
-            const encodedQueuePayload = Value.Encode(
-              queueSchema,
-              decodedQueuePayload,
-            );
+            const decodedQueuePayload = decodeValue(queueSchema, payload);
 
             queued.push({
               queueName: String(queueName),
-              payload: encodedQueuePayload,
+              payload: decodedQueuePayload,
               availableAtMs: options?.availableAtMs ?? signalInput.nowMs,
             });
           },
@@ -1527,7 +1512,7 @@ function openDatabaseLedgerEngine<
         throw new Error(`unknown queue schema for ${claimed.queueName}`);
       }
 
-      const decodedPayload = Value.Decode(
+      const decodedPayload = decodeValue(
         queueSchema,
         parseJson(claimed.payloadJson, "work.payload_json"),
       );

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Replace `@sinclair/typebox` with `typebox` for JSON-compatible schema construction and runtime validation.
+
 ## 0.4.0
 
 - Simplify model registration to a single typed object keyed by event/signal/queue names
