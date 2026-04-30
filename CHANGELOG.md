@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0
+
 - Breaking: ledgers and storage adapters no longer own the underlying database
   handle lifecycle. Callers that open a database must close it after closing any
   workers and the ledger.
@@ -10,6 +12,8 @@
   disposable worker handle. `ledger.close()` no longer closes the underlying
   database handle, so applications must close their DB connections
   separately.
+- Reject concurrent worker handles for the same ledger instance so queue
+  execution has one explicit lifecycle owner at a time.
 
 ## 0.5.0
 
