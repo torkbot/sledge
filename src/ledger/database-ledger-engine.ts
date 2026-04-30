@@ -73,15 +73,6 @@ export interface StorageDatabase {
   exec(sql: string): Promise<void>;
 
   prepare(sql: string): StorageStatement;
-
-  /**
-   * Optional storage-level close hook.
-   *
-   * The ledger engine does not own the database lifecycle and intentionally
-   * does not call this. Callers that open the database are responsible for
-   * closing it when appropriate for their process.
-   */
-  close(): Promise<void>;
 }
 
 type OpenDatabaseLedgerEngineInput<
@@ -1927,26 +1918,24 @@ function openDatabaseLedgerEngine<
     worker.leaseHeartbeatTasks.clear();
     worker.leaseAbortControllers.clear();
 
-    if (leaseIds.length === 0) {
-      return;
+    if (leaseIds.length > 0) {
+      const leaseIdPlaceholders = leaseIds.map(() => "?").join(", ");
+
+      await runInTransaction(async () => {
+        await database
+          .prepare(
+            `UPDATE work
+             SET
+               lease_id = NULL,
+               lease_acquired_at_ms = NULL,
+               lease_expires_at_ms = NULL,
+               available_at_ms = ?
+             WHERE dead = 0
+               AND lease_id IN (${leaseIdPlaceholders})`,
+          )
+          .run(clock.nowMs(), ...leaseIds);
+      });
     }
-
-    const leaseIdPlaceholders = leaseIds.map(() => "?").join(", ");
-
-    await runInTransaction(async () => {
-      await database
-        .prepare(
-          `UPDATE work
-           SET
-             lease_id = NULL,
-             lease_acquired_at_ms = NULL,
-             lease_expires_at_ms = NULL,
-             available_at_ms = ?
-           WHERE dead = 0
-             AND lease_id IN (${leaseIdPlaceholders})`,
-        )
-        .run(clock.nowMs(), ...leaseIds);
-    });
 
     if (dispatchLoopFailure !== null) {
       throw dispatchLoopFailure;

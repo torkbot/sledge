@@ -115,8 +115,5 @@ function wrapBetterSqliteDatabase(
         },
       };
     },
-    close: async () => {
-      database.close();
-    },
   };
 }

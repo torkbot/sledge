@@ -205,9 +205,6 @@ function wrapBetterSqliteDatabase(
         },
       };
     },
-    close: async () => {
-      database.close();
-    },
   };
 }
 
@@ -284,7 +281,6 @@ test("closing workers during a pending claim releases the claimed work", async (
 
   const blockingStorage: StorageDatabase = {
     exec: storage.exec,
-    close: storage.close,
     prepare: (sql): StorageStatement => {
       const statement = storage.prepare(sql);
 

@@ -109,8 +109,5 @@ function wrapTursoPromiseDatabase(database: Database): StorageDatabase {
         },
       };
     },
-    close: async () => {
-      await database.close();
-    },
   };
 }

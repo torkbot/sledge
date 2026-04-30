@@ -142,6 +142,8 @@ await ledger.emit("user.created", {
   userId: "u_123",
   email: "alice@example.com",
 });
+
+db.close();
 ```
 
 ---

@@ -613,9 +613,6 @@ export interface LedgerEngineFactory {
       TSignalQueues
     >;
     readonly timing: LedgerTiming;
-    readonly leaseMs?: number;
-    readonly defaultRetryDelayMs?: number;
-    readonly maxInFlight?: number;
     readonly maxBusyRetries?: number;
     readonly maxBusyRetryDelayMs?: number;
   }): Ledger<TEvents, TQueries, TSignals>;
@@ -639,18 +636,12 @@ export function createLedger<
   >;
   readonly engineFactory: LedgerEngineFactory;
   readonly timing: LedgerTiming;
-  readonly leaseMs?: number;
-  readonly defaultRetryDelayMs?: number;
-  readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 }): Ledger<TEvents, TQueries, TSignals> {
   return input.engineFactory.openLedger({
     boundModel: input.boundModel,
     timing: input.timing,
-    leaseMs: input.leaseMs,
-    defaultRetryDelayMs: input.defaultRetryDelayMs,
-    maxInFlight: input.maxInFlight,
     maxBusyRetries: input.maxBusyRetries,
     maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   });
