@@ -162,6 +162,69 @@ async function settlesWithin<T>(
   }
 }
 
+test("ledger construction and emit do not start queue workers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let processed = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": () => {
+          processed += 1;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await runtime.flush();
+  await runtime.advanceByMs(1_000);
+
+  assert.equal(processed, 0);
+  assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
+
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await waitFor(runtime, () => processed === 1);
+  await waitFor(
+    runtime,
+    () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+  );
+});
+
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
@@ -216,8 +279,10 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
     maxInFlight: 2,
   });
 
@@ -307,8 +372,10 @@ test("deduped emit does not replay projections or materialization", async () => 
       }),
       timing: {
         clock: runtime.clock,
-        scheduler: runtime.scheduler,
       },
+    });
+    await using workers = await ledger.startWorkers({
+      scheduler: runtime.scheduler,
     });
 
     await ledger.emit(
@@ -392,8 +459,10 @@ test("event handlers can query to drive enqueue decisions", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   await ledger.emit("job.requested", { id: 1 });
@@ -519,8 +588,10 @@ test("signals materialize signal work and are pruned after ack", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   const observedSignals: Array<{ id: number; seq: number }> = [];
@@ -646,8 +717,10 @@ test("queue handlers publish signals immediately before handler completion", asy
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   const subscription = ledger.onSignal("response.delta", () => {
@@ -743,8 +816,10 @@ test("signal retry keeps signal event until signal work acks", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   await ledger.emit("response.generate", { id: 1 });
@@ -812,7 +887,6 @@ test("emit retries SQLITE_BUSY transaction conflicts", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -880,7 +954,6 @@ test("emit fails fast when busy retries are disabled", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
     maxBusyRetries: 0,
   });
@@ -961,7 +1034,6 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -1018,7 +1090,6 @@ test("tailEvents yields last N events then follows new events", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -1092,7 +1163,6 @@ test("resumeEvents continues from opaque cursor", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -1186,7 +1256,6 @@ test("tail iterator return stops stream without external abort", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 

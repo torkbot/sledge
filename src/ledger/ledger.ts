@@ -370,6 +370,19 @@ export interface Ledger<
     readonly signal: AbortSignal;
   }): AsyncIterable<LedgerStreamEvent<TEvents>>;
 
+  startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
+
+  close(): Promise<void>;
+}
+
+export type LedgerWorkerOptions = {
+  readonly scheduler: RuntimeScheduler;
+  readonly leaseMs?: number;
+  readonly defaultRetryDelayMs?: number;
+  readonly maxInFlight?: number;
+};
+
+export interface LedgerWorkers extends AsyncDisposable {
   close(): Promise<void>;
 }
 
@@ -378,7 +391,6 @@ export interface Ledger<
  */
 export type LedgerTiming = {
   readonly clock: RuntimeClock;
-  readonly scheduler: RuntimeScheduler;
 };
 
 /**

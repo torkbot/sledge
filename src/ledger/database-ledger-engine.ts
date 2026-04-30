@@ -11,6 +11,8 @@ import type {
   LedgerCursor,
   LedgerStreamEvent,
   LedgerTiming,
+  LedgerWorkerOptions,
+  LedgerWorkers,
   QuerySchema,
   QueueActions,
   QueueHandlerControl,
@@ -93,9 +95,6 @@ type OpenDatabaseLedgerEngineInput<
   >;
   readonly timing: LedgerTiming;
   readonly database: StorageDatabase;
-  readonly leaseMs?: number;
-  readonly defaultRetryDelayMs?: number;
-  readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 };
@@ -118,9 +117,6 @@ export type CreateDatabaseLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly leaseMs?: number;
-  readonly defaultRetryDelayMs?: number;
-  readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 };
@@ -146,9 +142,6 @@ export function createDatabaseLedger<
     boundModel: input.boundModel,
     timing: input.timing,
     database: input.database,
-    leaseMs: input.leaseMs,
-    defaultRetryDelayMs: input.defaultRetryDelayMs,
-    maxInFlight: input.maxInFlight,
     maxBusyRetries: input.maxBusyRetries,
     maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   });
@@ -373,22 +366,12 @@ function openDatabaseLedgerEngine<
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
-  const scheduler = input.timing.scheduler;
   const database = input.database;
   const model = input.boundModel.model;
   const implementations = input.boundModel.implementations;
   const registration = input.boundModel.register;
-  const leaseMs = input.leaseMs ?? 1_000;
-  const defaultRetryDelayMs = input.defaultRetryDelayMs ?? 1_000;
-  const maxInFlight = input.maxInFlight ?? 16;
   const maxBusyRetries = input.maxBusyRetries ?? 8;
   const maxBusyRetryDelayMs = input.maxBusyRetryDelayMs ?? 50;
-
-  if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
-    throw new Error(
-      `maxInFlight must be a positive integer, received ${maxInFlight}`,
-    );
-  }
 
   if (!Number.isInteger(maxBusyRetries) || maxBusyRetries < 0) {
     throw new Error(
@@ -403,17 +386,27 @@ function openDatabaseLedgerEngine<
   }
 
   let closed = false;
-  let dispatchLoopActive = false;
-  let dispatchLoopQueued = false;
-  let scheduledDispatch: { dueAtMs: number; cancel(): void } | null = null;
-  const inFlight = new Set<Promise<void>>();
-  const leaseAbortControllers = new Map<string, AbortController>();
-  const leaseExpiryTasks = new Map<string, { cancel(): void }>();
-  const leaseHeartbeatTasks = new Map<string, { cancel(): void }>();
+  const activeWorkers = new Set<WorkerRuntimeState>();
   const eventWaiters = new Set<() => void>();
   type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
+
+  type WorkerRuntimeState = {
+    readonly scheduler: LedgerWorkerOptions["scheduler"];
+    readonly leaseMs: number;
+    readonly defaultRetryDelayMs: number;
+    readonly maxInFlight: number;
+    readonly inFlight: Set<Promise<void>>;
+    readonly leaseAbortControllers: Map<string, AbortController>;
+    readonly leaseExpiryTasks: Map<string, { cancel(): void }>;
+    readonly leaseHeartbeatTasks: Map<string, { cancel(): void }>;
+    closed: boolean;
+    dispatchLoopActive: boolean;
+    dispatchLoopQueued: boolean;
+    dispatchLoopSettled: Promise<void> | null;
+    scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
+  };
 
   let mutationTail: Promise<void> = Promise.resolve();
 
@@ -452,9 +445,6 @@ function openDatabaseLedgerEngine<
 
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
-
-    await releaseExpiredLeases();
-    await scheduleNextDispatchFromStore();
   })();
 
   async function ensureColumn(
@@ -925,30 +915,38 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  function scheduleDispatchAt(targetAtMs: number): void {
-    if (closed) {
+  function scheduleDispatchAt(
+    worker: WorkerRuntimeState,
+    targetAtMs: number,
+  ): void {
+    if (closed || worker.closed) {
       return;
     }
 
-    if (scheduledDispatch !== null && scheduledDispatch.dueAtMs <= targetAtMs) {
+    if (
+      worker.scheduledDispatch !== null &&
+      worker.scheduledDispatch.dueAtMs <= targetAtMs
+    ) {
       return;
     }
 
-    scheduledDispatch?.cancel();
+    worker.scheduledDispatch?.cancel();
 
     const delayMs = Math.max(0, targetAtMs - clock.nowMs());
-    const task = scheduler.scheduleOnce(delayMs, () => {
-      scheduledDispatch = null;
-      requestDispatchRun();
+    const task = worker.scheduler.scheduleOnce(delayMs, () => {
+      worker.scheduledDispatch = null;
+      requestDispatchRun(worker);
     });
 
-    scheduledDispatch = {
+    worker.scheduledDispatch = {
       dueAtMs: clock.nowMs() + delayMs,
       cancel: () => task.cancel(),
     };
   }
 
-  async function scheduleNextDispatchFromStore(): Promise<void> {
+  async function scheduleNextDispatchFromStore(
+    worker: WorkerRuntimeState,
+  ): Promise<void> {
     const row = await database
       .prepare(
         `SELECT available_at_ms
@@ -964,7 +962,10 @@ function openDatabaseLedgerEngine<
       return;
     }
 
-    scheduleDispatchAt(decodeRow(row, AvailableAtRowSchema).available_at_ms);
+    scheduleDispatchAt(
+      worker,
+      decodeRow(row, AvailableAtRowSchema).available_at_ms,
+    );
   }
 
   function notifyEventWaiters(): void {
@@ -1224,7 +1225,9 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  async function claimNextDueWork(): Promise<PersistedWorkLease | null> {
+  async function claimNextDueWork(
+    worker: WorkerRuntimeState,
+  ): Promise<PersistedWorkLease | null> {
     return await runInTransaction(async () => {
       const nowMs = clock.nowMs();
 
@@ -1246,7 +1249,7 @@ function openDatabaseLedgerEngine<
 
       const candidateWorkId = decodeRow(candidate, WorkIdRowSchema).work_id;
       const leaseId = randomUUID();
-      const leaseExpiresAtMs = nowMs + leaseMs;
+      const leaseExpiresAtMs = nowMs + worker.leaseMs;
 
       const updateResult = await database
         .prepare(
@@ -1314,40 +1317,48 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  function requestDispatchRun(): void {
-    if (closed) {
+  function requestDispatchRun(worker: WorkerRuntimeState): void {
+    if (closed || worker.closed) {
       return;
     }
 
-    if (dispatchLoopActive) {
-      dispatchLoopQueued = true;
+    if (worker.dispatchLoopActive) {
+      worker.dispatchLoopQueued = true;
       return;
     }
 
-    dispatchLoopActive = true;
+    worker.dispatchLoopActive = true;
 
-    void runDispatchLoop().finally(() => {
-      dispatchLoopActive = false;
+    const dispatchLoopSettled = runDispatchLoop(worker).finally(() => {
+      worker.dispatchLoopActive = false;
+      worker.dispatchLoopSettled = null;
 
-      if (dispatchLoopQueued && !closed) {
-        dispatchLoopQueued = false;
-        requestDispatchRun();
+      if (worker.dispatchLoopQueued && !closed && !worker.closed) {
+        worker.dispatchLoopQueued = false;
+        requestDispatchRun(worker);
       }
     });
+    worker.dispatchLoopSettled = dispatchLoopSettled;
+
+    void dispatchLoopSettled;
   }
 
-  async function runDispatchLoop(): Promise<void> {
+  async function runDispatchLoop(worker: WorkerRuntimeState): Promise<void> {
     await startup;
 
-    if (closed) {
+    if (closed || worker.closed) {
       return;
     }
 
-    while (!closed && inFlight.size < maxInFlight) {
-      const claimed = await claimNextDueWork();
+    while (
+      !closed &&
+      !worker.closed &&
+      worker.inFlight.size < worker.maxInFlight
+    ) {
+      const claimed = await claimNextDueWork(worker);
 
       if (claimed === null) {
-        await scheduleNextDispatchFromStore();
+        await scheduleNextDispatchFromStore(worker);
         return;
       }
 
@@ -1379,29 +1390,30 @@ function openDatabaseLedgerEngine<
         continue;
       }
 
-      const run = processClaimedWork(claimed, handler).finally(() => {
-        inFlight.delete(run);
-        requestDispatchRun();
+      const run = processClaimedWork(worker, claimed, handler).finally(() => {
+        worker.inFlight.delete(run);
+        requestDispatchRun(worker);
       });
 
-      inFlight.add(run);
+      worker.inFlight.add(run);
     }
   }
 
   async function processClaimedWork(
+    worker: WorkerRuntimeState,
     claimed: PersistedWorkLease,
     handler:
       | QueueHandlerFunction<any, any, any, any, any>
       | SignalQueueHandlerFunction<any, any, any>,
   ): Promise<void> {
     const leaseAbortController = new AbortController();
-    leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
+    worker.leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
 
     let currentLeaseExpiresAtMs = claimed.leaseExpiresAtMs;
 
     const clearLeaseHeartbeat = (): void => {
-      leaseHeartbeatTasks.get(claimed.leaseId)?.cancel();
-      leaseHeartbeatTasks.delete(claimed.leaseId);
+      worker.leaseHeartbeatTasks.get(claimed.leaseId)?.cancel();
+      worker.leaseHeartbeatTasks.delete(claimed.leaseId);
     };
 
     const releaseLeaseInStore = async (): Promise<void> => {
@@ -1429,29 +1441,29 @@ function openDatabaseLedgerEngine<
     };
 
     const scheduleLeaseExpiry = (): void => {
-      leaseExpiryTasks.get(claimed.leaseId)?.cancel();
+      worker.leaseExpiryTasks.get(claimed.leaseId)?.cancel();
 
       const delayMs = Math.max(0, currentLeaseExpiresAtMs - clock.nowMs());
-      const expiryTask = scheduler.scheduleOnce(delayMs, () => {
+      const expiryTask = worker.scheduler.scheduleOnce(delayMs, () => {
         abortLease("lease expired");
         clearLeaseHeartbeat();
 
         void releaseLeaseInStore().then(
           () => {
-            scheduleDispatchAt(clock.nowMs());
+            scheduleDispatchAt(worker, clock.nowMs());
           },
           () => undefined,
         );
       });
 
-      leaseExpiryTasks.set(claimed.leaseId, {
+      worker.leaseExpiryTasks.set(claimed.leaseId, {
         cancel: () => expiryTask.cancel(),
       });
     };
 
     const renewLease = async (): Promise<void> => {
       const nowMs = clock.nowMs();
-      const renewedLeaseExpiresAtMs = nowMs + leaseMs;
+      const renewedLeaseExpiresAtMs = nowMs + worker.leaseMs;
 
       const renewal = await runInTransaction(async () => {
         return await database
@@ -1475,12 +1487,12 @@ function openDatabaseLedgerEngine<
     };
 
     const startLeaseHeartbeat = (): void => {
-      if (leaseHeartbeatTasks.has(claimed.leaseId)) {
+      if (worker.leaseHeartbeatTasks.has(claimed.leaseId)) {
         return;
       }
 
-      const heartbeatEveryMs = Math.max(1, Math.floor(leaseMs / 3));
-      const heartbeatTask = scheduler.scheduleRepeating(
+      const heartbeatEveryMs = Math.max(1, Math.floor(worker.leaseMs / 3));
+      const heartbeatTask = worker.scheduler.scheduleRepeating(
         heartbeatEveryMs,
         () => {
           if (leaseAbortController.signal.aborted) {
@@ -1495,7 +1507,7 @@ function openDatabaseLedgerEngine<
         },
       );
 
-      leaseHeartbeatTasks.set(claimed.leaseId, {
+      worker.leaseHeartbeatTasks.set(claimed.leaseId, {
         cancel: () => heartbeatTask.cancel(),
       });
     };
@@ -1592,7 +1604,7 @@ function openDatabaseLedgerEngine<
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
-            scheduleDispatchAt(clock.nowMs());
+            scheduleDispatchAt(worker, clock.nowMs());
           }
         },
         query: async (queryName, params) => {
@@ -1740,7 +1752,8 @@ function openDatabaseLedgerEngine<
                    AND dead = 0`,
               )
               .run(
-                disposition.retryAtMs ?? clock.nowMs() + defaultRetryDelayMs,
+                disposition.retryAtMs ??
+                  clock.nowMs() + worker.defaultRetryDelayMs,
                 disposition.error,
                 claimed.workId,
                 claimed.leaseId,
@@ -1774,12 +1787,67 @@ function openDatabaseLedgerEngine<
         notifyEventWaiters();
       }
 
-      scheduleDispatchAt(clock.nowMs());
+      scheduleDispatchAt(worker, clock.nowMs());
     } finally {
       clearLeaseHeartbeat();
-      leaseExpiryTasks.get(claimed.leaseId)?.cancel();
-      leaseExpiryTasks.delete(claimed.leaseId);
-      leaseAbortControllers.delete(claimed.leaseId);
+      worker.leaseExpiryTasks.get(claimed.leaseId)?.cancel();
+      worker.leaseExpiryTasks.delete(claimed.leaseId);
+      worker.leaseAbortControllers.delete(claimed.leaseId);
+    }
+  }
+
+  async function closeWorker(
+    worker: WorkerRuntimeState,
+    reason: string,
+  ): Promise<void> {
+    if (worker.closed) {
+      return;
+    }
+
+    worker.closed = true;
+    activeWorkers.delete(worker);
+
+    worker.scheduledDispatch?.cancel();
+    worker.scheduledDispatch = null;
+
+    const leaseIds = [...worker.leaseAbortControllers.keys()];
+
+    for (const expiryTask of worker.leaseExpiryTasks.values()) {
+      expiryTask.cancel();
+    }
+
+    worker.leaseExpiryTasks.clear();
+
+    for (const heartbeatTask of worker.leaseHeartbeatTasks.values()) {
+      heartbeatTask.cancel();
+    }
+
+    worker.leaseHeartbeatTasks.clear();
+
+    for (const controller of worker.leaseAbortControllers.values()) {
+      controller.abort(new Error(reason));
+    }
+
+    worker.leaseAbortControllers.clear();
+
+    await worker.dispatchLoopSettled;
+    await Promise.allSettled(worker.inFlight);
+
+    for (const leaseId of leaseIds) {
+      await runInTransaction(async () => {
+        await database
+          .prepare(
+            `UPDATE work
+             SET
+               lease_id = NULL,
+               lease_acquired_at_ms = NULL,
+               lease_expires_at_ms = NULL,
+               available_at_ms = ?
+             WHERE dead = 0
+               AND lease_id = ?`,
+          )
+          .run(clock.nowMs(), leaseId);
+      });
     }
   }
 
@@ -1791,44 +1859,13 @@ function openDatabaseLedgerEngine<
     closed = true;
     notifyEventWaiters();
 
-    scheduledDispatch?.cancel();
-    scheduledDispatch = null;
+    await Promise.allSettled(
+      [...activeWorkers].map(async (worker) => {
+        await closeWorker(worker, "ledger closed");
+      }),
+    );
 
-    for (const expiryTask of leaseExpiryTasks.values()) {
-      expiryTask.cancel();
-    }
-
-    leaseExpiryTasks.clear();
-
-    for (const heartbeatTask of leaseHeartbeatTasks.values()) {
-      heartbeatTask.cancel();
-    }
-
-    leaseHeartbeatTasks.clear();
-
-    for (const controller of leaseAbortControllers.values()) {
-      controller.abort(new Error("ledger closed"));
-    }
-
-    leaseAbortControllers.clear();
     signalObserversByName.clear();
-
-    await Promise.allSettled(inFlight);
-
-    await runInTransaction(async () => {
-      await database
-        .prepare(
-          `UPDATE work
-           SET
-             lease_id = NULL,
-             lease_acquired_at_ms = NULL,
-             lease_expires_at_ms = NULL,
-             available_at_ms = ?
-           WHERE dead = 0
-             AND lease_id IS NOT NULL`,
-        )
-        .run(clock.nowMs());
-    });
   }
 
   const ledger: Ledger<TEvents, TQueries, TSignals> = {
@@ -1848,7 +1885,9 @@ function openDatabaseLedgerEngine<
 
       if (result.created) {
         notifyEventWaiters();
-        scheduleDispatchAt(clock.nowMs());
+        for (const worker of activeWorkers) {
+          scheduleDispatchAt(worker, clock.nowMs());
+        }
       }
     },
     query: async (queryName, params) => {
@@ -1956,6 +1995,59 @@ function openDatabaseLedgerEngine<
             closeReason: "resume iterator closed",
           });
         },
+      };
+    },
+    startWorkers: async (options): Promise<LedgerWorkers> => {
+      await startup;
+
+      if (closed) {
+        throw new Error("cannot start workers after ledger is closed");
+      }
+
+      const leaseMs = options.leaseMs ?? 1_000;
+      const defaultRetryDelayMs = options.defaultRetryDelayMs ?? 1_000;
+      const maxInFlight = options.maxInFlight ?? 16;
+
+      if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
+        throw new Error(
+          `maxInFlight must be a positive integer, received ${maxInFlight}`,
+        );
+      }
+
+      const worker: WorkerRuntimeState = {
+        scheduler: options.scheduler,
+        leaseMs,
+        defaultRetryDelayMs,
+        maxInFlight,
+        inFlight: new Set(),
+        leaseAbortControllers: new Map(),
+        leaseExpiryTasks: new Map(),
+        leaseHeartbeatTasks: new Map(),
+        closed: false,
+        dispatchLoopActive: false,
+        dispatchLoopQueued: false,
+        dispatchLoopSettled: null,
+        scheduledDispatch: null,
+      };
+
+      activeWorkers.add(worker);
+
+      await releaseExpiredLeases();
+      await scheduleNextDispatchFromStore(worker);
+
+      let disposed = false;
+      const closeHandle = async (): Promise<void> => {
+        if (disposed) {
+          return;
+        }
+
+        disposed = true;
+        await closeWorker(worker, "ledger workers closed");
+      };
+
+      return {
+        close: closeHandle,
+        [Symbol.asyncDispose]: closeHandle,
       };
     },
     close,

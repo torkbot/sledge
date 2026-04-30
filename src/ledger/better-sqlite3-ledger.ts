@@ -34,9 +34,6 @@ type CreateBetterSqliteLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly leaseMs?: number;
-  readonly defaultRetryDelayMs?: number;
-  readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 };
@@ -69,9 +66,6 @@ export function createBetterSqliteLedger<
     database: wrapBetterSqliteDatabase(input.database),
     boundModel: input.boundModel,
     timing: input.timing,
-    leaseMs: input.leaseMs,
-    defaultRetryDelayMs: input.defaultRetryDelayMs,
-    maxInFlight: input.maxInFlight,
     maxBusyRetries: input.maxBusyRetries,
     maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   };

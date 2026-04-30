@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Separate passive ledger construction from queue execution. Ledgers now start
+  queue dispatch only through `ledger.startWorkers(...)`, which returns a
+  disposable worker handle.
+
 ## 0.5.0
 
 - Replace `@sinclair/typebox` with `typebox` for JSON-compatible schema construction and runtime validation.
