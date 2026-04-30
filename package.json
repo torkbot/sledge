@@ -1,6 +1,6 @@
 {
   "name": "@torkbot/sledge",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": false,
   "type": "module",
   "description": "A SQLite-backed event and work engine that stays consistent across retries, restarts, and failures.",
