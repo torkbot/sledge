@@ -74,6 +74,13 @@ export interface StorageDatabase {
 
   prepare(sql: string): StorageStatement;
 
+  /**
+   * Optional storage-level close hook.
+   *
+   * The ledger engine does not own the database lifecycle and intentionally
+   * does not call this. Callers that open the database are responsible for
+   * closing it when appropriate for their process.
+   */
   close(): Promise<void>;
 }
 
@@ -1892,7 +1899,13 @@ function openDatabaseLedgerEngine<
 
     // Wait until claiming has quiesced so we can snapshot+abort the final set
     // of leases this worker owns.
-    await worker.dispatchLoopSettled;
+    let dispatchLoopFailure: unknown = null;
+
+    try {
+      await worker.dispatchLoopSettled;
+    } catch (error: unknown) {
+      dispatchLoopFailure = error;
+    }
 
     const leaseIds = [...worker.leaseAbortControllers.keys()];
 
@@ -1934,6 +1947,10 @@ function openDatabaseLedgerEngine<
         )
         .run(clock.nowMs(), ...leaseIds);
     });
+
+    if (dispatchLoopFailure !== null) {
+      throw dispatchLoopFailure;
+    }
   }
 
   async function close(): Promise<void> {
@@ -2092,6 +2109,18 @@ function openDatabaseLedgerEngine<
       const leaseMs = options.leaseMs ?? 1_000;
       const defaultRetryDelayMs = options.defaultRetryDelayMs ?? 1_000;
       const maxInFlight = options.maxInFlight ?? 16;
+
+      if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
+        throw new Error(
+          `leaseMs must be a positive integer, received ${leaseMs}`,
+        );
+      }
+
+      if (!Number.isInteger(defaultRetryDelayMs) || defaultRetryDelayMs <= 0) {
+        throw new Error(
+          `defaultRetryDelayMs must be a positive integer, received ${defaultRetryDelayMs}`,
+        );
+      }
 
       if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
         throw new Error(

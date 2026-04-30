@@ -114,7 +114,7 @@ const db = new Database("./app.sqlite");
 const clock = new SystemRuntimeClock();
 const scheduler = new NodeRuntimeScheduler();
 
-const ledger = createBetterSqliteLedger({
+await using ledger = createBetterSqliteLedger({
   database: db,
   boundModel: bindLedgerModel(registeredModel, {
     indexers: {

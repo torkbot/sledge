@@ -371,6 +371,76 @@ test("closing workers during a pending claim releases the claimed work", async (
   );
 });
 
+test("startWorkers rejects invalid lease and retry timing options", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": () => undefined,
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        scheduler: runtime.scheduler,
+        leaseMs: 0,
+      }),
+    /leaseMs must be a positive integer/,
+  );
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        scheduler: runtime.scheduler,
+        defaultRetryDelayMs: -1,
+      }),
+    /defaultRetryDelayMs must be a positive integer/,
+  );
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        scheduler: runtime.scheduler,
+        maxInFlight: 0,
+      }),
+    /maxInFlight must be a positive integer/,
+  );
+});
+
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
