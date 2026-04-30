@@ -367,6 +367,96 @@ test("closing workers during a pending claim releases the claimed work", async (
   );
 });
 
+test("ledger close reports dispatch loop claim failures", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const storage = wrapBetterSqliteDatabase(database);
+  let failedClaim = false;
+
+  const failingStorage: StorageDatabase = {
+    exec: storage.exec,
+    prepare: (sql): StorageStatement => {
+      const statement = storage.prepare(sql);
+
+      if (
+        !failedClaim &&
+        sql.includes("SELECT work_id") &&
+        sql.includes("available_at_ms <= ?")
+      ) {
+        failedClaim = true;
+
+        return {
+          run: statement.run,
+          all: statement.all,
+          get: async () => {
+            throw new Error("claim failed");
+          },
+        };
+      }
+
+      return statement;
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+    },
+  });
+
+  const ledger = createDatabaseLedger({
+    database: failingStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+  await runtime.flush();
+
+  await assert.rejects(
+    async () => {
+      await ledger.close();
+    },
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "failed to close ledger workers");
+      assert.equal(error.errors.length, 1);
+
+      const failure = error.errors[0];
+      assert.ok(failure instanceof Error);
+      assert.equal(failure.message, "claim failed");
+
+      return true;
+    },
+  );
+});
+
 test("startWorkers rejects invalid lease and retry timing options", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");

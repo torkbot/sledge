@@ -462,6 +462,12 @@ function openDatabaseLedgerEngine<
      */
     dispatchLoopSettled: Promise<void> | null;
     /**
+     * First dispatch loop failure observed for this worker. Dispatch runs are
+     * background tasks, so the error is retained until worker/ledger shutdown
+     * can report it to the caller.
+     */
+    dispatchLoopFailure: unknown;
+    /**
      * Next scheduled dispatch wakeup for this handle, if any.
      */
     scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
@@ -1408,15 +1414,23 @@ function openDatabaseLedgerEngine<
 
     worker.dispatchLoopActive = true;
 
-    const dispatchLoopSettled = runDispatchLoop(worker).finally(() => {
-      worker.dispatchLoopActive = false;
-      worker.dispatchLoopSettled = null;
+    const dispatchLoopSettled = runDispatchLoop(worker)
+      .catch((error: unknown) => {
+        if (worker.dispatchLoopFailure === null) {
+          worker.dispatchLoopFailure = error;
+        }
 
-      if (worker.dispatchLoopQueued && !closed && !worker.closed) {
-        worker.dispatchLoopQueued = false;
-        requestDispatchRun(worker);
-      }
-    });
+        throw error;
+      })
+      .finally(() => {
+        worker.dispatchLoopActive = false;
+        worker.dispatchLoopSettled = null;
+
+        if (worker.dispatchLoopQueued && !closed && !worker.closed) {
+          worker.dispatchLoopQueued = false;
+          requestDispatchRun(worker);
+        }
+      });
     worker.dispatchLoopSettled = dispatchLoopSettled;
 
     void dispatchLoopSettled.catch(() => undefined);
@@ -1896,12 +1910,14 @@ function openDatabaseLedgerEngine<
 
     // Wait until claiming has quiesced so we can snapshot+abort the final set
     // of leases this worker owns.
-    let dispatchLoopFailure: unknown = null;
+    let dispatchLoopFailure = worker.dispatchLoopFailure;
 
     try {
       await worker.dispatchLoopSettled;
     } catch (error: unknown) {
-      dispatchLoopFailure = error;
+      if (dispatchLoopFailure === null) {
+        dispatchLoopFailure = error;
+      }
     }
 
     const leaseIds = [...worker.leaseAbortControllers.keys()];
@@ -1956,13 +1972,25 @@ function openDatabaseLedgerEngine<
     closed = true;
     notifyEventWaiters();
 
-    await Promise.allSettled(
+    const closeResults = await Promise.allSettled(
       [...activeWorkers].map(async (worker) => {
         await closeWorker(worker, "ledger closed");
       }),
     );
 
     signalObserversByName.clear();
+
+    const failures = closeResults.flatMap((result) => {
+      if (result.status === "fulfilled") {
+        return [];
+      }
+
+      return [result.reason];
+    });
+
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "failed to close ledger workers");
+    }
   }
 
   const ledger: Ledger<TEvents, TQueries, TSignals> = {
@@ -2136,6 +2164,7 @@ function openDatabaseLedgerEngine<
         dispatchLoopActive: false,
         dispatchLoopQueued: false,
         dispatchLoopSettled: null,
+        dispatchLoopFailure: null,
         scheduledDispatch: null,
       };
 
