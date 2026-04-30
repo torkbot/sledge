@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import { Type, type Static, type TSchema } from "typebox";
 
-import { Value } from "typebox/value";
 import Sqids from "sqids";
+import { Value } from "typebox/value";
 import type {
   BoundLedgerModel,
   EventEnvelope,
@@ -392,19 +392,74 @@ function openDatabaseLedgerEngine<
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
 
+  /**
+   * Per-worker-handle runtime state.
+   *
+   * A handle created by `ledger.startWorkers(...)` owns exactly one
+   * `WorkerRuntimeState`. Ownership is strict: lease bookkeeping and scheduler
+   * tasks in this object are only for work claimed by this handle. That allows
+   * shutdown to abort and release only this handle's leases without affecting
+   * other concurrently running worker handles in the same process.
+   */
   type WorkerRuntimeState = {
+    /**
+     * Scheduler instance bound to this worker handle. All dispatch wakeups,
+     * lease expiry timers, and lease heartbeats for this handle use this
+     * scheduler.
+     */
     readonly scheduler: LedgerWorkerOptions["scheduler"];
+    /**
+     * Lease duration for newly claimed work by this handle.
+     */
     readonly leaseMs: number;
+    /**
+     * Fallback retry delay used when a handler requests retry without an
+     * explicit `retryAtMs`.
+     */
     readonly defaultRetryDelayMs: number;
+    /**
+     * Maximum number of concurrently executing handlers for this handle.
+     */
     readonly maxInFlight: number;
+    /**
+     * Currently executing handler promises claimed by this handle.
+     */
     readonly inFlight: Set<Promise<void>>;
+    /**
+     * Abort controllers keyed by lease id for claims currently owned by this
+     * handle. Shutdown and lease-expiry paths abort through these controllers.
+     */
     readonly leaseAbortControllers: Map<string, AbortController>;
+    /**
+     * One-shot timers keyed by lease id that abort work when a lease expires.
+     */
     readonly leaseExpiryTasks: Map<string, { cancel(): void }>;
+    /**
+     * Repeating timers keyed by lease id that periodically renew active leases.
+     */
     readonly leaseHeartbeatTasks: Map<string, { cancel(): void }>;
+    /**
+     * Set once this worker handle has begun shutdown. Dispatching and new
+     * scheduling bail out when true.
+     */
     closed: boolean;
+    /**
+     * True while a dispatch loop invocation is actively running.
+     */
     dispatchLoopActive: boolean;
+    /**
+     * Latch set when dispatch is requested during an active loop; consumed in
+     * loop-finally to trigger one follow-up pass.
+     */
     dispatchLoopQueued: boolean;
+    /**
+     * Promise for the currently running dispatch loop, or null when idle.
+     * Shutdown awaits this to stop new claims before aborting in-flight leases.
+     */
     dispatchLoopSettled: Promise<void> | null;
+    /**
+     * Next scheduled dispatch wakeup for this handle, if any.
+     */
     scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
   };
 
@@ -1810,7 +1865,16 @@ function openDatabaseLedgerEngine<
     worker.scheduledDispatch?.cancel();
     worker.scheduledDispatch = null;
 
+    // Wait until claiming has quiesced so we can snapshot+abort the final set
+    // of leases this worker owns.
+    await worker.dispatchLoopSettled;
+
     const leaseIds = [...worker.leaseAbortControllers.keys()];
+
+    for (const controller of worker.leaseAbortControllers.values()) {
+      controller.abort(new Error(reason));
+    }
+    await Promise.allSettled(worker.inFlight);
 
     for (const expiryTask of worker.leaseExpiryTasks.values()) {
       expiryTask.cancel();
@@ -1823,32 +1887,28 @@ function openDatabaseLedgerEngine<
     }
 
     worker.leaseHeartbeatTasks.clear();
-
-    for (const controller of worker.leaseAbortControllers.values()) {
-      controller.abort(new Error(reason));
-    }
-
     worker.leaseAbortControllers.clear();
 
-    await worker.dispatchLoopSettled;
-    await Promise.allSettled(worker.inFlight);
-
-    for (const leaseId of leaseIds) {
-      await runInTransaction(async () => {
-        await database
-          .prepare(
-            `UPDATE work
-             SET
-               lease_id = NULL,
-               lease_acquired_at_ms = NULL,
-               lease_expires_at_ms = NULL,
-               available_at_ms = ?
-             WHERE dead = 0
-               AND lease_id = ?`,
-          )
-          .run(clock.nowMs(), leaseId);
-      });
+    if (leaseIds.length === 0) {
+      return;
     }
+
+    const leaseIdPlaceholders = leaseIds.map(() => "?").join(", ");
+
+    await runInTransaction(async () => {
+      await database
+        .prepare(
+          `UPDATE work
+           SET
+             lease_id = NULL,
+             lease_acquired_at_ms = NULL,
+             lease_expires_at_ms = NULL,
+             available_at_ms = ?
+           WHERE dead = 0
+             AND lease_id IN (${leaseIdPlaceholders})`,
+        )
+        .run(clock.nowMs(), ...leaseIds);
+    });
   }
 
   async function close(): Promise<void> {
@@ -2032,8 +2092,13 @@ function openDatabaseLedgerEngine<
 
       activeWorkers.add(worker);
 
-      await releaseExpiredLeases();
-      await scheduleNextDispatchFromStore(worker);
+      try {
+        await releaseExpiredLeases();
+        await scheduleNextDispatchFromStore(worker);
+      } catch (error: unknown) {
+        await closeWorker(worker, "ledger workers startup failed");
+        throw error;
+      }
 
       let disposed = false;
       const closeHandle = async (): Promise<void> => {
