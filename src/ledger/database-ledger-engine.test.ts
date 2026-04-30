@@ -1,14 +1,19 @@
+import Database from "better-sqlite3";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
 import test from "node:test";
 import { Type, type TSchema } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
+import {
+  createDatabaseLedger,
+  type StorageDatabase,
+  type StorageStatement,
+} from "./database-ledger-engine.ts";
 import {
   bindLedgerModel,
   defineLedgerModel as defineStaticLedgerModel,
@@ -162,6 +167,50 @@ async function settlesWithin<T>(
   }
 }
 
+function wrapBetterSqliteDatabase(
+  database: Database.Database,
+): StorageDatabase {
+  return {
+    exec: async (sql) => {
+      database.exec(sql);
+    },
+    prepare: (sql) => {
+      const statement = database.prepare(sql);
+
+      return {
+        run: async (...params) => statement.run(...params),
+        get: async (...params) => {
+          const row = statement.get(...params);
+
+          if (row === undefined) {
+            return undefined;
+          }
+
+          if (typeof row !== "object" || row === null || Array.isArray(row)) {
+            throw new Error("expected row object");
+          }
+
+          return row as Record<string, unknown>;
+        },
+        all: async (...params) => {
+          const rows = statement.all(...params);
+
+          return rows.map((row) => {
+            if (typeof row !== "object" || row === null || Array.isArray(row)) {
+              throw new Error("expected row object");
+            }
+
+            return row as Record<string, unknown>;
+          });
+        },
+      };
+    },
+    close: async () => {
+      database.close();
+    },
+  };
+}
+
 test("ledger construction and emit do not start queue workers", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
@@ -222,6 +271,103 @@ test("ledger construction and emit do not start queue workers", async () => {
   await waitFor(
     runtime,
     () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+  );
+});
+
+test("closing workers during a pending claim releases the claimed work", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const claimStarted = Promise.withResolvers<void>();
+  const allowClaim = Promise.withResolvers<void>();
+  const storage = wrapBetterSqliteDatabase(database);
+  let blockedClaim = false;
+
+  const blockingStorage: StorageDatabase = {
+    exec: storage.exec,
+    close: storage.close,
+    prepare: (sql): StorageStatement => {
+      const statement = storage.prepare(sql);
+
+      if (
+        !blockedClaim &&
+        sql.includes("SELECT work_id") &&
+        sql.includes("available_at_ms <= ?")
+      ) {
+        blockedClaim = true;
+
+        return {
+          run: statement.run,
+          all: statement.all,
+          get: async (...params) => {
+            claimStarted.resolve();
+            await allowClaim.promise;
+            return await statement.get(...params);
+          },
+        };
+      }
+
+      return statement;
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+    },
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: blockingStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  const workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await runtime.flush();
+  await claimStarted.promise;
+
+  const closing = workers.close();
+  allowClaim.resolve();
+  await closing;
+
+  assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
+  assert.equal(
+    readCount(database, `SELECT COUNT(*) as total FROM work WHERE dead = 1`),
+    0,
+  );
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM work WHERE lease_id IS NOT NULL`,
+    ),
+    0,
   );
 });
 

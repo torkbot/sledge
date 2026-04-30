@@ -1372,6 +1372,26 @@ function openDatabaseLedgerEngine<
     });
   }
 
+  async function releaseClaimedLease(
+    claimed: PersistedWorkLease,
+  ): Promise<void> {
+    await runInTransaction(async () => {
+      await database
+        .prepare(
+          `UPDATE work
+           SET
+             lease_id = NULL,
+             lease_acquired_at_ms = NULL,
+             lease_expires_at_ms = NULL,
+             available_at_ms = ?
+           WHERE work_id = ?
+             AND lease_id = ?
+             AND dead = 0`,
+        )
+        .run(clock.nowMs(), claimed.workId, claimed.leaseId);
+    });
+  }
+
   function requestDispatchRun(worker: WorkerRuntimeState): void {
     if (closed || worker.closed) {
       return;
@@ -1414,6 +1434,11 @@ function openDatabaseLedgerEngine<
 
       if (claimed === null) {
         await scheduleNextDispatchFromStore(worker);
+        return;
+      }
+
+      if (closed || worker.closed) {
+        await releaseClaimedLease(claimed);
         return;
       }
 
