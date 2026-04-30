@@ -457,6 +457,49 @@ test("ledger close reports dispatch loop claim failures", async () => {
   );
 });
 
+test("startWorkers rejects while workers are already running", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await assert.rejects(
+    ledger.startWorkers({
+      scheduler: runtime.scheduler,
+    }),
+    /ledger workers are already running/,
+  );
+});
+
 test("startWorkers rejects invalid lease and retry timing options", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
