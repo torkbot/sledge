@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import { Type, type Static, type TSchema } from "typebox";
 
-import { Value } from "typebox/value";
 import Sqids from "sqids";
+import { Value } from "typebox/value";
 import type {
   BoundLedgerModel,
   EventEnvelope,
@@ -11,6 +11,8 @@ import type {
   LedgerCursor,
   LedgerStreamEvent,
   LedgerTiming,
+  LedgerWorkerOptions,
+  LedgerWorkers,
   QuerySchema,
   QueueActions,
   QueueHandlerControl,
@@ -67,12 +69,16 @@ export interface StorageStatement {
   all(...params: unknown[]): Promise<readonly StorageRow[]>;
 }
 
+/**
+ * Minimal storage operations used by the ledger engine.
+ *
+ * The engine does not own storage lifecycle; callers that open a database are
+ * responsible for closing it after ledger/workers are closed.
+ */
 export interface StorageDatabase {
   exec(sql: string): Promise<void>;
 
   prepare(sql: string): StorageStatement;
-
-  close(): Promise<void>;
 }
 
 type OpenDatabaseLedgerEngineInput<
@@ -93,9 +99,6 @@ type OpenDatabaseLedgerEngineInput<
   >;
   readonly timing: LedgerTiming;
   readonly database: StorageDatabase;
-  readonly leaseMs?: number;
-  readonly defaultRetryDelayMs?: number;
-  readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 };
@@ -118,9 +121,6 @@ export type CreateDatabaseLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly leaseMs?: number;
-  readonly defaultRetryDelayMs?: number;
-  readonly maxInFlight?: number;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 };
@@ -146,9 +146,6 @@ export function createDatabaseLedger<
     boundModel: input.boundModel,
     timing: input.timing,
     database: input.database,
-    leaseMs: input.leaseMs,
-    defaultRetryDelayMs: input.defaultRetryDelayMs,
-    maxInFlight: input.maxInFlight,
     maxBusyRetries: input.maxBusyRetries,
     maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   });
@@ -373,22 +370,12 @@ function openDatabaseLedgerEngine<
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
-  const scheduler = input.timing.scheduler;
   const database = input.database;
   const model = input.boundModel.model;
   const implementations = input.boundModel.implementations;
   const registration = input.boundModel.register;
-  const leaseMs = input.leaseMs ?? 1_000;
-  const defaultRetryDelayMs = input.defaultRetryDelayMs ?? 1_000;
-  const maxInFlight = input.maxInFlight ?? 16;
   const maxBusyRetries = input.maxBusyRetries ?? 8;
   const maxBusyRetryDelayMs = input.maxBusyRetryDelayMs ?? 50;
-
-  if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
-    throw new Error(
-      `maxInFlight must be a positive integer, received ${maxInFlight}`,
-    );
-  }
 
   if (!Number.isInteger(maxBusyRetries) || maxBusyRetries < 0) {
     throw new Error(
@@ -403,17 +390,85 @@ function openDatabaseLedgerEngine<
   }
 
   let closed = false;
-  let dispatchLoopActive = false;
-  let dispatchLoopQueued = false;
-  let scheduledDispatch: { dueAtMs: number; cancel(): void } | null = null;
-  const inFlight = new Set<Promise<void>>();
-  const leaseAbortControllers = new Map<string, AbortController>();
-  const leaseExpiryTasks = new Map<string, { cancel(): void }>();
-  const leaseHeartbeatTasks = new Map<string, { cancel(): void }>();
+  let activeWorker: WorkerRuntimeState | null = null;
   const eventWaiters = new Set<() => void>();
   type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
+
+  /**
+   * Per-worker-handle runtime state.
+   *
+   * A ledger may have at most one active worker handle. The handle owns this
+   * runtime state until closed, then the ledger may start workers again.
+   */
+  type WorkerRuntimeState = {
+    /**
+     * Scheduler instance bound to this worker handle. All dispatch wakeups,
+     * lease expiry timers, and lease heartbeats for this handle use this
+     * scheduler.
+     */
+    readonly scheduler: LedgerWorkerOptions["scheduler"];
+    /**
+     * Lease duration for newly claimed work by this handle.
+     */
+    readonly leaseMs: number;
+    /**
+     * Fallback retry delay used when a handler requests retry without an
+     * explicit `retryAtMs`.
+     */
+    readonly defaultRetryDelayMs: number;
+    /**
+     * Maximum number of concurrently executing handlers for this handle.
+     */
+    readonly maxInFlight: number;
+    /**
+     * Currently executing handler promises claimed by this handle.
+     */
+    readonly inFlight: Set<Promise<void>>;
+    /**
+     * Abort controllers keyed by lease id for claims currently owned by this
+     * handle. Shutdown and lease-expiry paths abort through these controllers.
+     */
+    readonly leaseAbortControllers: Map<string, AbortController>;
+    /**
+     * One-shot timers keyed by lease id that abort work when a lease expires.
+     */
+    readonly leaseExpiryTasks: Map<string, { cancel(): void }>;
+    /**
+     * Repeating timers keyed by lease id that periodically renew active leases.
+     */
+    readonly leaseHeartbeatTasks: Map<string, { cancel(): void }>;
+    /**
+     * Set once this worker handle has begun shutdown. Dispatching and new
+     * scheduling bail out when true.
+     */
+    closed: boolean;
+    /**
+     * True while a dispatch loop invocation is actively running.
+     */
+    dispatchLoopActive: boolean;
+    /**
+     * Latch set when dispatch is requested during an active loop; consumed in
+     * loop-finally to trigger one follow-up pass.
+     */
+    dispatchLoopQueued: boolean;
+    /**
+     * Promise for the currently running dispatch loop, or null when idle.
+     * Shutdown awaits this to stop new claims before aborting in-flight leases.
+     */
+    dispatchLoopSettled: Promise<void> | null;
+    /**
+     * First dispatch loop failure observed for this worker. Dispatch runs are
+     * background tasks, so the error is retained until worker/ledger shutdown
+     * can report it to the caller.
+     */
+    dispatchLoopFailure: unknown | null;
+    /**
+     * Next scheduled dispatch wakeup for this handle, if any.
+     */
+    scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
+  };
 
   let mutationTail: Promise<void> = Promise.resolve();
 
@@ -452,9 +507,6 @@ function openDatabaseLedgerEngine<
 
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
-
-    await releaseExpiredLeases();
-    await scheduleNextDispatchFromStore();
   })();
 
   async function ensureColumn(
@@ -925,30 +977,38 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  function scheduleDispatchAt(targetAtMs: number): void {
-    if (closed) {
+  function scheduleDispatchAt(
+    worker: WorkerRuntimeState,
+    targetAtMs: number,
+  ): void {
+    if (closed || worker.closed) {
       return;
     }
 
-    if (scheduledDispatch !== null && scheduledDispatch.dueAtMs <= targetAtMs) {
+    if (
+      worker.scheduledDispatch !== null &&
+      worker.scheduledDispatch.dueAtMs <= targetAtMs
+    ) {
       return;
     }
 
-    scheduledDispatch?.cancel();
+    worker.scheduledDispatch?.cancel();
 
     const delayMs = Math.max(0, targetAtMs - clock.nowMs());
-    const task = scheduler.scheduleOnce(delayMs, () => {
-      scheduledDispatch = null;
-      requestDispatchRun();
+    const task = worker.scheduler.scheduleOnce(delayMs, () => {
+      worker.scheduledDispatch = null;
+      requestDispatchRun(worker);
     });
 
-    scheduledDispatch = {
+    worker.scheduledDispatch = {
       dueAtMs: clock.nowMs() + delayMs,
       cancel: () => task.cancel(),
     };
   }
 
-  async function scheduleNextDispatchFromStore(): Promise<void> {
+  async function scheduleNextDispatchFromStore(
+    worker: WorkerRuntimeState,
+  ): Promise<void> {
     const row = await database
       .prepare(
         `SELECT available_at_ms
@@ -964,7 +1024,10 @@ function openDatabaseLedgerEngine<
       return;
     }
 
-    scheduleDispatchAt(decodeRow(row, AvailableAtRowSchema).available_at_ms);
+    scheduleDispatchAt(
+      worker,
+      decodeRow(row, AvailableAtRowSchema).available_at_ms,
+    );
   }
 
   function notifyEventWaiters(): void {
@@ -1224,7 +1287,9 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  async function claimNextDueWork(): Promise<PersistedWorkLease | null> {
+  async function claimNextDueWork(
+    worker: WorkerRuntimeState,
+  ): Promise<PersistedWorkLease | null> {
     return await runInTransaction(async () => {
       const nowMs = clock.nowMs();
 
@@ -1246,7 +1311,7 @@ function openDatabaseLedgerEngine<
 
       const candidateWorkId = decodeRow(candidate, WorkIdRowSchema).work_id;
       const leaseId = randomUUID();
-      const leaseExpiresAtMs = nowMs + leaseMs;
+      const leaseExpiresAtMs = nowMs + worker.leaseMs;
 
       const updateResult = await database
         .prepare(
@@ -1314,94 +1379,153 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  function requestDispatchRun(): void {
-    if (closed) {
-      return;
-    }
-
-    if (dispatchLoopActive) {
-      dispatchLoopQueued = true;
-      return;
-    }
-
-    dispatchLoopActive = true;
-
-    void runDispatchLoop().finally(() => {
-      dispatchLoopActive = false;
-
-      if (dispatchLoopQueued && !closed) {
-        dispatchLoopQueued = false;
-        requestDispatchRun();
-      }
+  async function releaseClaimedLease(
+    claimed: PersistedWorkLease,
+  ): Promise<void> {
+    await runInTransaction(async () => {
+      await database
+        .prepare(
+          `UPDATE work
+           SET
+             lease_id = NULL,
+             lease_acquired_at_ms = NULL,
+             lease_expires_at_ms = NULL,
+             available_at_ms = ?
+           WHERE work_id = ?
+             AND lease_id = ?
+             AND dead = 0`,
+        )
+        .run(clock.nowMs(), claimed.workId, claimed.leaseId);
     });
   }
 
-  async function runDispatchLoop(): Promise<void> {
-    await startup;
-
-    if (closed) {
+  function requestDispatchRun(worker: WorkerRuntimeState): void {
+    if (closed || worker.closed) {
       return;
     }
 
-    while (!closed && inFlight.size < maxInFlight) {
-      const claimed = await claimNextDueWork();
+    if (worker.dispatchLoopActive) {
+      worker.dispatchLoopQueued = true;
+      return;
+    }
+
+    worker.dispatchLoopActive = true;
+
+    const dispatchLoopSettled = runDispatchLoop(worker)
+      .catch((error: unknown) => {
+        if (worker.dispatchLoopFailure === null) {
+          worker.dispatchLoopFailure = error;
+        }
+
+        throw error;
+      })
+      .finally(() => {
+        worker.dispatchLoopActive = false;
+        worker.dispatchLoopSettled = null;
+
+        if (worker.dispatchLoopQueued && !closed && !worker.closed) {
+          worker.dispatchLoopQueued = false;
+          requestDispatchRun(worker);
+        }
+      });
+    worker.dispatchLoopSettled = dispatchLoopSettled;
+
+    void dispatchLoopSettled.catch(() => undefined);
+  }
+
+  async function runDispatchLoop(worker: WorkerRuntimeState): Promise<void> {
+    await startup;
+
+    if (closed || worker.closed) {
+      return;
+    }
+
+    while (
+      !closed &&
+      !worker.closed &&
+      worker.inFlight.size < worker.maxInFlight
+    ) {
+      const claimed = await claimNextDueWork(worker);
 
       if (claimed === null) {
-        await scheduleNextDispatchFromStore();
+        await scheduleNextDispatchFromStore(worker);
         return;
       }
 
-      const handler = claimed.signal
-        ? registration.signalQueues?.[claimed.queueName as keyof TSignalQueues]
-        : registration.queues?.[claimed.queueName as keyof TQueues];
-
-      if (handler === undefined) {
-        await runInTransaction(async () => {
-          await database
-            .prepare(
-              `UPDATE work
-               SET
-                 dead = 1,
-                 lease_id = NULL,
-                 lease_acquired_at_ms = NULL,
-                 lease_expires_at_ms = NULL,
-                 last_error = ?
-               WHERE work_id = ?
-                 AND lease_id = ?`,
-            )
-            .run(
-              `no handler for ${claimed.signal ? "signal " : ""}queue ${claimed.queueName}`,
-              claimed.workId,
-              claimed.leaseId,
-            );
-        });
-
-        continue;
+      if (closed || worker.closed) {
+        await releaseClaimedLease(claimed);
+        return;
       }
 
-      const run = processClaimedWork(claimed, handler).finally(() => {
-        inFlight.delete(run);
-        requestDispatchRun();
-      });
+      let handedOffToHandler = false;
 
-      inFlight.add(run);
+      try {
+        const handler = claimed.signal
+          ? registration.signalQueues?.[
+              claimed.queueName as keyof TSignalQueues
+            ]
+          : registration.queues?.[claimed.queueName as keyof TQueues];
+
+        if (handler === undefined) {
+          await runInTransaction(async () => {
+            await database
+              .prepare(
+                `UPDATE work
+                 SET
+                   dead = 1,
+                   lease_id = NULL,
+                   lease_acquired_at_ms = NULL,
+                   lease_expires_at_ms = NULL,
+                   last_error = ?
+                 WHERE work_id = ?
+                   AND lease_id = ?`,
+              )
+              .run(
+                `no handler for ${claimed.signal ? "signal " : ""}queue ${claimed.queueName}`,
+                claimed.workId,
+                claimed.leaseId,
+              );
+          });
+
+          continue;
+        }
+
+        const run = processClaimedWork(worker, claimed, handler).finally(() => {
+          worker.inFlight.delete(run);
+          requestDispatchRun(worker);
+        });
+        handedOffToHandler = true;
+
+        worker.inFlight.add(run);
+      } catch (error: unknown) {
+        if (!handedOffToHandler) {
+          try {
+            await releaseClaimedLease(claimed);
+          } catch {
+            // Preserve the root dispatch failure for shutdown reporting.
+          }
+        }
+
+        throw error;
+      }
     }
   }
 
   async function processClaimedWork(
+    worker: WorkerRuntimeState,
     claimed: PersistedWorkLease,
     handler:
       | QueueHandlerFunction<any, any, any, any, any>
       | SignalQueueHandlerFunction<any, any, any>,
   ): Promise<void> {
     const leaseAbortController = new AbortController();
-    leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
+    worker.leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
 
     let currentLeaseExpiresAtMs = claimed.leaseExpiresAtMs;
 
     const clearLeaseHeartbeat = (): void => {
-      leaseHeartbeatTasks.get(claimed.leaseId)?.cancel();
-      leaseHeartbeatTasks.delete(claimed.leaseId);
+      worker.leaseHeartbeatTasks.get(claimed.leaseId)?.cancel();
+      worker.leaseHeartbeatTasks.delete(claimed.leaseId);
     };
 
     const releaseLeaseInStore = async (): Promise<void> => {
@@ -1429,29 +1553,29 @@ function openDatabaseLedgerEngine<
     };
 
     const scheduleLeaseExpiry = (): void => {
-      leaseExpiryTasks.get(claimed.leaseId)?.cancel();
+      worker.leaseExpiryTasks.get(claimed.leaseId)?.cancel();
 
       const delayMs = Math.max(0, currentLeaseExpiresAtMs - clock.nowMs());
-      const expiryTask = scheduler.scheduleOnce(delayMs, () => {
+      const expiryTask = worker.scheduler.scheduleOnce(delayMs, () => {
         abortLease("lease expired");
         clearLeaseHeartbeat();
 
         void releaseLeaseInStore().then(
           () => {
-            scheduleDispatchAt(clock.nowMs());
+            scheduleDispatchAt(worker, clock.nowMs());
           },
           () => undefined,
         );
       });
 
-      leaseExpiryTasks.set(claimed.leaseId, {
+      worker.leaseExpiryTasks.set(claimed.leaseId, {
         cancel: () => expiryTask.cancel(),
       });
     };
 
     const renewLease = async (): Promise<void> => {
       const nowMs = clock.nowMs();
-      const renewedLeaseExpiresAtMs = nowMs + leaseMs;
+      const renewedLeaseExpiresAtMs = nowMs + worker.leaseMs;
 
       const renewal = await runInTransaction(async () => {
         return await database
@@ -1475,12 +1599,12 @@ function openDatabaseLedgerEngine<
     };
 
     const startLeaseHeartbeat = (): void => {
-      if (leaseHeartbeatTasks.has(claimed.leaseId)) {
+      if (worker.leaseHeartbeatTasks.has(claimed.leaseId)) {
         return;
       }
 
-      const heartbeatEveryMs = Math.max(1, Math.floor(leaseMs / 3));
-      const heartbeatTask = scheduler.scheduleRepeating(
+      const heartbeatEveryMs = Math.max(1, Math.floor(worker.leaseMs / 3));
+      const heartbeatTask = worker.scheduler.scheduleRepeating(
         heartbeatEveryMs,
         () => {
           if (leaseAbortController.signal.aborted) {
@@ -1495,7 +1619,7 @@ function openDatabaseLedgerEngine<
         },
       );
 
-      leaseHeartbeatTasks.set(claimed.leaseId, {
+      worker.leaseHeartbeatTasks.set(claimed.leaseId, {
         cancel: () => heartbeatTask.cancel(),
       });
     };
@@ -1592,7 +1716,7 @@ function openDatabaseLedgerEngine<
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
-            scheduleDispatchAt(clock.nowMs());
+            scheduleDispatchAt(worker, clock.nowMs());
           }
         },
         query: async (queryName, params) => {
@@ -1740,7 +1864,8 @@ function openDatabaseLedgerEngine<
                    AND dead = 0`,
               )
               .run(
-                disposition.retryAtMs ?? clock.nowMs() + defaultRetryDelayMs,
+                disposition.retryAtMs ??
+                  clock.nowMs() + worker.defaultRetryDelayMs,
                 disposition.error,
                 claimed.workId,
                 claimed.leaseId,
@@ -1774,12 +1899,84 @@ function openDatabaseLedgerEngine<
         notifyEventWaiters();
       }
 
-      scheduleDispatchAt(clock.nowMs());
+      scheduleDispatchAt(worker, clock.nowMs());
     } finally {
       clearLeaseHeartbeat();
-      leaseExpiryTasks.get(claimed.leaseId)?.cancel();
-      leaseExpiryTasks.delete(claimed.leaseId);
-      leaseAbortControllers.delete(claimed.leaseId);
+      worker.leaseExpiryTasks.get(claimed.leaseId)?.cancel();
+      worker.leaseExpiryTasks.delete(claimed.leaseId);
+      worker.leaseAbortControllers.delete(claimed.leaseId);
+    }
+  }
+
+  async function closeWorker(
+    worker: WorkerRuntimeState,
+    reason: string,
+  ): Promise<void> {
+    if (worker.closed) {
+      return;
+    }
+
+    worker.closed = true;
+    if (activeWorker === worker) {
+      activeWorker = null;
+    }
+
+    worker.scheduledDispatch?.cancel();
+    worker.scheduledDispatch = null;
+
+    // Wait until claiming has quiesced so we can snapshot+abort the final set
+    // of leases this worker owns.
+    let dispatchLoopFailure = worker.dispatchLoopFailure;
+
+    try {
+      await worker.dispatchLoopSettled;
+    } catch (error: unknown) {
+      if (dispatchLoopFailure === null) {
+        dispatchLoopFailure = error;
+      }
+    }
+
+    const leaseIds = [...worker.leaseAbortControllers.keys()];
+
+    for (const controller of worker.leaseAbortControllers.values()) {
+      controller.abort(new Error(reason));
+    }
+    await Promise.allSettled(worker.inFlight);
+
+    for (const expiryTask of worker.leaseExpiryTasks.values()) {
+      expiryTask.cancel();
+    }
+
+    worker.leaseExpiryTasks.clear();
+
+    for (const heartbeatTask of worker.leaseHeartbeatTasks.values()) {
+      heartbeatTask.cancel();
+    }
+
+    worker.leaseHeartbeatTasks.clear();
+    worker.leaseAbortControllers.clear();
+
+    if (leaseIds.length > 0) {
+      const leaseIdPlaceholders = leaseIds.map(() => "?").join(", ");
+
+      await runInTransaction(async () => {
+        await database
+          .prepare(
+            `UPDATE work
+             SET
+               lease_id = NULL,
+               lease_acquired_at_ms = NULL,
+               lease_expires_at_ms = NULL,
+               available_at_ms = ?
+             WHERE dead = 0
+               AND lease_id IN (${leaseIdPlaceholders})`,
+          )
+          .run(clock.nowMs(), ...leaseIds);
+      });
+    }
+
+    if (dispatchLoopFailure !== null) {
+      throw dispatchLoopFailure;
     }
   }
 
@@ -1791,44 +1988,27 @@ function openDatabaseLedgerEngine<
     closed = true;
     notifyEventWaiters();
 
-    scheduledDispatch?.cancel();
-    scheduledDispatch = null;
+    const workerToClose = activeWorker;
+    const closeResults =
+      workerToClose === null
+        ? []
+        : await Promise.allSettled([
+            closeWorker(workerToClose, "ledger closed"),
+          ]);
 
-    for (const expiryTask of leaseExpiryTasks.values()) {
-      expiryTask.cancel();
-    }
-
-    leaseExpiryTasks.clear();
-
-    for (const heartbeatTask of leaseHeartbeatTasks.values()) {
-      heartbeatTask.cancel();
-    }
-
-    leaseHeartbeatTasks.clear();
-
-    for (const controller of leaseAbortControllers.values()) {
-      controller.abort(new Error("ledger closed"));
-    }
-
-    leaseAbortControllers.clear();
     signalObserversByName.clear();
 
-    await Promise.allSettled(inFlight);
+    const failures = closeResults.flatMap((result) => {
+      if (result.status === "fulfilled") {
+        return [];
+      }
 
-    await runInTransaction(async () => {
-      await database
-        .prepare(
-          `UPDATE work
-           SET
-             lease_id = NULL,
-             lease_acquired_at_ms = NULL,
-             lease_expires_at_ms = NULL,
-             available_at_ms = ?
-           WHERE dead = 0
-             AND lease_id IS NOT NULL`,
-        )
-        .run(clock.nowMs());
+      return [result.reason];
     });
+
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "failed to close ledger workers");
+    }
   }
 
   const ledger: Ledger<TEvents, TQueries, TSignals> = {
@@ -1848,7 +2028,9 @@ function openDatabaseLedgerEngine<
 
       if (result.created) {
         notifyEventWaiters();
-        scheduleDispatchAt(clock.nowMs());
+        if (activeWorker !== null) {
+          scheduleDispatchAt(activeWorker, clock.nowMs());
+        }
       }
     },
     query: async (queryName, params) => {
@@ -1956,6 +2138,81 @@ function openDatabaseLedgerEngine<
             closeReason: "resume iterator closed",
           });
         },
+      };
+    },
+    startWorkers: async (options): Promise<LedgerWorkers> => {
+      await startup;
+
+      if (closed) {
+        throw new Error("cannot start workers after ledger is closed");
+      }
+
+      if (activeWorker !== null) {
+        throw new Error("ledger workers are already running");
+      }
+
+      const leaseMs = options.leaseMs ?? 1_000;
+      const defaultRetryDelayMs = options.defaultRetryDelayMs ?? 1_000;
+      const maxInFlight = options.maxInFlight ?? 16;
+
+      if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
+        throw new Error(
+          `leaseMs must be a positive integer, received ${leaseMs}`,
+        );
+      }
+
+      if (!Number.isInteger(defaultRetryDelayMs) || defaultRetryDelayMs <= 0) {
+        throw new Error(
+          `defaultRetryDelayMs must be a positive integer, received ${defaultRetryDelayMs}`,
+        );
+      }
+
+      if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
+        throw new Error(
+          `maxInFlight must be a positive integer, received ${maxInFlight}`,
+        );
+      }
+
+      const worker: WorkerRuntimeState = {
+        scheduler: options.scheduler,
+        leaseMs,
+        defaultRetryDelayMs,
+        maxInFlight,
+        inFlight: new Set(),
+        leaseAbortControllers: new Map(),
+        leaseExpiryTasks: new Map(),
+        leaseHeartbeatTasks: new Map(),
+        closed: false,
+        dispatchLoopActive: false,
+        dispatchLoopQueued: false,
+        dispatchLoopSettled: null,
+        dispatchLoopFailure: null,
+        scheduledDispatch: null,
+      };
+
+      activeWorker = worker;
+
+      try {
+        await releaseExpiredLeases();
+        await scheduleNextDispatchFromStore(worker);
+      } catch (error: unknown) {
+        await closeWorker(worker, "ledger workers startup failed");
+        throw error;
+      }
+
+      let disposed = false;
+      const closeHandle = async (): Promise<void> => {
+        if (disposed) {
+          return;
+        }
+
+        disposed = true;
+        await closeWorker(worker, "ledger workers closed");
+      };
+
+      return {
+        close: closeHandle,
+        [Symbol.asyncDispose]: closeHandle,
       };
     },
     close,

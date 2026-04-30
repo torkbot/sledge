@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Breaking: ledgers and storage adapters no longer own the underlying database
+  handle lifecycle. Callers that open a database must close it after closing any
+  workers and the ledger.
+- Separate passive ledger construction from queue execution. Ledgers now start
+  queue dispatch only through `ledger.startWorkers(...)`, which returns a
+  disposable worker handle. `ledger.close()` no longer closes the underlying
+  database handle, so applications must close their DB connections
+  separately.
+
 ## 0.5.0
 
 - Replace `@sinclair/typebox` with `typebox` for JSON-compatible schema construction and runtime validation.

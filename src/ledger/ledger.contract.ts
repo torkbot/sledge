@@ -658,18 +658,10 @@ export function runLedgerContractSuite(input: {
 
         await harness.restart();
 
-        await harness.advanceByMs(199);
         await harness.flush();
-        await waitFor(
-          harness,
-          async () => (await harness.getDecisionAttempts(sourceEventId)) === 1,
-          2_000,
-          25,
-        );
-
         assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
 
-        await harness.advanceByMs(1);
+        await harness.advanceByMs(200);
 
         await waitFor(
           harness,

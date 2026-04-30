@@ -1,14 +1,19 @@
+import Database from "better-sqlite3";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
 import test from "node:test";
 import { Type, type TSchema } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
+import {
+  createDatabaseLedger,
+  type StorageDatabase,
+  type StorageStatement,
+} from "./database-ledger-engine.ts";
 import {
   bindLedgerModel,
   defineLedgerModel as defineStaticLedgerModel,
@@ -162,6 +167,409 @@ async function settlesWithin<T>(
   }
 }
 
+function wrapBetterSqliteDatabase(
+  database: Database.Database,
+): StorageDatabase {
+  return {
+    exec: async (sql) => {
+      database.exec(sql);
+    },
+    prepare: (sql) => {
+      const statement = database.prepare(sql);
+
+      return {
+        run: async (...params) => statement.run(...params),
+        get: async (...params) => {
+          const row = statement.get(...params);
+
+          if (row === undefined) {
+            return undefined;
+          }
+
+          if (typeof row !== "object" || row === null || Array.isArray(row)) {
+            throw new Error("expected row object");
+          }
+
+          return row as Record<string, unknown>;
+        },
+        all: async (...params) => {
+          const rows = statement.all(...params);
+
+          return rows.map((row) => {
+            if (typeof row !== "object" || row === null || Array.isArray(row)) {
+              throw new Error("expected row object");
+            }
+
+            return row as Record<string, unknown>;
+          });
+        },
+      };
+    },
+  };
+}
+
+test("ledger construction and emit do not start queue workers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let processed = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": () => {
+          processed += 1;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await runtime.flush();
+  await runtime.advanceByMs(1_000);
+
+  assert.equal(processed, 0);
+  assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
+
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await waitFor(runtime, () => processed === 1);
+  await waitFor(
+    runtime,
+    () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+  );
+});
+
+test("closing workers during a pending claim releases the claimed work", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const claimStarted = Promise.withResolvers<void>();
+  const allowClaim = Promise.withResolvers<void>();
+  const storage = wrapBetterSqliteDatabase(database);
+  let blockedClaim = false;
+
+  const blockingStorage: StorageDatabase = {
+    exec: storage.exec,
+    prepare: (sql): StorageStatement => {
+      const statement = storage.prepare(sql);
+
+      if (
+        !blockedClaim &&
+        sql.includes("SELECT work_id") &&
+        sql.includes("available_at_ms <= ?")
+      ) {
+        blockedClaim = true;
+
+        return {
+          run: statement.run,
+          all: statement.all,
+          get: async (...params) => {
+            claimStarted.resolve();
+            await allowClaim.promise;
+            return await statement.get(...params);
+          },
+        };
+      }
+
+      return statement;
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+    },
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: blockingStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  const workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await runtime.flush();
+  await claimStarted.promise;
+
+  const closing = workers.close();
+  allowClaim.resolve();
+  await closing;
+
+  assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
+  assert.equal(
+    readCount(database, `SELECT COUNT(*) as total FROM work WHERE dead = 1`),
+    0,
+  );
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM work WHERE lease_id IS NOT NULL`,
+    ),
+    0,
+  );
+});
+
+test("ledger close reports dispatch loop claim failures", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const storage = wrapBetterSqliteDatabase(database);
+  let failedClaim = false;
+
+  const failingStorage: StorageDatabase = {
+    exec: storage.exec,
+    prepare: (sql): StorageStatement => {
+      const statement = storage.prepare(sql);
+
+      if (
+        !failedClaim &&
+        sql.includes("SELECT work_id") &&
+        sql.includes("available_at_ms <= ?")
+      ) {
+        failedClaim = true;
+
+        return {
+          run: statement.run,
+          all: statement.all,
+          get: async () => {
+            throw new Error("claim failed");
+          },
+        };
+      }
+
+      return statement;
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+    },
+  });
+
+  const ledger = createDatabaseLedger({
+    database: failingStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+  await runtime.flush();
+
+  await assert.rejects(
+    async () => {
+      await ledger.close();
+    },
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "failed to close ledger workers");
+      assert.equal(error.errors.length, 1);
+
+      const failure = error.errors[0];
+      assert.ok(failure instanceof Error);
+      assert.equal(failure.message, "claim failed");
+
+      return true;
+    },
+  );
+});
+
+test("startWorkers rejects while workers are already running", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await assert.rejects(
+    ledger.startWorkers({
+      scheduler: runtime.scheduler,
+    }),
+    /ledger workers are already running/,
+  );
+});
+
+test("startWorkers rejects invalid lease and retry timing options", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": () => undefined,
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        scheduler: runtime.scheduler,
+        leaseMs: 0,
+      }),
+    /leaseMs must be a positive integer/,
+  );
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        scheduler: runtime.scheduler,
+        defaultRetryDelayMs: -1,
+      }),
+    /defaultRetryDelayMs must be a positive integer/,
+  );
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        scheduler: runtime.scheduler,
+        maxInFlight: 0,
+      }),
+    /maxInFlight must be a positive integer/,
+  );
+});
+
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
@@ -216,8 +624,10 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
     maxInFlight: 2,
   });
 
@@ -307,8 +717,10 @@ test("deduped emit does not replay projections or materialization", async () => 
       }),
       timing: {
         clock: runtime.clock,
-        scheduler: runtime.scheduler,
       },
+    });
+    await using workers = await ledger.startWorkers({
+      scheduler: runtime.scheduler,
     });
 
     await ledger.emit(
@@ -392,8 +804,10 @@ test("event handlers can query to drive enqueue decisions", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   await ledger.emit("job.requested", { id: 1 });
@@ -519,8 +933,10 @@ test("signals materialize signal work and are pruned after ack", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   const observedSignals: Array<{ id: number; seq: number }> = [];
@@ -646,8 +1062,10 @@ test("queue handlers publish signals immediately before handler completion", asy
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   const subscription = ledger.onSignal("response.delta", () => {
@@ -743,8 +1161,10 @@ test("signal retry keeps signal event until signal work acks", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
   });
 
   await ledger.emit("response.generate", { id: 1 });
@@ -812,7 +1232,6 @@ test("emit retries SQLITE_BUSY transaction conflicts", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -880,7 +1299,6 @@ test("emit fails fast when busy retries are disabled", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
     maxBusyRetries: 0,
   });
@@ -961,7 +1379,6 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -1018,7 +1435,6 @@ test("tailEvents yields last N events then follows new events", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -1092,7 +1508,6 @@ test("resumeEvents continues from opaque cursor", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 
@@ -1186,7 +1601,6 @@ test("tail iterator return stops stream without external abort", async () => {
     }),
     timing: {
       clock: runtime.clock,
-      scheduler: runtime.scheduler,
     },
   });
 

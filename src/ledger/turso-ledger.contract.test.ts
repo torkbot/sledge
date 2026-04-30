@@ -16,6 +16,7 @@ import {
   defineLedgerModel,
   registerLedgerModel,
   type LedgerImplementations,
+  type LedgerWorkers,
 } from "./ledger.ts";
 
 runLedgerContractSuite({
@@ -141,14 +142,16 @@ runLedgerContractSuite({
         boundModel: bindLedgerModel(registeredModel, implementations),
         timing: {
           clock: runtime.clock,
-          scheduler: runtime.scheduler,
         },
-        leaseMs: 1_000,
-        defaultRetryDelayMs: 1_000,
       });
     };
 
     let ledger = createRuntimeLedger();
+    let workers: LedgerWorkers = await ledger.startWorkers({
+      scheduler: runtime.scheduler,
+      leaseMs: 1_000,
+      defaultRetryDelayMs: 1_000,
+    });
 
     return {
       get ledger() {
@@ -158,10 +161,17 @@ runLedgerContractSuite({
       advanceByMs: async (ms) => runtime.advanceByMs(ms),
       flush: async () => runtime.flush(),
       restart: async () => {
+        await workers.close();
         await ledger.close();
         ledger = createRuntimeLedger();
+        workers = await ledger.startWorkers({
+          scheduler: runtime.scheduler,
+          leaseMs: 1_000,
+          defaultRetryDelayMs: 1_000,
+        });
       },
       stop: async () => {
+        await workers.close();
         await ledger.close();
         await db.close();
       },

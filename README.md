@@ -114,33 +114,38 @@ const db = new Database("./app.sqlite");
 const clock = new SystemRuntimeClock();
 const scheduler = new NodeRuntimeScheduler();
 
-const ledger = createBetterSqliteLedger({
-  database: db,
-  boundModel: bindLedgerModel(registeredModel, {
-    indexers: {
-      upsertUser: async () => {
-        // Write to your own projection table(s)
+{
+  await using ledger = createBetterSqliteLedger({
+    database: db,
+    boundModel: bindLedgerModel(registeredModel, {
+      indexers: {
+        upsertUser: async () => {
+          // Write to your own projection table(s)
+        },
       },
-    },
-    queries: {
-      userById: async () => {
-        // Read from your own projection table(s)
-        return null;
+      queries: {
+        userById: async () => {
+          // Read from your own projection table(s)
+          return null;
+        },
       },
+    }),
+    timing: {
+      clock,
     },
-  }),
-  timing: {
-    clock,
+  });
+
+  await using workers = await ledger.startWorkers({
     scheduler,
-  },
-});
+  });
 
-await ledger.emit("user.created", {
-  userId: "u_123",
-  email: "alice@example.com",
-});
+  await ledger.emit("user.created", {
+    userId: "u_123",
+    email: "alice@example.com",
+  });
+}
 
-await ledger.close();
+db.close();
 ```
 
 ---
@@ -170,7 +175,7 @@ You provide concrete implementations for indexers and queries.
 
 ### 4) `create*Ledger(...)`
 
-You choose backend adapter and start the runtime:
+You choose a backend adapter and open the durable ledger:
 
 - `createBetterSqliteLedger(...)`
 - `createTursoLedger(...)`
@@ -179,7 +184,21 @@ The runtime exposes:
 
 - `emit(eventName, payload, options?)`
 - `query(queryName, params)`
+- `startWorkers(options)`
 - `close()`
+
+Opening a ledger is passive: it initializes storage and can emit, query, tail,
+resume, and observe signals, but it does not claim or process queue work. Start
+workers explicitly in the process that owns queue execution:
+
+```ts
+await using workers = await ledger.startWorkers({
+  scheduler: new NodeRuntimeScheduler(),
+  leaseMs: 1_000,
+  defaultRetryDelayMs: 1_000,
+  maxInFlight: 16,
+});
+```
 
 ---
 
@@ -342,11 +361,14 @@ register: {
 
 ## Runtime tuning knobs
 
-Available options when creating a ledger:
+Available options when starting workers:
 
 - `leaseMs`
 - `defaultRetryDelayMs`
 - `maxInFlight`
+
+Available options when creating a ledger:
+
 - `maxBusyRetries`
 - `maxBusyRetryDelayMs`
 
