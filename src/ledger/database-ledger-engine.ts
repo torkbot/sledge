@@ -69,6 +69,12 @@ export interface StorageStatement {
   all(...params: unknown[]): Promise<readonly StorageRow[]>;
 }
 
+/**
+ * Minimal storage operations used by the ledger engine.
+ *
+ * The engine does not own storage lifecycle; callers that open a database are
+ * responsible for closing it after ledger/workers are closed.
+ */
 export interface StorageDatabase {
   exec(sql: string): Promise<void>;
 
@@ -1413,7 +1419,7 @@ function openDatabaseLedgerEngine<
     });
     worker.dispatchLoopSettled = dispatchLoopSettled;
 
-    void dispatchLoopSettled;
+    void dispatchLoopSettled.catch(() => undefined);
   }
 
   async function runDispatchLoop(worker: WorkerRuntimeState): Promise<void> {

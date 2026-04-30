@@ -114,34 +114,36 @@ const db = new Database("./app.sqlite");
 const clock = new SystemRuntimeClock();
 const scheduler = new NodeRuntimeScheduler();
 
-await using ledger = createBetterSqliteLedger({
-  database: db,
-  boundModel: bindLedgerModel(registeredModel, {
-    indexers: {
-      upsertUser: async () => {
-        // Write to your own projection table(s)
+{
+  await using ledger = createBetterSqliteLedger({
+    database: db,
+    boundModel: bindLedgerModel(registeredModel, {
+      indexers: {
+        upsertUser: async () => {
+          // Write to your own projection table(s)
+        },
       },
-    },
-    queries: {
-      userById: async () => {
-        // Read from your own projection table(s)
-        return null;
+      queries: {
+        userById: async () => {
+          // Read from your own projection table(s)
+          return null;
+        },
       },
+    }),
+    timing: {
+      clock,
     },
-  }),
-  timing: {
-    clock,
-  },
-});
+  });
 
-await using workers = await ledger.startWorkers({
-  scheduler,
-});
+  await using workers = await ledger.startWorkers({
+    scheduler,
+  });
 
-await ledger.emit("user.created", {
-  userId: "u_123",
-  email: "alice@example.com",
-});
+  await ledger.emit("user.created", {
+    userId: "u_123",
+    email: "alice@example.com",
+  });
+}
 
 db.close();
 ```
