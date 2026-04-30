@@ -4,7 +4,9 @@
 
 - Separate passive ledger construction from queue execution. Ledgers now start
   queue dispatch only through `ledger.startWorkers(...)`, which returns a
-  disposable worker handle.
+  disposable worker handle. `ledger.close()` no longer closes the underlying
+  database handle, so applications must close their DB connections
+  separately.
 
 ## 0.5.0
 
