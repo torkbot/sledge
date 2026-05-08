@@ -396,6 +396,17 @@ function openDatabaseLedgerEngine<
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
 
+  type TransactionScope = {
+    readonly query: <const TQueryName extends keyof TQueries>(
+      queryName: TQueryName,
+      params: Static<TQueries[TQueryName]["params"]>,
+    ) => Promise<Static<TQueries[TQueryName]["result"]>>;
+    readonly index: <const TIndexName extends keyof TIndexers>(
+      indexName: TIndexName,
+      input: Static<TIndexers[TIndexName]>,
+    ) => Promise<void>;
+  };
+
   /**
    * Per-worker-handle runtime state.
    *
@@ -570,7 +581,9 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  async function runInTransaction<T>(run: () => Promise<T>): Promise<T> {
+  async function runInTransaction<T>(
+    run: (tx: TransactionScope) => Promise<T>,
+  ): Promise<T> {
     return await runSerialized(async () => {
       return await withBusyRetry(async () => {
         let began = false;
@@ -579,7 +592,7 @@ function openDatabaseLedgerEngine<
           await database.exec("BEGIN IMMEDIATE");
           began = true;
 
-          const result = await run();
+          const result = await run(createTransactionScope());
           await database.exec("COMMIT");
 
           return result;
@@ -624,58 +637,76 @@ function openDatabaseLedgerEngine<
     return decodeValue(schema, payload);
   }
 
-  async function runStorageRead<T>(
-    mode: "serialized" | "transaction-local",
-    run: () => Promise<T>,
-  ): Promise<T> {
-    /**
-     * Async SQLite adapters generally expose one connection at this boundary.
-     * Reads must not interleave with BEGIN/COMMIT on that same connection, but
-     * event handlers are allowed to query projections while their explicit
-     * append action scope is active.
-     */
-    if (mode === "transaction-local") {
-      return await run();
+  async function runQueryImplementation<
+    const TQueryName extends keyof TQueries,
+  >(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<Static<TQueries[TQueryName]["result"]>> {
+    const schema = model.queries[queryName];
+
+    if (schema === undefined) {
+      throw new Error(`unknown query: ${String(queryName)}`);
     }
 
+    const implementation = implementations.queries?.[queryName];
+
+    if (implementation === undefined) {
+      throw new Error(`missing query implementation: ${String(queryName)}`);
+    }
+
+    const decodedParams = decodeValue(schema.params, params);
+
+    const rawResult = await implementation(decodedParams as never);
+    const decodedResult = decodeValue(schema.result, rawResult);
+
+    return decodedResult as never;
+  }
+
+  async function runSerializedQuery<const TQueryName extends keyof TQueries>(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<Static<TQueries[TQueryName]["result"]>> {
     return await runSerialized(async () => {
-      return await withBusyRetry(run);
+      return await withBusyRetry(async () => {
+        return await runQueryImplementation(queryName, params);
+      });
     });
   }
 
-  async function runQuery<const TQueryName extends keyof TQueries>(
-    queryName: TQueryName,
-    params: Static<TQueries[TQueryName]["params"]>,
-    options?: {
-      readonly storageReadMode?: "serialized" | "transaction-local";
-    },
-  ): Promise<Static<TQueries[TQueryName]["result"]>> {
-    return await runStorageRead(
-      options?.storageReadMode ?? "serialized",
-      async () => {
-        const schema = model.queries[queryName];
+  async function runIndexerImplementation<
+    const TIndexName extends keyof TIndexers,
+  >(indexName: TIndexName, indexInput: Static<TIndexers[TIndexName]>) {
+    const schema = model.indexers[indexName];
 
-        if (schema === undefined) {
-          throw new Error(`unknown query: ${String(queryName)}`);
-        }
+    if (schema === undefined) {
+      throw new Error(`unknown indexer: ${String(indexName)}`);
+    }
 
-        const implementation = implementations.queries?.[queryName];
+    const implementation = implementations.indexers?.[indexName];
 
-        if (implementation === undefined) {
-          throw new Error(`missing query implementation: ${String(queryName)}`);
-        }
+    if (implementation === undefined) {
+      throw new Error(`missing indexer implementation: ${String(indexName)}`);
+    }
 
-        const decodedParams = decodeValue(schema.params, params);
+    const decodedInput = decodeValue(schema, indexInput);
 
-        const rawResult = await implementation(decodedParams as never);
-        const decodedResult = decodeValue(schema.result, rawResult);
+    await implementation(decodedInput as never);
+  }
 
-        return decodedResult as never;
+  function createTransactionScope(): TransactionScope {
+    return {
+      query: async (queryName, params) => {
+        return await runQueryImplementation(queryName, params);
       },
-    );
+      index: async (indexName, input) => {
+        await runIndexerImplementation(indexName, input);
+      },
+    };
   }
 
   async function appendEventInTransaction(
+    tx: TransactionScope,
     eventInput: AppendEventInput,
   ): Promise<{
     eventId: number;
@@ -761,40 +792,54 @@ function openDatabaseLedgerEngine<
     }[] = [];
 
     if (eventHandler !== undefined) {
-      let actionsActive = true;
-      const assertActionsActive = () => {
-        if (!actionsActive) {
+      let actionScopeOpen = true;
+      const pendingActions = new Set<Promise<unknown>>();
+
+      const assertActionScopeOpen = () => {
+        if (!actionScopeOpen) {
           throw new Error("event actions are only valid during event handling");
         }
       };
+
+      const trackAction = <T>(promise: Promise<T>): Promise<T> => {
+        assertActionScopeOpen();
+
+        let tracked: Promise<T>;
+        tracked = promise.finally(() => {
+          pendingActions.delete(tracked);
+        });
+        pendingActions.add(tracked);
+
+        return tracked;
+      };
+
+      const closeActionScope = async (): Promise<void> => {
+        actionScopeOpen = false;
+
+        if (pendingActions.size === 0) {
+          return;
+        }
+
+        const pending = [...pendingActions];
+        await Promise.allSettled(pending);
+
+        throw new Error(
+          "event actions must be awaited before the handler returns",
+        );
+      };
+
+      let handlerFailed = false;
+      let handlerError: unknown;
 
       try {
         await eventHandler({
           event: envelope,
           actions: {
-            index: async (indexName, indexInput) => {
-              assertActionsActive();
-              const schema = model.indexers[indexName as keyof TIndexers];
-
-              if (schema === undefined) {
-                throw new Error(`unknown indexer: ${String(indexName)}`);
-              }
-
-              const implementation =
-                implementations.indexers?.[indexName as keyof TIndexers];
-
-              if (implementation === undefined) {
-                throw new Error(
-                  `missing indexer implementation: ${String(indexName)}`,
-                );
-              }
-
-              const decodedInput = decodeValue(schema, indexInput);
-
-              await implementation(decodedInput as never);
+            index: (indexName, indexInput) => {
+              return trackAction(tx.index(indexName, indexInput));
             },
             enqueue: (queueName, payload, options) => {
-              assertActionsActive();
+              assertActionScopeOpen();
               const queueSchema = model.queues[queueName as keyof TQueues];
 
               if (queueSchema === undefined) {
@@ -809,16 +854,27 @@ function openDatabaseLedgerEngine<
                 availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
               });
             },
-            query: async (queryName, params) => {
-              assertActionsActive();
-              return await runQuery(queryName, params, {
-                storageReadMode: "transaction-local",
-              });
+            query: (queryName, params) => {
+              return trackAction(tx.query(queryName, params));
             },
           },
         });
-      } finally {
-        actionsActive = false;
+      } catch (error: unknown) {
+        handlerFailed = true;
+        handlerError = error;
+      }
+
+      const actionScopeError = await closeActionScope().then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      if (handlerFailed) {
+        throw handlerError;
+      }
+
+      if (actionScopeError !== null) {
+        throw actionScopeError;
       }
     }
 
@@ -1763,7 +1819,10 @@ function openDatabaseLedgerEngine<
           }
         },
         query: async (queryName, params) => {
-          return await runQuery(queryName as keyof TQueries, params as never);
+          return await runSerializedQuery(
+            queryName as keyof TQueries,
+            params as never,
+          );
         },
       };
 
@@ -1833,7 +1892,7 @@ function openDatabaseLedgerEngine<
         };
       }
 
-      const emitted = await runInTransaction(async () => {
+      const emitted = await runInTransaction(async (tx) => {
         const active = await database
           .prepare(
             `SELECT work_id
@@ -1853,7 +1912,7 @@ function openDatabaseLedgerEngine<
         let createdDurableCount = 0;
 
         for (const stagedEvent of stagedEvents) {
-          const appended = await appendEventInTransaction(stagedEvent);
+          const appended = await appendEventInTransaction(tx, stagedEvent);
 
           if (appended.created) {
             createdDurableCount += 1;
@@ -2059,8 +2118,8 @@ function openDatabaseLedgerEngine<
       await startup;
 
       const result = await runInTransaction(
-        async () =>
-          await appendEventInTransaction({
+        async (tx) =>
+          await appendEventInTransaction(tx, {
             eventName: String(eventName),
             payload: event,
             nowMs: clock.nowMs(),
@@ -2078,7 +2137,7 @@ function openDatabaseLedgerEngine<
     },
     query: async (queryName, params) => {
       await startup;
-      return await runQuery(queryName, params);
+      return await runSerializedQuery(queryName, params);
     },
     onSignal: (signalName, observer) => {
       const signalSchema = model.signals[signalName as keyof TSignals];
