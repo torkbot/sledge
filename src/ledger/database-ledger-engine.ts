@@ -1112,16 +1112,18 @@ function openDatabaseLedgerEngine<
   async function scheduleNextDispatchFromStore(
     worker: WorkerRuntimeState,
   ): Promise<void> {
-    const row = await database
-      .prepare(
-        `SELECT available_at_ms
-         FROM work
-         WHERE dead = 0
-           AND lease_id IS NULL
-         ORDER BY available_at_ms ASC
-         LIMIT 1`,
-      )
-      .get();
+    const row = await runSerialized(async () => {
+      return await database
+        .prepare(
+          `SELECT available_at_ms
+           FROM work
+           WHERE dead = 0
+             AND lease_id IS NULL
+           ORDER BY available_at_ms ASC
+           LIMIT 1`,
+        )
+        .get();
+    });
 
     if (row === undefined) {
       return;

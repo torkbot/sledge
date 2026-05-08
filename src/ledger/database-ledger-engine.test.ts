@@ -295,6 +295,84 @@ test("ledger queries serialize before external write transactions", async () => 
   assert.equal(beginAttemptedDuringSlowQuery, false);
 });
 
+test("dispatch scheduling reads serialize before external write transactions", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const scheduleReadStarted = Promise.withResolvers<void>();
+  const releaseScheduleRead = Promise.withResolvers<void>();
+  let scheduleReadActive = false;
+  let beginAttemptedDuringScheduleRead = false;
+
+  const storage = wrapBetterSqliteDatabase(database);
+  const serializedStorage: StorageDatabase = {
+    exec: async (sql) => {
+      if (sql === "BEGIN IMMEDIATE" && scheduleReadActive) {
+        beginAttemptedDuringScheduleRead = true;
+      }
+
+      await storage.exec(sql);
+    },
+    prepare: (sql) => {
+      if (sql.includes("SELECT available_at_ms")) {
+        return {
+          run: async () => {
+            return { changes: 0, lastInsertRowid: 0 };
+          },
+          get: async () => {
+            scheduleReadActive = true;
+            scheduleReadStarted.resolve();
+            await releaseScheduleRead.promise;
+            scheduleReadActive = false;
+
+            return undefined;
+          },
+          all: async () => [],
+        };
+      }
+
+      return storage.prepare(sql);
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: serializedStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  const workersPromise = ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+  await scheduleReadStarted.promise;
+
+  const emitPromise = ledger.emit("thing.recorded", { id: 1 });
+  assert.equal(await settlesWithin(emitPromise, 10), false);
+  assert.equal(beginAttemptedDuringScheduleRead, false);
+
+  releaseScheduleRead.resolve();
+
+  await using workers = await workersPromise;
+  await emitPromise;
+  assert.equal(beginAttemptedDuringScheduleRead, false);
+});
+
 test("event-handler queries remain reentrant inside append transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");

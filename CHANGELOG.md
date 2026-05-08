@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.6.2
+
+- Serialize the worker dispatch scheduling read with writes so idle-work
+  polling cannot overlap `BEGIN` / `COMMIT` on single-connection async SQLite
+  adapters.
+
 ## 0.6.1
 
 - Serialize external `ledger.query(...)` and queue-handler `actions.query(...)`
