@@ -208,6 +208,315 @@ function wrapBetterSqliteDatabase(
   };
 }
 
+test("ledger queries serialize before external write transactions", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const queryStarted = Promise.withResolvers<void>();
+  const releaseQuery = Promise.withResolvers<void>();
+  let slowQueryActive = false;
+  let beginAttemptedDuringSlowQuery = false;
+
+  const storage = wrapBetterSqliteDatabase(database);
+  const serializedStorage: StorageDatabase = {
+    exec: async (sql) => {
+      if (sql === "BEGIN IMMEDIATE" && slowQueryActive) {
+        beginAttemptedDuringSlowQuery = true;
+      }
+
+      await storage.exec(sql);
+    },
+    prepare: (sql) => {
+      if (sql === "SELECT value FROM slow_read") {
+        return {
+          run: async () => {
+            return { changes: 0, lastInsertRowid: 0 };
+          },
+          get: async () => {
+            slowQueryActive = true;
+            queryStarted.resolve();
+            await releaseQuery.promise;
+            slowQueryActive = false;
+
+            return { value: "ok" };
+          },
+          all: async () => [],
+        };
+      }
+
+      return storage.prepare(sql);
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      slow: {
+        params: Type.Object({}),
+        result: Type.Object({ value: Type.String() }),
+      },
+    },
+    register: {},
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: serializedStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        slow: async () => {
+          return await serializedStorage
+            .prepare("SELECT value FROM slow_read")
+            .get();
+        },
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  const queryPromise = ledger.query("slow", {});
+  await queryStarted.promise;
+
+  const emitPromise = ledger.emit("thing.recorded", { id: 1 });
+  assert.equal(await settlesWithin(emitPromise, 10), false);
+  assert.equal(beginAttemptedDuringSlowQuery, false);
+
+  releaseQuery.resolve();
+
+  assert.deepEqual(await queryPromise, { value: "ok" });
+  await emitPromise;
+  assert.equal(beginAttemptedDuringSlowQuery, false);
+});
+
+test("event-handler queries remain reentrant inside append transactions", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let observedEvents = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      eventCount: {
+        params: Type.Object({}),
+        result: Type.Object({ count: Type.Number() }),
+      },
+    },
+    register: {
+      events: {
+        "thing.recorded": async ({ actions }) => {
+          const result = await actions.query("eventCount", {});
+          observedEvents = result.count;
+        },
+      },
+    },
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: wrapBetterSqliteDatabase(database),
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        eventCount: async () => {
+          const row = await wrapBetterSqliteDatabase(database)
+            .prepare("SELECT COUNT(*) AS count FROM events")
+            .get();
+
+          return row;
+        },
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("thing.recorded", { id: 1 });
+
+  assert.equal(observedEvents, 1);
+});
+
+test("event-handler query actions expire after handler completion", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let queryInvocations = 0;
+  let capturedQuery:
+    | ((params: Record<string, never>) => Promise<{ count: number }>)
+    | null = null;
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      eventCount: {
+        params: Type.Object({}),
+        result: Type.Object({ count: Type.Number() }),
+      },
+    },
+    register: {
+      events: {
+        "thing.recorded": async ({ actions }) => {
+          capturedQuery = async (params) => {
+            return await actions.query("eventCount", params);
+          };
+        },
+      },
+    },
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: wrapBetterSqliteDatabase(database),
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        eventCount: async () => {
+          queryInvocations += 1;
+          const row = await wrapBetterSqliteDatabase(database)
+            .prepare("SELECT COUNT(*) AS count FROM events")
+            .get();
+
+          return row;
+        },
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("thing.recorded", { id: 1 });
+
+  assert.notEqual(capturedQuery, null);
+  await assert.rejects(
+    async () => await capturedQuery?.({}),
+    /event actions are only valid during event handling/,
+  );
+  assert.equal(queryInvocations, 0);
+});
+
+test("unawaited event-handler queries settle before rollback", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const queryStarted = Promise.withResolvers<void>();
+  const releaseQuery = Promise.withResolvers<void>();
+  let slowQueryActive = false;
+  let commitAttemptedDuringSlowQuery = false;
+  let rolledBack = false;
+
+  const storage = wrapBetterSqliteDatabase(database);
+  const serializedStorage: StorageDatabase = {
+    exec: async (sql) => {
+      if (sql === "COMMIT" && slowQueryActive) {
+        commitAttemptedDuringSlowQuery = true;
+      }
+
+      if (sql === "ROLLBACK") {
+        rolledBack = true;
+      }
+
+      await storage.exec(sql);
+    },
+    prepare: (sql) => {
+      if (sql === "SELECT value FROM slow_read") {
+        return {
+          run: async () => {
+            return { changes: 0, lastInsertRowid: 0 };
+          },
+          get: async () => {
+            slowQueryActive = true;
+            queryStarted.resolve();
+            await releaseQuery.promise;
+            slowQueryActive = false;
+
+            return { value: "ok" };
+          },
+          all: async () => [],
+        };
+      }
+
+      return storage.prepare(sql);
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      slow: {
+        params: Type.Object({}),
+        result: Type.Object({ value: Type.String() }),
+      },
+    },
+    register: {
+      events: {
+        "thing.recorded": ({ actions }) => {
+          void actions.query("slow", {});
+        },
+      },
+    },
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: serializedStorage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        slow: async () => {
+          return await serializedStorage
+            .prepare("SELECT value FROM slow_read")
+            .get();
+        },
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  const emitPromise = ledger.emit("thing.recorded", { id: 1 });
+  await queryStarted.promise;
+
+  assert.equal(await settlesWithin(emitPromise, 10), false);
+  assert.equal(commitAttemptedDuringSlowQuery, false);
+
+  releaseQuery.resolve();
+
+  await assert.rejects(
+    async () => await emitPromise,
+    /event actions must be awaited before the handler returns/,
+  );
+  assert.equal(commitAttemptedDuringSlowQuery, false);
+  assert.equal(rolledBack, true);
+
+  const row = await storage
+    .prepare("SELECT COUNT(*) AS count FROM events")
+    .get();
+
+  assert.deepEqual(row, { count: 0 });
+});
+
 test("ledger construction and emit do not start queue workers", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");

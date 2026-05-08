@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.6.1
+
+- Serialize external `ledger.query(...)` and queue-handler `actions.query(...)`
+  calls with ledger writes so single-connection async SQLite adapters do not
+  interleave reads with `BEGIN` / `COMMIT` transaction boundaries.
+- Keep event-handler `actions.query(...)` and `actions.index(...)`
+  transaction-local through an explicit internal transaction scope, preserving
+  read-your-writes behavior while rejecting action calls that escape the event
+  handler lifetime.
+
 ## 0.6.0
 
 - Breaking: ledgers and storage adapters no longer own the underlying database

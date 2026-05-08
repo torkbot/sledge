@@ -396,6 +396,17 @@ function openDatabaseLedgerEngine<
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
   let appendSequence = 0;
 
+  type TransactionScope = {
+    readonly query: <const TQueryName extends keyof TQueries>(
+      queryName: TQueryName,
+      params: Static<TQueries[TQueryName]["params"]>,
+    ) => Promise<Static<TQueries[TQueryName]["result"]>>;
+    readonly index: <const TIndexName extends keyof TIndexers>(
+      indexName: TIndexName,
+      input: Static<TIndexers[TIndexName]>,
+    ) => Promise<void>;
+  };
+
   /**
    * Per-worker-handle runtime state.
    *
@@ -570,7 +581,9 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  async function runInTransaction<T>(run: () => Promise<T>): Promise<T> {
+  async function runInTransaction<T>(
+    run: (tx: TransactionScope) => Promise<T>,
+  ): Promise<T> {
     return await runSerialized(async () => {
       return await withBusyRetry(async () => {
         let began = false;
@@ -579,7 +592,7 @@ function openDatabaseLedgerEngine<
           await database.exec("BEGIN IMMEDIATE");
           began = true;
 
-          const result = await run();
+          const result = await run(createTransactionScope());
           await database.exec("COMMIT");
 
           return result;
@@ -624,7 +637,9 @@ function openDatabaseLedgerEngine<
     return decodeValue(schema, payload);
   }
 
-  async function runQuery<const TQueryName extends keyof TQueries>(
+  async function runQueryImplementation<
+    const TQueryName extends keyof TQueries,
+  >(
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
@@ -648,7 +663,50 @@ function openDatabaseLedgerEngine<
     return decodedResult as never;
   }
 
+  async function runSerializedQuery<const TQueryName extends keyof TQueries>(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<Static<TQueries[TQueryName]["result"]>> {
+    return await runSerialized(async () => {
+      return await withBusyRetry(async () => {
+        return await runQueryImplementation(queryName, params);
+      });
+    });
+  }
+
+  async function runIndexerImplementation<
+    const TIndexName extends keyof TIndexers,
+  >(indexName: TIndexName, indexInput: Static<TIndexers[TIndexName]>) {
+    const schema = model.indexers[indexName];
+
+    if (schema === undefined) {
+      throw new Error(`unknown indexer: ${String(indexName)}`);
+    }
+
+    const implementation = implementations.indexers?.[indexName];
+
+    if (implementation === undefined) {
+      throw new Error(`missing indexer implementation: ${String(indexName)}`);
+    }
+
+    const decodedInput = decodeValue(schema, indexInput);
+
+    await implementation(decodedInput as never);
+  }
+
+  function createTransactionScope(): TransactionScope {
+    return {
+      query: async (queryName, params) => {
+        return await runQueryImplementation(queryName, params);
+      },
+      index: async (indexName, input) => {
+        await runIndexerImplementation(indexName, input);
+      },
+    };
+  }
+
   async function appendEventInTransaction(
+    tx: TransactionScope,
     eventInput: AppendEventInput,
   ): Promise<{
     eventId: number;
@@ -734,49 +792,94 @@ function openDatabaseLedgerEngine<
     }[] = [];
 
     if (eventHandler !== undefined) {
-      await eventHandler({
-        event: envelope,
-        actions: {
-          index: async (indexName, indexInput) => {
-            const schema = model.indexers[indexName as keyof TIndexers];
+      let actionScopeOpen = true;
+      const pendingActions = new Set<Promise<unknown>>();
 
-            if (schema === undefined) {
-              throw new Error(`unknown indexer: ${String(indexName)}`);
-            }
+      const assertActionScopeOpen = () => {
+        if (!actionScopeOpen) {
+          throw new Error("event actions are only valid during event handling");
+        }
+      };
 
-            const implementation =
-              implementations.indexers?.[indexName as keyof TIndexers];
+      const trackAction = <T>(run: () => Promise<T>): Promise<T> => {
+        assertActionScopeOpen();
 
-            if (implementation === undefined) {
-              throw new Error(
-                `missing indexer implementation: ${String(indexName)}`,
-              );
-            }
+        let tracked: Promise<T>;
+        tracked = run().finally(() => {
+          pendingActions.delete(tracked);
+        });
+        pendingActions.add(tracked);
 
-            const decodedInput = decodeValue(schema, indexInput);
+        return tracked;
+      };
 
-            await implementation(decodedInput as never);
+      const closeActionScope = async (): Promise<void> => {
+        actionScopeOpen = false;
+
+        if (pendingActions.size === 0) {
+          return;
+        }
+
+        const pending = [...pendingActions];
+        await Promise.allSettled(pending);
+
+        throw new Error(
+          "event actions must be awaited before the handler returns",
+        );
+      };
+
+      let handlerFailed = false;
+      let handlerError: unknown;
+
+      try {
+        await eventHandler({
+          event: envelope,
+          actions: {
+            index: (indexName, indexInput) => {
+              return trackAction(async () => {
+                await tx.index(indexName, indexInput);
+              });
+            },
+            enqueue: (queueName, payload, options) => {
+              assertActionScopeOpen();
+              const queueSchema = model.queues[queueName as keyof TQueues];
+
+              if (queueSchema === undefined) {
+                throw new Error(`unknown queue: ${String(queueName)}`);
+              }
+
+              const decodedQueuePayload = decodeValue(queueSchema, payload);
+
+              queued.push({
+                queueName: String(queueName),
+                payload: decodedQueuePayload,
+                availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
+              });
+            },
+            query: (queryName, params) => {
+              return trackAction(async () => {
+                return await tx.query(queryName, params);
+              });
+            },
           },
-          enqueue: (queueName, payload, options) => {
-            const queueSchema = model.queues[queueName as keyof TQueues];
+        });
+      } catch (error: unknown) {
+        handlerFailed = true;
+        handlerError = error;
+      }
 
-            if (queueSchema === undefined) {
-              throw new Error(`unknown queue: ${String(queueName)}`);
-            }
+      const actionScopeError = await closeActionScope().then(
+        () => null,
+        (error: unknown) => error,
+      );
 
-            const decodedQueuePayload = decodeValue(queueSchema, payload);
+      if (handlerFailed) {
+        throw handlerError;
+      }
 
-            queued.push({
-              queueName: String(queueName),
-              payload: decodedQueuePayload,
-              availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
-            });
-          },
-          query: async (queryName, params) => {
-            return await runQuery(queryName, params);
-          },
-        },
-      });
+      if (actionScopeError !== null) {
+        throw actionScopeError;
+      }
     }
 
     for (const work of queued) {
@@ -1720,7 +1823,10 @@ function openDatabaseLedgerEngine<
           }
         },
         query: async (queryName, params) => {
-          return await runQuery(queryName as keyof TQueries, params as never);
+          return await runSerializedQuery(
+            queryName as keyof TQueries,
+            params as never,
+          );
         },
       };
 
@@ -1790,7 +1896,7 @@ function openDatabaseLedgerEngine<
         };
       }
 
-      const emitted = await runInTransaction(async () => {
+      const emitted = await runInTransaction(async (tx) => {
         const active = await database
           .prepare(
             `SELECT work_id
@@ -1810,7 +1916,7 @@ function openDatabaseLedgerEngine<
         let createdDurableCount = 0;
 
         for (const stagedEvent of stagedEvents) {
-          const appended = await appendEventInTransaction(stagedEvent);
+          const appended = await appendEventInTransaction(tx, stagedEvent);
 
           if (appended.created) {
             createdDurableCount += 1;
@@ -2016,8 +2122,8 @@ function openDatabaseLedgerEngine<
       await startup;
 
       const result = await runInTransaction(
-        async () =>
-          await appendEventInTransaction({
+        async (tx) =>
+          await appendEventInTransaction(tx, {
             eventName: String(eventName),
             payload: event,
             nowMs: clock.nowMs(),
@@ -2035,7 +2141,7 @@ function openDatabaseLedgerEngine<
     },
     query: async (queryName, params) => {
       await startup;
-      return await runQuery(queryName, params);
+      return await runSerializedQuery(queryName, params);
     },
     onSignal: (signalName, observer) => {
       const signalSchema = model.signals[signalName as keyof TSignals];
