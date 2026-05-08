@@ -801,11 +801,11 @@ function openDatabaseLedgerEngine<
         }
       };
 
-      const trackAction = <T>(promise: Promise<T>): Promise<T> => {
+      const trackAction = <T>(run: () => Promise<T>): Promise<T> => {
         assertActionScopeOpen();
 
         let tracked: Promise<T>;
-        tracked = promise.finally(() => {
+        tracked = run().finally(() => {
           pendingActions.delete(tracked);
         });
         pendingActions.add(tracked);
@@ -836,7 +836,9 @@ function openDatabaseLedgerEngine<
           event: envelope,
           actions: {
             index: (indexName, indexInput) => {
-              return trackAction(tx.index(indexName, indexInput));
+              return trackAction(async () => {
+                await tx.index(indexName, indexInput);
+              });
             },
             enqueue: (queueName, payload, options) => {
               assertActionScopeOpen();
@@ -855,7 +857,9 @@ function openDatabaseLedgerEngine<
               });
             },
             query: (queryName, params) => {
-              return trackAction(tx.query(queryName, params));
+              return trackAction(async () => {
+                return await tx.query(queryName, params);
+              });
             },
           },
         });

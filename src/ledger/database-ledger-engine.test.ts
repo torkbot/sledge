@@ -351,6 +351,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
 test("event-handler query actions expire after handler completion", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
+  let queryInvocations = 0;
   let capturedQuery:
     | ((params: Record<string, never>) => Promise<{ count: number }>)
     | null = null;
@@ -386,6 +387,7 @@ test("event-handler query actions expire after handler completion", async () => 
       indexers: {},
       queries: {
         eventCount: async () => {
+          queryInvocations += 1;
           const row = await wrapBetterSqliteDatabase(database)
             .prepare("SELECT COUNT(*) AS count FROM events")
             .get();
@@ -406,6 +408,7 @@ test("event-handler query actions expire after handler completion", async () => 
     async () => await capturedQuery?.({}),
     /event actions are only valid during event handling/,
   );
+  assert.equal(queryInvocations, 0);
 });
 
 test("unawaited event-handler queries settle before rollback", async () => {
