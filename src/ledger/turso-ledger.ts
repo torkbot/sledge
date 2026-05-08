@@ -5,6 +5,7 @@ import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
+  type StorageSerializationGate,
 } from "./database-ledger-engine.ts";
 import type {
   BoundLedgerModel,
@@ -15,6 +16,7 @@ import type {
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
+const storageGates = new WeakMap<Database, StorageSerializationGate>();
 
 type CreateTursoLedgerInput<
   TEvents extends Record<string, TSchema>,
@@ -64,6 +66,7 @@ export function createTursoLedger<
     TSignalQueues
   > = {
     database: wrapTursoPromiseDatabase(input.database),
+    storageGate: getStorageGate(input.database),
     boundModel: input.boundModel,
     timing: input.timing,
     maxBusyRetries: input.maxBusyRetries,
@@ -71,6 +74,17 @@ export function createTursoLedger<
   };
 
   return createDatabaseLedger(sharedInput);
+}
+
+function getStorageGate(database: Database): StorageSerializationGate {
+  let gate = storageGates.get(database);
+
+  if (gate === undefined) {
+    gate = { tail: Promise.resolve() };
+    storageGates.set(database, gate);
+  }
+
+  return gate;
 }
 
 function wrapTursoPromiseDatabase(database: Database): StorageDatabase {

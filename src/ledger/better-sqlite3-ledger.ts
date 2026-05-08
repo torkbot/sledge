@@ -11,10 +11,12 @@ import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
+  type StorageSerializationGate,
 } from "./database-ledger-engine.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
+const storageGates = new WeakMap<Database.Database, StorageSerializationGate>();
 
 type CreateBetterSqliteLedgerInput<
   TEvents extends Record<string, TSchema>,
@@ -64,6 +66,7 @@ export function createBetterSqliteLedger<
     TSignalQueues
   > = {
     database: wrapBetterSqliteDatabase(input.database),
+    storageGate: getStorageGate(input.database),
     boundModel: input.boundModel,
     timing: input.timing,
     maxBusyRetries: input.maxBusyRetries,
@@ -71,6 +74,17 @@ export function createBetterSqliteLedger<
   };
 
   return createDatabaseLedger(sharedInput);
+}
+
+function getStorageGate(database: Database.Database): StorageSerializationGate {
+  let gate = storageGates.get(database);
+
+  if (gate === undefined) {
+    gate = { tail: Promise.resolve() };
+    storageGates.set(database, gate);
+  }
+
+  return gate;
 }
 
 function wrapBetterSqliteDatabase(

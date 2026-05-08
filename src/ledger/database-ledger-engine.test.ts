@@ -12,6 +12,7 @@ import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
 import {
   createDatabaseLedger,
   type StorageDatabase,
+  type StorageSerializationGate,
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
@@ -285,6 +286,117 @@ test("ledger queries serialize before external write transactions", async () => 
   await queryStarted.promise;
 
   const emitPromise = ledger.emit("thing.recorded", { id: 1 });
+  assert.equal(await settlesWithin(emitPromise, 10), false);
+  assert.equal(beginAttemptedDuringSlowQuery, false);
+
+  releaseQuery.resolve();
+
+  assert.deepEqual(await queryPromise, { value: "ok" });
+  await emitPromise;
+  assert.equal(beginAttemptedDuringSlowQuery, false);
+});
+
+test("ledger instances sharing a storage gate serialize reads before writes", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const sharedGate: StorageSerializationGate = {
+    tail: Promise.resolve(),
+  };
+  const queryStarted = Promise.withResolvers<void>();
+  const releaseQuery = Promise.withResolvers<void>();
+  let slowQueryActive = false;
+  let beginAttemptedDuringSlowQuery = false;
+
+  const storage = wrapBetterSqliteDatabase(database);
+  const serializedStorage: StorageDatabase = {
+    exec: async (sql) => {
+      if (sql === "BEGIN IMMEDIATE" && slowQueryActive) {
+        beginAttemptedDuringSlowQuery = true;
+      }
+
+      await storage.exec(sql);
+    },
+    prepare: (sql) => {
+      if (sql === "SELECT value FROM slow_read") {
+        return {
+          run: async () => {
+            return { changes: 0, lastInsertRowid: 0 };
+          },
+          get: async () => {
+            slowQueryActive = true;
+            queryStarted.resolve();
+            await releaseQuery.promise;
+            slowQueryActive = false;
+
+            return { value: "ok" };
+          },
+          all: async () => [],
+        };
+      }
+
+      return storage.prepare(sql);
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      noop: {
+        params: Type.Object({}),
+        result: Type.Object({ value: Type.String() }),
+      },
+      slow: {
+        params: Type.Object({}),
+        result: Type.Object({ value: Type.String() }),
+      },
+    },
+    register: {},
+  });
+  const boundModel = model.bind({
+    indexers: {},
+    queries: {
+      noop: async () => {
+        return { value: "ready" };
+      },
+      slow: async () => {
+        return await serializedStorage
+          .prepare("SELECT value FROM slow_read")
+          .get();
+      },
+    },
+  });
+  await using queryLedger = createDatabaseLedger({
+    database: serializedStorage,
+    storageGate: sharedGate,
+    boundModel,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  await using writeLedger = createDatabaseLedger({
+    database: serializedStorage,
+    storageGate: sharedGate,
+    boundModel,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await Promise.all([
+    queryLedger.query("noop", {}),
+    writeLedger.query("noop", {}),
+  ]);
+
+  const queryPromise = queryLedger.query("slow", {});
+  await queryStarted.promise;
+
+  const emitPromise = writeLedger.emit("thing.recorded", { id: 1 });
   assert.equal(await settlesWithin(emitPromise, 10), false);
   assert.equal(beginAttemptedDuringSlowQuery, false);
 

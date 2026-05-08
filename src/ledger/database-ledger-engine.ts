@@ -81,6 +81,10 @@ export interface StorageDatabase {
   prepare(sql: string): StorageStatement;
 }
 
+export type StorageSerializationGate = {
+  tail: Promise<void>;
+};
+
 type OpenDatabaseLedgerEngineInput<
   TEvents extends Record<string, TSchema>,
   TSignals extends Record<string, TSchema>,
@@ -99,6 +103,7 @@ type OpenDatabaseLedgerEngineInput<
   >;
   readonly timing: LedgerTiming;
   readonly database: StorageDatabase;
+  readonly storageGate?: StorageSerializationGate;
   readonly maxBusyRetries?: number;
   readonly maxBusyRetryDelayMs?: number;
 };
@@ -112,6 +117,7 @@ export type CreateDatabaseLedgerInput<
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
   readonly database: StorageDatabase;
+  readonly storageGate?: StorageSerializationGate;
   readonly boundModel: BoundLedgerModel<
     TEvents,
     TQueues,
@@ -146,6 +152,7 @@ export function createDatabaseLedger<
     boundModel: input.boundModel,
     timing: input.timing,
     database: input.database,
+    storageGate: input.storageGate,
     maxBusyRetries: input.maxBusyRetries,
     maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   });
@@ -481,11 +488,12 @@ function openDatabaseLedgerEngine<
     scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
   };
 
-  let mutationTail: Promise<void> = Promise.resolve();
+  const storageGate = input.storageGate ?? { tail: Promise.resolve() };
 
   const startup = (async () => {
-    await withBusyRetry(async () => {
-      await database.exec(`
+    await runSerialized(async () => {
+      await withBusyRetry(async () => {
+        await database.exec(`
       CREATE TABLE IF NOT EXISTS events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts_ms INTEGER NOT NULL,
@@ -514,6 +522,7 @@ function openDatabaseLedgerEngine<
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
     `);
+      });
     });
 
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
@@ -526,8 +535,10 @@ function openDatabaseLedgerEngine<
     definition: string,
   ): Promise<void> {
     let rows: readonly StorageRow[] = [];
-    await withBusyRetry(async () => {
-      rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
+    await runSerialized(async () => {
+      await withBusyRetry(async () => {
+        rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
+      });
     });
 
     const hasColumn = rows.some((row) => {
@@ -539,10 +550,12 @@ function openDatabaseLedgerEngine<
     }
 
     try {
-      await withBusyRetry(async () => {
-        await database.exec(
-          `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
-        );
+      await runSerialized(async () => {
+        await withBusyRetry(async () => {
+          await database.exec(
+            `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
+          );
+        });
       });
     } catch (error: unknown) {
       if (isDuplicateColumnError(error)) {
@@ -554,8 +567,8 @@ function openDatabaseLedgerEngine<
   }
 
   function runSerialized<T>(run: () => Promise<T>): Promise<T> {
-    const operation = mutationTail.then(run, run);
-    mutationTail = operation.then(
+    const operation = storageGate.tail.then(run, run);
+    storageGate.tail = operation.then(
       () => undefined,
       () => undefined,
     );

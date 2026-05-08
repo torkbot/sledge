@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.6.3
+
+- Share the storage serialization gate across Sledge ledger instances created
+  for the same adapter database handle, preventing independent ledgers on one
+  async SQLite/Turso connection from overlapping reads and write transactions.
+
 ## 0.6.2
 
 - Serialize the worker dispatch scheduling read with writes so idle-work
