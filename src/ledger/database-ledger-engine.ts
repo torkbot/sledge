@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import { Type, type Static, type TSchema } from "typebox";
@@ -471,6 +472,9 @@ function openDatabaseLedgerEngine<
   };
 
   let mutationTail: Promise<void> = Promise.resolve();
+  const storageContext = new AsyncLocalStorage<{
+    readonly transaction: true;
+  }>();
 
   const startup = (async () => {
     await withBusyRetry(async () => {
@@ -579,7 +583,7 @@ function openDatabaseLedgerEngine<
           await database.exec("BEGIN IMMEDIATE");
           began = true;
 
-          const result = await run();
+          const result = await storageContext.run({ transaction: true }, run);
           await database.exec("COMMIT");
 
           return result;
@@ -624,28 +628,47 @@ function openDatabaseLedgerEngine<
     return decodeValue(schema, payload);
   }
 
+  async function runStorageRead<T>(run: () => Promise<T>): Promise<T> {
+    /**
+     * Async SQLite adapters generally expose one connection at this boundary.
+     * Reads must not interleave with BEGIN/COMMIT on that same connection, but
+     * event handlers are allowed to query projections while their append
+     * transaction is active. AsyncLocalStorage distinguishes those reentrant
+     * transaction reads from independent reads that must queue behind writes.
+     */
+    if (storageContext.getStore()?.transaction === true) {
+      return await run();
+    }
+
+    return await runSerialized(async () => {
+      return await withBusyRetry(run);
+    });
+  }
+
   async function runQuery<const TQueryName extends keyof TQueries>(
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
-    const schema = model.queries[queryName];
+    return await runStorageRead(async () => {
+      const schema = model.queries[queryName];
 
-    if (schema === undefined) {
-      throw new Error(`unknown query: ${String(queryName)}`);
-    }
+      if (schema === undefined) {
+        throw new Error(`unknown query: ${String(queryName)}`);
+      }
 
-    const implementation = implementations.queries?.[queryName];
+      const implementation = implementations.queries?.[queryName];
 
-    if (implementation === undefined) {
-      throw new Error(`missing query implementation: ${String(queryName)}`);
-    }
+      if (implementation === undefined) {
+        throw new Error(`missing query implementation: ${String(queryName)}`);
+      }
 
-    const decodedParams = decodeValue(schema.params, params);
+      const decodedParams = decodeValue(schema.params, params);
 
-    const rawResult = await implementation(decodedParams as never);
-    const decodedResult = decodeValue(schema.result, rawResult);
+      const rawResult = await implementation(decodedParams as never);
+      const decodedResult = decodeValue(schema.result, rawResult);
 
-    return decodedResult as never;
+      return decodedResult as never;
+    });
   }
 
   async function appendEventInTransaction(
