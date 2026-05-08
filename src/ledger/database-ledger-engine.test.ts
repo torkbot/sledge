@@ -348,6 +348,66 @@ test("event-handler queries remain reentrant inside append transactions", async 
   assert.equal(observedEvents, 1);
 });
 
+test("event-handler query actions expire after handler completion", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let capturedQuery:
+    | ((params: Record<string, never>) => Promise<{ count: number }>)
+    | null = null;
+
+  const model = defineLedgerModel({
+    events: {
+      "thing.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      eventCount: {
+        params: Type.Object({}),
+        result: Type.Object({ count: Type.Number() }),
+      },
+    },
+    register: {
+      events: {
+        "thing.recorded": async ({ actions }) => {
+          capturedQuery = async (params) => {
+            return await actions.query("eventCount", params);
+          };
+        },
+      },
+    },
+  });
+
+  await using ledger = createDatabaseLedger({
+    database: wrapBetterSqliteDatabase(database),
+    boundModel: model.bind({
+      indexers: {},
+      queries: {
+        eventCount: async () => {
+          const row = await wrapBetterSqliteDatabase(database)
+            .prepare("SELECT COUNT(*) AS count FROM events")
+            .get();
+
+          return row;
+        },
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("thing.recorded", { id: 1 });
+
+  assert.notEqual(capturedQuery, null);
+  await assert.rejects(
+    async () => await capturedQuery?.({}),
+    /event actions are only valid during event handling/,
+  );
+});
+
 test("ledger construction and emit do not start queue workers", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");

@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import { Type, type Static, type TSchema } from "typebox";
@@ -472,9 +471,6 @@ function openDatabaseLedgerEngine<
   };
 
   let mutationTail: Promise<void> = Promise.resolve();
-  const storageContext = new AsyncLocalStorage<{
-    readonly transaction: true;
-  }>();
 
   const startup = (async () => {
     await withBusyRetry(async () => {
@@ -583,7 +579,7 @@ function openDatabaseLedgerEngine<
           await database.exec("BEGIN IMMEDIATE");
           began = true;
 
-          const result = await storageContext.run({ transaction: true }, run);
+          const result = await run();
           await database.exec("COMMIT");
 
           return result;
@@ -628,15 +624,17 @@ function openDatabaseLedgerEngine<
     return decodeValue(schema, payload);
   }
 
-  async function runStorageRead<T>(run: () => Promise<T>): Promise<T> {
+  async function runStorageRead<T>(
+    mode: "serialized" | "transaction-local",
+    run: () => Promise<T>,
+  ): Promise<T> {
     /**
      * Async SQLite adapters generally expose one connection at this boundary.
      * Reads must not interleave with BEGIN/COMMIT on that same connection, but
-     * event handlers are allowed to query projections while their append
-     * transaction is active. AsyncLocalStorage distinguishes those reentrant
-     * transaction reads from independent reads that must queue behind writes.
+     * event handlers are allowed to query projections while their explicit
+     * append action scope is active.
      */
-    if (storageContext.getStore()?.transaction === true) {
+    if (mode === "transaction-local") {
       return await run();
     }
 
@@ -648,27 +646,33 @@ function openDatabaseLedgerEngine<
   async function runQuery<const TQueryName extends keyof TQueries>(
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
+    options?: {
+      readonly storageReadMode?: "serialized" | "transaction-local";
+    },
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
-    return await runStorageRead(async () => {
-      const schema = model.queries[queryName];
+    return await runStorageRead(
+      options?.storageReadMode ?? "serialized",
+      async () => {
+        const schema = model.queries[queryName];
 
-      if (schema === undefined) {
-        throw new Error(`unknown query: ${String(queryName)}`);
-      }
+        if (schema === undefined) {
+          throw new Error(`unknown query: ${String(queryName)}`);
+        }
 
-      const implementation = implementations.queries?.[queryName];
+        const implementation = implementations.queries?.[queryName];
 
-      if (implementation === undefined) {
-        throw new Error(`missing query implementation: ${String(queryName)}`);
-      }
+        if (implementation === undefined) {
+          throw new Error(`missing query implementation: ${String(queryName)}`);
+        }
 
-      const decodedParams = decodeValue(schema.params, params);
+        const decodedParams = decodeValue(schema.params, params);
 
-      const rawResult = await implementation(decodedParams as never);
-      const decodedResult = decodeValue(schema.result, rawResult);
+        const rawResult = await implementation(decodedParams as never);
+        const decodedResult = decodeValue(schema.result, rawResult);
 
-      return decodedResult as never;
-    });
+        return decodedResult as never;
+      },
+    );
   }
 
   async function appendEventInTransaction(
@@ -757,49 +761,65 @@ function openDatabaseLedgerEngine<
     }[] = [];
 
     if (eventHandler !== undefined) {
-      await eventHandler({
-        event: envelope,
-        actions: {
-          index: async (indexName, indexInput) => {
-            const schema = model.indexers[indexName as keyof TIndexers];
+      let actionsActive = true;
+      const assertActionsActive = () => {
+        if (!actionsActive) {
+          throw new Error("event actions are only valid during event handling");
+        }
+      };
 
-            if (schema === undefined) {
-              throw new Error(`unknown indexer: ${String(indexName)}`);
-            }
+      try {
+        await eventHandler({
+          event: envelope,
+          actions: {
+            index: async (indexName, indexInput) => {
+              assertActionsActive();
+              const schema = model.indexers[indexName as keyof TIndexers];
 
-            const implementation =
-              implementations.indexers?.[indexName as keyof TIndexers];
+              if (schema === undefined) {
+                throw new Error(`unknown indexer: ${String(indexName)}`);
+              }
 
-            if (implementation === undefined) {
-              throw new Error(
-                `missing indexer implementation: ${String(indexName)}`,
-              );
-            }
+              const implementation =
+                implementations.indexers?.[indexName as keyof TIndexers];
 
-            const decodedInput = decodeValue(schema, indexInput);
+              if (implementation === undefined) {
+                throw new Error(
+                  `missing indexer implementation: ${String(indexName)}`,
+                );
+              }
 
-            await implementation(decodedInput as never);
+              const decodedInput = decodeValue(schema, indexInput);
+
+              await implementation(decodedInput as never);
+            },
+            enqueue: (queueName, payload, options) => {
+              assertActionsActive();
+              const queueSchema = model.queues[queueName as keyof TQueues];
+
+              if (queueSchema === undefined) {
+                throw new Error(`unknown queue: ${String(queueName)}`);
+              }
+
+              const decodedQueuePayload = decodeValue(queueSchema, payload);
+
+              queued.push({
+                queueName: String(queueName),
+                payload: decodedQueuePayload,
+                availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
+              });
+            },
+            query: async (queryName, params) => {
+              assertActionsActive();
+              return await runQuery(queryName, params, {
+                storageReadMode: "transaction-local",
+              });
+            },
           },
-          enqueue: (queueName, payload, options) => {
-            const queueSchema = model.queues[queueName as keyof TQueues];
-
-            if (queueSchema === undefined) {
-              throw new Error(`unknown queue: ${String(queueName)}`);
-            }
-
-            const decodedQueuePayload = decodeValue(queueSchema, payload);
-
-            queued.push({
-              queueName: String(queueName),
-              payload: decodedQueuePayload,
-              availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
-            });
-          },
-          query: async (queryName, params) => {
-            return await runQuery(queryName, params);
-          },
-        },
-      });
+        });
+      } finally {
+        actionsActive = false;
+      }
     }
 
     for (const work of queued) {
