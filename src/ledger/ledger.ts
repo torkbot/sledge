@@ -101,6 +101,11 @@ export type LedgerImplementations<
     ) => void | Promise<void>;
   };
 
+  /**
+   * Projection reads. Query implementations are not serialized with durable
+   * ledger mutations and should avoid application orchestration, long-running
+   * I/O, and re-entering ledger-backed write paths.
+   */
   readonly queries?: {
     readonly [TQueryName in keyof TQueries]: (
       params: Static<TQueries[TQueryName]["params"]>,

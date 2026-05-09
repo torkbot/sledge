@@ -208,7 +208,7 @@ function wrapBetterSqliteDatabase(
   };
 }
 
-test("ledger queries serialize before external write transactions", async () => {
+test("ledger queries do not block external write transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
   const queryStarted = Promise.withResolvers<void>();
@@ -285,14 +285,12 @@ test("ledger queries serialize before external write transactions", async () => 
   await queryStarted.promise;
 
   const emitPromise = ledger.emit("thing.recorded", { id: 1 });
-  assert.equal(await settlesWithin(emitPromise, 10), false);
-  assert.equal(beginAttemptedDuringSlowQuery, false);
+  assert.equal(await settlesWithin(emitPromise, 10), true);
+  assert.equal(beginAttemptedDuringSlowQuery, true);
 
   releaseQuery.resolve();
 
   assert.deepEqual(await queryPromise, { value: "ok" });
-  await emitPromise;
-  assert.equal(beginAttemptedDuringSlowQuery, false);
 });
 
 test("dispatch scheduling reads serialize before external write transactions", async () => {

@@ -173,6 +173,12 @@ Event handlers can `index`, `enqueue`, and `query`.
 
 You provide concrete implementations for indexers and queries.
 
+Query implementations are projection reads. They are not serialized behind
+ledger mutations, so a long-running query cannot block unrelated durable writes.
+Keep query implementations bounded to read-side state; avoid application
+orchestration, attachment/network/model I/O, and re-entering ledger-backed write
+paths from inside a query.
+
 ### 4) `create*Ledger(...)`
 
 You choose a backend adapter and open the durable ledger:
