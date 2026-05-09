@@ -483,6 +483,7 @@ function openDatabaseLedgerEngine<
 
   let mutationTail: Promise<void> = Promise.resolve();
   let committedEventId = 0;
+  let activeMutationTransactions = 0;
 
   const startup = (async () => {
     await withBusyRetry(async () => {
@@ -595,6 +596,7 @@ function openDatabaseLedgerEngine<
         try {
           await database.exec("BEGIN IMMEDIATE");
           began = true;
+          activeMutationTransactions += 1;
 
           const result = await run(createTransactionScope());
           await database.exec("COMMIT");
@@ -610,6 +612,10 @@ function openDatabaseLedgerEngine<
           }
 
           throw error;
+        } finally {
+          if (began) {
+            activeMutationTransactions -= 1;
+          }
         }
       });
     });
@@ -1224,6 +1230,7 @@ function openDatabaseLedgerEngine<
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
     return await withBusyRetry(async () => {
+      const highWaterMark = await readCommittedEventId();
       const rows = await database
         .prepare(
           `SELECT
@@ -1240,7 +1247,7 @@ function openDatabaseLedgerEngine<
            ORDER BY event_id ASC
            LIMIT ?`,
         )
-        .all(afterEventId, committedEventId, limit);
+        .all(afterEventId, highWaterMark, limit);
 
       return rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
@@ -1248,10 +1255,12 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  async function readLastEvents(
-    limit: number,
-  ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
+  async function readLastEvents(limit: number): Promise<{
+    readonly events: readonly EventEnvelope<TEvents, keyof TEvents>[];
+    readonly highWaterMark: number;
+  }> {
     return await withBusyRetry(async () => {
+      const highWaterMark = await readCommittedEventId();
       const rows = await database
         .prepare(
           `SELECT
@@ -1267,13 +1276,16 @@ function openDatabaseLedgerEngine<
            ORDER BY event_id DESC
            LIMIT ?`,
         )
-        .all(committedEventId, limit);
+        .all(highWaterMark, limit);
 
       const envelopes = rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
       });
 
-      return envelopes.reverse();
+      return {
+        events: envelopes.reverse(),
+        highWaterMark,
+      };
     });
   }
 
@@ -1293,6 +1305,16 @@ function openDatabaseLedgerEngine<
     }
 
     return decodeRow(row, EventIdRowSchema).event_id;
+  }
+
+  async function readCommittedEventId(): Promise<number> {
+    if (activeMutationTransactions > 0) {
+      return committedEventId;
+    }
+
+    const storedLatestEventId = await readStoredLatestEventId();
+    committedEventId = Math.max(committedEventId, storedLatestEventId);
+    return committedEventId;
   }
 
   function readLatestEventId(): number {
@@ -2207,10 +2229,13 @@ function openDatabaseLedgerEngine<
 
           // Capture a follow boundary before reading backlog so we never skip
           // events appended during tail startup when `last` resolves to no rows.
-          let afterEventId = readLatestEventId();
-          const historicalEvents = await readLastEvents(last);
+          const history = await readLastEvents(last);
+          let afterEventId = Math.max(
+            readLatestEventId(),
+            history.highWaterMark,
+          );
 
-          for (const event of historicalEvents) {
+          for (const event of history.events) {
             if (streamSignal.aborted || closed) {
               return;
             }

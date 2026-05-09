@@ -1869,6 +1869,163 @@ test("tailEvents yields last N events then follows new events", async () => {
   assert.equal(done.done, true);
 });
 
+test("tailEvents reads durable events committed by another handle", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databasePath = join(
+    tmpdir(),
+    `ledger-tail-shared-${randomUUID()}.sqlite`,
+  );
+  const firstDatabase = new Database(databasePath);
+  const secondDatabase = new Database(databasePath);
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  try {
+    await using firstLedger = createBetterSqliteLedger({
+      database: firstDatabase,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await using secondLedger = createBetterSqliteLedger({
+      database: secondDatabase,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await secondLedger.emit("message.received", { id: 1 });
+
+    const abortController = new AbortController();
+    const iterator = firstLedger
+      .tailEvents({
+        last: 1,
+        signal: abortController.signal,
+      })
+      [Symbol.asyncIterator]();
+
+    const first = await nextWithTimeout(iterator);
+    assert.equal(first.done, false);
+
+    if (first.done) {
+      throw new Error("expected event from second ledger handle");
+    }
+
+    assert.equal(first.value.event.payload.id, 1);
+
+    abortController.abort();
+
+    const done = await nextWithTimeout(iterator);
+    assert.equal(done.done, true);
+  } finally {
+    firstDatabase.close();
+    secondDatabase.close();
+    await rm(databasePath, {
+      force: true,
+    });
+  }
+});
+
+test("tailEvents last 0 follows after another handle's current boundary", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databasePath = join(
+    tmpdir(),
+    `ledger-tail-follow-shared-${randomUUID()}.sqlite`,
+  );
+  const firstDatabase = new Database(databasePath);
+  const secondDatabase = new Database(databasePath);
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  try {
+    await using firstLedger = createBetterSqliteLedger({
+      database: firstDatabase,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await using secondLedger = createBetterSqliteLedger({
+      database: secondDatabase,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await secondLedger.emit("message.received", { id: 1 });
+
+    const abortController = new AbortController();
+    const iterator = firstLedger
+      .tailEvents({
+        last: 0,
+        signal: abortController.signal,
+      })
+      [Symbol.asyncIterator]();
+
+    const next = nextWithTimeout(iterator);
+    assert.equal(await settlesWithin(next, 10), false);
+
+    await firstLedger.emit("message.received", { id: 2 });
+
+    const followed = await next;
+    assert.equal(followed.done, false);
+
+    if (followed.done) {
+      throw new Error("expected followed event");
+    }
+
+    assert.equal(followed.value.event.payload.id, 2);
+
+    abortController.abort();
+
+    const done = await nextWithTimeout(iterator);
+    assert.equal(done.done, true);
+  } finally {
+    firstDatabase.close();
+    secondDatabase.close();
+    await rm(databasePath, {
+      force: true,
+    });
+  }
+});
+
 test("resumeEvents continues from opaque cursor", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
