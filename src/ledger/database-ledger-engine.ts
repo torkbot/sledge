@@ -482,6 +482,8 @@ function openDatabaseLedgerEngine<
   };
 
   let mutationTail: Promise<void> = Promise.resolve();
+  let committedEventId = 0;
+  let activeMutationTransactions = 0;
 
   const startup = (async () => {
     await withBusyRetry(async () => {
@@ -518,6 +520,9 @@ function openDatabaseLedgerEngine<
 
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+    committedEventId = await withBusyRetry(async () => {
+      return await readStoredLatestEventId();
+    });
   })();
 
   async function ensureColumn(
@@ -591,6 +596,7 @@ function openDatabaseLedgerEngine<
         try {
           await database.exec("BEGIN IMMEDIATE");
           began = true;
+          activeMutationTransactions += 1;
 
           const result = await run(createTransactionScope());
           await database.exec("COMMIT");
@@ -606,6 +612,10 @@ function openDatabaseLedgerEngine<
           }
 
           throw error;
+        } finally {
+          if (began) {
+            activeMutationTransactions -= 1;
+          }
         }
       });
     });
@@ -663,14 +673,12 @@ function openDatabaseLedgerEngine<
     return decodedResult as never;
   }
 
-  async function runSerializedQuery<const TQueryName extends keyof TQueries>(
+  async function runLedgerQuery<const TQueryName extends keyof TQueries>(
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
-    return await runSerialized(async () => {
-      return await withBusyRetry(async () => {
-        return await runQueryImplementation(queryName, params);
-      });
+    return await withBusyRetry(async () => {
+      return await runQueryImplementation(queryName, params);
     });
   }
 
@@ -1221,9 +1229,8 @@ function openDatabaseLedgerEngine<
     afterEventId: number,
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
-    // Serialize stream reads after mutations so consumers never observe
-    // uncommitted event rows from in-flight write transactions.
-    return await runSerialized(async () => {
+    return await withBusyRetry(async () => {
+      const highWaterMark = await readCommittedEventId();
       const rows = await database
         .prepare(
           `SELECT
@@ -1236,10 +1243,11 @@ function openDatabaseLedgerEngine<
            FROM events
            WHERE signal = 0
              AND event_id > ?
+             AND event_id <= ?
            ORDER BY event_id ASC
            LIMIT ?`,
         )
-        .all(afterEventId, limit);
+        .all(afterEventId, highWaterMark, limit);
 
       return rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
@@ -1247,12 +1255,12 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  async function readLastEvents(
-    limit: number,
-  ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
-    // Serialize stream reads after mutations so consumers never observe
-    // uncommitted event rows from in-flight write transactions.
-    return await runSerialized(async () => {
+  async function readLastEvents(limit: number): Promise<{
+    readonly events: readonly EventEnvelope<TEvents, keyof TEvents>[];
+    readonly highWaterMark: number;
+  }> {
+    return await withBusyRetry(async () => {
+      const highWaterMark = await readCommittedEventId();
       const rows = await database
         .prepare(
           `SELECT
@@ -1264,39 +1272,53 @@ function openDatabaseLedgerEngine<
              dedupe_key
            FROM events
            WHERE signal = 0
+             AND event_id <= ?
            ORDER BY event_id DESC
            LIMIT ?`,
         )
-        .all(limit);
+        .all(highWaterMark, limit);
 
       const envelopes = rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
       });
 
-      return envelopes.reverse();
+      return {
+        events: envelopes.reverse(),
+        highWaterMark,
+      };
     });
   }
 
-  async function readLatestEventId(): Promise<number> {
-    // Serialize stream reads after mutations so consumers never observe
-    // uncommitted event rows from in-flight write transactions.
-    return await runSerialized(async () => {
-      const row = await database
-        .prepare(
-          `SELECT event_id
-           FROM events
-           WHERE signal = 0
-           ORDER BY event_id DESC
-           LIMIT 1`,
-        )
-        .get();
+  async function readStoredLatestEventId(): Promise<number> {
+    const row = await database
+      .prepare(
+        `SELECT event_id
+         FROM events
+         WHERE signal = 0
+         ORDER BY event_id DESC
+         LIMIT 1`,
+      )
+      .get();
 
-      if (row === undefined) {
-        return 0;
-      }
+    if (row === undefined) {
+      return 0;
+    }
 
-      return decodeRow(row, EventIdRowSchema).event_id;
-    });
+    return decodeRow(row, EventIdRowSchema).event_id;
+  }
+
+  async function readCommittedEventId(): Promise<number> {
+    if (activeMutationTransactions > 0) {
+      return committedEventId;
+    }
+
+    const storedLatestEventId = await readStoredLatestEventId();
+    committedEventId = Math.max(committedEventId, storedLatestEventId);
+    return committedEventId;
+  }
+
+  function readLatestEventId(): number {
+    return committedEventId;
   }
 
   function createManagedStreamIterator(input: {
@@ -1825,7 +1847,7 @@ function openDatabaseLedgerEngine<
           }
         },
         query: async (queryName, params) => {
-          return await runSerializedQuery(
+          return await runLedgerQuery(
             queryName as keyof TQueries,
             params as never,
           );
@@ -1912,16 +1934,22 @@ function openDatabaseLedgerEngine<
         if (active === undefined) {
           return {
             durableEvents: 0,
+            latestDurableEventId: committedEventId,
           };
         }
 
         let createdDurableCount = 0;
+        let latestDurableEventId = committedEventId;
 
         for (const stagedEvent of stagedEvents) {
           const appended = await appendEventInTransaction(tx, stagedEvent);
 
           if (appended.created) {
             createdDurableCount += 1;
+            latestDurableEventId = Math.max(
+              latestDurableEventId,
+              appended.eventId,
+            );
           }
         }
 
@@ -2000,10 +2028,15 @@ function openDatabaseLedgerEngine<
 
         return {
           durableEvents: createdDurableCount,
+          latestDurableEventId,
         };
       });
 
       if (emitted.durableEvents > 0) {
+        committedEventId = Math.max(
+          committedEventId,
+          emitted.latestDurableEventId,
+        );
         notifyEventWaiters();
       }
 
@@ -2135,6 +2168,7 @@ function openDatabaseLedgerEngine<
       );
 
       if (result.created) {
+        committedEventId = Math.max(committedEventId, result.eventId);
         notifyEventWaiters();
         if (activeWorker !== null) {
           scheduleDispatchAt(activeWorker, clock.nowMs());
@@ -2143,7 +2177,7 @@ function openDatabaseLedgerEngine<
     },
     query: async (queryName, params) => {
       await startup;
-      return await runSerializedQuery(queryName, params);
+      return await runLedgerQuery(queryName, params);
     },
     onSignal: (signalName, observer) => {
       const signalSchema = model.signals[signalName as keyof TSignals];
@@ -2195,10 +2229,13 @@ function openDatabaseLedgerEngine<
 
           // Capture a follow boundary before reading backlog so we never skip
           // events appended during tail startup when `last` resolves to no rows.
-          let afterEventId = await readLatestEventId();
-          const historicalEvents = await readLastEvents(last);
+          const history = await readLastEvents(last);
+          let afterEventId = Math.max(
+            readLatestEventId(),
+            history.highWaterMark,
+          );
 
-          for (const event of historicalEvents) {
+          for (const event of history.events) {
             if (streamSignal.aborted || closed) {
               return;
             }

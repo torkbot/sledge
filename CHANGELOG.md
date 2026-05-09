@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.6.3
+
+- Stop serializing external `ledger.query(...)` and queue-handler
+  `actions.query(...)` calls behind the storage mutation gate. Durable writes
+  remain serialized; event streams use the committed event high-water mark to
+  avoid exposing uncommitted events and refresh that mark from storage so
+  same-process ledger handles stay consistent.
+
 ## 0.6.2
 
 - Serialize the worker dispatch scheduling read with writes so idle-work
