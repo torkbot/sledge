@@ -1741,12 +1741,14 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
-                   last_error = ?
+                   last_error = ?,
+                   terminal_at_ms = ?
                  WHERE work_id = ?
                    AND lease_id = ?`,
               )
               .run(
                 `no handler for ${claimed.signal ? "signal " : ""}queue ${claimed.queueName}`,
+                clock.nowMs(),
                 claimed.workId,
                 claimed.leaseId,
               );
@@ -2443,6 +2445,47 @@ function openDatabaseLedgerEngine<
         params.push(input.sourceEventId);
       }
 
+      if (input.states !== undefined) {
+        if (input.states.length === 0) {
+          return [];
+        }
+
+        const nowMs = clock.nowMs();
+        const stateClauses: string[] = [];
+
+        for (const state of input.states) {
+          switch (state) {
+            case "cancelled":
+              stateClauses.push("cancelled != 0");
+              break;
+            case "dead":
+              stateClauses.push("dead != 0 AND cancelled = 0");
+              break;
+            case "leased":
+              stateClauses.push(
+                "dead = 0 AND cancelled = 0 AND lease_id IS NOT NULL",
+              );
+              break;
+            case "delayed":
+              stateClauses.push(
+                "dead = 0 AND cancelled = 0 AND lease_id IS NULL AND available_at_ms > ?",
+              );
+              params.push(nowMs);
+              break;
+            case "pending":
+              stateClauses.push(
+                "dead = 0 AND cancelled = 0 AND lease_id IS NULL AND available_at_ms <= ?",
+              );
+              params.push(nowMs);
+              break;
+          }
+        }
+
+        clauses.push(
+          `(${stateClauses.map((clause) => `(${clause})`).join(" OR ")})`,
+        );
+      }
+
       const where =
         clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
       const rows = await database
@@ -2468,15 +2511,7 @@ function openDatabaseLedgerEngine<
            LIMIT ?`,
         )
         .all(...params, limit);
-      const snapshots = rows.map(workSnapshotFromRow);
-
-      if (input.states === undefined) {
-        return snapshots;
-      }
-
-      const states = new Set(input.states);
-
-      return snapshots.filter((work) => states.has(work.state));
+      return rows.map(workSnapshotFromRow);
     },
     onSignal: (signalName, observer) => {
       const signalSchema = model.signals[signalName as keyof TSignals];

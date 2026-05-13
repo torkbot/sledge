@@ -2397,3 +2397,106 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
 
   assert.deepEqual(await ledger.listWork(), []);
 });
+
+test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", { id: event.payload.id });
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    terminalWorkRetentionMs: 10,
+  });
+
+  await waitFor(runtime, async () => {
+    return (await ledger.listWork({ states: ["dead"] })).length === 1;
+  });
+
+  await runtime.advanceByMs(11);
+  await workers.close();
+  await using nextWorkers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    terminalWorkRetentionMs: 10,
+  });
+
+  assert.deepEqual(await ledger.listWork(), []);
+});
+
+test("listWork applies state filters before limit", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+        delayMs: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            { availableAtMs: runtime.nowMs() + event.payload.delayMs },
+          );
+        },
+      },
+      queues: {},
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+
+  await ledger.emit("job.requested", { id: 1, delayMs: 0 });
+  await ledger.emit("job.requested", { id: 2, delayMs: 0 });
+  await ledger.emit("job.requested", { id: 3, delayMs: 10_000 });
+
+  const delayed = await ledger.listWork({
+    states: ["delayed"],
+    limit: 1,
+  });
+
+  assert.equal(delayed.length, 1);
+  assert.equal(delayed[0]?.state, "delayed");
+});
