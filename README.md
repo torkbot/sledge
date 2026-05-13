@@ -139,10 +139,12 @@ const scheduler = new NodeRuntimeScheduler();
     scheduler,
   });
 
-  await ledger.emit("user.created", {
+  const event = await ledger.emit("user.created", {
     userId: "u_123",
     email: "alice@example.com",
   });
+
+  console.log(event.eventId);
 }
 
 db.close();
@@ -188,10 +190,16 @@ You choose a backend adapter and open the durable ledger:
 
 The runtime exposes:
 
-- `emit(eventName, payload, options?)`
-- `query(queryName, params)`
-- `startWorkers(options)`
-- `close()`
+- `emit(eventName, payload, options?)`: append an event and return its durable envelope
+- `query(queryName, params)`: run a model query implementation
+- `cancelWork({ workId, reason? })`: durably mark non-terminal work as cancelled
+- `queryWork({ workId })`: inspect one durable work item
+- `listWork({ queueName?, sourceEventId?, states?, limit? })`: inspect durable work items
+- `tailEvents({ last, signal })`: read recent durable events and follow new ones
+- `resumeEvents({ cursor, signal })`: continue an event stream from an opaque cursor
+- `onSignal(signalName, observer)`: subscribe to live signal notifications
+- `startWorkers(options)`: start queue dispatch for this ledger handle
+- `close()`: close the ledger runtime without closing the underlying database handle
 
 Opening a ledger is passive: it initializes storage and can emit, query, tail,
 resume, and observe signals, but it does not claim or process queue work. Start
@@ -203,10 +211,42 @@ await using workers = await ledger.startWorkers({
   leaseMs: 1_000,
   defaultRetryDelayMs: 1_000,
   maxInFlight: 16,
+  terminalWorkRetentionMs: 7 * 24 * 60 * 60 * 1_000,
 });
 ```
 
 ---
+
+## Work inspection and cancellation
+
+Sledge stores durable work rows for queued, leased, delayed-retry, dead-lettered,
+and cancelled work. Successful work is deleted when it acks. Terminal retained
+work (`dead` and `cancelled`) is pruned when workers start according to
+`terminalWorkRetentionMs`.
+
+```ts
+const currentWork = await ledger.listWork({
+  states: ["pending", "delayed", "leased"],
+  limit: 100,
+});
+
+const result = await ledger.cancelWork({
+  workId: currentWork[0]?.workId ?? 0,
+  reason: "user requested cancellation",
+});
+
+if (result.status === "cancelled") {
+  console.log(result.work.state); // "cancelled"
+}
+```
+
+Cancellation is terminal. Once `cancelWork(...)` succeeds for a non-terminal
+work item, Sledge will not dispatch that work again, including after process
+restart. If the work is currently leased by this ledger's active worker handle,
+Sledge also aborts that lease's `AbortSignal` as a live-delivery fast path.
+
+`queryWork(...)` and `listWork(...)` read only committed work state; they do not
+expose rows staged by in-flight event materialization that may later roll back.
 
 ## Handler behavior
 
@@ -300,14 +340,18 @@ This is a live notification only. It does not have a cursor, and sledge does not
 
 ## Dedupe and idempotency
 
-Use `dedupeKey` in `emit(...)` for producer retries.
+Use `dedupeKey` in `emit(...)` for producer retries. `emit(...)` returns the
+winning durable event envelope. With a duplicate key, the existing event envelope
+is returned and downstream materialization is not replayed.
 
 ```ts
-await ledger.emit(
+const event = await ledger.emit(
   "user.created",
   { userId: "u_123", email: "alice@example.com" },
   { dedupeKey: "provider-event:abc-123" },
 );
+
+console.log(event.eventId);
 ```
 
 Same key => same durable event winner, no duplicate downstream materialization.
