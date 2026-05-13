@@ -96,10 +96,14 @@ const registeredModel = registerLedgerModel(definedModel, {
         email: event.payload.email,
       });
 
-      actions.enqueue("welcome-email.send", {
-        userId: event.payload.userId,
-        email: event.payload.email,
-      });
+      actions.enqueue(
+        "welcome-email.send",
+        {
+          userId: event.payload.userId,
+          email: event.payload.email,
+        },
+        { workKey: `welcome-email:${event.payload.userId}` },
+      );
     },
   },
   queues: {
@@ -192,8 +196,8 @@ The runtime exposes:
 
 - `emit(eventName, payload, options?)`: append an event and return its durable envelope
 - `query(queryName, params)`: run a model query implementation
-- `cancelWork({ workId, reason? })`: durably mark non-terminal work as cancelled
-- `queryWork({ workId })`: inspect one durable work item
+- `cancelWork({ ref, reason? })`: durably mark non-terminal keyed work as cancelled
+- `queryWork({ workId })`: inspect one durable work item by storage id
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`: inspect durable work items
 - `tailEvents({ last, signal })`: read recent durable events and follow new ones
 - `resumeEvents({ cursor, signal })`: continue an event stream from an opaque cursor
@@ -232,14 +236,31 @@ and cancelled work. Successful work is deleted when it acks. Terminal retained
 work (`dead` and `cancelled`) is pruned when workers start according to
 `terminalWorkRetentionMs`.
 
+Event and signal handlers can assign a `workKey` when they enqueue work. Sledge
+combines that key with the source event id, queue name, and signal flag into a
+stable `WorkRef`. Use refs for cancellation; `workId` remains a storage-local
+inspection id.
+
 ```ts
+actions.enqueue(
+  "welcome-email.send",
+  { userId: event.payload.userId, email: event.payload.email },
+  { workKey: `welcome-email:${event.payload.userId}` },
+);
+
 const currentWork = await ledger.listWork({
   states: ["pending", "delayed", "leased"],
   limit: 100,
 });
 
+const target = currentWork.find((work) => work.ref !== null);
+
+if (target?.ref === undefined || target.ref === null) {
+  throw new Error("no keyed work to cancel");
+}
+
 const result = await ledger.cancelWork({
-  workId: currentWork[0]?.workId ?? 0,
+  ref: target.ref,
   reason: "user requested cancellation",
 });
 

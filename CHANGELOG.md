@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.8.0
+
+- Breaking: `ledger.cancelWork(...)` now targets a durable `WorkRef` instead of
+  the storage-local `workId`.
+- Add `workKey` to `actions.enqueue(...)` and `actions.enqueueSignal(...)`
+  options. Keyed work is exposed with a durable `ref` in work snapshots so
+  consumers can inspect and cancel logical work items without relying on
+  storage row ids.
+
 ## 0.7.0
 
 - Breaking: `ledger.emit(...)` now returns the durable event envelope for the

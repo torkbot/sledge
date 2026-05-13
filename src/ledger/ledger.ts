@@ -14,6 +14,7 @@ export type EmitOptions = {
  */
 export type EnqueueOptions = {
   readonly availableAtMs?: number;
+  readonly workKey?: string;
 };
 
 /**
@@ -357,8 +358,16 @@ export type WorkCancellationSnapshot = {
   readonly reason: string | null;
 };
 
+export type WorkRef = {
+  readonly sourceEventId: number;
+  readonly signal: boolean;
+  readonly queueName: string;
+  readonly workKey: string;
+};
+
 export type WorkSnapshot = {
   readonly workId: number;
+  readonly ref: WorkRef | null;
   readonly queueName: string;
   readonly sourceEventId: number;
   readonly attempt: number;
@@ -371,7 +380,7 @@ export type WorkSnapshot = {
 };
 
 export type CancelWorkInput = {
-  readonly workId: number;
+  readonly ref: WorkRef;
   readonly reason?: string;
 };
 
@@ -382,12 +391,12 @@ export type CancelWorkResult =
     }
   | {
       readonly status: "already_terminal";
-      readonly workId: number;
+      readonly ref: WorkRef;
       readonly work: WorkSnapshot;
     }
   | {
       readonly status: "not_found";
-      readonly workId: number;
+      readonly ref: WorkRef;
     };
 
 export type QueryWorkInput = {

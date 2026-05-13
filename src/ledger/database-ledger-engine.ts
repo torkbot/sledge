@@ -25,6 +25,7 @@ import type {
   CancelWorkInput,
   CancelWorkResult,
   WorkLease,
+  WorkRef,
   WorkSnapshot,
   WorkState,
 } from "./ledger.ts";
@@ -35,6 +36,7 @@ type AnyQueryDef = QuerySchema<TSchema, TSchema>;
 type PersistedWorkLease = {
   readonly workId: number;
   readonly queueName: string;
+  readonly workKey: string | null;
   readonly payloadJson: string;
   readonly sourceEventId: number;
   readonly attempt: number;
@@ -313,6 +315,7 @@ const WorkSnapshotRowSchema = Type.Object({
   lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
   lease_expires_at_ms: Type.Union([Type.Null(), Type.Number()]),
   last_error: Type.Union([Type.Null(), Type.String()]),
+  work_key: Type.Union([Type.Null(), Type.String()]),
   cancelled: Type.Number(),
   cancel_requested_at_ms: Type.Union([Type.Null(), Type.Number()]),
   cancel_reason: Type.Union([Type.Null(), Type.String()]),
@@ -321,6 +324,7 @@ const WorkSnapshotRowSchema = Type.Object({
 const ClaimedWorkRowSchema = Type.Object({
   work_id: Type.Number(),
   queue_name: Type.String(),
+  work_key: Type.Union([Type.Null(), Type.String()]),
   payload_json: Type.String(),
   source_event_id: Type.Number(),
   signal: Type.Number(),
@@ -535,6 +539,7 @@ function openDatabaseLedgerEngine<
       CREATE TABLE IF NOT EXISTS work (
         work_id INTEGER PRIMARY KEY AUTOINCREMENT,
         queue_name TEXT NOT NULL,
+        work_key TEXT,
         payload_json TEXT NOT NULL,
         source_event_id INTEGER NOT NULL,
         signal INTEGER NOT NULL DEFAULT 0,
@@ -558,10 +563,18 @@ function openDatabaseLedgerEngine<
 
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+    await ensureColumn("work", "work_key", "TEXT");
     await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
     await ensureColumn("work", "cancel_reason", "TEXT");
     await ensureColumn("work", "terminal_at_ms", "INTEGER");
+    await withBusyRetry(async () => {
+      await database.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
+          ON work(source_event_id, signal, queue_name, work_key)
+          WHERE work_key IS NOT NULL;
+      `);
+    });
     committedEventId = await withBusyRetry(async () => {
       return await readStoredLatestEventId();
     });
@@ -604,6 +617,15 @@ function openDatabaseLedgerEngine<
 
     return {
       workId: decoded.work_id,
+      ref:
+        decoded.work_key === null
+          ? null
+          : {
+              sourceEventId: decoded.source_event_id,
+              signal: decoded.signal !== 0,
+              queueName: decoded.queue_name,
+              workKey: decoded.work_key,
+            },
       queueName: decoded.queue_name,
       sourceEventId: decoded.source_event_id,
       attempt: decoded.attempt,
@@ -639,6 +661,7 @@ function openDatabaseLedgerEngine<
            lease_acquired_at_ms,
            lease_expires_at_ms,
            last_error,
+           work_key,
            cancelled,
            cancel_requested_at_ms,
            cancel_reason
@@ -646,6 +669,58 @@ function openDatabaseLedgerEngine<
          WHERE work_id = ?`,
       )
       .get(workId);
+
+    return row === undefined ? null : workSnapshotFromRow(row);
+  }
+
+  function validateWorkKey(workKey: string): void {
+    if (workKey.length === 0) {
+      throw new Error("workKey must be non-empty");
+    }
+  }
+
+  function validateWorkRef(ref: WorkRef): void {
+    if (!Number.isInteger(ref.sourceEventId) || ref.sourceEventId <= 0) {
+      throw new Error(
+        `sourceEventId must be a positive integer, received ${ref.sourceEventId}`,
+      );
+    }
+
+    if (ref.queueName.length === 0) {
+      throw new Error("queueName must be non-empty");
+    }
+
+    validateWorkKey(ref.workKey);
+  }
+
+  async function readWorkSnapshotByRef(
+    ref: WorkRef,
+  ): Promise<WorkSnapshot | null> {
+    const row = await database
+      .prepare(
+        `SELECT
+           work_id,
+           queue_name,
+           source_event_id,
+           signal,
+           attempt,
+           available_at_ms,
+           dead,
+           lease_id,
+           lease_acquired_at_ms,
+           lease_expires_at_ms,
+           last_error,
+           work_key,
+           cancelled,
+           cancel_requested_at_ms,
+           cancel_reason
+         FROM work
+         WHERE source_event_id = ?
+           AND signal = ?
+           AND queue_name = ?
+           AND work_key = ?`,
+      )
+      .get(ref.sourceEventId, ref.signal ? 1 : 0, ref.queueName, ref.workKey);
 
     return row === undefined ? null : workSnapshotFromRow(row);
   }
@@ -936,6 +1011,7 @@ function openDatabaseLedgerEngine<
     const eventHandler = registration.events?.[eventName];
     const queued: {
       queueName: string;
+      workKey: string | null;
       payload: unknown;
       availableAtMs: number;
     }[] = [];
@@ -999,8 +1075,13 @@ function openDatabaseLedgerEngine<
 
               const decodedQueuePayload = decodeValue(queueSchema, payload);
 
+              if (options?.workKey !== undefined) {
+                validateWorkKey(options.workKey);
+              }
+
               queued.push({
                 queueName: String(queueName),
+                workKey: options?.workKey ?? null,
                 payload: decodedQueuePayload,
                 availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
               });
@@ -1036,6 +1117,7 @@ function openDatabaseLedgerEngine<
         .prepare(
           `INSERT INTO work (
               queue_name,
+              work_key,
               payload_json,
               source_event_id,
               signal,
@@ -1046,10 +1128,11 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
           work.queueName,
+          work.workKey,
           JSON.stringify(work.payload),
           eventId,
           work.availableAtMs,
@@ -1144,6 +1227,7 @@ function openDatabaseLedgerEngine<
     const signalHandler = registration.signals?.[signalName];
     const queued: {
       queueName: string;
+      workKey: string | null;
       payload: unknown;
       availableAtMs: number;
     }[] = [];
@@ -1162,8 +1246,13 @@ function openDatabaseLedgerEngine<
 
             const decodedQueuePayload = decodeValue(queueSchema, payload);
 
+            if (options?.workKey !== undefined) {
+              validateWorkKey(options.workKey);
+            }
+
             queued.push({
               queueName: String(queueName),
+              workKey: options?.workKey ?? null,
               payload: decodedQueuePayload,
               availableAtMs: options?.availableAtMs ?? signalInput.nowMs,
             });
@@ -1177,6 +1266,7 @@ function openDatabaseLedgerEngine<
         .prepare(
           `INSERT INTO work (
               queue_name,
+              work_key,
               payload_json,
               source_event_id,
               signal,
@@ -1187,10 +1277,11 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
           work.queueName,
+          work.workKey,
           JSON.stringify(work.payload),
           eventId,
           work.availableAtMs,
@@ -1607,6 +1698,7 @@ function openDatabaseLedgerEngine<
           `SELECT
             work_id,
             queue_name,
+            work_key,
             payload_json,
             source_event_id,
             signal,
@@ -1639,6 +1731,7 @@ function openDatabaseLedgerEngine<
       return {
         workId: decodedClaimed.work_id,
         queueName: decodedClaimed.queue_name,
+        workKey: decodedClaimed.work_key,
         payloadJson: decodedClaimed.payload_json,
         sourceEventId: decodedClaimed.source_event_id,
         signal: decodedClaimed.signal === 1,
@@ -2336,17 +2429,12 @@ function openDatabaseLedgerEngine<
     },
     cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
       await startup;
-
-      if (!Number.isInteger(input.workId) || input.workId <= 0) {
-        throw new Error(
-          `workId must be a positive integer, received ${input.workId}`,
-        );
-      }
+      validateWorkRef(input.ref);
 
       const nowMs = clock.nowMs();
       let cancelledLeaseId: string | null = null;
       const work = await runInTransaction(async () => {
-        const existing = await readWorkSnapshot(input.workId);
+        const existing = await readWorkSnapshotByRef(input.ref);
 
         if (existing === null) {
           return null;
@@ -2375,7 +2463,10 @@ function openDatabaseLedgerEngine<
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
                last_error = ?
-             WHERE work_id = ?
+             WHERE source_event_id = ?
+               AND signal = ?
+               AND queue_name = ?
+               AND work_key = ?
                AND dead = 0
                AND cancelled = 0`,
           )
@@ -2384,23 +2475,26 @@ function openDatabaseLedgerEngine<
             input.reason ?? null,
             nowMs,
             input.reason ?? "work cancelled",
-            input.workId,
+            input.ref.sourceEventId,
+            input.ref.signal ? 1 : 0,
+            input.ref.queueName,
+            input.ref.workKey,
           );
 
-        return await readWorkSnapshot(input.workId);
+        return await readWorkSnapshotByRef(input.ref);
       });
 
       if (work === null) {
         return {
           status: "not_found",
-          workId: input.workId,
+          ref: input.ref,
         };
       }
 
       if (work.state === "dead") {
         return {
           status: "already_terminal",
-          workId: input.workId,
+          ref: input.ref,
           work,
         };
       }
@@ -2512,6 +2606,7 @@ function openDatabaseLedgerEngine<
                  lease_acquired_at_ms,
                  lease_expires_at_ms,
                  last_error,
+                 work_key,
                  cancelled,
                  cancel_requested_at_ms,
                  cancel_reason
