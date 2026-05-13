@@ -558,10 +558,6 @@ function openDatabaseLedgerEngine<
 
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
-        ON work(source_event_id, signal, queue_name, work_key)
-        WHERE work_key IS NOT NULL;
     `);
     });
 
@@ -572,6 +568,13 @@ function openDatabaseLedgerEngine<
     await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
     await ensureColumn("work", "cancel_reason", "TEXT");
     await ensureColumn("work", "terminal_at_ms", "INTEGER");
+    await withBusyRetry(async () => {
+      await database.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
+          ON work(source_event_id, signal, queue_name, work_key)
+          WHERE work_key IS NOT NULL;
+      `);
+    });
     committedEventId = await withBusyRetry(async () => {
       return await readStoredLatestEventId();
     });
@@ -670,6 +673,12 @@ function openDatabaseLedgerEngine<
     return row === undefined ? null : workSnapshotFromRow(row);
   }
 
+  function validateWorkKey(workKey: string): void {
+    if (workKey.length === 0) {
+      throw new Error("workKey must be non-empty");
+    }
+  }
+
   function validateWorkRef(ref: WorkRef): void {
     if (!Number.isInteger(ref.sourceEventId) || ref.sourceEventId <= 0) {
       throw new Error(
@@ -681,9 +690,7 @@ function openDatabaseLedgerEngine<
       throw new Error("queueName must be non-empty");
     }
 
-    if (ref.workKey.length === 0) {
-      throw new Error("workKey must be non-empty");
-    }
+    validateWorkKey(ref.workKey);
   }
 
   async function readWorkSnapshotByRef(
@@ -1068,6 +1075,10 @@ function openDatabaseLedgerEngine<
 
               const decodedQueuePayload = decodeValue(queueSchema, payload);
 
+              if (options?.workKey !== undefined) {
+                validateWorkKey(options.workKey);
+              }
+
               queued.push({
                 queueName: String(queueName),
                 workKey: options?.workKey ?? null,
@@ -1234,6 +1245,10 @@ function openDatabaseLedgerEngine<
             }
 
             const decodedQueuePayload = decodeValue(queueSchema, payload);
+
+            if (options?.workKey !== undefined) {
+              validateWorkKey(options.workKey);
+            }
 
             queued.push({
               queueName: String(queueName),
