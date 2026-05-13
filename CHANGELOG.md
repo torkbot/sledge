@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0
+
 - Breaking: `ledger.cancelWork(...)` now targets a durable `WorkRef` instead of
   the storage-local `workId`.
 - Add `workKey` to `actions.enqueue(...)` and `actions.enqueueSignal(...)`
