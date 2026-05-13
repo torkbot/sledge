@@ -2500,3 +2500,53 @@ test("listWork applies state filters before limit", async () => {
   assert.equal(delayed.length, 1);
   assert.equal(delayed[0]?.state, "delayed");
 });
+
+test("work queries wait for in-flight mutations before reading work rows", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const handlerStarted = Promise.withResolvers<void>();
+  const releaseHandler = Promise.withResolvers<void>();
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": async ({ event, actions }) => {
+          actions.enqueue("job.run", { id: event.payload.id });
+          handlerStarted.resolve();
+          await releaseHandler.promise;
+          throw new Error("rollback append");
+        },
+      },
+      queues: {},
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+
+  const emitPromise = ledger.emit("job.requested", { id: 1 });
+  await handlerStarted.promise;
+
+  const listPromise = ledger.listWork();
+  assert.equal(await settlesWithin(listPromise, 10), false);
+
+  releaseHandler.resolve();
+  await assert.rejects(async () => await emitPromise, /rollback append/);
+
+  assert.deepEqual(await listPromise, []);
+});

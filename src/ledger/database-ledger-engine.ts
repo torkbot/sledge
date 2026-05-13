@@ -2421,7 +2421,9 @@ function openDatabaseLedgerEngine<
         );
       }
 
-      return await readWorkSnapshot(input.workId);
+      return await runSerialized(
+        async () => await readWorkSnapshot(input.workId),
+      );
     },
     listWork: async (input = {}) => {
       await startup;
@@ -2488,29 +2490,33 @@ function openDatabaseLedgerEngine<
 
       const where =
         clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
-      const rows = await database
-        .prepare(
-          `SELECT
-             work_id,
-             queue_name,
-             source_event_id,
-             signal,
-             attempt,
-             available_at_ms,
-             dead,
-             lease_id,
-             lease_acquired_at_ms,
-             lease_expires_at_ms,
-             last_error,
-             cancelled,
-             cancel_requested_at_ms,
-             cancel_reason
-           FROM work
-           ${where}
-           ORDER BY work_id ASC
-           LIMIT ?`,
-        )
-        .all(...params, limit);
+      const rows = await runSerialized(
+        async () =>
+          await database
+            .prepare(
+              `SELECT
+                 work_id,
+                 queue_name,
+                 source_event_id,
+                 signal,
+                 attempt,
+                 available_at_ms,
+                 dead,
+                 lease_id,
+                 lease_acquired_at_ms,
+                 lease_expires_at_ms,
+                 last_error,
+                 cancelled,
+                 cancel_requested_at_ms,
+                 cancel_reason
+               FROM work
+               ${where}
+               ORDER BY work_id ASC
+               LIMIT ?`,
+            )
+            .all(...params, limit),
+      );
+
       return rows.map(workSnapshotFromRow);
     },
     onSignal: (signalName, observer) => {
