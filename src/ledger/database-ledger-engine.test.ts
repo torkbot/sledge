@@ -614,9 +614,13 @@ test("ledger construction and emit do not start queue workers", async () => {
     register: {
       events: {
         "job.requested": ({ event, actions }) => {
-          actions.enqueue("job.run", {
-            id: event.payload.id,
-          });
+          actions.enqueue(
+            "job.run",
+            {
+              id: event.payload.id,
+            },
+            { workKey: `job:${event.payload.id}` },
+          );
         },
       },
       queues: {
@@ -2169,7 +2173,7 @@ test("tail iterator return stops stream without external abort", async () => {
   assert.equal(done.done, true);
 });
 
-test("cancelWork durably cancels pending work before execution", async () => {
+test("cancelWork durably cancels pending work by ref before execution", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
   let processed = 0;
@@ -2190,9 +2194,13 @@ test("cancelWork durably cancels pending work before execution", async () => {
     register: {
       events: {
         "job.requested": ({ event, actions }) => {
-          actions.enqueue("job.run", {
-            id: event.payload.id,
-          });
+          actions.enqueue(
+            "job.run",
+            {
+              id: event.payload.id,
+            },
+            { workKey: `job:${event.payload.id}` },
+          );
         },
       },
       queues: {
@@ -2220,8 +2228,12 @@ test("cancelWork durably cancels pending work before execution", async () => {
   assert.notEqual(work, undefined);
   assert.equal(work?.state, "pending");
 
+  if (work.ref === null) {
+    assert.fail("expected queued work to have a ref");
+  }
+
   const cancelled = await ledger.cancelWork({
-    workId: work.workId,
+    ref: work.ref,
     reason: "not needed",
   });
 
@@ -2242,11 +2254,17 @@ test("cancelWork durably cancels pending work before execution", async () => {
   );
 });
 
-test("cancelWork aborts an in-flight lease and makes the work terminal", async () => {
+test("cancelWork aborts an in-flight lease by ref and makes the work terminal", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");
   const observedAbort = Promise.withResolvers<void>();
   let workId = 0;
+  let workRef: {
+    readonly sourceEventId: number;
+    readonly signal: boolean;
+    readonly queueName: string;
+    readonly workKey: string;
+  } | null = null;
 
   const model = defineLedgerModel({
     events: {
@@ -2264,14 +2282,24 @@ test("cancelWork aborts an in-flight lease and makes the work terminal", async (
     register: {
       events: {
         "job.requested": ({ event, actions }) => {
-          actions.enqueue("job.run", {
-            id: event.payload.id,
-          });
+          actions.enqueue(
+            "job.run",
+            {
+              id: event.payload.id,
+            },
+            { workKey: `job:${event.payload.id}` },
+          );
         },
       },
       queues: {
         "job.run": async ({ work, lease }) => {
           workId = work.workId;
+          workRef = {
+            sourceEventId: work.sourceEventId,
+            signal: false,
+            queueName: String(work.queueName),
+            workKey: `job:${work.payload.id}`,
+          };
 
           if (lease.signal.aborted) {
             observedAbort.resolve();
@@ -2311,8 +2339,12 @@ test("cancelWork aborts an in-flight lease and makes the work terminal", async (
   await ledger.emit("job.requested", { id: 1 });
   await waitFor(runtime, () => workId !== 0);
 
+  if (workRef === null) {
+    assert.fail("expected work ref");
+  }
+
   const cancelled = await ledger.cancelWork({
-    workId,
+    ref: workRef,
     reason: "stop now",
   });
 
@@ -2343,9 +2375,13 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
     register: {
       events: {
         "job.requested": ({ event, actions }) => {
-          actions.enqueue("job.run", {
-            mode: event.payload.mode,
-          });
+          actions.enqueue(
+            "job.run",
+            {
+              mode: event.payload.mode,
+            },
+            { workKey: `job:${event.payload.mode}` },
+          );
         },
       },
       queues: {
@@ -2376,7 +2412,11 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
     assert.fail("expected queued work to cancel");
   }
 
-  await ledger.cancelWork({ workId: cancelWork.workId });
+  if (cancelWork.ref === null) {
+    assert.fail("expected queued work to have a ref");
+  }
+
+  await ledger.cancelWork({ ref: cancelWork.ref });
 
   await using workers = await ledger.startWorkers({
     scheduler: runtime.scheduler,
