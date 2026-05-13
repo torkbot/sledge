@@ -2168,3 +2168,232 @@ test("tail iterator return stops stream without external abort", async () => {
   const done = await nextWithTimeout(iterator);
   assert.equal(done.done, true);
 });
+
+test("cancelWork durably cancels pending work before execution", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  let processed = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": () => {
+          processed += 1;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  const [work] = await ledger.listWork();
+
+  assert.notEqual(work, undefined);
+  assert.equal(work?.state, "pending");
+
+  const cancelled = await ledger.cancelWork({
+    workId: work.workId,
+    reason: "not needed",
+  });
+
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.work.state, "cancelled");
+
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await runtime.flush();
+  await runtime.advanceByMs(1_000);
+
+  assert.equal(processed, 0);
+  assert.equal(
+    (await ledger.queryWork({ workId: work.workId }))?.state,
+    "cancelled",
+  );
+});
+
+test("cancelWork aborts an in-flight lease and makes the work terminal", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const observedAbort = Promise.withResolvers<void>();
+  let workId = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": async ({ work, lease }) => {
+          workId = work.workId;
+
+          if (lease.signal.aborted) {
+            observedAbort.resolve();
+            return;
+          }
+
+          await new Promise<void>((resolve) => {
+            lease.signal.addEventListener(
+              "abort",
+              () => {
+                observedAbort.resolve();
+                resolve();
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    leaseMs: 1_000,
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await waitFor(runtime, () => workId !== 0);
+
+  const cancelled = await ledger.cancelWork({
+    workId,
+    reason: "stop now",
+  });
+
+  assert.equal(cancelled.status, "cancelled");
+  await observedAbort.promise;
+  await waitFor(runtime, async () => {
+    return (await ledger.queryWork({ workId }))?.state === "cancelled";
+  });
+});
+
+test("terminalWorkRetentionMs prunes retained dead and cancelled work", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        mode: Type.Union([Type.Literal("cancel"), Type.Literal("dead")]),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        mode: Type.Union([Type.Literal("cancel"), Type.Literal("dead")]),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            mode: event.payload.mode,
+          });
+        },
+      },
+      queues: {
+        "job.run": ({ control }) => {
+          return control.deadLetter("done");
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await ledger.emit("job.requested", { mode: "cancel" });
+  await ledger.emit("job.requested", { mode: "dead" });
+  const work = await ledger.listWork();
+  const cancelWork = work.find((item) => item.state === "pending");
+
+  if (cancelWork === undefined) {
+    assert.fail("expected queued work to cancel");
+  }
+
+  await ledger.cancelWork({ workId: cancelWork.workId });
+
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    terminalWorkRetentionMs: 10,
+  });
+
+  await waitFor(runtime, async () => {
+    const states = (await ledger.listWork()).map((item) => item.state);
+    return states.includes("cancelled") && states.includes("dead");
+  });
+
+  await runtime.advanceByMs(11);
+  await workers.close();
+  await using nextWorkers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    terminalWorkRetentionMs: 10,
+  });
+
+  assert.deepEqual(await ledger.listWork(), []);
+});
