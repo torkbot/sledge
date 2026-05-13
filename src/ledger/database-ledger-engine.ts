@@ -22,7 +22,11 @@ import type {
   SignalQueueActions,
   SignalQueueHandlerControl,
   SignalQueueHandlerFunction,
+  CancelWorkInput,
+  CancelWorkResult,
   WorkLease,
+  WorkSnapshot,
+  WorkState,
 } from "./ledger.ts";
 
 type AnyIndexerDef = TSchema;
@@ -74,6 +78,12 @@ export interface StorageStatement {
  *
  * The engine does not own storage lifecycle; callers that open a database are
  * responsible for closing it after ledger/workers are closed.
+ *
+ * A raw database handle must be owned by at most one Sledge ledger instance at a
+ * time. Ledger instances serialize mutations, committed reads, worker leases,
+ * and work inspection through per-ledger runtime state; sharing one handle
+ * across multiple live ledger instances bypasses that coordination and is not a
+ * supported topology.
  */
 export interface StorageDatabase {
   exec(sql: string): Promise<void>;
@@ -291,6 +301,23 @@ const WorkIdRowSchema = Type.Object({
   work_id: Type.Number(),
 });
 
+const WorkSnapshotRowSchema = Type.Object({
+  work_id: Type.Number(),
+  queue_name: Type.String(),
+  source_event_id: Type.Number(),
+  signal: Type.Number(),
+  attempt: Type.Number(),
+  available_at_ms: Type.Number(),
+  dead: Type.Number(),
+  lease_id: Type.Union([Type.Null(), Type.String()]),
+  lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
+  lease_expires_at_ms: Type.Union([Type.Null(), Type.Number()]),
+  last_error: Type.Union([Type.Null(), Type.String()]),
+  cancelled: Type.Number(),
+  cancel_requested_at_ms: Type.Union([Type.Null(), Type.Number()]),
+  cancel_reason: Type.Union([Type.Null(), Type.String()]),
+});
+
 const ClaimedWorkRowSchema = Type.Object({
   work_id: Type.Number(),
   queue_name: Type.String(),
@@ -430,6 +457,11 @@ function openDatabaseLedgerEngine<
      */
     readonly defaultRetryDelayMs: number;
     /**
+     * How long terminal retained work remains queryable before worker-driven
+     * pruning deletes it from the durable work table.
+     */
+    readonly terminalWorkRetentionMs: number;
+    /**
      * Maximum number of concurrently executing handlers for this handle.
      */
     readonly maxInFlight: number;
@@ -481,6 +513,8 @@ function openDatabaseLedgerEngine<
     scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
   };
 
+  const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
+
   let mutationTail: Promise<void> = Promise.resolve();
   let committedEventId = 0;
   let activeMutationTransactions = 0;
@@ -510,7 +544,11 @@ function openDatabaseLedgerEngine<
         lease_id TEXT,
         lease_acquired_at_ms INTEGER,
         lease_expires_at_ms INTEGER,
-        last_error TEXT
+        last_error TEXT,
+        cancelled INTEGER NOT NULL DEFAULT 0,
+        cancel_requested_at_ms INTEGER,
+        cancel_reason TEXT,
+        terminal_at_ms INTEGER
       );
 
       CREATE INDEX IF NOT EXISTS idx_work_due
@@ -520,14 +558,117 @@ function openDatabaseLedgerEngine<
 
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+    await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
+    await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
+    await ensureColumn("work", "cancel_reason", "TEXT");
+    await ensureColumn("work", "terminal_at_ms", "INTEGER");
     committedEventId = await withBusyRetry(async () => {
       return await readStoredLatestEventId();
     });
   })();
 
+  function workStateFromRow(
+    row: Static<typeof WorkSnapshotRowSchema>,
+  ): WorkState {
+    if (row.cancelled !== 0) {
+      return "cancelled";
+    }
+
+    if (row.dead !== 0) {
+      return "dead";
+    }
+
+    if (row.lease_id !== null) {
+      return "leased";
+    }
+
+    if (row.available_at_ms > clock.nowMs()) {
+      return "delayed";
+    }
+
+    return "pending";
+  }
+
+  function workSnapshotFromRow(row: StorageRow): WorkSnapshot {
+    const decoded = decodeRow(row, WorkSnapshotRowSchema);
+    const lease =
+      decoded.lease_id === null ||
+      decoded.lease_acquired_at_ms === null ||
+      decoded.lease_expires_at_ms === null
+        ? null
+        : {
+            leaseId: decoded.lease_id,
+            acquiredAtMs: decoded.lease_acquired_at_ms,
+            expiresAtMs: decoded.lease_expires_at_ms,
+          };
+
+    return {
+      workId: decoded.work_id,
+      queueName: decoded.queue_name,
+      sourceEventId: decoded.source_event_id,
+      attempt: decoded.attempt,
+      availableAtMs: decoded.available_at_ms,
+      state: workStateFromRow(decoded),
+      lease,
+      cancellation:
+        decoded.cancel_requested_at_ms === null
+          ? null
+          : {
+              requestedAtMs: decoded.cancel_requested_at_ms,
+              reason: decoded.cancel_reason,
+            },
+      lastError: decoded.last_error,
+      signal: decoded.signal !== 0,
+    };
+  }
+
+  async function readWorkSnapshot(
+    workId: number,
+  ): Promise<WorkSnapshot | null> {
+    const row = await database
+      .prepare(
+        `SELECT
+           work_id,
+           queue_name,
+           source_event_id,
+           signal,
+           attempt,
+           available_at_ms,
+           dead,
+           lease_id,
+           lease_acquired_at_ms,
+           lease_expires_at_ms,
+           last_error,
+           cancelled,
+           cancel_requested_at_ms,
+           cancel_reason
+         FROM work
+         WHERE work_id = ?`,
+      )
+      .get(workId);
+
+    return row === undefined ? null : workSnapshotFromRow(row);
+  }
+
+  async function pruneTerminalWork(retentionMs: number): Promise<void> {
+    if (retentionMs < 0) {
+      return;
+    }
+
+    await runInTransaction(async () => {
+      await database
+        .prepare(
+          `DELETE FROM work
+           WHERE terminal_at_ms IS NOT NULL
+             AND terminal_at_ms <= ?`,
+        )
+        .run(clock.nowMs() - retentionMs);
+    });
+  }
+
   async function ensureColumn(
     tableName: "events" | "work",
-    columnName: "signal",
+    columnName: string,
     definition: string,
   ): Promise<void> {
     let rows: readonly StorageRow[] = [];
@@ -717,7 +858,7 @@ function openDatabaseLedgerEngine<
     tx: TransactionScope,
     eventInput: AppendEventInput,
   ): Promise<{
-    eventId: number;
+    envelope: EventEnvelope<TEvents, keyof TEvents>;
     created: boolean;
   }> {
     const eventName = eventInput.eventName as keyof TEvents;
@@ -776,13 +917,6 @@ function openDatabaseLedgerEngine<
       }
     }
 
-    if (!created) {
-      return {
-        eventId,
-        created: false,
-      };
-    }
-
     const envelope: EventEnvelope<TEvents, keyof TEvents> = {
       eventId,
       tsMs: eventInput.nowMs,
@@ -791,6 +925,13 @@ function openDatabaseLedgerEngine<
       causationEventId: eventInput.causationEventId,
       dedupeKey: eventInput.dedupeKey ?? null,
     };
+
+    if (!created) {
+      return {
+        envelope,
+        created: false,
+      };
+    }
 
     const eventHandler = registration.events?.[eventName];
     const queued: {
@@ -916,7 +1057,7 @@ function openDatabaseLedgerEngine<
     }
 
     return {
-      eventId,
+      envelope,
       created,
     };
   }
@@ -1126,6 +1267,7 @@ function openDatabaseLedgerEngine<
           `SELECT available_at_ms
            FROM work
            WHERE dead = 0
+             AND cancelled = 0
              AND lease_id IS NULL
            ORDER BY available_at_ms ASC
            LIMIT 1`,
@@ -1425,6 +1567,7 @@ function openDatabaseLedgerEngine<
           `SELECT work_id
            FROM work
            WHERE dead = 0
+             AND cancelled = 0
              AND lease_id IS NULL
              AND available_at_ms <= ?
            ORDER BY work_id ASC
@@ -1450,6 +1593,7 @@ function openDatabaseLedgerEngine<
              lease_expires_at_ms = ?
            WHERE work_id = ?
              AND dead = 0
+             AND cancelled = 0
              AND lease_id IS NULL`,
         )
         .run(leaseId, nowMs, leaseExpiresAtMs, candidateWorkId);
@@ -1603,12 +1747,14 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
-                   last_error = ?
+                   last_error = ?,
+                   terminal_at_ms = ?
                  WHERE work_id = ?
                    AND lease_id = ?`,
               )
               .run(
                 `no handler for ${claimed.signal ? "signal " : ""}queue ${claimed.queueName}`,
+                clock.nowMs(),
                 claimed.workId,
                 claimed.leaseId,
               );
@@ -1712,7 +1858,8 @@ function openDatabaseLedgerEngine<
                lease_expires_at_ms = ?
              WHERE work_id = ?
                AND lease_id = ?
-               AND dead = 0`,
+               AND dead = 0
+               AND cancelled = 0`,
           )
           .run(renewedLeaseExpiresAtMs, claimed.workId, claimed.leaseId);
       });
@@ -1948,7 +2095,7 @@ function openDatabaseLedgerEngine<
             createdDurableCount += 1;
             latestDurableEventId = Math.max(
               latestDurableEventId,
-              appended.eventId,
+              appended.envelope.eventId,
             );
           }
         }
@@ -2017,12 +2164,18 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
-                   last_error = ?
+                   last_error = ?,
+                   terminal_at_ms = ?
                  WHERE work_id = ?
                    AND lease_id = ?
                    AND dead = 0`,
               )
-              .run(disposition.error, claimed.workId, claimed.leaseId);
+              .run(
+                disposition.error,
+                clock.nowMs(),
+                claimed.workId,
+                claimed.leaseId,
+              );
             break;
         }
 
@@ -2168,16 +2321,209 @@ function openDatabaseLedgerEngine<
       );
 
       if (result.created) {
-        committedEventId = Math.max(committedEventId, result.eventId);
+        committedEventId = Math.max(committedEventId, result.envelope.eventId);
         notifyEventWaiters();
         if (activeWorker !== null) {
           scheduleDispatchAt(activeWorker, clock.nowMs());
         }
       }
+
+      return result.envelope as EventEnvelope<TEvents, typeof eventName>;
     },
     query: async (queryName, params) => {
       await startup;
       return await runLedgerQuery(queryName, params);
+    },
+    cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
+      await startup;
+
+      if (!Number.isInteger(input.workId) || input.workId <= 0) {
+        throw new Error(
+          `workId must be a positive integer, received ${input.workId}`,
+        );
+      }
+
+      const nowMs = clock.nowMs();
+      let cancelledLeaseId: string | null = null;
+      const work = await runInTransaction(async () => {
+        const existing = await readWorkSnapshot(input.workId);
+
+        if (existing === null) {
+          return null;
+        }
+
+        if (existing.state === "dead") {
+          return existing;
+        }
+
+        if (existing.state === "cancelled") {
+          cancelledLeaseId = existing.lease?.leaseId ?? null;
+          return existing;
+        }
+
+        cancelledLeaseId = existing.lease?.leaseId ?? null;
+
+        await database
+          .prepare(
+            `UPDATE work
+             SET
+               cancelled = 1,
+               cancel_requested_at_ms = ?,
+               cancel_reason = ?,
+               terminal_at_ms = ?,
+               lease_id = NULL,
+               lease_acquired_at_ms = NULL,
+               lease_expires_at_ms = NULL,
+               last_error = ?
+             WHERE work_id = ?
+               AND dead = 0
+               AND cancelled = 0`,
+          )
+          .run(
+            nowMs,
+            input.reason ?? null,
+            nowMs,
+            input.reason ?? "work cancelled",
+            input.workId,
+          );
+
+        return await readWorkSnapshot(input.workId);
+      });
+
+      if (work === null) {
+        return {
+          status: "not_found",
+          workId: input.workId,
+        };
+      }
+
+      if (work.state === "dead") {
+        return {
+          status: "already_terminal",
+          workId: input.workId,
+          work,
+        };
+      }
+
+      const worker = activeWorker;
+
+      if (worker !== null && cancelledLeaseId !== null) {
+        worker.leaseAbortControllers
+          .get(cancelledLeaseId)
+          ?.abort(new Error(input.reason ?? "work cancelled"));
+      }
+
+      return {
+        status: "cancelled",
+        work,
+      };
+    },
+    queryWork: async (input) => {
+      await startup;
+
+      if (!Number.isInteger(input.workId) || input.workId <= 0) {
+        throw new Error(
+          `workId must be a positive integer, received ${input.workId}`,
+        );
+      }
+
+      return await runSerialized(
+        async () => await readWorkSnapshot(input.workId),
+      );
+    },
+    listWork: async (input = {}) => {
+      await startup;
+
+      const limit = input.limit ?? 100;
+
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw new Error(`limit must be a positive integer, received ${limit}`);
+      }
+
+      const clauses: string[] = [];
+      const params: unknown[] = [];
+
+      if (input.queueName !== undefined) {
+        clauses.push("queue_name = ?");
+        params.push(input.queueName);
+      }
+
+      if (input.sourceEventId !== undefined) {
+        clauses.push("source_event_id = ?");
+        params.push(input.sourceEventId);
+      }
+
+      if (input.states !== undefined) {
+        if (input.states.length === 0) {
+          return [];
+        }
+
+        const nowMs = clock.nowMs();
+        const stateClauses: string[] = [];
+
+        for (const state of input.states) {
+          switch (state) {
+            case "cancelled":
+              stateClauses.push("cancelled != 0");
+              break;
+            case "dead":
+              stateClauses.push("dead != 0 AND cancelled = 0");
+              break;
+            case "leased":
+              stateClauses.push(
+                "dead = 0 AND cancelled = 0 AND lease_id IS NOT NULL",
+              );
+              break;
+            case "delayed":
+              stateClauses.push(
+                "dead = 0 AND cancelled = 0 AND lease_id IS NULL AND available_at_ms > ?",
+              );
+              params.push(nowMs);
+              break;
+            case "pending":
+              stateClauses.push(
+                "dead = 0 AND cancelled = 0 AND lease_id IS NULL AND available_at_ms <= ?",
+              );
+              params.push(nowMs);
+              break;
+          }
+        }
+
+        clauses.push(
+          `(${stateClauses.map((clause) => `(${clause})`).join(" OR ")})`,
+        );
+      }
+
+      const where =
+        clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+      const rows = await runSerialized(
+        async () =>
+          await database
+            .prepare(
+              `SELECT
+                 work_id,
+                 queue_name,
+                 source_event_id,
+                 signal,
+                 attempt,
+                 available_at_ms,
+                 dead,
+                 lease_id,
+                 lease_acquired_at_ms,
+                 lease_expires_at_ms,
+                 last_error,
+                 cancelled,
+                 cancel_requested_at_ms,
+                 cancel_reason
+               FROM work
+               ${where}
+               ORDER BY work_id ASC
+               LIMIT ?`,
+            )
+            .all(...params, limit),
+      );
+
+      return rows.map(workSnapshotFromRow);
     },
     onSignal: (signalName, observer) => {
       const signalSchema = model.signals[signalName as keyof TSignals];
@@ -2299,6 +2645,8 @@ function openDatabaseLedgerEngine<
       const leaseMs = options.leaseMs ?? 1_000;
       const defaultRetryDelayMs = options.defaultRetryDelayMs ?? 1_000;
       const maxInFlight = options.maxInFlight ?? 16;
+      const terminalWorkRetentionMs =
+        options.terminalWorkRetentionMs ?? defaultTerminalWorkRetentionMs;
 
       if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
         throw new Error(
@@ -2318,10 +2666,20 @@ function openDatabaseLedgerEngine<
         );
       }
 
+      if (
+        !Number.isInteger(terminalWorkRetentionMs) ||
+        terminalWorkRetentionMs < 0
+      ) {
+        throw new Error(
+          `terminalWorkRetentionMs must be a non-negative integer, received ${terminalWorkRetentionMs}`,
+        );
+      }
+
       const worker: WorkerRuntimeState = {
         scheduler: options.scheduler,
         leaseMs,
         defaultRetryDelayMs,
+        terminalWorkRetentionMs,
         maxInFlight,
         inFlight: new Set(),
         leaseAbortControllers: new Map(),
@@ -2339,6 +2697,7 @@ function openDatabaseLedgerEngine<
 
       try {
         await releaseExpiredLeases();
+        await pruneTerminalWork(worker.terminalWorkRetentionMs);
         await scheduleNextDispatchFromStore(worker);
       } catch (error: unknown) {
         await closeWorker(worker, "ledger workers startup failed");

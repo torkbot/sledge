@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.7.0
+
+- Breaking: `ledger.emit(...)` now returns the durable event envelope for the
+  winning event instead of `void`. When `dedupeKey` matches an existing event,
+  Sledge returns that existing event envelope without replaying materialization.
+- Add durable work inspection and cancellation APIs: `ledger.cancelWork(...)`,
+  `ledger.queryWork(...)`, and `ledger.listWork(...)`. Cancellation is terminal:
+  cancelled work will not dispatch or retry after restart. If the cancelled work
+  is leased by the active worker handle, Sledge also aborts the lease signal.
+- Add `terminalWorkRetentionMs` to `ledger.startWorkers(...)` options. Retained
+  terminal work (`dead` and `cancelled`) is pruned according to this shared
+  retention window.
+- Ensure work inspection APIs read committed work state only and do not expose
+  rows staged by in-flight event materialization that may roll back.
+
 ## 0.6.3
 
 - Stop serializing external `ledger.query(...)` and queue-handler

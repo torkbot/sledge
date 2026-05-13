@@ -344,6 +344,63 @@ export type SignalObserverFunction<
   TSignalName extends keyof TSignals = keyof TSignals,
 > = (signal: EventEnvelope<TSignals, TSignalName>) => void | Promise<void>;
 
+export type WorkState = "pending" | "delayed" | "leased" | "cancelled" | "dead";
+
+export type WorkLeaseSnapshot = {
+  readonly leaseId: string;
+  readonly acquiredAtMs: number;
+  readonly expiresAtMs: number;
+};
+
+export type WorkCancellationSnapshot = {
+  readonly requestedAtMs: number;
+  readonly reason: string | null;
+};
+
+export type WorkSnapshot = {
+  readonly workId: number;
+  readonly queueName: string;
+  readonly sourceEventId: number;
+  readonly attempt: number;
+  readonly availableAtMs: number;
+  readonly state: WorkState;
+  readonly lease: WorkLeaseSnapshot | null;
+  readonly cancellation: WorkCancellationSnapshot | null;
+  readonly lastError: string | null;
+  readonly signal: boolean;
+};
+
+export type CancelWorkInput = {
+  readonly workId: number;
+  readonly reason?: string;
+};
+
+export type CancelWorkResult =
+  | {
+      readonly status: "cancelled";
+      readonly work: WorkSnapshot;
+    }
+  | {
+      readonly status: "already_terminal";
+      readonly workId: number;
+      readonly work: WorkSnapshot;
+    }
+  | {
+      readonly status: "not_found";
+      readonly workId: number;
+    };
+
+export type QueryWorkInput = {
+  readonly workId: number;
+};
+
+export type ListWorkInput = {
+  readonly queueName?: string;
+  readonly sourceEventId?: number;
+  readonly states?: readonly WorkState[];
+  readonly limit?: number;
+};
+
 export interface Ledger<
   TEvents extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQuerySchema>,
@@ -353,12 +410,18 @@ export interface Ledger<
     eventName: TEventName,
     event: Static<TEvents[TEventName]>,
     options?: EmitOptions,
-  ): Promise<void>;
+  ): Promise<EventEnvelope<TEvents, TEventName>>;
 
   query<const TQueryName extends keyof TQueries>(
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>>;
+
+  cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
+
+  queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
+
+  listWork(input?: ListWorkInput): Promise<readonly WorkSnapshot[]>;
 
   onSignal<const TSignalName extends keyof TSignals>(
     signalName: TSignalName,
@@ -385,6 +448,7 @@ export type LedgerWorkerOptions = {
   readonly leaseMs?: number;
   readonly defaultRetryDelayMs?: number;
   readonly maxInFlight?: number;
+  readonly terminalWorkRetentionMs?: number;
 };
 
 export interface LedgerWorkers extends AsyncDisposable {
