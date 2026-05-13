@@ -78,6 +78,12 @@ export interface StorageStatement {
  *
  * The engine does not own storage lifecycle; callers that open a database are
  * responsible for closing it after ledger/workers are closed.
+ *
+ * A raw database handle must be owned by at most one Sledge ledger instance at a
+ * time. Ledger instances serialize mutations, committed reads, worker leases,
+ * and work inspection through per-ledger runtime state; sharing one handle
+ * across multiple live ledger instances bypasses that coordination and is not a
+ * supported topology.
  */
 export interface StorageDatabase {
   exec(sql: string): Promise<void>;

@@ -202,8 +202,16 @@ The runtime exposes:
 - `close()`: close the ledger runtime without closing the underlying database handle
 
 Opening a ledger is passive: it initializes storage and can emit, query, tail,
-resume, and observe signals, but it does not claim or process queue work. Start
-workers explicitly in the process that owns queue execution:
+resume, and observe signals, but it does not claim or process queue work.
+
+A raw SQLite/Turso database handle must be owned by at most one live Sledge
+ledger instance at a time. Sledge coordinates mutations, committed reads, worker
+leases, and work inspection through per-ledger runtime state; wrapping the same
+raw handle in multiple live ledgers bypasses that coordination and is not a
+supported topology. Use one composed ledger per database handle, then pass that
+ledger to the parts of your application that need it.
+
+Start workers explicitly in the process that owns queue execution:
 
 ```ts
 await using workers = await ledger.startWorkers({
