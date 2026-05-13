@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.0
+
 - Breaking: `ledger.emit(...)` now returns the durable event envelope for the
   winning event instead of `void`. When `dedupeKey` matches an existing event,
   Sledge returns that existing event envelope without replaying materialization.
