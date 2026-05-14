@@ -2490,6 +2490,84 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   assert.deepEqual(await ledger.listWork(), []);
 });
 
+test("active handler is not aborted when lease renewal is delayed behind domain mutation", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const database = new Database(":memory:");
+  const handlerStarted = Promise.withResolvers<void>();
+  const mutationStarted = Promise.withResolvers<void>();
+  const releaseMutation = Promise.withResolvers<void>();
+  const releaseHandler = Promise.withResolvers<void>();
+  let handlerWasStarted = false;
+  let handlerSignalAborted = false;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+      "mutation.blocked": Type.Object({}),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", { id: event.payload.id });
+        },
+        "mutation.blocked": async () => {
+          mutationStarted.resolve();
+          await releaseMutation.promise;
+        },
+      },
+      queues: {
+        "job.run": async ({ lease }) => {
+          lease.signal.addEventListener("abort", () => {
+            handlerSignalAborted = true;
+          });
+          handlerWasStarted = true;
+          handlerStarted.resolve();
+          await releaseHandler.promise;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    database,
+    boundModel: model.bind({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    leaseMs: 1_000,
+  });
+
+  await waitFor(runtime, () => handlerWasStarted);
+
+  const blockingMutation = ledger
+    .emit("mutation.blocked", {})
+    .catch(() => undefined);
+  await mutationStarted.promise;
+
+  await runtime.advanceByMs(5_000);
+
+  assert.equal(handlerSignalAborted, false);
+
+  releaseMutation.resolve();
+  releaseHandler.resolve();
+  await blockingMutation;
+  await waitFor(runtime, async () => {
+    return (await ledger.listWork({ states: ["leased"] })).length === 0;
+  });
+});
+
 test("listWork applies state filters before limit", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const database = new Database(":memory:");

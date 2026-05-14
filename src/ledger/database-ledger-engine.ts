@@ -784,6 +784,19 @@ function openDatabaseLedgerEngine<
     return operation;
   }
 
+  async function runLeaseStorageOperation<T>(
+    run: () => Promise<T>,
+  ): Promise<T> {
+    /**
+     * Lease maintenance is queue ownership metadata, not a ledger-domain
+     * mutation. Running it behind the event/indexer mutation tail allows normal
+     * handler activity to starve the heartbeat that keeps that same handler's
+     * lease alive. Guarded work-row predicates preserve ownership correctness
+     * without coupling renewal latency to unrelated ledger writes.
+     */
+    return await withBusyRetry(run);
+  }
+
   async function withBusyRetry<T>(run: () => Promise<T>): Promise<T> {
     let attempt = 0;
 
@@ -1894,24 +1907,6 @@ function openDatabaseLedgerEngine<
       worker.leaseHeartbeatTasks.delete(claimed.leaseId);
     };
 
-    const releaseLeaseInStore = async (): Promise<void> => {
-      await runInTransaction(async () => {
-        await database
-          .prepare(
-            `UPDATE work
-             SET
-               lease_id = NULL,
-               lease_acquired_at_ms = NULL,
-               lease_expires_at_ms = NULL,
-               available_at_ms = ?
-             WHERE work_id = ?
-               AND lease_id = ?
-               AND dead = 0`,
-          )
-          .run(clock.nowMs(), claimed.workId, claimed.leaseId);
-      });
-    };
-
     const abortLease = (reason: string): void => {
       if (!leaseAbortController.signal.aborted) {
         leaseAbortController.abort(new Error(reason));
@@ -1921,17 +1916,22 @@ function openDatabaseLedgerEngine<
     const scheduleLeaseExpiry = (): void => {
       worker.leaseExpiryTasks.get(claimed.leaseId)?.cancel();
 
-      const delayMs = Math.max(0, currentLeaseExpiresAtMs - clock.nowMs());
+      const delayMs = Math.max(
+        worker.leaseMs,
+        currentLeaseExpiresAtMs - clock.nowMs(),
+      );
       const expiryTask = worker.scheduler.scheduleOnce(delayMs, () => {
-        abortLease("lease expired");
-        clearLeaseHeartbeat();
-
-        void releaseLeaseInStore().then(
-          () => {
-            scheduleDispatchAt(worker, clock.nowMs());
-          },
-          () => undefined,
-        );
+        /**
+         * This process still owns a live handler promise for the lease. The
+         * heartbeat is responsible for renewing ownership and will abort the
+         * signal if renewal proves ownership was lost. Expiring a local active
+         * handler solely because the wall-clock deadline passed creates a race:
+         * a renewal can already be queued behind normal ledger mutations while
+         * the expiry timer aborts a healthy handler. Durable recovery for dead
+         * processes still happens through releaseExpiredLeases() when workers
+         * start or another process claims work.
+         */
+        return;
       });
 
       worker.leaseExpiryTasks.set(claimed.leaseId, {
@@ -1943,7 +1943,7 @@ function openDatabaseLedgerEngine<
       const nowMs = clock.nowMs();
       const renewedLeaseExpiresAtMs = nowMs + worker.leaseMs;
 
-      const renewal = await runInTransaction(async () => {
+      const renewal = await runLeaseStorageOperation(async () => {
         return await database
           .prepare(
             `UPDATE work
