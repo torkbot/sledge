@@ -89,6 +89,25 @@ export interface WorkLease<
   readonly signal: AbortSignal;
 }
 
+export type LedgerStorageRow = Record<string, unknown>;
+
+export interface LedgerStorageStatement {
+  run(...params: unknown[]): Promise<{
+    readonly changes: number;
+    readonly lastInsertRowid: number | bigint;
+  }>;
+
+  get(...params: unknown[]): Promise<LedgerStorageRow | undefined>;
+
+  all(...params: unknown[]): Promise<readonly LedgerStorageRow[]>;
+}
+
+export interface LedgerStorageScope {
+  exec(sql: string): Promise<void>;
+
+  prepare(sql: string): LedgerStorageStatement;
+}
+
 /**
  * Runtime implementations bound to index and query schema contracts.
  */
@@ -98,17 +117,18 @@ export type LedgerImplementations<
 > = {
   readonly indexers?: {
     readonly [TIndexName in keyof TIndexers]: (
+      scope: LedgerStorageScope,
       input: Static<TIndexers[TIndexName]>,
     ) => void | Promise<void>;
   };
 
   /**
-   * Projection reads. Query implementations are not serialized with durable
-   * ledger mutations and should avoid application orchestration, long-running
-   * I/O, and re-entering ledger-backed write paths.
+   * Projection reads. Top-level ledger queries receive an ambient read scope;
+   * event projection queries receive the projection transaction scope.
    */
   readonly queries?: {
     readonly [TQueryName in keyof TQueries]: (
+      scope: LedgerStorageScope,
       params: Static<TQueries[TQueryName]["params"]>,
     ) => unknown | Promise<unknown>;
   };
@@ -471,21 +491,6 @@ export type LedgerTiming = {
   readonly clock: RuntimeClock;
 };
 
-/**
- * SQLite contention retry tuning for busy lock conflicts.
- */
-export type BusyRetryPolicy = {
-  /**
-   * Maximum number of retries after a SQLITE_BUSY conflict before failing.
-   */
-  readonly maxBusyRetries?: number;
-
-  /**
-   * Upper bound for exponential backoff between SQLITE_BUSY retries.
-   */
-  readonly maxBusyRetryDelayMs?: number;
-};
-
 export type DefinedLedgerModel<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
@@ -691,8 +696,6 @@ export interface LedgerEngineFactory {
       TSignalQueues
     >;
     readonly timing: LedgerTiming;
-    readonly maxBusyRetries?: number;
-    readonly maxBusyRetryDelayMs?: number;
   }): Ledger<TEvents, TQueries, TSignals>;
 }
 
@@ -714,13 +717,9 @@ export function createLedger<
   >;
   readonly engineFactory: LedgerEngineFactory;
   readonly timing: LedgerTiming;
-  readonly maxBusyRetries?: number;
-  readonly maxBusyRetryDelayMs?: number;
 }): Ledger<TEvents, TQueries, TSignals> {
   return input.engineFactory.openLedger({
     boundModel: input.boundModel,
     timing: input.timing,
-    maxBusyRetries: input.maxBusyRetries,
-    maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   });
 }

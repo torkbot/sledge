@@ -1,10 +1,11 @@
+import { connect, type Database } from "@tursodatabase/database";
 import type { TSchema } from "typebox";
-import type { Database } from "@tursodatabase/database";
 
 import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
+  type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import type {
   BoundLedgerModel,
@@ -24,7 +25,7 @@ type CreateTursoLedgerInput<
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
-  readonly database: Database;
+  readonly databaseUrl: string;
   readonly boundModel: BoundLedgerModel<
     TEvents,
     TQueues,
@@ -34,11 +35,9 @@ type CreateTursoLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly maxBusyRetries?: number;
-  readonly maxBusyRetryDelayMs?: number;
 };
 
-export function createTursoLedger<
+export async function createTursoLedger<
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, AnyIndexerDef> = {},
@@ -54,7 +53,7 @@ export function createTursoLedger<
     TSignals,
     TSignalQueues
   >,
-): Ledger<TEvents, TQueries, TSignals> {
+): Promise<Ledger<TEvents, TQueries, TSignals>> {
   const sharedInput: CreateDatabaseLedgerInput<
     TEvents,
     TQueues,
@@ -63,14 +62,83 @@ export function createTursoLedger<
     TSignals,
     TSignalQueues
   > = {
-    database: wrapTursoPromiseDatabase(input.database),
+    storage: await createTursoStorageRuntime(input.databaseUrl),
     boundModel: input.boundModel,
     timing: input.timing,
-    maxBusyRetries: input.maxBusyRetries,
-    maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   };
 
   return createDatabaseLedger(sharedInput);
+}
+
+export async function createTursoStorageRuntime(
+  databaseUrl: string,
+): Promise<StorageRuntime> {
+  validateDatabaseUrl(databaseUrl);
+
+  const writer = await connect(databaseUrl);
+  const writerStorage = wrapTursoPromiseDatabase(writer);
+  let closed = false;
+  let writeTail: Promise<void> = Promise.resolve();
+
+  const openConnection = async (): Promise<Database> => {
+    if (closed) {
+      throw new Error("storage runtime is closed");
+    }
+
+    return await connect(databaseUrl);
+  };
+
+  const closeConnection = async (database: Database): Promise<void> => {
+    await database.close();
+  };
+
+  return {
+    read: async (run) => {
+      const database = await openConnection();
+
+      try {
+        return await run(wrapTursoPromiseDatabase(database));
+      } finally {
+        await closeConnection(database);
+      }
+    },
+    write: async (run) => {
+      const operation = writeTail.then(async () => {
+        if (closed) {
+          throw new Error("storage runtime is closed");
+        }
+
+        return await run(writerStorage);
+      });
+      writeTail = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+
+      return await operation;
+    },
+    close: async () => {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+      await writeTail;
+      await writer.close();
+    },
+  };
+}
+
+function validateDatabaseUrl(databaseUrl: string): void {
+  if (databaseUrl === ":memory:") {
+    throw new Error(
+      "plain :memory: databases are not supported; use a shared memory URL such as file:sledge?mode=memory&cache=shared",
+    );
+  }
+
+  if (databaseUrl.length === 0) {
+    throw new Error("databaseUrl must be non-empty");
+  }
 }
 
 function wrapTursoPromiseDatabase(database: Database): StorageDatabase {

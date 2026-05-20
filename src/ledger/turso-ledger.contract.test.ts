@@ -1,4 +1,8 @@
 import { connect } from "@tursodatabase/database";
+import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { createTursoLedger } from "./turso-ledger.ts";
@@ -23,7 +27,11 @@ runLedgerContractSuite({
   suiteName: "turso ledger contract",
   create: async (): Promise<LedgerContractHarness> => {
     const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-    const db = await connect(":memory:");
+    const databaseUrl = join(
+      tmpdir(),
+      `sledge-contract-turso-${randomUUID()}.sqlite`,
+    );
+    const db = await connect(databaseUrl);
 
     await db.exec(`
       CREATE TABLE IF NOT EXISTS contract_projection (
@@ -42,8 +50,8 @@ runLedgerContractSuite({
       LedgerContractQueries
     > = {
       indexers: {
-        upsertObserved: async (input) => {
-          await db
+        upsertObserved: async (scope, input) => {
+          await scope
             .prepare(
               `INSERT INTO contract_projection (
                 source_event_id,
@@ -55,8 +63,8 @@ runLedgerContractSuite({
             )
             .run(input.sourceEventId);
         },
-        incrementDecisionAttempts: async (input) => {
-          await db
+        incrementDecisionAttempts: async (scope, input) => {
+          await scope
             .prepare(
               `UPDATE contract_projection
                SET decision_attempts = decision_attempts + 1
@@ -64,8 +72,8 @@ runLedgerContractSuite({
             )
             .run(input.sourceEventId);
         },
-        setPlannedIntent: async (input) => {
-          await db
+        setPlannedIntent: async (scope, input) => {
+          await scope
             .prepare(
               `UPDATE contract_projection
                SET planned_intent_event_id = ?
@@ -73,8 +81,8 @@ runLedgerContractSuite({
             )
             .run(input.intentEventId, input.sourceEventId);
         },
-        incrementDispatchCount: async (input) => {
-          await db
+        incrementDispatchCount: async (scope, input) => {
+          await scope
             .prepare(
               `UPDATE contract_projection
                SET dispatch_count = dispatch_count + 1
@@ -84,8 +92,8 @@ runLedgerContractSuite({
         },
       },
       queries: {
-        decisionAttempts: async (params) => {
-          const row = await db
+        decisionAttempts: async (scope, params) => {
+          const row = await scope
             .prepare(
               `SELECT decision_attempts
                FROM contract_projection
@@ -95,8 +103,8 @@ runLedgerContractSuite({
 
           return row?.decision_attempts ?? 0;
         },
-        dispatchCount: async (params) => {
-          const row = await db
+        dispatchCount: async (scope, params) => {
+          const row = await scope
             .prepare(
               `SELECT dispatch_count
                FROM contract_projection
@@ -106,8 +114,8 @@ runLedgerContractSuite({
 
           return row?.dispatch_count ?? 0;
         },
-        seenSourceEventIds: async () => {
-          const rows = await db
+        seenSourceEventIds: async (scope, _params) => {
+          const rows = await scope
             .prepare(
               `SELECT source_event_id
                FROM contract_projection
@@ -120,7 +128,7 @@ runLedgerContractSuite({
       },
     };
 
-    const createRuntimeLedger = () => {
+    const createRuntimeLedger = async () => {
       const definedModel = defineLedgerModel({
         events: ledgerContractModel.events,
         queues: ledgerContractModel.queues,
@@ -137,8 +145,8 @@ runLedgerContractSuite({
         }),
       );
 
-      return createTursoLedger({
-        database: db,
+      return await createTursoLedger({
+        databaseUrl,
         boundModel: bindLedgerModel(registeredModel, implementations),
         timing: {
           clock: runtime.clock,
@@ -146,7 +154,7 @@ runLedgerContractSuite({
       });
     };
 
-    let ledger = createRuntimeLedger();
+    let ledger = await createRuntimeLedger();
     let workers: LedgerWorkers = await ledger.startWorkers({
       scheduler: runtime.scheduler,
       leaseMs: 1_000,
@@ -163,7 +171,7 @@ runLedgerContractSuite({
       restart: async () => {
         await workers.close();
         await ledger.close();
-        ledger = createRuntimeLedger();
+        ledger = await createRuntimeLedger();
         workers = await ledger.startWorkers({
           scheduler: runtime.scheduler,
           leaseMs: 1_000,
@@ -174,6 +182,8 @@ runLedgerContractSuite({
         await workers.close();
         await ledger.close();
         await db.close();
+        await rm(databaseUrl, { force: true });
+        await rm(`${databaseUrl}-wal`, { force: true });
       },
       setDecisionMode: (mode) => {
         decisionMode = mode;

@@ -12,6 +12,7 @@ import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
 import {
   createDatabaseLedger,
   type StorageDatabase,
+  type StorageRuntime,
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
@@ -117,12 +118,6 @@ async function waitFor(
   throw new Error("waitFor timed out");
 }
 
-async function sleepMs(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
 async function nextWithTimeout<T>(
   iterator: AsyncIterator<T>,
   timeoutMs: number = 2_000,
@@ -208,9 +203,24 @@ function wrapBetterSqliteDatabase(
   };
 }
 
+function createTempDatabasePath(): string {
+  return join(tmpdir(), `sledge-${randomUUID()}.sqlite`);
+}
+
+function singleConnectionStorageRuntime(
+  database: StorageDatabase,
+): StorageRuntime {
+  return {
+    read: async (run) => await run(database),
+    write: async (run) => await run(database),
+    close: async () => undefined,
+  };
+}
+
 test("ledger queries do not block external write transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const queryStarted = Promise.withResolvers<void>();
   const releaseQuery = Promise.withResolvers<void>();
   let slowQueryActive = false;
@@ -265,7 +275,7 @@ test("ledger queries do not block external write transactions", async () => {
   });
 
   await using ledger = createDatabaseLedger({
-    database: serializedStorage,
+    storage: singleConnectionStorageRuntime(serializedStorage),
     boundModel: model.bind({
       indexers: {},
       queries: {
@@ -293,9 +303,10 @@ test("ledger queries do not block external write transactions", async () => {
   assert.deepEqual(await queryPromise, { value: "ok" });
 });
 
-test("dispatch scheduling reads serialize before external write transactions", async () => {
+test("dispatch scheduling reads do not block event writes", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const scheduleReadStarted = Promise.withResolvers<void>();
   const releaseScheduleRead = Promise.withResolvers<void>();
   let scheduleReadActive = false;
@@ -345,7 +356,7 @@ test("dispatch scheduling reads serialize before external write transactions", a
   });
 
   await using ledger = createDatabaseLedger({
-    database: serializedStorage,
+    storage: singleConnectionStorageRuntime(serializedStorage),
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -361,19 +372,20 @@ test("dispatch scheduling reads serialize before external write transactions", a
   await scheduleReadStarted.promise;
 
   const emitPromise = ledger.emit("thing.recorded", { id: 1 });
-  assert.equal(await settlesWithin(emitPromise, 10), false);
-  assert.equal(beginAttemptedDuringScheduleRead, false);
+  assert.equal(await settlesWithin(emitPromise, 10), true);
+  assert.equal(beginAttemptedDuringScheduleRead, true);
 
   releaseScheduleRead.resolve();
 
   await using workers = await workersPromise;
   await emitPromise;
-  assert.equal(beginAttemptedDuringScheduleRead, false);
+  assert.equal(beginAttemptedDuringScheduleRead, true);
 });
 
 test("event-handler queries remain reentrant inside append transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   let observedEvents = 0;
 
   const model = defineLedgerModel({
@@ -401,7 +413,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
   });
 
   await using ledger = createDatabaseLedger({
-    database: wrapBetterSqliteDatabase(database),
+    storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
     boundModel: model.bind({
       indexers: {},
       queries: {
@@ -426,7 +438,8 @@ test("event-handler queries remain reentrant inside append transactions", async 
 
 test("event-handler query actions expire after handler completion", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   let queryInvocations = 0;
   let capturedQuery:
     | ((params: Record<string, never>) => Promise<{ count: number }>)
@@ -458,7 +471,7 @@ test("event-handler query actions expire after handler completion", async () => 
   });
 
   await using ledger = createDatabaseLedger({
-    database: wrapBetterSqliteDatabase(database),
+    storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
     boundModel: model.bind({
       indexers: {},
       queries: {
@@ -489,7 +502,8 @@ test("event-handler query actions expire after handler completion", async () => 
 
 test("unawaited event-handler queries settle before rollback", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const queryStarted = Promise.withResolvers<void>();
   const releaseQuery = Promise.withResolvers<void>();
   let slowQueryActive = false;
@@ -555,7 +569,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
   });
 
   await using ledger = createDatabaseLedger({
-    database: serializedStorage,
+    storage: singleConnectionStorageRuntime(serializedStorage),
     boundModel: model.bind({
       indexers: {},
       queries: {
@@ -595,7 +609,8 @@ test("unawaited event-handler queries settle before rollback", async () => {
 
 test("ledger construction and emit do not start queue workers", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   let processed = 0;
 
   const model = defineLedgerModel({
@@ -632,7 +647,7 @@ test("ledger construction and emit do not start queue workers", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -662,7 +677,8 @@ test("ledger construction and emit do not start queue workers", async () => {
 
 test("closing workers during a pending claim releases the claimed work", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const claimStarted = Promise.withResolvers<void>();
   const allowClaim = Promise.withResolvers<void>();
   const storage = wrapBetterSqliteDatabase(database);
@@ -720,7 +736,7 @@ test("closing workers during a pending claim releases the claimed work", async (
   });
 
   await using ledger = createDatabaseLedger({
-    database: blockingStorage,
+    storage: singleConnectionStorageRuntime(blockingStorage),
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -758,7 +774,8 @@ test("closing workers during a pending claim releases the claimed work", async (
 
 test("ledger close reports dispatch loop claim failures", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const storage = wrapBetterSqliteDatabase(database);
   let failedClaim = false;
 
@@ -812,7 +829,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
   });
 
   const ledger = createDatabaseLedger({
-    database: failingStorage,
+    storage: singleConnectionStorageRuntime(failingStorage),
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -848,7 +865,8 @@ test("ledger close reports dispatch loop claim failures", async () => {
 
 test("startWorkers rejects while workers are already running", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -867,7 +885,7 @@ test("startWorkers rejects while workers are already running", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -891,7 +909,8 @@ test("startWorkers rejects while workers are already running", async () => {
 
 test("startWorkers rejects invalid lease and retry timing options", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -921,7 +940,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -961,7 +980,8 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
 
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -1006,7 +1026,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const releases: Array<() => void> = [];
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1095,7 +1115,7 @@ test("deduped emit does not replay projections or materialization", async () => 
 
   try {
     await using ledger = createBetterSqliteLedger({
-      database,
+      databaseUrl: databasePath,
       boundModel: model.bind({
         indexers: {
           trackProjection: async () => {
@@ -1144,7 +1164,8 @@ test("deduped emit does not replay projections or materialization", async () => 
 
 test("event handlers can query to drive enqueue decisions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   let enabled = false;
 
   const model = defineLedgerModel({
@@ -1184,7 +1205,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {
@@ -1238,7 +1259,8 @@ function readCount(database: Database.Database, sql: string): number {
 
 test("signals materialize signal work and are pruned after ack", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   let broadcasts = 0;
   let holdSignal = true;
@@ -1315,7 +1337,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1397,7 +1419,8 @@ test("signals materialize signal work and are pruned after ack", async () => {
 
 test("queue handlers publish signals immediately before handler completion", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const gate = Promise.withResolvers<void>();
   let observerCount = 0;
@@ -1444,7 +1467,7 @@ test("queue handlers publish signals immediately before handler completion", asy
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1475,7 +1498,8 @@ test("queue handlers publish signals immediately before handler completion", asy
 
 test("signal retry keeps signal event until signal work acks", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   let attempts = 0;
 
@@ -1543,7 +1567,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1601,70 +1625,6 @@ function createBusyTestModel() {
   });
 }
 
-test("emit retries SQLITE_BUSY transaction conflicts", async () => {
-  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const databasePath = join(tmpdir(), `ledger-r1-busy-${randomUUID()}.sqlite`);
-  const lockHolder = new Database(databasePath, {
-    timeout: 0,
-  });
-  const ledgerDb = new Database(databasePath, {
-    timeout: 0,
-  });
-
-  const model = createBusyTestModel();
-
-  const ledger = createBetterSqliteLedger({
-    database: ledgerDb,
-    boundModel: model.bind({
-      indexers: {},
-      queries: {},
-    }),
-    timing: {
-      clock: runtime.clock,
-    },
-  });
-
-  try {
-    lockHolder.exec("BEGIN IMMEDIATE");
-
-    const emit = ledger.emit("message.received", {
-      id: 42,
-    });
-
-    await sleepMs(25);
-
-    lockHolder.exec("COMMIT");
-
-    await emit;
-
-    const row = lockHolder
-      .prepare(`SELECT COUNT(*) as total FROM events`)
-      .get();
-
-    if (typeof row !== "object" || row === null || Array.isArray(row)) {
-      throw new Error("expected count row object");
-    }
-
-    const total = (row as Record<string, unknown>)["total"];
-
-    assert.equal(total, 1);
-  } finally {
-    try {
-      lockHolder.exec("ROLLBACK");
-    } catch {
-      // Ignore rollback when no transaction is active.
-    }
-
-    await ledger.close();
-
-    lockHolder.close();
-
-    await rm(databasePath, {
-      force: true,
-    });
-  }
-});
-
 test("emit fails fast when busy retries are disabled", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databasePath = join(
@@ -1674,14 +1634,10 @@ test("emit fails fast when busy retries are disabled", async () => {
   const lockHolder = new Database(databasePath, {
     timeout: 0,
   });
-  const ledgerDb = new Database(databasePath, {
-    timeout: 0,
-  });
-
   const model = createBusyTestModel();
 
   const ledger = createBetterSqliteLedger({
-    database: ledgerDb,
+    databaseUrl: databasePath,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1689,7 +1645,6 @@ test("emit fails fast when busy retries are disabled", async () => {
     timing: {
       clock: runtime.clock,
     },
-    maxBusyRetries: 0,
   });
 
   try {
@@ -1728,7 +1683,8 @@ test("emit fails fast when busy retries are disabled", async () => {
 
 test("tailEvents does not expose rolled back in-flight events", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   let releaseMaterializer!: () => void;
   const materializerGate = new Promise<void>((resolve) => {
@@ -1761,7 +1717,7 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1802,7 +1758,8 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
 
 test("tailEvents yields last N events then follows new events", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -1817,7 +1774,7 @@ test("tailEvents yields last N events then follows new events", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -1896,7 +1853,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
 
   try {
     await using firstLedger = createBetterSqliteLedger({
-      database: firstDatabase,
+      databaseUrl: databasePath,
       boundModel: model.bind({
         indexers: {},
         queries: {},
@@ -1907,7 +1864,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
     });
 
     await using secondLedger = createBetterSqliteLedger({
-      database: secondDatabase,
+      databaseUrl: databasePath,
       boundModel: model.bind({
         indexers: {},
         queries: {},
@@ -1972,7 +1929,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
 
   try {
     await using firstLedger = createBetterSqliteLedger({
-      database: firstDatabase,
+      databaseUrl: databasePath,
       boundModel: model.bind({
         indexers: {},
         queries: {},
@@ -1983,7 +1940,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
     });
 
     await using secondLedger = createBetterSqliteLedger({
-      database: secondDatabase,
+      databaseUrl: databasePath,
       boundModel: model.bind({
         indexers: {},
         queries: {},
@@ -2032,7 +1989,8 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
 
 test("resumeEvents continues from opaque cursor", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -2047,7 +2005,7 @@ test("resumeEvents continues from opaque cursor", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -2125,7 +2083,8 @@ test("resumeEvents continues from opaque cursor", async () => {
 
 test("tail iterator return stops stream without external abort", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -2140,7 +2099,7 @@ test("tail iterator return stops stream without external abort", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -2175,7 +2134,8 @@ test("tail iterator return stops stream without external abort", async () => {
 
 test("cancelWork durably cancels pending work by ref before execution", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   let processed = 0;
 
   const model = defineLedgerModel({
@@ -2212,7 +2172,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -2256,7 +2216,8 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
 
 test("cancelWork aborts an in-flight lease by ref and makes the work terminal", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const observedAbort = Promise.withResolvers<void>();
   let workId = 0;
   let workRef: {
@@ -2322,7 +2283,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -2357,7 +2318,8 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
 
 test("terminalWorkRetentionMs prunes retained dead and cancelled work", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -2393,7 +2355,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({
       indexers: {},
       queries: {},
@@ -2440,7 +2402,8 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
 
 test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -2465,7 +2428,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
@@ -2492,7 +2455,8 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
 
 test("listWork applies state filters before limit", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -2523,7 +2487,7 @@ test("listWork applies state filters before limit", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
@@ -2541,9 +2505,10 @@ test("listWork applies state filters before limit", async () => {
   assert.equal(delayed[0]?.state, "delayed");
 });
 
-test("work queries wait for in-flight mutations before reading work rows", async () => {
+test("work queries do not wait for in-flight event projection transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
   const handlerStarted = Promise.withResolvers<void>();
   const releaseHandler = Promise.withResolvers<void>();
 
@@ -2574,7 +2539,7 @@ test("work queries wait for in-flight mutations before reading work rows", async
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
@@ -2583,17 +2548,17 @@ test("work queries wait for in-flight mutations before reading work rows", async
   await handlerStarted.promise;
 
   const listPromise = ledger.listWork();
-  assert.equal(await settlesWithin(listPromise, 10), false);
+  assert.equal(await settlesWithin(listPromise, 10), true);
+  assert.deepEqual(await listPromise, []);
 
   releaseHandler.resolve();
   await assert.rejects(async () => await emitPromise, /rollback append/);
-
-  assert.deepEqual(await listPromise, []);
 });
 
 test("work key migration adds column before creating ref index", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   database.exec(`
     CREATE TABLE events (
@@ -2637,7 +2602,7 @@ test("work key migration adds column before creating ref index", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
@@ -2655,7 +2620,8 @@ test("work key migration adds column before creating ref index", async () => {
 
 test("enqueue rejects empty work keys", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const database = new Database(":memory:");
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
 
   const model = defineLedgerModel({
     events: {
@@ -2676,7 +2642,7 @@ test("enqueue rejects empty work keys", async () => {
   });
 
   await using ledger = createBetterSqliteLedger({
-    database,
+    databaseUrl,
     boundModel: model.bind({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });

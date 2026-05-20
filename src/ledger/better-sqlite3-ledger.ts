@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import type { TSchema } from "typebox";
 
 import type {
@@ -11,6 +11,7 @@ import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
+  type StorageRuntime,
 } from "./database-ledger-engine.ts";
 
 type AnyIndexerDef = TSchema;
@@ -24,7 +25,7 @@ type CreateBetterSqliteLedgerInput<
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
-  readonly database: Database.Database;
+  readonly databaseUrl: string;
   readonly boundModel: BoundLedgerModel<
     TEvents,
     TQueues,
@@ -34,8 +35,6 @@ type CreateBetterSqliteLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly maxBusyRetries?: number;
-  readonly maxBusyRetryDelayMs?: number;
 };
 
 export function createBetterSqliteLedger<
@@ -63,14 +62,83 @@ export function createBetterSqliteLedger<
     TSignals,
     TSignalQueues
   > = {
-    database: wrapBetterSqliteDatabase(input.database),
+    storage: createBetterSqliteStorageRuntime(input.databaseUrl),
     boundModel: input.boundModel,
     timing: input.timing,
-    maxBusyRetries: input.maxBusyRetries,
-    maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   };
 
   return createDatabaseLedger(sharedInput);
+}
+
+export function createBetterSqliteStorageRuntime(
+  databaseUrl: string,
+): StorageRuntime {
+  validateDatabaseUrl(databaseUrl);
+
+  const writer = new Database(databaseUrl);
+  const writerStorage = wrapBetterSqliteDatabase(writer);
+  let closed = false;
+  let writeTail: Promise<void> = Promise.resolve();
+
+  const openConnection = (): Database.Database => {
+    if (closed) {
+      throw new Error("storage runtime is closed");
+    }
+
+    return new Database(databaseUrl);
+  };
+
+  const closeConnection = (database: Database.Database): void => {
+    database.close();
+  };
+
+  return {
+    read: async (run) => {
+      const database = openConnection();
+
+      try {
+        return await run(wrapBetterSqliteDatabase(database));
+      } finally {
+        closeConnection(database);
+      }
+    },
+    write: async (run) => {
+      const operation = writeTail.then(async () => {
+        if (closed) {
+          throw new Error("storage runtime is closed");
+        }
+
+        return await run(writerStorage);
+      });
+      writeTail = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+
+      return await operation;
+    },
+    close: async () => {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+      await writeTail;
+      writer.close();
+    },
+  };
+}
+
+function validateDatabaseUrl(databaseUrl: string): void {
+  if (databaseUrl === ":memory:") {
+    throw new Error(
+      "plain :memory: databases are not supported; use a shared memory URL such as file:sledge?mode=memory&cache=shared",
+    );
+  }
+
+  if (databaseUrl.length === 0) {
+    throw new Error("databaseUrl must be non-empty");
+  }
 }
 
 function wrapBetterSqliteDatabase(
