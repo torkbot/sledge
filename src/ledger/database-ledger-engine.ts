@@ -2308,7 +2308,20 @@ function openDatabaseLedgerEngine<
           ]);
 
     signalObserversByName.clear();
-    await storage.close();
+
+    const storageFailures: unknown[] = [];
+
+    try {
+      await startup;
+    } catch (error: unknown) {
+      storageFailures.push(error);
+    }
+
+    try {
+      await storage.close();
+    } catch (error: unknown) {
+      storageFailures.push(error);
+    }
 
     const failures = closeResults.flatMap((result) => {
       if (result.status === "fulfilled") {
@@ -2318,8 +2331,15 @@ function openDatabaseLedgerEngine<
       return [result.reason];
     });
 
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "failed to close ledger workers");
+    const allFailures = [...failures, ...storageFailures];
+
+    if (allFailures.length > 0) {
+      const message =
+        storageFailures.length === 0
+          ? "failed to close ledger workers"
+          : "failed to close ledger";
+
+      throw new AggregateError(allFailures, message);
     }
   }
 

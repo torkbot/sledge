@@ -77,6 +77,7 @@ export async function createTursoStorageRuntime(
 
   const writer = await connect(databaseUrl);
   const writerStorage = wrapTursoPromiseDatabase(writer);
+  const activeReads = new Set<Promise<void>>();
   let closed = false;
   let writeTail: Promise<void> = Promise.resolve();
 
@@ -94,12 +95,30 @@ export async function createTursoStorageRuntime(
 
   return {
     read: async (run) => {
-      const database = await openConnection();
+      if (closed) {
+        throw new Error("storage runtime is closed");
+      }
+
+      const readSettled = Promise.withResolvers<void>();
+      activeReads.add(readSettled.promise);
+      let database: Database | null = null;
 
       try {
+        database = await openConnection();
+        if (closed) {
+          throw new Error("storage runtime is closed");
+        }
+
         return await run(wrapTursoPromiseDatabase(database));
       } finally {
-        await closeConnection(database);
+        try {
+          if (database !== null) {
+            await closeConnection(database);
+          }
+        } finally {
+          activeReads.delete(readSettled.promise);
+          readSettled.resolve();
+        }
       }
     },
     write: async (run) => {
@@ -123,22 +142,46 @@ export async function createTursoStorageRuntime(
       }
 
       closed = true;
-      await writeTail;
+      await Promise.all([writeTail, ...activeReads]);
       await writer.close();
     },
   };
 }
 
 function validateDatabaseUrl(databaseUrl: string): void {
-  if (databaseUrl === ":memory:") {
+  if (isUnsupportedInMemoryUrl(databaseUrl)) {
     throw new Error(
-      "plain :memory: databases are not supported; use a shared memory URL such as file:sledge?mode=memory&cache=shared",
+      "non-shared in-memory databases are not supported; use a shared memory URL such as file:sledge?mode=memory&cache=shared",
     );
   }
 
   if (databaseUrl.length === 0) {
     throw new Error("databaseUrl must be non-empty");
   }
+}
+
+function isUnsupportedInMemoryUrl(databaseUrl: string): boolean {
+  if (databaseUrl === ":memory:") {
+    return true;
+  }
+
+  if (!databaseUrl.startsWith("file:")) {
+    return false;
+  }
+
+  const queryStart = databaseUrl.indexOf("?");
+  const fileTarget =
+    queryStart === -1
+      ? databaseUrl.slice("file:".length)
+      : databaseUrl.slice("file:".length, queryStart);
+  const params =
+    queryStart === -1
+      ? new URLSearchParams()
+      : new URLSearchParams(databaseUrl.slice(queryStart + 1));
+  const usesMemory =
+    fileTarget === ":memory:" || params.get("mode") === "memory";
+
+  return usesMemory && params.get("cache") !== "shared";
 }
 
 function wrapTursoPromiseDatabase(database: Database): StorageDatabase {

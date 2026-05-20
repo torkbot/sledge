@@ -8,7 +8,10 @@ import test from "node:test";
 import { Type, type TSchema } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
-import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
+import {
+  createBetterSqliteLedger,
+  createBetterSqliteStorageRuntime,
+} from "./better-sqlite3-ledger.ts";
 import {
   createDatabaseLedger,
   type StorageDatabase,
@@ -25,6 +28,7 @@ import {
   type RegisterFunction,
   type RegisteredLedgerModel,
 } from "./ledger.ts";
+import { createTursoStorageRuntime } from "./turso-ledger.ts";
 
 type LegacyRegisteredLedgerModel<
   TEvents extends Record<string, TSchema>,
@@ -216,6 +220,147 @@ function singleConnectionStorageRuntime(
     close: async () => undefined,
   };
 }
+
+test("better-sqlite runtime enables WAL and fail-fast lock handling", async () => {
+  const databaseUrl = createTempDatabasePath();
+  const storage = createBetterSqliteStorageRuntime(databaseUrl);
+  const inspector = new Database(databaseUrl, {
+    timeout: 0,
+  });
+
+  try {
+    const row = inspector.pragma("journal_mode", {
+      simple: true,
+    });
+
+    assert.equal(row, "wal");
+
+    const lockHolder = new Database(databaseUrl, {
+      timeout: 0,
+    });
+
+    try {
+      lockHolder.exec("BEGIN IMMEDIATE");
+
+      await assert.rejects(
+        storage.write(async (database) => {
+          await database.exec(
+            "CREATE TABLE lock_probe (id INTEGER PRIMARY KEY)",
+          );
+        }),
+        (error: unknown) => {
+          if (!(error instanceof Error)) {
+            return false;
+          }
+
+          const maybeCode = (error as { readonly code?: unknown }).code;
+
+          return maybeCode === "SQLITE_BUSY" || error.message.includes("BUSY");
+        },
+      );
+    } finally {
+      try {
+        lockHolder.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback when no transaction is active.
+      }
+
+      lockHolder.close();
+    }
+  } finally {
+    await storage.close();
+    inspector.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+  }
+});
+
+test("storage runtimes reject non-shared in-memory database URLs", async () => {
+  assert.throws(
+    () => createBetterSqliteStorageRuntime(":memory:"),
+    /non-shared in-memory/,
+  );
+  assert.throws(
+    () => createBetterSqliteStorageRuntime("file::memory:"),
+    /non-shared in-memory/,
+  );
+  assert.throws(
+    () => createBetterSqliteStorageRuntime("file:ledger?mode=memory"),
+    /non-shared in-memory/,
+  );
+
+  await assert.rejects(
+    async () => await createTursoStorageRuntime(":memory:"),
+    /non-shared in-memory/,
+  );
+  await assert.rejects(
+    async () => await createTursoStorageRuntime("file::memory:"),
+    /non-shared in-memory/,
+  );
+  await assert.rejects(
+    async () => await createTursoStorageRuntime("file:ledger?mode=memory"),
+    /non-shared in-memory/,
+  );
+});
+
+test("better-sqlite runtime close waits for in-flight reads", async () => {
+  const databaseUrl = createTempDatabasePath();
+  const storage = createBetterSqliteStorageRuntime(databaseUrl);
+  const readStarted = Promise.withResolvers<void>();
+  const releaseRead = Promise.withResolvers<void>();
+
+  try {
+    const read = storage.read(async () => {
+      readStarted.resolve();
+      await releaseRead.promise;
+      return 1;
+    });
+
+    await readStarted.promise;
+
+    const closing = storage.close();
+    assert.equal(await settlesWithin(closing, 10), false);
+
+    releaseRead.resolve();
+    assert.equal(await read, 1);
+    await closing;
+  } finally {
+    await storage.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+  }
+});
+
+test("turso runtime close waits for in-flight reads", async () => {
+  const databaseUrl = createTempDatabasePath();
+  const storage = await createTursoStorageRuntime(databaseUrl);
+  const readStarted = Promise.withResolvers<void>();
+  const releaseRead = Promise.withResolvers<void>();
+
+  try {
+    const read = storage.read(async () => {
+      readStarted.resolve();
+      await releaseRead.promise;
+      return 1;
+    });
+
+    await readStarted.promise;
+
+    const closing = storage.close();
+    assert.equal(await settlesWithin(closing, 10), false);
+
+    releaseRead.resolve();
+    assert.equal(await read, 1);
+    await closing;
+  } finally {
+    await storage.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+  }
+});
 
 test("ledger queries do not block external write transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
@@ -860,6 +1005,116 @@ test("idle workers discover work materialized by another ledger handle", async (
       force: true,
     });
   }
+});
+
+test("ledger close waits for startup before closing storage", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+  const storageDatabase = wrapBetterSqliteDatabase(database);
+  const startupEntered = Promise.withResolvers<void>();
+  const allowStartup = Promise.withResolvers<void>();
+  let closeCalled = false;
+
+  const storage: StorageRuntime = {
+    read: async (run) => await run(storageDatabase),
+    write: async (run) => {
+      startupEntered.resolve();
+      await allowStartup.promise;
+      return await run(storageDatabase);
+    },
+    close: async () => {
+      closeCalled = true;
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {},
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  try {
+    await using ledger = createDatabaseLedger({
+      storage,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await startupEntered.promise;
+
+    const closing = ledger.close();
+    assert.equal(await settlesWithin(closing, 10), false);
+    assert.equal(closeCalled, false);
+
+    allowStartup.resolve();
+    await closing;
+    assert.equal(closeCalled, true);
+  } finally {
+    database.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+  }
+});
+
+test("ledger close closes storage after startup failure", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  let closeCalled = false;
+
+  const storage: StorageRuntime = {
+    read: async () => {
+      throw new Error("unexpected read");
+    },
+    write: async () => {
+      throw new Error("startup failed");
+    },
+    close: async () => {
+      closeCalled = true;
+    },
+  };
+
+  const model = defineLedgerModel({
+    events: {},
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  const ledger = createDatabaseLedger({
+    storage,
+    boundModel: model.bind({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  await assert.rejects(
+    async () => await ledger.close(),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "failed to close ledger");
+      assert.equal(error.errors.length, 1);
+
+      const failure = error.errors[0];
+      assert.ok(failure instanceof Error);
+      assert.equal(failure.message, "startup failed");
+
+      return true;
+    },
+  );
+  assert.equal(closeCalled, true);
 });
 
 test("ledger close reports dispatch loop claim failures", async () => {
@@ -1738,6 +1993,7 @@ test("emit fails fast when busy retries are disabled", async () => {
   });
 
   try {
+    await ledger.listWork();
     lockHolder.exec("BEGIN IMMEDIATE");
 
     await assert.rejects(
