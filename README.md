@@ -221,6 +221,13 @@ multi-connection read/write semantics. The `better-sqlite3` adapter verifies
 that the opened database actually enters WAL journal mode and rejects databases
 that cannot.
 
+Sledge assumes a single process owns writes to a ledger database. Its
+multi-connection support is for Sledge-managed read/write scopes inside that
+runtime, not for competing writer processes. Cross-process consumers should use
+durable event streams (`tailEvents` / `resumeEvents`) and work inspection APIs.
+`onSignal(...)` is a live, process-local notification hook; signals are
+transient and are not a durable distributed pub/sub channel.
+
 The runtime exposes:
 
 - `emit(eventName, payload, options?)`: append an event and return its durable envelope
@@ -230,7 +237,7 @@ The runtime exposes:
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`: inspect durable work items
 - `tailEvents({ last, signal })`: read recent durable events and follow new ones
 - `resumeEvents({ cursor, signal })`: continue an event stream from an opaque cursor
-- `onSignal(signalName, observer)`: subscribe to live signal notifications
+- `onSignal(signalName, observer)`: subscribe to live process-local signal notifications
 - `startWorkers(options)`: start queue dispatch for this ledger handle
 - `close()`: close the ledger runtime and the database connections owned by it
 

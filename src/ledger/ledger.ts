@@ -452,6 +452,11 @@ export interface Ledger<
 
   listWork(input?: ListWorkInput): Promise<readonly WorkSnapshot[]>;
 
+  /**
+   * Subscribe to live signal notifications emitted by this ledger runtime.
+   * Signals are process-local and transient; use durable event streams for
+   * cross-process consumption.
+   */
   onSignal<const TSignalName extends keyof TSignals>(
     signalName: TSignalName,
     observer: SignalObserverFunction<TSignals, TSignalName>,
