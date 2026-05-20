@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 - 2026-05-20
 
 - Breaking: SQLite/Turso adapters now take a `databaseUrl` instead of a
   caller-owned database handle. Sledge owns the connections it opens and closes
