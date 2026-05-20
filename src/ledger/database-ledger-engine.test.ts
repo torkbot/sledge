@@ -772,6 +772,96 @@ test("closing workers during a pending claim releases the claimed work", async (
   );
 });
 
+test("idle workers discover work materialized by another ledger handle", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+  let processed = 0;
+
+  const model = defineLedgerModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            {
+              id: event.payload.id,
+            },
+            { workKey: `job:${event.payload.id}` },
+          );
+        },
+      },
+      queues: {
+        "job.run": () => {
+          processed += 1;
+        },
+      },
+    },
+  });
+
+  try {
+    await using workerLedger = createBetterSqliteLedger({
+      databaseUrl,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await using emitterLedger = createBetterSqliteLedger({
+      databaseUrl,
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    await using workers = await workerLedger.startWorkers({
+      scheduler: runtime.scheduler,
+    });
+
+    await runtime.flush();
+    await emitterLedger.emit("job.requested", { id: 1 });
+
+    assert.equal(processed, 0);
+    assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
+
+    await runtime.advanceByMs(999);
+    await runtime.flush();
+    assert.equal(processed, 0);
+
+    await runtime.advanceByMs(1);
+    await waitFor(runtime, () => processed === 1);
+    await waitFor(
+      runtime,
+      () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+    );
+  } finally {
+    database.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+  }
+});
+
 test("ledger close reports dispatch loop claim failures", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();

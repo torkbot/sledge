@@ -408,6 +408,12 @@ function openDatabaseLedgerEngine<
      */
     readonly terminalWorkRetentionMs: number;
     /**
+     * Fallback cadence for re-checking durable work when no local append woke
+     * this worker. SQLite gives us cross-connection visibility, not
+     * cross-connection notifications.
+     */
+    readonly storePollMs: number;
+    /**
      * Maximum number of concurrently executing handlers for this handle.
      */
     readonly maxInFlight: number;
@@ -460,6 +466,7 @@ function openDatabaseLedgerEngine<
   };
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
+  const defaultStorePollMs = 1_000;
 
   let committedEventId = 0;
 
@@ -1280,14 +1287,13 @@ function openDatabaseLedgerEngine<
         .get();
     });
 
-    if (row === undefined) {
-      return;
-    }
+    const pollAtMs = clock.nowMs() + worker.storePollMs;
+    const nextWorkAtMs =
+      row === undefined
+        ? pollAtMs
+        : decodeRow(row, AvailableAtRowSchema).available_at_ms;
 
-    scheduleDispatchAt(
-      worker,
-      decodeRow(row, AvailableAtRowSchema).available_at_ms,
-    );
+    scheduleDispatchAt(worker, Math.min(nextWorkAtMs, pollAtMs));
   }
 
   function notifyEventWaiters(): void {
@@ -2694,6 +2700,7 @@ function openDatabaseLedgerEngine<
         leaseMs,
         defaultRetryDelayMs,
         terminalWorkRetentionMs,
+        storePollMs: defaultStorePollMs,
         maxInFlight,
         inFlight: new Set(),
         leaseAbortControllers: new Map(),
