@@ -14,6 +14,8 @@
   connections fail fast.
 - Reject plain `:memory:` database URLs because they cannot support the
   multi-connection storage model.
+- Require the `better-sqlite3` adapter to open databases in WAL journal mode so
+  owned reader connections do not block writer commits.
 
 ## 0.8.0
 

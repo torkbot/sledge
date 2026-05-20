@@ -80,7 +80,17 @@ export function createBetterSqliteStorageRuntime(
   validateDatabaseUrl(databaseUrl);
 
   const writer = new Database(databaseUrl, connectionOptions);
-  writer.pragma("journal_mode = WAL");
+  const journalMode = writer.pragma("journal_mode = WAL", {
+    simple: true,
+  });
+
+  if (journalMode !== "wal") {
+    writer.close();
+    throw new Error(
+      `databaseUrl must support WAL journal mode, received ${String(journalMode)}`,
+    );
+  }
+
   const writerStorage = wrapBetterSqliteDatabase(writer);
   const activeReads = new Set<Promise<void>>();
   let closed = false;
@@ -106,13 +116,16 @@ export function createBetterSqliteStorageRuntime(
 
       const readSettled = Promise.withResolvers<void>();
       activeReads.add(readSettled.promise);
-      const database = openConnection();
+      let database: Database.Database | null = null;
 
       try {
+        database = openConnection();
         return await run(wrapBetterSqliteDatabase(database));
       } finally {
         try {
-          closeConnection(database);
+          if (database !== null) {
+            closeConnection(database);
+          }
         } finally {
           activeReads.delete(readSettled.promise);
           readSettled.resolve();

@@ -216,7 +216,10 @@ You choose a backend adapter and open the durable ledger:
 Adapters take a `databaseUrl` and Sledge owns the database connections it opens.
 Plain `:memory:` URLs are rejected because they cannot support more than one
 connection. Use a real database file for local SQLite, or a backend-specific
-shared-memory URL where the driver supports one.
+shared-memory URL only where the driver can still provide the required
+multi-connection read/write semantics. The `better-sqlite3` adapter verifies
+that the opened database actually enters WAL journal mode and rejects databases
+that cannot.
 
 The runtime exposes:
 

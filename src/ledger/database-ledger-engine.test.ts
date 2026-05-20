@@ -2102,6 +2102,90 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
   assert.equal(done.done, true);
 });
 
+test("tailEvents does not expose rolled back events from a shared read/write scope", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+
+  let releaseMaterializer!: () => void;
+  const materializerGate = new Promise<void>((resolve) => {
+    releaseMaterializer = () => {
+      resolve();
+    };
+  });
+
+  let materializerStarted = false;
+
+  const model = defineLedgerModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "message.received": async () => {
+          materializerStarted = true;
+          await materializerGate;
+
+          throw new Error("materialization failure");
+        },
+      },
+    },
+  });
+
+  try {
+    await using ledger = createDatabaseLedger({
+      storage: singleConnectionStorageRuntime(
+        wrapBetterSqliteDatabase(database),
+      ),
+      boundModel: model.bind({
+        indexers: {},
+        queries: {},
+      }),
+      timing: {
+        clock: runtime.clock,
+      },
+    });
+
+    const emit = ledger.emit("message.received", {
+      id: 1,
+    });
+
+    await waitFor(runtime, () => materializerStarted);
+
+    const abortController = new AbortController();
+    const iterator = ledger
+      .tailEvents({
+        last: 1,
+        signal: abortController.signal,
+      })
+      [Symbol.asyncIterator]();
+
+    const next = iterator.next();
+    assert.equal(await settlesWithin(next, 20), false);
+
+    releaseMaterializer();
+
+    await assert.rejects(emit);
+
+    assert.equal(await settlesWithin(next, 20), false);
+
+    abortController.abort();
+
+    const done = await next;
+    assert.equal(done.done, true);
+  } finally {
+    database.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+  }
+});
+
 test("tailEvents yields last N events then follows new events", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();

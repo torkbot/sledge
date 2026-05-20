@@ -469,6 +469,7 @@ function openDatabaseLedgerEngine<
   const defaultStorePollMs = 1_000;
 
   let committedEventId = 0;
+  let activeWriteTransactions = 0;
 
   const startup = (async () => {
     await storage.write(async (database) => {
@@ -732,9 +733,12 @@ function openDatabaseLedgerEngine<
       try {
         await database.exec("BEGIN IMMEDIATE");
         began = true;
+        activeWriteTransactions += 1;
 
         const result = await run(database, createTransactionScope(database));
         await database.exec("COMMIT");
+        activeWriteTransactions -= 1;
+        began = false;
 
         return result;
       } catch (error: unknown) {
@@ -743,6 +747,8 @@ function openDatabaseLedgerEngine<
             await database.exec("ROLLBACK");
           } catch {
             // Suppress rollback failures to preserve the root cause.
+          } finally {
+            activeWriteTransactions -= 1;
           }
         }
 
@@ -1465,6 +1471,10 @@ function openDatabaseLedgerEngine<
   async function readCommittedEventId(
     database: StorageDatabase,
   ): Promise<number> {
+    if (activeWriteTransactions > 0) {
+      return committedEventId;
+    }
+
     const storedLatestEventId = await readStoredLatestEventId(database);
     committedEventId = Math.max(committedEventId, storedLatestEventId);
     return committedEventId;
