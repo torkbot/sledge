@@ -10,6 +10,9 @@ import type {
   Ledger,
   LedgerCursor,
   LedgerStreamEvent,
+  LedgerStorageScope,
+  LedgerStorageStatement,
+  LedgerStorageRow,
   LedgerTiming,
   LedgerWorkerOptions,
   LedgerWorkers,
@@ -62,35 +65,18 @@ type AppendSignalInput = {
   readonly causationEventId: number | null;
 };
 
-type StorageRow = Record<string, unknown>;
+type StorageRow = LedgerStorageRow;
 
-export interface StorageStatement {
-  run(...params: unknown[]): Promise<{
-    readonly changes: number;
-    readonly lastInsertRowid: number | bigint;
-  }>;
+export type StorageStatement = LedgerStorageStatement;
 
-  get(...params: unknown[]): Promise<StorageRow | undefined>;
+export type StorageDatabase = LedgerStorageScope;
 
-  all(...params: unknown[]): Promise<readonly StorageRow[]>;
-}
+export interface StorageRuntime {
+  read<T>(run: (scope: LedgerStorageScope) => Promise<T>): Promise<T>;
 
-/**
- * Minimal storage operations used by the ledger engine.
- *
- * The engine does not own storage lifecycle; callers that open a database are
- * responsible for closing it after ledger/workers are closed.
- *
- * A raw database handle must be owned by at most one Sledge ledger instance at a
- * time. Ledger instances serialize mutations, committed reads, worker leases,
- * and work inspection through per-ledger runtime state; sharing one handle
- * across multiple live ledger instances bypasses that coordination and is not a
- * supported topology.
- */
-export interface StorageDatabase {
-  exec(sql: string): Promise<void>;
+  write<T>(run: (scope: LedgerStorageScope) => Promise<T>): Promise<T>;
 
-  prepare(sql: string): StorageStatement;
+  close(): Promise<void>;
 }
 
 type OpenDatabaseLedgerEngineInput<
@@ -110,9 +96,7 @@ type OpenDatabaseLedgerEngineInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly database: StorageDatabase;
-  readonly maxBusyRetries?: number;
-  readonly maxBusyRetryDelayMs?: number;
+  readonly storage: StorageRuntime;
 };
 
 export type CreateDatabaseLedgerInput<
@@ -123,7 +107,7 @@ export type CreateDatabaseLedgerInput<
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
-  readonly database: StorageDatabase;
+  readonly storage: StorageRuntime;
   readonly boundModel: BoundLedgerModel<
     TEvents,
     TQueues,
@@ -133,8 +117,6 @@ export type CreateDatabaseLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly maxBusyRetries?: number;
-  readonly maxBusyRetryDelayMs?: number;
 };
 
 export function createDatabaseLedger<
@@ -157,9 +139,7 @@ export function createDatabaseLedger<
   return openDatabaseLedgerEngine({
     boundModel: input.boundModel,
     timing: input.timing,
-    database: input.database,
-    maxBusyRetries: input.maxBusyRetries,
-    maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
+    storage: input.storage,
   });
 }
 
@@ -208,36 +188,12 @@ type HandlerDisposition =
     }
   | { readonly kind: "dead_letter"; readonly error: string };
 
-function isSqliteBusyError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  const maybeCode = (error as { readonly code?: unknown }).code;
-
-  if (maybeCode === "SQLITE_BUSY") {
-    return true;
-  }
-
-  return error.message.includes("SQLITE_BUSY");
-}
-
 function isDuplicateColumnError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
   }
 
   return error.message.includes("duplicate column");
-}
-
-function computeBusyRetryDelayMs(attempt: number, maxDelayMs: number): number {
-  return Math.min(maxDelayMs, 2 ** attempt);
-}
-
-async function sleepMs(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }
 
 const CURSOR_ALPHABET =
@@ -401,24 +357,10 @@ function openDatabaseLedgerEngine<
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
-  const database = input.database;
+  const storage = input.storage;
   const model = input.boundModel.model;
   const implementations = input.boundModel.implementations;
   const registration = input.boundModel.register;
-  const maxBusyRetries = input.maxBusyRetries ?? 8;
-  const maxBusyRetryDelayMs = input.maxBusyRetryDelayMs ?? 50;
-
-  if (!Number.isInteger(maxBusyRetries) || maxBusyRetries < 0) {
-    throw new Error(
-      `maxBusyRetries must be a non-negative integer, received ${maxBusyRetries}`,
-    );
-  }
-
-  if (!Number.isInteger(maxBusyRetryDelayMs) || maxBusyRetryDelayMs <= 0) {
-    throw new Error(
-      `maxBusyRetryDelayMs must be a positive integer, received ${maxBusyRetryDelayMs}`,
-    );
-  }
 
   let closed = false;
   let activeWorker: WorkerRuntimeState | null = null;
@@ -465,6 +407,12 @@ function openDatabaseLedgerEngine<
      * pruning deletes it from the durable work table.
      */
     readonly terminalWorkRetentionMs: number;
+    /**
+     * Fallback cadence for re-checking durable work when no local append woke
+     * this worker. SQLite gives us cross-connection visibility, not
+     * cross-connection notifications.
+     */
+    readonly storePollMs: number;
     /**
      * Maximum number of concurrently executing handlers for this handle.
      */
@@ -518,13 +466,13 @@ function openDatabaseLedgerEngine<
   };
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
+  const defaultStorePollMs = 1_000;
 
-  let mutationTail: Promise<void> = Promise.resolve();
   let committedEventId = 0;
-  let activeMutationTransactions = 0;
+  let activeWriteTransactions = 0;
 
   const startup = (async () => {
-    await withBusyRetry(async () => {
+    await storage.write(async (database) => {
       await database.exec(`
       CREATE TABLE IF NOT EXISTS events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -568,15 +516,15 @@ function openDatabaseLedgerEngine<
     await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
     await ensureColumn("work", "cancel_reason", "TEXT");
     await ensureColumn("work", "terminal_at_ms", "INTEGER");
-    await withBusyRetry(async () => {
+    await storage.write(async (database) => {
       await database.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
           ON work(source_event_id, signal, queue_name, work_key)
           WHERE work_key IS NOT NULL;
       `);
     });
-    committedEventId = await withBusyRetry(async () => {
-      return await readStoredLatestEventId();
+    committedEventId = await storage.read(async (database) => {
+      return await readStoredLatestEventId(database);
     });
   })();
 
@@ -645,6 +593,7 @@ function openDatabaseLedgerEngine<
   }
 
   async function readWorkSnapshot(
+    database: StorageDatabase,
     workId: number,
   ): Promise<WorkSnapshot | null> {
     const row = await database
@@ -694,6 +643,7 @@ function openDatabaseLedgerEngine<
   }
 
   async function readWorkSnapshotByRef(
+    database: StorageDatabase,
     ref: WorkRef,
   ): Promise<WorkSnapshot | null> {
     const row = await database
@@ -730,7 +680,7 @@ function openDatabaseLedgerEngine<
       return;
     }
 
-    await runInTransaction(async () => {
+    await runInTransaction(async (database) => {
       await database
         .prepare(
           `DELETE FROM work
@@ -747,7 +697,7 @@ function openDatabaseLedgerEngine<
     definition: string,
   ): Promise<void> {
     let rows: readonly StorageRow[] = [];
-    await withBusyRetry(async () => {
+    await storage.read(async (database) => {
       rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
     });
 
@@ -760,7 +710,7 @@ function openDatabaseLedgerEngine<
     }
 
     try {
-      await withBusyRetry(async () => {
+      await storage.write(async (database) => {
         await database.exec(
           `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
         );
@@ -774,66 +724,36 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  function runSerialized<T>(run: () => Promise<T>): Promise<T> {
-    const operation = mutationTail.then(run, run);
-    mutationTail = operation.then(
-      () => undefined,
-      () => undefined,
-    );
-
-    return operation;
-  }
-
-  async function withBusyRetry<T>(run: () => Promise<T>): Promise<T> {
-    let attempt = 0;
-
-    while (true) {
-      try {
-        return await run();
-      } catch (error: unknown) {
-        if (!isSqliteBusyError(error) || attempt >= maxBusyRetries) {
-          throw error;
-        }
-
-        attempt += 1;
-
-        await sleepMs(computeBusyRetryDelayMs(attempt, maxBusyRetryDelayMs));
-      }
-    }
-  }
-
   async function runInTransaction<T>(
-    run: (tx: TransactionScope) => Promise<T>,
+    run: (database: StorageDatabase, tx: TransactionScope) => Promise<T>,
   ): Promise<T> {
-    return await runSerialized(async () => {
-      return await withBusyRetry(async () => {
-        let began = false;
+    return await storage.write(async (database) => {
+      let began = false;
 
-        try {
-          await database.exec("BEGIN IMMEDIATE");
-          began = true;
-          activeMutationTransactions += 1;
+      try {
+        await database.exec("BEGIN IMMEDIATE");
+        began = true;
+        activeWriteTransactions += 1;
 
-          const result = await run(createTransactionScope());
-          await database.exec("COMMIT");
+        const result = await run(database, createTransactionScope(database));
+        await database.exec("COMMIT");
+        activeWriteTransactions -= 1;
+        began = false;
 
-          return result;
-        } catch (error: unknown) {
-          if (began) {
-            try {
-              await database.exec("ROLLBACK");
-            } catch {
-              // Suppress rollback failures to preserve the root cause.
-            }
-          }
-
-          throw error;
-        } finally {
-          if (began) {
-            activeMutationTransactions -= 1;
+        return result;
+      } catch (error: unknown) {
+        if (began) {
+          try {
+            await database.exec("ROLLBACK");
+          } catch {
+            // Suppress rollback failures to preserve the root cause.
+          } finally {
+            activeWriteTransactions -= 1;
           }
         }
-      });
+
+        throw error;
+      }
     });
   }
 
@@ -866,6 +786,7 @@ function openDatabaseLedgerEngine<
   async function runQueryImplementation<
     const TQueryName extends keyof TQueries,
   >(
+    database: StorageDatabase,
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
@@ -883,7 +804,7 @@ function openDatabaseLedgerEngine<
 
     const decodedParams = decodeValue(schema.params, params);
 
-    const rawResult = await implementation(decodedParams as never);
+    const rawResult = await implementation(database, decodedParams as never);
     const decodedResult = decodeValue(schema.result, rawResult);
 
     return decodedResult as never;
@@ -893,14 +814,18 @@ function openDatabaseLedgerEngine<
     queryName: TQueryName,
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
-    return await withBusyRetry(async () => {
-      return await runQueryImplementation(queryName, params);
+    return await storage.read(async (database) => {
+      return await runQueryImplementation(database, queryName, params);
     });
   }
 
   async function runIndexerImplementation<
     const TIndexName extends keyof TIndexers,
-  >(indexName: TIndexName, indexInput: Static<TIndexers[TIndexName]>) {
+  >(
+    database: StorageDatabase,
+    indexName: TIndexName,
+    indexInput: Static<TIndexers[TIndexName]>,
+  ) {
     const schema = model.indexers[indexName];
 
     if (schema === undefined) {
@@ -915,21 +840,22 @@ function openDatabaseLedgerEngine<
 
     const decodedInput = decodeValue(schema, indexInput);
 
-    await implementation(decodedInput as never);
+    await implementation(database, decodedInput as never);
   }
 
-  function createTransactionScope(): TransactionScope {
+  function createTransactionScope(database: StorageDatabase): TransactionScope {
     return {
       query: async (queryName, params) => {
-        return await runQueryImplementation(queryName, params);
+        return await runQueryImplementation(database, queryName, params);
       },
       index: async (indexName, input) => {
-        await runIndexerImplementation(indexName, input);
+        await runIndexerImplementation(database, indexName, input);
       },
     };
   }
 
   async function appendEventInTransaction(
+    database: StorageDatabase,
     tx: TransactionScope,
     eventInput: AppendEventInput,
   ): Promise<{
@@ -1146,6 +1072,7 @@ function openDatabaseLedgerEngine<
   }
 
   async function appendSignalInTransaction(
+    database: StorageDatabase,
     signalInput: AppendSignalInput,
   ): Promise<{
     eventId: number;
@@ -1302,7 +1229,7 @@ function openDatabaseLedgerEngine<
   }
 
   async function releaseExpiredLeases(): Promise<void> {
-    await runInTransaction(async () => {
+    await runInTransaction(async (database) => {
       await database
         .prepare(
           `UPDATE work
@@ -1352,7 +1279,7 @@ function openDatabaseLedgerEngine<
   async function scheduleNextDispatchFromStore(
     worker: WorkerRuntimeState,
   ): Promise<void> {
-    const row = await runSerialized(async () => {
+    const row = await storage.read(async (database) => {
       return await database
         .prepare(
           `SELECT available_at_ms
@@ -1366,14 +1293,13 @@ function openDatabaseLedgerEngine<
         .get();
     });
 
-    if (row === undefined) {
-      return;
-    }
+    const pollAtMs = clock.nowMs() + worker.storePollMs;
+    const nextWorkAtMs =
+      row === undefined
+        ? pollAtMs
+        : decodeRow(row, AvailableAtRowSchema).available_at_ms;
 
-    scheduleDispatchAt(
-      worker,
-      decodeRow(row, AvailableAtRowSchema).available_at_ms,
-    );
+    scheduleDispatchAt(worker, Math.min(nextWorkAtMs, pollAtMs));
   }
 
   function notifyEventWaiters(): void {
@@ -1462,8 +1388,8 @@ function openDatabaseLedgerEngine<
     afterEventId: number,
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
-    return await withBusyRetry(async () => {
-      const highWaterMark = await readCommittedEventId();
+    return await storage.read(async (database) => {
+      const highWaterMark = await readCommittedEventId(database);
       const rows = await database
         .prepare(
           `SELECT
@@ -1492,8 +1418,8 @@ function openDatabaseLedgerEngine<
     readonly events: readonly EventEnvelope<TEvents, keyof TEvents>[];
     readonly highWaterMark: number;
   }> {
-    return await withBusyRetry(async () => {
-      const highWaterMark = await readCommittedEventId();
+    return await storage.read(async (database) => {
+      const highWaterMark = await readCommittedEventId(database);
       const rows = await database
         .prepare(
           `SELECT
@@ -1522,7 +1448,9 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  async function readStoredLatestEventId(): Promise<number> {
+  async function readStoredLatestEventId(
+    database: StorageDatabase,
+  ): Promise<number> {
     const row = await database
       .prepare(
         `SELECT event_id
@@ -1540,12 +1468,14 @@ function openDatabaseLedgerEngine<
     return decodeRow(row, EventIdRowSchema).event_id;
   }
 
-  async function readCommittedEventId(): Promise<number> {
-    if (activeMutationTransactions > 0) {
+  async function readCommittedEventId(
+    database: StorageDatabase,
+  ): Promise<number> {
+    if (activeWriteTransactions > 0) {
       return committedEventId;
     }
 
-    const storedLatestEventId = await readStoredLatestEventId();
+    const storedLatestEventId = await readStoredLatestEventId(database);
     committedEventId = Math.max(committedEventId, storedLatestEventId);
     return committedEventId;
   }
@@ -1650,7 +1580,7 @@ function openDatabaseLedgerEngine<
   async function claimNextDueWork(
     worker: WorkerRuntimeState,
   ): Promise<PersistedWorkLease | null> {
-    return await runInTransaction(async () => {
+    return await runInTransaction(async (database) => {
       const nowMs = clock.nowMs();
 
       const candidate = await database
@@ -1746,7 +1676,7 @@ function openDatabaseLedgerEngine<
   async function releaseClaimedLease(
     claimed: PersistedWorkLease,
   ): Promise<void> {
-    await runInTransaction(async () => {
+    await runInTransaction(async (database) => {
       await database
         .prepare(
           `UPDATE work
@@ -1831,7 +1761,7 @@ function openDatabaseLedgerEngine<
           : registration.queues?.[claimed.queueName as keyof TQueues];
 
         if (handler === undefined) {
-          await runInTransaction(async () => {
+          await runInTransaction(async (database) => {
             await database
               .prepare(
                 `UPDATE work
@@ -1895,7 +1825,7 @@ function openDatabaseLedgerEngine<
     };
 
     const releaseLeaseInStore = async (): Promise<void> => {
-      await runInTransaction(async () => {
+      await runInTransaction(async (database) => {
         await database
           .prepare(
             `UPDATE work
@@ -1943,7 +1873,7 @@ function openDatabaseLedgerEngine<
       const nowMs = clock.nowMs();
       const renewedLeaseExpiresAtMs = nowMs + worker.leaseMs;
 
-      const renewal = await runInTransaction(async () => {
+      const renewal = await runInTransaction(async (database) => {
         return await database
           .prepare(
             `UPDATE work
@@ -2048,7 +1978,7 @@ function openDatabaseLedgerEngine<
           };
 
           const appended = await runInTransaction(
-            async (): Promise<ImmediateSignalEmission> => {
+            async (database): Promise<ImmediateSignalEmission> => {
               const active = await database
                 .prepare(
                   `SELECT work_id
@@ -2066,7 +1996,7 @@ function openDatabaseLedgerEngine<
                 };
               }
 
-              const result = await appendSignalInTransaction({
+              const result = await appendSignalInTransaction(database, {
                 signalName: String(signalName),
                 payload: signal,
                 nowMs: clock.nowMs(),
@@ -2160,7 +2090,7 @@ function openDatabaseLedgerEngine<
         };
       }
 
-      const emitted = await runInTransaction(async (tx) => {
+      const emitted = await runInTransaction(async (database, tx) => {
         const active = await database
           .prepare(
             `SELECT work_id
@@ -2182,7 +2112,11 @@ function openDatabaseLedgerEngine<
         let latestDurableEventId = committedEventId;
 
         for (const stagedEvent of stagedEvents) {
-          const appended = await appendEventInTransaction(tx, stagedEvent);
+          const appended = await appendEventInTransaction(
+            database,
+            tx,
+            stagedEvent,
+          );
 
           if (appended.created) {
             createdDurableCount += 1;
@@ -2346,7 +2280,7 @@ function openDatabaseLedgerEngine<
     if (leaseIds.length > 0) {
       const leaseIdPlaceholders = leaseIds.map(() => "?").join(", ");
 
-      await runInTransaction(async () => {
+      await runInTransaction(async (database) => {
         await database
           .prepare(
             `UPDATE work
@@ -2385,6 +2319,20 @@ function openDatabaseLedgerEngine<
 
     signalObserversByName.clear();
 
+    const storageFailures: unknown[] = [];
+
+    try {
+      await startup;
+    } catch (error: unknown) {
+      storageFailures.push(error);
+    }
+
+    try {
+      await storage.close();
+    } catch (error: unknown) {
+      storageFailures.push(error);
+    }
+
     const failures = closeResults.flatMap((result) => {
       if (result.status === "fulfilled") {
         return [];
@@ -2393,8 +2341,15 @@ function openDatabaseLedgerEngine<
       return [result.reason];
     });
 
-    if (failures.length > 0) {
-      throw new AggregateError(failures, "failed to close ledger workers");
+    const allFailures = [...failures, ...storageFailures];
+
+    if (allFailures.length > 0) {
+      const message =
+        storageFailures.length === 0
+          ? "failed to close ledger workers"
+          : "failed to close ledger";
+
+      throw new AggregateError(allFailures, message);
     }
   }
 
@@ -2403,8 +2358,8 @@ function openDatabaseLedgerEngine<
       await startup;
 
       const result = await runInTransaction(
-        async (tx) =>
-          await appendEventInTransaction(tx, {
+        async (database, tx) =>
+          await appendEventInTransaction(database, tx, {
             eventName: String(eventName),
             payload: event,
             nowMs: clock.nowMs(),
@@ -2433,8 +2388,8 @@ function openDatabaseLedgerEngine<
 
       const nowMs = clock.nowMs();
       let cancelledLeaseId: string | null = null;
-      const work = await runInTransaction(async () => {
-        const existing = await readWorkSnapshotByRef(input.ref);
+      const work = await runInTransaction(async (database) => {
+        const existing = await readWorkSnapshotByRef(database, input.ref);
 
         if (existing === null) {
           return null;
@@ -2481,7 +2436,7 @@ function openDatabaseLedgerEngine<
             input.ref.workKey,
           );
 
-        return await readWorkSnapshotByRef(input.ref);
+        return await readWorkSnapshotByRef(database, input.ref);
       });
 
       if (work === null) {
@@ -2521,8 +2476,8 @@ function openDatabaseLedgerEngine<
         );
       }
 
-      return await runSerialized(
-        async () => await readWorkSnapshot(input.workId),
+      return await storage.read(
+        async (database) => await readWorkSnapshot(database, input.workId),
       );
     },
     listWork: async (input = {}) => {
@@ -2590,8 +2545,8 @@ function openDatabaseLedgerEngine<
 
       const where =
         clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
-      const rows = await runSerialized(
-        async () =>
+      const rows = await storage.read(
+        async (database) =>
           await database
             .prepare(
               `SELECT
@@ -2775,6 +2730,7 @@ function openDatabaseLedgerEngine<
         leaseMs,
         defaultRetryDelayMs,
         terminalWorkRetentionMs,
+        storePollMs: defaultStorePollMs,
         maxInFlight,
         inFlight: new Set(),
         leaseAbortControllers: new Map(),

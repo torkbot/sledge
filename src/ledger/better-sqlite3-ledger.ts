@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import type { TSchema } from "typebox";
 
 import type {
@@ -11,10 +11,15 @@ import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
+  type StorageRuntime,
 } from "./database-ledger-engine.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
+
+const connectionOptions = {
+  timeout: 0,
+} satisfies Database.Options;
 
 type CreateBetterSqliteLedgerInput<
   TEvents extends Record<string, TSchema>,
@@ -24,7 +29,7 @@ type CreateBetterSqliteLedgerInput<
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
-  readonly database: Database.Database;
+  readonly databaseUrl: string;
   readonly boundModel: BoundLedgerModel<
     TEvents,
     TQueues,
@@ -34,8 +39,6 @@ type CreateBetterSqliteLedgerInput<
     TSignalQueues
   >;
   readonly timing: LedgerTiming;
-  readonly maxBusyRetries?: number;
-  readonly maxBusyRetryDelayMs?: number;
 };
 
 export function createBetterSqliteLedger<
@@ -63,14 +66,133 @@ export function createBetterSqliteLedger<
     TSignals,
     TSignalQueues
   > = {
-    database: wrapBetterSqliteDatabase(input.database),
+    storage: createBetterSqliteStorageRuntime(input.databaseUrl),
     boundModel: input.boundModel,
     timing: input.timing,
-    maxBusyRetries: input.maxBusyRetries,
-    maxBusyRetryDelayMs: input.maxBusyRetryDelayMs,
   };
 
   return createDatabaseLedger(sharedInput);
+}
+
+export function createBetterSqliteStorageRuntime(
+  databaseUrl: string,
+): StorageRuntime {
+  validateDatabaseUrl(databaseUrl);
+
+  const writer = new Database(databaseUrl, connectionOptions);
+  const journalMode = writer.pragma("journal_mode = WAL", {
+    simple: true,
+  });
+
+  if (journalMode !== "wal") {
+    writer.close();
+    throw new Error(
+      `databaseUrl must support WAL journal mode, received ${String(journalMode)}`,
+    );
+  }
+
+  const writerStorage = wrapBetterSqliteDatabase(writer);
+  const activeReads = new Set<Promise<void>>();
+  let closed = false;
+  let writeTail: Promise<void> = Promise.resolve();
+
+  const openConnection = (): Database.Database => {
+    if (closed) {
+      throw new Error("storage runtime is closed");
+    }
+
+    return new Database(databaseUrl, connectionOptions);
+  };
+
+  const closeConnection = (database: Database.Database): void => {
+    database.close();
+  };
+
+  return {
+    read: async (run) => {
+      if (closed) {
+        throw new Error("storage runtime is closed");
+      }
+
+      const readSettled = Promise.withResolvers<void>();
+      activeReads.add(readSettled.promise);
+      let database: Database.Database | null = null;
+
+      try {
+        database = openConnection();
+        return await run(wrapBetterSqliteDatabase(database));
+      } finally {
+        try {
+          if (database !== null) {
+            closeConnection(database);
+          }
+        } finally {
+          activeReads.delete(readSettled.promise);
+          readSettled.resolve();
+        }
+      }
+    },
+    write: async (run) => {
+      const operation = writeTail.then(async () => {
+        if (closed) {
+          throw new Error("storage runtime is closed");
+        }
+
+        return await run(writerStorage);
+      });
+      writeTail = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+
+      return await operation;
+    },
+    close: async () => {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+      await Promise.all([writeTail, ...activeReads]);
+      writer.close();
+    },
+  };
+}
+
+function validateDatabaseUrl(databaseUrl: string): void {
+  if (isUnsupportedInMemoryUrl(databaseUrl)) {
+    throw new Error(
+      "non-shared in-memory databases are not supported; use a shared memory URL such as file:sledge?mode=memory&cache=shared",
+    );
+  }
+
+  if (databaseUrl.length === 0) {
+    throw new Error("databaseUrl must be non-empty");
+  }
+}
+
+function isUnsupportedInMemoryUrl(databaseUrl: string): boolean {
+  if (databaseUrl === ":memory:") {
+    return true;
+  }
+
+  if (!databaseUrl.startsWith("file:")) {
+    return false;
+  }
+
+  const queryStart = databaseUrl.indexOf("?");
+  const fileTarget =
+    queryStart === -1
+      ? databaseUrl.slice("file:".length)
+      : databaseUrl.slice("file:".length, queryStart);
+  const params =
+    queryStart === -1
+      ? new URLSearchParams()
+      : new URLSearchParams(databaseUrl.slice(queryStart + 1));
+  const usesMemory =
+    fileTarget === ":memory:" || params.get("mode") === "memory";
+
+  return usesMemory && params.get("cache") !== "shared";
 }
 
 function wrapBetterSqliteDatabase(

@@ -21,7 +21,6 @@ Use `@torkbot/sledge` when you want:
 - **Lease-based execution** for queue handlers
 - **Idempotent producer retries** via `dedupeKey`
 - **Signals** for short-lived work created inside queue handlers
-- **Configurable contention behavior** (`maxBusyRetries`, `maxBusyRetryDelayMs`)
 
 ## Example use-cases
 
@@ -36,7 +35,6 @@ Use `@torkbot/sledge` when you want:
 ## Quick start (copy/paste)
 
 ```ts
-import Database from "better-sqlite3";
 import { Type } from "typebox";
 
 import {
@@ -114,23 +112,44 @@ const registeredModel = registerLedgerModel(definedModel, {
   },
 });
 
-const db = new Database("./app.sqlite");
 const clock = new SystemRuntimeClock();
 const scheduler = new NodeRuntimeScheduler();
 
 {
   await using ledger = createBetterSqliteLedger({
-    database: db,
+    databaseUrl: "./app.sqlite",
     boundModel: bindLedgerModel(registeredModel, {
       indexers: {
-        upsertUser: async () => {
+        upsertUser: async (scope, input) => {
           // Write to your own projection table(s)
+          await scope
+            .prepare(
+              `INSERT INTO users (user_id, email)
+               VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET email = excluded.email`,
+            )
+            .run(input.userId, input.email);
         },
       },
       queries: {
-        userById: async () => {
+        userById: async (scope, params) => {
           // Read from your own projection table(s)
-          return null;
+          const row = await scope
+            .prepare(
+              `SELECT user_id, email
+               FROM users
+               WHERE user_id = ?`,
+            )
+            .get(params.userId);
+
+          if (row === undefined) {
+            return null;
+          }
+
+          return {
+            userId: row.user_id,
+            email: row.email,
+          };
         },
       },
     }),
@@ -177,7 +196,9 @@ Event handlers can `index`, `enqueue`, and `query`.
 
 ### 3) `bindLedgerModel(...)`
 
-You provide concrete implementations for indexers and queries.
+You provide concrete implementations for indexers and queries. Sledge passes a
+storage scope as the first argument and the typed input/params as the second
+argument.
 
 Query implementations are projection reads. They are not serialized behind
 ledger mutations, so a long-running query cannot block unrelated durable writes.
@@ -192,6 +213,21 @@ You choose a backend adapter and open the durable ledger:
 - `createBetterSqliteLedger(...)`
 - `createTursoLedger(...)`
 
+Adapters take a `databaseUrl` and Sledge owns the database connections it opens.
+Plain `:memory:` URLs are rejected because they cannot support more than one
+connection. Use a real database file for local SQLite, or a backend-specific
+shared-memory URL only where the driver can still provide the required
+multi-connection read/write semantics. The `better-sqlite3` adapter verifies
+that the opened database actually enters WAL journal mode and rejects databases
+that cannot.
+
+Sledge assumes a single process owns writes to a ledger database. Its
+multi-connection support is for Sledge-managed read/write scopes inside that
+runtime, not for competing writer processes. Cross-process consumers should use
+durable event streams (`tailEvents` / `resumeEvents`) and work inspection APIs.
+`onSignal(...)` is a live, process-local notification hook; signals are
+transient and are not a durable distributed pub/sub channel.
+
 The runtime exposes:
 
 - `emit(eventName, payload, options?)`: append an event and return its durable envelope
@@ -201,19 +237,17 @@ The runtime exposes:
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`: inspect durable work items
 - `tailEvents({ last, signal })`: read recent durable events and follow new ones
 - `resumeEvents({ cursor, signal })`: continue an event stream from an opaque cursor
-- `onSignal(signalName, observer)`: subscribe to live signal notifications
+- `onSignal(signalName, observer)`: subscribe to live process-local signal notifications
 - `startWorkers(options)`: start queue dispatch for this ledger handle
-- `close()`: close the ledger runtime without closing the underlying database handle
+- `close()`: close the ledger runtime and the database connections owned by it
 
 Opening a ledger is passive: it initializes storage and can emit, query, tail,
 resume, and observe signals, but it does not claim or process queue work.
 
-A raw SQLite/Turso database handle must be owned by at most one live Sledge
-ledger instance at a time. Sledge coordinates mutations, committed reads, worker
-leases, and work inspection through per-ledger runtime state; wrapping the same
-raw handle in multiple live ledgers bypasses that coordination and is not a
-supported topology. Use one composed ledger per database handle, then pass that
-ledger to the parts of your application that need it.
+Sledge manages read and write scopes internally. Ambient `ledger.query(...)`
+calls receive an ambient read scope. Event projection `actions.query(...)` and
+`actions.index(...)` receive the same transaction-local scope as the event
+append and work materialization transaction.
 
 Start workers explicitly in the process that owns queue execution:
 
@@ -445,11 +479,6 @@ Available options when starting workers:
 - `leaseMs`
 - `defaultRetryDelayMs`
 - `maxInFlight`
-
-Available options when creating a ledger:
-
-- `maxBusyRetries`
-- `maxBusyRetryDelayMs`
 
 Start simple; tune only when you observe contention/throughput issues.
 

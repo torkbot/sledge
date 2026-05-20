@@ -1,4 +1,8 @@
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
@@ -23,7 +27,11 @@ runLedgerContractSuite({
   suiteName: "better-sqlite ledger contract",
   create: async (): Promise<LedgerContractHarness> => {
     const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-    const db = new Database(":memory:");
+    const databaseUrl = join(
+      tmpdir(),
+      `sledge-contract-better-${randomUUID()}.sqlite`,
+    );
+    const db = new Database(databaseUrl);
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS contract_projection (
@@ -42,72 +50,80 @@ runLedgerContractSuite({
       LedgerContractQueries
     > = {
       indexers: {
-        upsertObserved: (input) => {
-          db.prepare(
-            `INSERT INTO contract_projection (
+        upsertObserved: async (scope, input) => {
+          await scope
+            .prepare(
+              `INSERT INTO contract_projection (
               source_event_id,
               decision_attempts,
               dispatch_count,
               planned_intent_event_id
             ) VALUES (?, 0, 0, NULL)
             ON CONFLICT(source_event_id) DO NOTHING`,
-          ).run(input.sourceEventId);
+            )
+            .run(input.sourceEventId);
         },
-        incrementDecisionAttempts: (input) => {
-          db.prepare(
-            `UPDATE contract_projection
+        incrementDecisionAttempts: async (scope, input) => {
+          await scope
+            .prepare(
+              `UPDATE contract_projection
              SET decision_attempts = decision_attempts + 1
              WHERE source_event_id = ?`,
-          ).run(input.sourceEventId);
+            )
+            .run(input.sourceEventId);
         },
-        setPlannedIntent: (input) => {
-          db.prepare(
-            `UPDATE contract_projection
+        setPlannedIntent: async (scope, input) => {
+          await scope
+            .prepare(
+              `UPDATE contract_projection
              SET planned_intent_event_id = ?
              WHERE source_event_id = ?`,
-          ).run(input.intentEventId, input.sourceEventId);
+            )
+            .run(input.intentEventId, input.sourceEventId);
         },
-        incrementDispatchCount: (input) => {
-          db.prepare(
-            `UPDATE contract_projection
+        incrementDispatchCount: async (scope, input) => {
+          await scope
+            .prepare(
+              `UPDATE contract_projection
              SET dispatch_count = dispatch_count + 1
              WHERE source_event_id = ?`,
-          ).run(input.sourceEventId);
+            )
+            .run(input.sourceEventId);
         },
       },
       queries: {
-        decisionAttempts: (params) => {
-          const row = db
-            .prepare<[number], { decision_attempts: number }>(
+        decisionAttempts: async (scope, params) => {
+          const row = await scope
+            .prepare(
               `SELECT decision_attempts
                FROM contract_projection
                WHERE source_event_id = ?`,
             )
             .get(params.sourceEventId);
 
-          return row?.decision_attempts ?? 0;
+          return (row?.decision_attempts as number | undefined) ?? 0;
         },
-        dispatchCount: (params) => {
-          const row = db
-            .prepare<[number], { dispatch_count: number }>(
+        dispatchCount: async (scope, params) => {
+          const row = await scope
+            .prepare(
               `SELECT dispatch_count
                FROM contract_projection
                WHERE source_event_id = ?`,
             )
             .get(params.sourceEventId);
 
-          return row?.dispatch_count ?? 0;
+          return (row?.dispatch_count as number | undefined) ?? 0;
         },
-        seenSourceEventIds: () => {
-          const rows = db
-            .prepare<[], { source_event_id: number }>(
+        seenSourceEventIds: async (scope, _params) => {
+          const rows = await scope
+            .prepare(
               `SELECT source_event_id
                FROM contract_projection
                ORDER BY source_event_id ASC`,
             )
             .all();
 
-          return rows.map((row) => row.source_event_id);
+          return rows.map((row) => row.source_event_id as number);
         },
       },
     };
@@ -130,7 +146,7 @@ runLedgerContractSuite({
       );
 
       return createBetterSqliteLedger({
-        database: db,
+        databaseUrl,
         boundModel: bindLedgerModel(registeredModel, implementations),
         timing: {
           clock: runtime.clock,
@@ -166,6 +182,7 @@ runLedgerContractSuite({
         await workers.close();
         await ledger.close();
         db.close();
+        await rm(databaseUrl, { force: true });
       },
       setDecisionMode: (mode) => {
         decisionMode = mode;

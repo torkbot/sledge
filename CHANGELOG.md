@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 - 2026-05-20
+
+- Breaking: SQLite/Turso adapters now take a `databaseUrl` instead of a
+  caller-owned database handle. Sledge owns the connections it opens and closes
+  them with the ledger.
+- Breaking: query and indexer implementations now receive the Sledge-provided
+  storage scope as their first argument. Ambient `ledger.query(...)` receives an
+  ambient read scope; event projection `actions.query(...)` and
+  `actions.index(...)` receive the event transaction scope.
+- Remove ledger-level busy retry configuration. Conventional SQLite adapters
+  keep a single writer gate internally; busy lock conflicts from other
+  connections fail fast.
+- Reject plain `:memory:` database URLs because they cannot support the
+  multi-connection storage model.
+- Require the `better-sqlite3` adapter to open databases in WAL journal mode so
+  owned reader connections do not block writer commits.
 
 ## 0.8.0
 
