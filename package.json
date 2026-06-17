@@ -17,6 +17,10 @@
       "types": "./dist/ledger/ledger.d.ts",
       "default": "./dist/ledger/ledger.js"
     },
+    "./projections": {
+      "types": "./dist/ledger/projections.d.ts",
+      "default": "./dist/ledger/projections.js"
+    },
     "./database-ledger-engine": {
       "types": "./dist/ledger/database-ledger-engine.d.ts",
       "default": "./dist/ledger/database-ledger-engine.js"

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add `@torkbot/sledge/projections` as an exploratory typed projection-schema
+  surface for v2 design work. It records table-local columns, indexes, semantic
+  event references, and second-phase cross-table foreign-key metadata without
+  changing the existing runtime.
+
 ## 0.9.0 - 2026-05-20
 
 - Breaking: SQLite/Turso adapters now take a `databaseUrl` instead of a

@@ -482,11 +482,89 @@ Available options when starting workers:
 
 Start simple; tune only when you observe contention/throughput issues.
 
+## Typed projection schema exploration
+
+Sledge v2 is exploring a stricter separation between ledger shape, projection
+schema, access definitions, storage hygiene, and runtime use. The first building
+block is `@torkbot/sledge/projections`, which records projection tables,
+table-local indexes, semantic event references, and cross-table foreign keys as
+typed metadata.
+
+```ts
+import {
+  defineProjectionSchemaForEvents,
+  type EventRef,
+  type ProjectionRow,
+  type ProjectionSchemaTables,
+  type ProjectionTableColumns,
+} from "@torkbot/sledge/projections";
+
+const defineProjections = defineProjectionSchemaForEvents<
+  "session.created" | "user.created"
+>();
+
+const projections = defineProjections({
+  users: (t) =>
+    t
+      .columns({
+        userId: t.text().notNull(),
+        email: t.text().notNull(),
+        source: t.eventRef("user.created").notNull(),
+      })
+      .primaryKey(["userId"])
+      .unique("users_email_unique", ["email"]),
+
+  sessions: (t) =>
+    t
+      .columns({
+        sessionId: t.text().notNull(),
+        userId: t.text().notNull(),
+        source: t.eventRef("session.created").notNull(),
+      })
+      .primaryKey(["sessionId"])
+      .index("sessions_by_user", ["userId"]),
+}).relations((r) => ({
+  sessionUser: r
+    .foreignKey("sessions", ["userId"])
+    .references("users", ["userId"])
+    .onDelete("cascade"),
+}));
+
+type Tables = ProjectionSchemaTables<typeof projections>;
+type UserRow = ProjectionRow<ProjectionTableColumns<Tables["users"]>>;
+
+const source: EventRef<"user.created"> = {
+  eventName: "user.created",
+  eventId: 1,
+};
+const row: UserRow = {
+  userId: "u_123",
+  email: "alice@example.com",
+  source,
+};
+```
+
+The intended v2 lifecycle is:
+
+1. Define the ledger shape with TypeBox event, queue, signal, indexer, and query
+   contracts.
+2. Define projection schema separately with table-local relational builders.
+3. Define named indexers and queries over those projections using a sledge-owned
+   query facade.
+4. Establish a storage connection.
+5. Run database hygiene explicitly: internal migrations first, then projection
+   migrations.
+6. Open a tenant-scoped runtime ledger.
+
+This projection API is metadata-only today. It does not yet compile migrations,
+execute queries, or change the current SQLite/Turso runtime behavior.
+
 ---
 
 ## Package exports
 
 - `@torkbot/sledge/ledger`
+- `@torkbot/sledge/projections`
 - `@torkbot/sledge/database-ledger-engine`
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`
