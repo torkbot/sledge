@@ -11,6 +11,8 @@
   columns, indexes, semantic event references, and second-phase foreign-key
   metadata, then infers typed projection indexers and queries from the
   ledger-scoped projection schema.
+- Change projection attachment to an object-shaped definition:
+  `.withProjections({ tables, relations }, { indexers, queries })`.
 - Add ledger-owned event refs on event envelopes so projection access callbacks
   can write semantic event references without exposing the internal events
   table.

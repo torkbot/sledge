@@ -15,8 +15,9 @@ import {
 } from "./projection-access.ts";
 import {
   defineProjectionSchemaForEvents,
+  type ProjectionRelationBuilder,
+  type ProjectionRelations,
   type ProjectionSchema,
-  type ProjectionSchemaEventName,
   type ProjectionTableFactories,
   type ProjectionTablesForFactories,
 } from "./projections.ts";
@@ -589,24 +590,18 @@ export type LedgerShape<
   readonly signalQueues: TSignalQueues;
 };
 
-export type LedgerProjectionSchemaBuilder<TEventName extends string> = {
-  tables<const TFactories extends ProjectionTableFactories<TEventName>>(
-    factories: TFactories,
-  ): ProjectionSchema<ProjectionTablesForFactories<TFactories>, {}, TEventName>;
-};
-
-type ProjectionSchemaCompatibleWithEvents<
+export type LedgerProjectionDefinition<
   TEventName extends string,
-  TProjectionSchema,
-> =
-  Exclude<
-    ProjectionSchemaEventName<TProjectionSchema>,
-    TEventName
-  > extends never
-    ? unknown
-    : {
-        readonly projectionEventNamesMustComeFromLedgerShape: never;
-      };
+  TFactories extends ProjectionTableFactories<TEventName>,
+  TRelations extends ProjectionRelations,
+> = {
+  readonly tables: TFactories;
+  readonly relations?: (
+    relations: ProjectionRelationBuilder<
+      ProjectionTablesForFactories<TFactories>
+    >,
+  ) => TRelations;
+};
 
 export type DefinedLedgerShape<
   TEvents extends Record<string, TSchema>,
@@ -634,18 +629,42 @@ export type DefinedLedgerShape<
     ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>
   >;
   withProjections<
-    const TProjectionSchema extends AnyProjectionSchema,
-    const TIndexerFactories extends
-      ProjectionIndexerFactories<TProjectionSchema>,
-    const TQueryFactories extends ProjectionQueryFactories<TProjectionSchema>,
+    const TFactories extends ProjectionTableFactories<
+      Extract<keyof TEvents, string>
+    >,
+    const TRelations extends ProjectionRelations = {},
+    const TIndexerFactories extends ProjectionIndexerFactories<
+      ProjectionSchema<
+        ProjectionTablesForFactories<TFactories>,
+        TRelations,
+        Extract<keyof TEvents, string>
+      >
+    > = ProjectionIndexerFactories<
+      ProjectionSchema<
+        ProjectionTablesForFactories<TFactories>,
+        TRelations,
+        Extract<keyof TEvents, string>
+      >
+    >,
+    const TQueryFactories extends ProjectionQueryFactories<
+      ProjectionSchema<
+        ProjectionTablesForFactories<TFactories>,
+        TRelations,
+        Extract<keyof TEvents, string>
+      >
+    > = ProjectionQueryFactories<
+      ProjectionSchema<
+        ProjectionTablesForFactories<TFactories>,
+        TRelations,
+        Extract<keyof TEvents, string>
+      >
+    >,
   >(
-    defineSchema: (
-      builder: LedgerProjectionSchemaBuilder<Extract<keyof TEvents, string>>,
-    ) => TProjectionSchema &
-      ProjectionSchemaCompatibleWithEvents<
-        Extract<keyof TEvents, string>,
-        TProjectionSchema
-      >,
+    definition: LedgerProjectionDefinition<
+      Extract<keyof TEvents, string>,
+      TFactories,
+      TRelations
+    >,
     access: {
       readonly indexers: TIndexerFactories;
       readonly queries: TQueryFactories;
@@ -653,7 +672,11 @@ export type DefinedLedgerShape<
   ): DefinedLedgerModel<
     TEvents,
     TQueues,
-    TProjectionSchema,
+    ProjectionSchema<
+      ProjectionTablesForFactories<TFactories>,
+      TRelations,
+      Extract<keyof TEvents, string>
+    >,
     ProjectionIndexerSchemas<
       InferProjectionIndexerDefinitions<TIndexerFactories>
     >,
@@ -727,10 +750,53 @@ export function defineLedgerShape<
         access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
       }).register(register);
     },
-    withProjections: (defineSchema, accessDefinition) => {
-      const projections = defineSchema(
-        createLedgerProjectionSchemaBuilder<Extract<keyof TEvents, string>>(),
-      );
+    withProjections: <
+      const TFactories extends ProjectionTableFactories<
+        Extract<keyof TEvents, string>
+      >,
+      const TRelations extends ProjectionRelations = {},
+      const TIndexerFactories extends ProjectionIndexerFactories<
+        ProjectionSchema<
+          ProjectionTablesForFactories<TFactories>,
+          TRelations,
+          Extract<keyof TEvents, string>
+        >
+      > = ProjectionIndexerFactories<
+        ProjectionSchema<
+          ProjectionTablesForFactories<TFactories>,
+          TRelations,
+          Extract<keyof TEvents, string>
+        >
+      >,
+      const TQueryFactories extends ProjectionQueryFactories<
+        ProjectionSchema<
+          ProjectionTablesForFactories<TFactories>,
+          TRelations,
+          Extract<keyof TEvents, string>
+        >
+      > = ProjectionQueryFactories<
+        ProjectionSchema<
+          ProjectionTablesForFactories<TFactories>,
+          TRelations,
+          Extract<keyof TEvents, string>
+        >
+      >,
+    >(
+      definition: LedgerProjectionDefinition<
+        Extract<keyof TEvents, string>,
+        TFactories,
+        TRelations
+      >,
+      accessDefinition: {
+        readonly indexers: TIndexerFactories;
+        readonly queries: TQueryFactories;
+      },
+    ) => {
+      const projections = createLedgerProjectionSchema<
+        Extract<keyof TEvents, string>,
+        TFactories,
+        TRelations
+      >(definition);
       const access = createProjectionAccess({
         projections,
         indexers: accessDefinition.indexers,
@@ -745,16 +811,29 @@ export function defineLedgerShape<
   };
 }
 
-function createLedgerProjectionSchemaBuilder<
+function createLedgerProjectionSchema<
   TEventName extends string,
->(): LedgerProjectionSchemaBuilder<TEventName> {
+  const TFactories extends ProjectionTableFactories<TEventName>,
+  const TRelations extends ProjectionRelations,
+>(
+  definition: LedgerProjectionDefinition<TEventName, TFactories, TRelations>,
+): ProjectionSchema<
+  ProjectionTablesForFactories<TFactories>,
+  TRelations,
+  TEventName
+> {
   const defineSchema = defineProjectionSchemaForEvents<TEventName>();
+  const schema = defineSchema(definition.tables);
 
-  return {
-    tables: (factories) => {
-      return defineSchema(factories);
-    },
-  };
+  if (definition.relations === undefined) {
+    return schema as ProjectionSchema<
+      ProjectionTablesForFactories<TFactories>,
+      TRelations,
+      TEventName
+    >;
+  }
+
+  return schema.relations(definition.relations);
 }
 
 function createEmptyProjectionAccess<

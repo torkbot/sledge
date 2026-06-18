@@ -27,8 +27,8 @@ const shape = defineLedgerShape({
 });
 
 const definedModel = shape.withProjections(
-  (p) =>
-    p.tables({
+  {
+    tables: {
       users: (t) =>
         t
           .columns({
@@ -37,7 +37,8 @@ const definedModel = shape.withProjections(
             source: t.eventRef("user.created").notNull(),
           })
           .primaryKey(["userId"]),
-    }),
+    },
+  },
   {
     indexers: {
       upsertUser: (i) =>
@@ -291,10 +292,51 @@ test("ledger shape can register without projections", () => {
   });
 });
 
+test("ledger projection definition applies relations over inferred tables", () => {
+  const model = shape.withProjections(
+    {
+      tables: {
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        sessions: (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+      },
+      relations: (r) => ({
+        sessionUser: r
+          .foreignKey("sessions", ["userId"])
+          .references("users", ["userId"]),
+      }),
+    },
+    {
+      indexers: {},
+      queries: {},
+    },
+  );
+
+  assert.deepEqual(model.projections.metadata.relations, {
+    sessionUser: {
+      fromTable: "sessions",
+      fromColumns: ["userId"],
+      toTable: "users",
+      toColumns: ["userId"],
+      onDelete: "restrict",
+    },
+  });
+});
+
 async function assertLedgerProjectionTypes(): Promise<void> {
   shape.withProjections(
-    (p) =>
-      p.tables({
+    {
+      tables: {
         sessions: (t) =>
           t
             .columns({
@@ -303,7 +345,8 @@ async function assertLedgerProjectionTypes(): Promise<void> {
               source: t.eventRef("session.created").notNull(),
             })
             .primaryKey(["sessionId"]),
-      }),
+      },
+    },
     {
       indexers: {},
       queries: {},
@@ -311,8 +354,8 @@ async function assertLedgerProjectionTypes(): Promise<void> {
   );
 
   shape.withProjections(
-    (p) =>
-      p.tables({
+    {
+      tables: {
         users: (t) =>
           t
             .columns({
@@ -321,7 +364,8 @@ async function assertLedgerProjectionTypes(): Promise<void> {
               source: t.eventRef("user.created").notNull(),
             })
             .primaryKey(["userId"]),
-      }),
+      },
+    },
     {
       indexers: {
         invalidSource: (i) =>

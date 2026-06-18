@@ -85,8 +85,8 @@ const ledgerContractShape = defineLedgerShape({
 });
 
 const ledgerContractDefinition = ledgerContractShape.withProjections(
-  (p) =>
-    p.tables({
+  {
+    tables: {
       contractProjection: (t) =>
         t
           .columns({
@@ -96,7 +96,8 @@ const ledgerContractDefinition = ledgerContractShape.withProjections(
             plannedIntentEventId: t.integer(),
           })
           .primaryKey(["sourceEventId"]),
-    }),
+    },
+  },
   {
     indexers: {
       upsertObserved: (i) =>

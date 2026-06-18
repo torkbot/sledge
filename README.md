@@ -60,8 +60,8 @@ const definedModel = defineLedgerShape({
   signals: {},
   signalQueues: {},
 }).withProjections(
-  (p) =>
-    p.tables({
+  {
+    tables: {
       users: (t) =>
         t
           .columns({
@@ -70,7 +70,8 @@ const definedModel = defineLedgerShape({
             source: t.eventRef("user.created").notNull(),
           })
           .primaryKey(["userId"]),
-    }),
+    },
+  },
   {
     indexers: {
       upsertUser: (i) =>
@@ -193,14 +194,41 @@ category.
 
 ### 2. Attach Projections
 
-Call `.withProjections((p) => p.tables(...), { indexers, queries })` to attach
+Call `.withProjections({ tables, relations }, { indexers, queries })` to attach
 projection tables and access callbacks to the ledger shape.
 
-The schema builder is scoped to the ledger event names, so semantic event refs
+Each table key owns one table-local builder function:
+
+```ts
+{
+  tables: {
+    users: (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+  },
+}
+```
+
+Those table builders are scoped to the ledger event names, so semantic event refs
 must point at real events:
 
 ```ts
 source: t.eventRef("user.created").notNull();
+```
+
+Foreign keys are declared in the optional second phase so relation builders can
+see all inferred tables:
+
+```ts
+relations: (r) => ({
+  sessionUser: r
+    .foreignKey("sessions", ["userId"])
+    .references("users", ["userId"]),
+});
 ```
 
 The access callbacks receive sledge-owned facades:
