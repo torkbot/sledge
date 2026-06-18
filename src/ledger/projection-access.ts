@@ -150,8 +150,8 @@ export type ProjectionIndexerDefinition<
   TSourceEventName extends ProjectionSchemaEventName<TProjectionSchema>,
 > = {
   readonly input: TInputSchema;
-  readonly sourceEventName: TSourceEventName;
-  run(
+  readonly sourceEvent: TSourceEventName;
+  write(
     input: ProjectionIndexerRunInput<
       TProjectionSchema,
       TInputSchema,
@@ -162,65 +162,33 @@ export type ProjectionIndexerDefinition<
 
 type ProjectionIndexerDefinitionLike = {
   readonly input: TSchema;
-  readonly sourceEventName: string;
-  run(input: {
+  readonly sourceEvent: string;
+  write(input: {
     readonly input: unknown;
     readonly event: ProjectionIndexerEvent<string>;
     readonly db: ProjectionWriteDatabase<AnyProjectionSchema>;
   }): void | Promise<void>;
 };
 
-export type ProjectionIndexerFactories<
+type ProjectionIndexerDefinitionMapValue<
   TProjectionSchema extends AnyProjectionSchema,
-> = Record<
-  string,
-  (
-    builder: ProjectionIndexerBuilder<TProjectionSchema>,
-  ) => ProjectionIndexerDefinitionLike
+> = {
+  readonly input: TSchema;
+  readonly sourceEvent: ProjectionSchemaEventName<TProjectionSchema>;
+  write(input: {
+    readonly input: unknown;
+    readonly event: ProjectionIndexerEvent<
+      ProjectionSchemaEventName<TProjectionSchema>
+    >;
+    readonly db: ProjectionWriteDatabase<TProjectionSchema>;
+  }): void | Promise<void>;
+};
+
+export type ProjectionIndexerDefinitions<
+  TProjectionSchema extends AnyProjectionSchema,
+> = Readonly<
+  Record<string, ProjectionIndexerDefinitionMapValue<TProjectionSchema>>
 >;
-
-export type ProjectionIndexerBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
-> = {
-  sourceEvent<
-    const TSourceEventName extends ProjectionSchemaEventName<TProjectionSchema>,
-  >(
-    eventName: TSourceEventName,
-  ): ProjectionIndexerSourceBuilder<TProjectionSchema, TSourceEventName>;
-};
-
-export type ProjectionIndexerSourceBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
-  TSourceEventName extends ProjectionSchemaEventName<TProjectionSchema>,
-> = {
-  input<const TInputSchema extends TSchema>(
-    schema: TInputSchema,
-  ): ProjectionIndexerInputBuilder<
-    TProjectionSchema,
-    TInputSchema,
-    TSourceEventName
-  >;
-};
-
-export type ProjectionIndexerInputBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
-  TInputSchema extends TSchema,
-  TSourceEventName extends ProjectionSchemaEventName<TProjectionSchema>,
-> = {
-  write(
-    run: (
-      input: ProjectionIndexerRunInput<
-        TProjectionSchema,
-        TInputSchema,
-        TSourceEventName
-      >,
-    ) => void | Promise<void>,
-  ): ProjectionIndexerDefinition<
-    TProjectionSchema,
-    TInputSchema,
-    TSourceEventName
-  >;
-};
 
 export type ProjectionQueryRunInput<
   TProjectionSchema extends AnyProjectionSchema,
@@ -237,79 +205,78 @@ export type ProjectionQueryDefinition<
 > = {
   readonly params: TParamsSchema;
   readonly result: TResultSchema;
-  run(
+  read(
     input: ProjectionQueryRunInput<TProjectionSchema, TParamsSchema>,
-  ): unknown | Promise<unknown>;
+  ): Static<TResultSchema> | Promise<Static<TResultSchema>>;
 };
 
 type ProjectionQueryDefinitionLike = {
   readonly params: TSchema;
   readonly result: TSchema;
-  run(input: {
+  read(input: {
     readonly params: unknown;
     readonly db: ProjectionReadDatabase<AnyProjectionSchema>;
   }): unknown | Promise<unknown>;
 };
 
-export type ProjectionQueryFactories<
+type ProjectionQueryDefinitionMapValue<
   TProjectionSchema extends AnyProjectionSchema,
-> = Record<
-  string,
-  (
-    builder: ProjectionQueryBuilder<TProjectionSchema>,
-  ) => ProjectionQueryDefinitionLike
+> = {
+  readonly params: TSchema;
+  readonly result: TSchema;
+  read(input: {
+    readonly params: unknown;
+    readonly db: ProjectionReadDatabase<TProjectionSchema>;
+  }): unknown | Promise<unknown>;
+};
+
+export type ProjectionQueryDefinitions<
+  TProjectionSchema extends AnyProjectionSchema,
+> = Readonly<
+  Record<string, ProjectionQueryDefinitionMapValue<TProjectionSchema>>
 >;
 
-export type ProjectionQueryBuilder<
+export type ProjectionAccessDefinitionBuilder<
   TProjectionSchema extends AnyProjectionSchema,
 > = {
-  params<const TParamsSchema extends TSchema>(
-    schema: TParamsSchema,
-  ): ProjectionQueryParamsBuilder<TProjectionSchema, TParamsSchema>;
-};
-
-export type ProjectionQueryParamsBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
-  TParamsSchema extends TSchema,
-> = {
-  result<const TResultSchema extends TSchema>(
-    schema: TResultSchema,
-  ): ProjectionQueryResultBuilder<
+  indexer<
+    const TSourceEventName extends ProjectionSchemaEventName<TProjectionSchema>,
+    const TInputSchema extends TSchema,
+  >(
+    definition: ProjectionIndexerDefinition<
+      TProjectionSchema,
+      TInputSchema,
+      TSourceEventName
+    >,
+  ): ProjectionIndexerDefinition<
     TProjectionSchema,
-    TParamsSchema,
-    TResultSchema
+    TInputSchema,
+    TSourceEventName
   >;
-};
-
-export type ProjectionQueryResultBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
-  TParamsSchema extends TSchema,
-  TResultSchema extends TSchema,
-> = {
-  read(
-    run: (
-      input: ProjectionQueryRunInput<TProjectionSchema, TParamsSchema>,
-    ) => Static<TResultSchema> | Promise<Static<TResultSchema>>,
+  query<
+    const TParamsSchema extends TSchema,
+    const TResultSchema extends TSchema,
+  >(
+    definition: ProjectionQueryDefinition<
+      TProjectionSchema,
+      TParamsSchema,
+      TResultSchema
+    >,
   ): ProjectionQueryDefinition<TProjectionSchema, TParamsSchema, TResultSchema>;
 };
 
-type FactoryReturn<TFactory> = TFactory extends (
-  builder: never,
-) => infer TReturn
-  ? TReturn
-  : never;
-
-export type InferProjectionIndexerDefinitions<TFactories> = {
-  readonly [TName in Extract<keyof TFactories, string>]: FactoryReturn<
-    TFactories[TName]
-  >;
-};
-
-export type InferProjectionQueryDefinitions<TFactories> = {
-  readonly [TName in Extract<keyof TFactories, string>]: FactoryReturn<
-    TFactories[TName]
-  >;
-};
+export function createProjectionAccessDefinitionBuilder<
+  TProjectionSchema extends AnyProjectionSchema,
+>(): ProjectionAccessDefinitionBuilder<TProjectionSchema> {
+  return {
+    indexer: (definition) => {
+      return definition;
+    },
+    query: (definition) => {
+      return definition;
+    },
+  };
+}
 
 export type ProjectionIndexerSchemas<TDefinitions> = {
   readonly [TName in Extract<
@@ -353,22 +320,18 @@ export type ProjectionAccess<
 
 export function createProjectionAccess<
   const TProjectionSchema extends AnyProjectionSchema,
-  const TIndexerFactories extends ProjectionIndexerFactories<TProjectionSchema>,
-  const TQueryFactories extends ProjectionQueryFactories<TProjectionSchema>,
+  const TIndexerDefinitions extends
+    ProjectionIndexerDefinitions<TProjectionSchema>,
+  const TQueryDefinitions extends ProjectionQueryDefinitions<TProjectionSchema>,
 >(input: {
   readonly projections: TProjectionSchema;
-  readonly indexers: TIndexerFactories;
-  readonly queries: TQueryFactories;
+  readonly indexers: TIndexerDefinitions;
+  readonly queries: TQueryDefinitions;
 }): ProjectionAccess<
   TProjectionSchema,
-  ProjectionIndexerSchemas<
-    InferProjectionIndexerDefinitions<TIndexerFactories>
-  >,
-  ProjectionQuerySchemas<InferProjectionQueryDefinitions<TQueryFactories>>
+  ProjectionIndexerSchemas<TIndexerDefinitions>,
+  ProjectionQuerySchemas<TQueryDefinitions>
 > {
-  const indexerBuilder = createProjectionIndexerBuilder(input.projections);
-  const queryBuilder = createProjectionQueryBuilder(input.projections);
-
   const indexers: Record<string, TSchema> = {};
   const queries: Record<string, AnyQuerySchema> = {};
   const indexerImplementations: Record<
@@ -384,8 +347,7 @@ export function createProjectionAccess<
     (scope: LedgerStorageScope, params: unknown) => Promise<unknown>
   > = {};
 
-  for (const [indexerName, factory] of Object.entries(input.indexers)) {
-    const definition = factory(indexerBuilder);
+  for (const [indexerName, definition] of Object.entries(input.indexers)) {
     indexers[indexerName] = definition.input;
     indexerImplementations[indexerName] = async (
       scope,
@@ -402,14 +364,13 @@ export function createProjectionAccess<
     };
   }
 
-  for (const [queryName, factory] of Object.entries(input.queries)) {
-    const definition = factory(queryBuilder);
+  for (const [queryName, definition] of Object.entries(input.queries)) {
     queries[queryName] = {
       params: definition.params,
       result: definition.result,
     };
     queryImplementations[queryName] = async (scope, params) => {
-      return await definition.run({
+      return await definition.read({
         params,
         db: createProjectionReadDatabase(input.projections.metadata, scope),
       });
@@ -426,57 +387,9 @@ export function createProjectionAccess<
     },
   } as ProjectionAccess<
     TProjectionSchema,
-    ProjectionIndexerSchemas<
-      InferProjectionIndexerDefinitions<TIndexerFactories>
-    >,
-    ProjectionQuerySchemas<InferProjectionQueryDefinitions<TQueryFactories>>
+    ProjectionIndexerSchemas<TIndexerDefinitions>,
+    ProjectionQuerySchemas<TQueryDefinitions>
   >;
-}
-
-function createProjectionIndexerBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
->(
-  _projections: TProjectionSchema,
-): ProjectionIndexerBuilder<TProjectionSchema> {
-  return {
-    sourceEvent: (sourceEventName) => {
-      return {
-        input: (inputSchema) => {
-          return {
-            write: (run) => {
-              return {
-                input: inputSchema,
-                sourceEventName,
-                run,
-              };
-            },
-          };
-        },
-      };
-    },
-  };
-}
-
-function createProjectionQueryBuilder<
-  TProjectionSchema extends AnyProjectionSchema,
->(_projections: TProjectionSchema): ProjectionQueryBuilder<TProjectionSchema> {
-  return {
-    params: (paramsSchema) => {
-      return {
-        result: (resultSchema) => {
-          return {
-            read: (run) => {
-              return {
-                params: paramsSchema,
-                result: resultSchema,
-                run,
-              };
-            },
-          };
-        },
-      };
-    },
-  };
 }
 
 async function runProjectionIndexer(
@@ -486,12 +399,9 @@ async function runProjectionIndexer(
   input: unknown,
   context: LedgerIndexerContext,
 ): Promise<void> {
-  const event = createProjectionIndexerEvent(
-    definition.sourceEventName,
-    context,
-  );
+  const event = createProjectionIndexerEvent(definition.sourceEvent, context);
 
-  await definition.run({
+  await definition.write({
     input,
     event,
     db: createProjectionWriteDatabase(projections.metadata, scope),

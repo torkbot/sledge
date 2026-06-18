@@ -72,64 +72,60 @@ const definedModel = defineLedgerShape({
           .primaryKey(["userId"]),
     },
   },
-  {
+  (p) => ({
     indexers: {
-      upsertUser: (i) =>
-        i
-          .sourceEvent("user.created")
-          .input(
-            Type.Object({
-              userId: Type.String(),
-              email: Type.String(),
-            }),
-          )
-          .write(async ({ input, event, db }) => {
-            await db
-              .insertInto("users")
-              .values({
-                userId: input.userId,
-                email: input.email,
-                source: event.ref,
-              })
-              .onConflict(["userId"])
-              .doUpdateSet({
-                email: input.email,
-                source: event.ref,
-              })
-              .execute();
-          }),
+      upsertUser: p.indexer({
+        sourceEvent: "user.created",
+        input: Type.Object({
+          userId: Type.String(),
+          email: Type.String(),
+        }),
+        write: async ({ input, event, db }) => {
+          await db
+            .insertInto("users")
+            .values({
+              userId: input.userId,
+              email: input.email,
+              source: event.ref,
+            })
+            .onConflict(["userId"])
+            .doUpdateSet({
+              email: input.email,
+              source: event.ref,
+            })
+            .execute();
+        },
+      }),
     },
     queries: {
-      userById: (q) =>
-        q
-          .params(Type.Object({ userId: Type.String() }))
-          .result(
-            Type.Union([
-              Type.Null(),
-              Type.Object({
-                userId: Type.String(),
-                email: Type.String(),
-              }),
-            ]),
-          )
-          .read(async ({ params, db }) => {
-            const row = await db
-              .selectFrom("users")
-              .select(["userId", "email"])
-              .where("userId", "=", params.userId)
-              .executeTakeFirst();
-
-            if (row === null) {
-              return null;
-            }
-
-            return {
-              userId: row.userId,
-              email: row.email,
-            };
+      userById: p.query({
+        params: Type.Object({ userId: Type.String() }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            userId: Type.String(),
+            email: Type.String(),
           }),
+        ]),
+        read: async ({ params, db }) => {
+          const row = await db
+            .selectFrom("users")
+            .select(["userId", "email"])
+            .where("userId", "=", params.userId)
+            .executeTakeFirst();
+
+          if (row === null) {
+            return null;
+          }
+
+          return {
+            userId: row.userId,
+            email: row.email,
+          };
+        },
+      }),
     },
-  },
+  }),
 );
 
 const model = definedModel.register({
@@ -194,8 +190,8 @@ category.
 
 ### 2. Attach Projections
 
-Call `.withProjections({ tables, relations }, { indexers, queries })` to attach
-projection tables and access callbacks to the ledger shape.
+Call `.withProjections({ tables, relations }, (p) => ({ indexers, queries }))`
+to attach projection tables and access callbacks to the ledger shape.
 
 Each table key owns one table-local builder function:
 
@@ -231,7 +227,36 @@ relations: (r) => ({
 });
 ```
 
-The access callbacks receive sledge-owned facades:
+Indexer and query definitions use the projection-local `p` handle:
+
+```ts
+(p) => ({
+  indexers: {
+    upsertUser: p.indexer({
+      sourceEvent: "user.created",
+      input: Type.Object({ userId: Type.String() }),
+      write: async ({ input, event, db }) => {
+        await db
+          .insertInto("users")
+          .values({
+            userId: input.userId,
+            source: event.ref,
+          })
+          .execute();
+      },
+    }),
+  },
+  queries: {
+    userById: p.query({
+      params: Type.Object({ userId: Type.String() }),
+      result: Type.Null(),
+      read: () => null,
+    }),
+  },
+});
+```
+
+These callbacks receive sledge-owned facades:
 
 - indexers can `insertInto(...).values(...).onConflict(...).doUpdateSet(...)`
 - queries can `selectFrom(...).select(...).where(...).executeTakeFirst()`

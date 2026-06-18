@@ -39,63 +39,57 @@ const definedModel = shape.withProjections(
           .primaryKey(["userId"]),
     },
   },
-  {
+  (p) => ({
     indexers: {
-      upsertUser: (i) =>
-        i
-          .sourceEvent("user.created")
-          .input(
-            Type.Object({
-              userId: Type.String(),
-              email: Type.String(),
-            }),
-          )
-          .write(async ({ input, event, db }) => {
-            await db
-              .insertInto("users")
-              .values({
-                userId: input.userId,
-                email: input.email,
-                source: event.ref,
-              })
-              .onConflict(["userId"])
-              .doUpdateSet({
-                email: input.email,
-                source: event.ref,
-              })
-              .execute();
-          }),
+      upsertUser: p.indexer({
+        sourceEvent: "user.created",
+        input: Type.Object({
+          userId: Type.String(),
+          email: Type.String(),
+        }),
+        write: async ({ input, event, db }) => {
+          await db
+            .insertInto("users")
+            .values({
+              userId: input.userId,
+              email: input.email,
+              source: event.ref,
+            })
+            .onConflict(["userId"])
+            .doUpdateSet({
+              email: input.email,
+              source: event.ref,
+            })
+            .execute();
+        },
+      }),
     },
     queries: {
-      userById: (q) =>
-        q
-          .params(
-            Type.Object({
-              userId: Type.String(),
+      userById: p.query({
+        params: Type.Object({
+          userId: Type.String(),
+        }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            userId: Type.String(),
+            email: Type.String(),
+            source: Type.Object({
+              eventName: Type.Literal("user.created"),
+              eventId: Type.Number(),
             }),
-          )
-          .result(
-            Type.Union([
-              Type.Null(),
-              Type.Object({
-                userId: Type.String(),
-                email: Type.String(),
-                source: Type.Object({
-                  eventName: Type.Literal("user.created"),
-                  eventId: Type.Number(),
-                }),
-              }),
-            ]),
-          )
-          .read(async ({ params, db }) => {
-            return await db
-              .selectFrom("users")
-              .select(["userId", "email", "source"])
-              .where("userId", "=", params.userId)
-              .executeTakeFirst();
           }),
+        ]),
+        read: async ({ params, db }) => {
+          return await db
+            .selectFrom("users")
+            .select(["userId", "email", "source"])
+            .where("userId", "=", params.userId)
+            .executeTakeFirst();
+        },
+      }),
     },
-  },
+  }),
 );
 
 const registeredModelWithoutHandlers = definedModel.register({});
@@ -189,7 +183,7 @@ function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
   };
 }
 
-test("projection access compiles typed indexer and query builders to storage operations", async () => {
+test("projection access compiles typed indexer and query definitions to storage operations", async () => {
   const indexer =
     registeredModelWithoutHandlers.implementations.indexers?.upsertUser;
   const query =
@@ -316,10 +310,10 @@ test("ledger projection definition applies relations over inferred tables", () =
           .references("users", ["userId"]),
       }),
     },
-    {
+    () => ({
       indexers: {},
       queries: {},
-    },
+    }),
   );
 
   assert.deepEqual(model.projections.metadata.relations, {
@@ -347,10 +341,10 @@ async function assertLedgerProjectionTypes(): Promise<void> {
             .primaryKey(["sessionId"]),
       },
     },
-    {
+    () => ({
       indexers: {},
       queries: {},
-    },
+    }),
   );
 
   shape.withProjections(
@@ -366,85 +360,85 @@ async function assertLedgerProjectionTypes(): Promise<void> {
             .primaryKey(["userId"]),
       },
     },
-    {
+    (p) => ({
       indexers: {
-        invalidSource: (i) =>
-          i
-            // @ts-expect-error source events must come from the projection event-name union.
-            .sourceEvent("session.created")
-            .input(Type.Object({}))
-            .write(() => undefined),
-        wrongEventRef: (i) =>
-          i
-            .sourceEvent("user.created")
-            .input(Type.Object({}))
-            .write(async ({ db }) => {
-              await db
-                .insertInto("users")
-                .values({
-                  userId: "u_123",
-                  email: "alice@example.com",
-                  // @ts-expect-error event_ref columns only accept matching event refs.
-                  source: createEventRef("session.created", 1),
-                })
-                .execute();
-            }),
-        incompleteInsert: (i) =>
-          i
-            .sourceEvent("user.created")
-            .input(Type.Object({}))
-            .write(async ({ db, event }) => {
-              await db
-                .insertInto("users")
-                // @ts-expect-error inserts must provide every projection column.
-                .values({
-                  userId: "u_123",
-                  source: event.ref,
-                })
-                .execute();
-            }),
-        nonKeyConflict: (i) =>
-          i
-            .sourceEvent("user.created")
-            .input(Type.Object({}))
-            .write(async ({ db, event }) => {
-              await db
-                .insertInto("users")
-                .values({
-                  userId: "u_123",
-                  email: "alice@example.com",
-                  source: event.ref,
-                })
-                // @ts-expect-error conflict targets must be primary or unique keys.
-                .onConflict(["email"])
-                .doNothing()
-                .execute();
-            }),
+        invalidSource: p.indexer({
+          // @ts-expect-error source events must come from the projection event-name union.
+          sourceEvent: "session.created",
+          input: Type.Object({}),
+          write: () => undefined,
+        }),
+        wrongEventRef: p.indexer({
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+          write: async ({ db }) => {
+            await db
+              .insertInto("users")
+              .values({
+                userId: "u_123",
+                email: "alice@example.com",
+                // @ts-expect-error event_ref columns only accept matching event refs.
+                source: createEventRef("session.created", 1),
+              })
+              .execute();
+          },
+        }),
+        incompleteInsert: p.indexer({
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+          write: async ({ db, event }) => {
+            await db
+              .insertInto("users")
+              // @ts-expect-error inserts must provide every projection column.
+              .values({
+                userId: "u_123",
+                source: event.ref,
+              })
+              .execute();
+          },
+        }),
+        nonKeyConflict: p.indexer({
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+          write: async ({ db, event }) => {
+            await db
+              .insertInto("users")
+              .values({
+                userId: "u_123",
+                email: "alice@example.com",
+                source: event.ref,
+              })
+              // @ts-expect-error conflict targets must be primary or unique keys.
+              .onConflict(["email"])
+              .doNothing()
+              .execute();
+          },
+        }),
       },
       queries: {
-        selectedColumns: (q) =>
-          q
-            .params(Type.Object({}))
-            .result(Type.Null())
-            .read(async ({ db }) => {
-              const row = await db
-                .selectFrom("users")
-                .select(["email"])
-                .executeTakeFirst();
+        selectedColumns: p.query({
+          params: Type.Object({}),
+          result: Type.Null(),
+          read: async ({ db }) => {
+            const row = await db
+              .selectFrom("users")
+              .select(["email"])
+              .executeTakeFirst();
 
-              if (row !== null) {
-                const email: string = row.email;
-                // @ts-expect-error only selected columns are available.
-                const userId: string = row.userId;
+            if (row !== null) {
+              const email: string = row.email;
+              // @ts-expect-error only selected columns are available.
+              const userId: string = row.userId;
 
-                void email;
-                void userId;
-              }
+              void email;
+              void userId;
+            }
 
-              return null;
-            }),
+            return null;
+          },
+        }),
       },
-    },
+    }),
   );
 }
 
