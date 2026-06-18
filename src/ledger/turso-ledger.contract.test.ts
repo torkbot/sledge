@@ -15,13 +15,8 @@ import {
   type LedgerContractIndexers,
   type LedgerContractQueries,
 } from "./ledger.contract.ts";
-import {
-  bindLedgerModel,
-  defineLedgerModel,
-  registerLedgerModel,
-  type LedgerImplementations,
-  type LedgerWorkers,
-} from "./ledger.ts";
+import { type LedgerImplementations, type LedgerWorkers } from "./ledger.ts";
+import { defineProjectionSchema } from "./projections.ts";
 
 runLedgerContractSuite({
   suiteName: "turso ledger contract",
@@ -129,25 +124,25 @@ runLedgerContractSuite({
     };
 
     const createRuntimeLedger = async () => {
-      const definedModel = defineLedgerModel({
-        events: ledgerContractModel.events,
-        queues: ledgerContractModel.queues,
-        indexers: ledgerContractModel.indexers,
-        queries: ledgerContractModel.queries,
-      });
-
-      const registeredModel = registerLedgerModel(
-        definedModel,
-        registerLedgerContractModel({
-          readDecisionMode: () => decisionMode,
-          readMaterializationFailureText: () => materializationFailureText,
-          nowMs: () => runtime.nowMs(),
-        }),
-      );
-
       return await createTursoLedger({
         databaseUrl,
-        boundModel: bindLedgerModel(registeredModel, implementations),
+        boundModel: {
+          model: {
+            events: ledgerContractModel.events,
+            queues: ledgerContractModel.queues,
+            signals: {},
+            signalQueues: {},
+            indexers: ledgerContractModel.indexers,
+            queries: ledgerContractModel.queries,
+          },
+          projections: defineProjectionSchema({}),
+          register: registerLedgerContractModel({
+            readDecisionMode: () => decisionMode,
+            readMaterializationFailureText: () => materializationFailureText,
+            nowMs: () => runtime.nowMs(),
+          }),
+          implementations,
+        },
         timing: {
           clock: runtime.clock,
         },

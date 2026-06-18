@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- Add exploratory v2 projection APIs: `@torkbot/sledge/projections` records
-  typed table-local columns, indexes, semantic event references, and
-  second-phase foreign-key metadata, while `@torkbot/sledge/projected-ledger`
-  adds `defineLedgerShape(...).withProjections(...)` to infer typed projection
+- Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /
+  `bindLedgerModel` construction path with
+  `defineLedgerShape(...).withProjections(...).register(...)`.
+- Add v2 projection APIs: `@torkbot/sledge/projections` records typed
+  table-local columns, indexes, semantic event references, and second-phase
+  foreign-key metadata; `@torkbot/sledge/ledger` now infers typed projection
   indexers and queries from the ledger-scoped projection schema.
 - Add ledger-owned event refs on event envelopes so projection access callbacks
   can write semantic event references without exposing the internal events

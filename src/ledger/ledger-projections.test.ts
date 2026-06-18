@@ -10,11 +10,7 @@ import type {
   LedgerStorageRow,
   LedgerStorageScope,
 } from "./ledger.ts";
-import {
-  bindProjectedLedgerModel,
-  defineLedgerShape,
-  registerProjectedLedgerModel,
-} from "./projected-ledger.ts";
+import { defineLedgerShape } from "./ledger.ts";
 
 const UserCreatedSchema = Type.Object({
   userId: Type.String(),
@@ -101,7 +97,7 @@ const definedModel = shape.withProjections(
   },
 );
 
-const access = definedModel.access;
+const boundModelWithoutHandlers = definedModel.register({});
 
 type FakeStatementCall = {
   readonly method: "all" | "exec" | "get" | "run";
@@ -193,8 +189,9 @@ function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
 }
 
 test("projection access compiles typed indexer and query builders to storage operations", async () => {
-  const indexer = access.implementations.indexers?.upsertUser;
-  const query = access.implementations.queries?.userById;
+  const indexer =
+    boundModelWithoutHandlers.implementations.indexers?.upsertUser;
+  const query = boundModelWithoutHandlers.implementations.queries?.userById;
 
   if (indexer === undefined) {
     throw new Error("expected upsertUser indexer implementation");
@@ -247,8 +244,8 @@ test("projection access compiles typed indexer and query builders to storage ope
   });
 });
 
-test("projected ledger construction feeds generated contracts and implementations into the current runtime model", () => {
-  const registeredModel = registerProjectedLedgerModel(definedModel, {
+test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
+  const boundModel = definedModel.register({
     events: {
       "user.created": async ({ event, actions }) => {
         await actions.index("upsertUser", {
@@ -258,21 +255,24 @@ test("projected ledger construction feeds generated contracts and implementation
       },
     },
   });
-  const boundModel = bindProjectedLedgerModel(registeredModel);
 
   assert.equal(boundModel.model.events["user.created"], UserCreatedSchema);
   assert.equal(
     boundModel.model.indexers.upsertUser,
-    access.indexers.upsertUser,
+    definedModel.model.indexers.upsertUser,
   );
-  assert.equal(boundModel.model.queries.userById, access.queries.userById);
+  assert.equal(
+    boundModel.model.queries.userById,
+    definedModel.model.queries.userById,
+  );
   assert.equal(
     boundModel.implementations.indexers?.upsertUser,
-    access.implementations.indexers?.upsertUser,
+    boundModelWithoutHandlers.implementations.indexers?.upsertUser,
   );
+  assert.equal(boundModel.projections, definedModel.projections);
 });
 
-async function assertProjectedLedgerTypes(): Promise<void> {
+async function assertLedgerProjectionTypes(): Promise<void> {
   shape.withProjections(
     (p) =>
       p.schema({
@@ -385,4 +385,4 @@ async function assertProjectedLedgerTypes(): Promise<void> {
   );
 }
 
-void assertProjectedLedgerTypes;
+void assertLedgerProjectionTypes;

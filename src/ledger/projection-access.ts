@@ -1,137 +1,31 @@
 import type { Static, TSchema } from "typebox";
 
-import {
-  bindLedgerModel,
-  defineLedgerModel,
-  registerLedgerModel,
-} from "./ledger.ts";
 import type { EventRef } from "./event-ref.ts";
 import { createEventRef } from "./event-ref.ts";
 import type {
-  BoundLedgerModel,
-  DefinedLedgerModel,
   LedgerImplementations,
   LedgerIndexerContext,
   LedgerStorageRow,
   LedgerStorageScope,
   QuerySchema,
-  RegisterFunction,
-  RegisteredLedgerModel,
 } from "./ledger.ts";
 import {
-  defineProjectionSchemaForEvents,
   type ProjectionColumnMetadata,
   type ProjectionColumnValue,
   type ProjectionRow,
-  type ProjectionSchema,
   type ProjectionSchemaEventName,
   type ProjectionSchemaMetadata,
   type ProjectionSchemaTables,
   type ProjectionTableColumnName,
   type ProjectionTableColumns,
-  type ProjectionTableFactories,
   type ProjectionTableKey,
   type ProjectionTableMetadata,
   type ProjectionTableName,
-  type ProjectionTablesForFactories,
 } from "./projections.ts";
 
 type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
-type AnyProjectionSchema = {
+export type AnyProjectionSchema = {
   readonly metadata: ProjectionSchemaMetadata;
-};
-
-export type LedgerShape<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TSignals extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
-> = {
-  readonly events: TEvents;
-  readonly queues: TQueues;
-  readonly signals: TSignals;
-  readonly signalQueues: TSignalQueues;
-};
-
-export type DefinedLedgerShape<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TSignals extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
-> = {
-  readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
-  withProjections<
-    const TProjectionSchema extends AnyProjectionSchema,
-    const TIndexerFactories extends
-      ProjectionIndexerFactories<TProjectionSchema>,
-    const TQueryFactories extends ProjectionQueryFactories<TProjectionSchema>,
-  >(
-    defineSchema: (
-      builder: LedgerProjectionSchemaBuilder<Extract<keyof TEvents, string>>,
-    ) => TProjectionSchema &
-      ProjectionSchemaCompatibleWithEvents<
-        Extract<keyof TEvents, string>,
-        TProjectionSchema
-      >,
-    access: {
-      readonly indexers: TIndexerFactories;
-      readonly queries: TQueryFactories;
-    },
-  ): DefinedProjectedLedgerModel<
-    TEvents,
-    TQueues,
-    TProjectionSchema,
-    ProjectionIndexerSchemas<
-      InferProjectionIndexerDefinitions<TIndexerFactories>
-    >,
-    ProjectionQuerySchemas<InferProjectionQueryDefinitions<TQueryFactories>>,
-    TSignals,
-    TSignalQueues
-  >;
-};
-
-export function defineLedgerShape<
-  const TEvents extends Record<string, TSchema>,
-  const TQueues extends Record<string, TSchema>,
-  const TSignals extends Record<string, TSchema>,
-  const TSignalQueues extends Record<string, TSchema>,
->(input: {
-  readonly events: TEvents;
-  readonly queues: TQueues;
-  readonly signals: TSignals;
-  readonly signalQueues: TSignalQueues;
-}): DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues> {
-  const shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues> = {
-    events: input.events,
-    queues: input.queues,
-    signals: input.signals,
-    signalQueues: input.signalQueues,
-  };
-
-  return {
-    shape,
-    withProjections: (defineSchema, accessDefinition) => {
-      const projections = defineSchema(
-        createLedgerProjectionSchemaBuilder<Extract<keyof TEvents, string>>(),
-      );
-      const access = createProjectionAccess({
-        projections,
-        indexers: accessDefinition.indexers,
-        queries: accessDefinition.queries,
-      });
-
-      return createProjectedLedgerModel({
-        shape,
-        access,
-      });
-    },
-  };
-}
-
-export type LedgerProjectionSchemaBuilder<TEventName extends string> = {
-  schema<const TFactories extends ProjectionTableFactories<TEventName>>(
-    factories: TFactories,
-  ): ProjectionSchema<ProjectionTablesForFactories<TFactories>, {}, TEventName>;
 };
 
 export type ProjectionIndexerEvent<TEventName extends string> = {
@@ -276,13 +170,14 @@ type ProjectionIndexerDefinitionLike = {
   }): void | Promise<void>;
 };
 
-type ProjectionIndexerFactories<TProjectionSchema extends AnyProjectionSchema> =
-  Record<
-    string,
-    (
-      builder: ProjectionIndexerBuilder<TProjectionSchema>,
-    ) => ProjectionIndexerDefinitionLike
-  >;
+export type ProjectionIndexerFactories<
+  TProjectionSchema extends AnyProjectionSchema,
+> = Record<
+  string,
+  (
+    builder: ProjectionIndexerBuilder<TProjectionSchema>,
+  ) => ProjectionIndexerDefinitionLike
+>;
 
 export type ProjectionIndexerBuilder<
   TProjectionSchema extends AnyProjectionSchema,
@@ -356,13 +251,14 @@ type ProjectionQueryDefinitionLike = {
   }): unknown | Promise<unknown>;
 };
 
-type ProjectionQueryFactories<TProjectionSchema extends AnyProjectionSchema> =
-  Record<
-    string,
-    (
-      builder: ProjectionQueryBuilder<TProjectionSchema>,
-    ) => ProjectionQueryDefinitionLike
-  >;
+export type ProjectionQueryFactories<
+  TProjectionSchema extends AnyProjectionSchema,
+> = Record<
+  string,
+  (
+    builder: ProjectionQueryBuilder<TProjectionSchema>,
+  ) => ProjectionQueryDefinitionLike
+>;
 
 export type ProjectionQueryBuilder<
   TProjectionSchema extends AnyProjectionSchema,
@@ -403,19 +299,19 @@ type FactoryReturn<TFactory> = TFactory extends (
   ? TReturn
   : never;
 
-type InferProjectionIndexerDefinitions<TFactories> = {
+export type InferProjectionIndexerDefinitions<TFactories> = {
   readonly [TName in Extract<keyof TFactories, string>]: FactoryReturn<
     TFactories[TName]
   >;
 };
 
-type InferProjectionQueryDefinitions<TFactories> = {
+export type InferProjectionQueryDefinitions<TFactories> = {
   readonly [TName in Extract<keyof TFactories, string>]: FactoryReturn<
     TFactories[TName]
   >;
 };
 
-type ProjectionIndexerSchemas<TDefinitions> = {
+export type ProjectionIndexerSchemas<TDefinitions> = {
   readonly [TName in Extract<
     keyof TDefinitions,
     string
@@ -428,7 +324,7 @@ type ProjectionIndexerSchemas<TDefinitions> = {
     : never;
 };
 
-type ProjectionQuerySchemas<TDefinitions> = {
+export type ProjectionQuerySchemas<TDefinitions> = {
   readonly [TName in Extract<
     keyof TDefinitions,
     string
@@ -455,44 +351,7 @@ export type ProjectionAccess<
   readonly implementations: LedgerImplementations<TIndexers, TQueries>;
 };
 
-type ProjectionSchemaCompatibleWithEvents<
-  TEventName extends string,
-  TProjectionSchema,
-> =
-  Exclude<
-    ProjectionSchemaEventName<TProjectionSchema>,
-    TEventName
-  > extends never
-    ? unknown
-    : {
-        readonly projectionEventNamesMustComeFromLedgerShape: never;
-      };
-
-type ProjectionAccessIndexers<TAccess> = TAccess extends {
-  readonly indexers: infer TIndexers;
-}
-  ? TIndexers extends Record<string, TSchema>
-    ? TIndexers
-    : never
-  : never;
-
-type ProjectionAccessProjectionSchema<TAccess> = TAccess extends {
-  readonly projections: infer TProjectionSchema;
-}
-  ? TProjectionSchema extends AnyProjectionSchema
-    ? TProjectionSchema
-    : never
-  : never;
-
-type ProjectionAccessQueries<TAccess> = TAccess extends {
-  readonly queries: infer TQueries;
-}
-  ? TQueries extends Record<string, AnyQuerySchema>
-    ? TQueries
-    : never
-  : never;
-
-function createProjectionAccess<
+export function createProjectionAccess<
   const TProjectionSchema extends AnyProjectionSchema,
   const TIndexerFactories extends ProjectionIndexerFactories<TProjectionSchema>,
   const TQueryFactories extends ProjectionQueryFactories<TProjectionSchema>,
@@ -572,184 +431,6 @@ function createProjectionAccess<
     >,
     ProjectionQuerySchemas<InferProjectionQueryDefinitions<TQueryFactories>>
   >;
-}
-
-export type DefinedProjectedLedgerModel<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TProjectionSchema extends AnyProjectionSchema,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
-> = DefinedLedgerModel<
-  TEvents,
-  TQueues,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> & {
-  readonly access: ProjectionAccess<TProjectionSchema, TIndexers, TQueries>;
-};
-
-export type RegisteredProjectedLedgerModel<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TProjectionSchema extends AnyProjectionSchema,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
-> = RegisteredLedgerModel<
-  TEvents,
-  TQueues,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> & {
-  readonly access: ProjectionAccess<TProjectionSchema, TIndexers, TQueries>;
-};
-
-function createProjectedLedgerModel<
-  const TEvents extends Record<string, TSchema>,
-  const TQueues extends Record<string, TSchema>,
-  const TSignals extends Record<string, TSchema>,
-  const TSignalQueues extends Record<string, TSchema>,
-  const TAccess extends ProjectionAccess<
-    AnyProjectionSchema,
-    Record<string, TSchema>,
-    Record<string, AnyQuerySchema>
-  >,
->(input: {
-  readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
-  readonly access: TAccess;
-}): DefinedProjectedLedgerModel<
-  TEvents,
-  TQueues,
-  ProjectionAccessProjectionSchema<TAccess>,
-  ProjectionAccessIndexers<TAccess>,
-  ProjectionAccessQueries<TAccess>,
-  TSignals,
-  TSignalQueues
-> {
-  const access = input.access as unknown as ProjectionAccess<
-    ProjectionAccessProjectionSchema<TAccess>,
-    ProjectionAccessIndexers<TAccess>,
-    ProjectionAccessQueries<TAccess>
-  >;
-  const definedModel = defineLedgerModel<
-    TEvents,
-    TQueues,
-    ProjectionAccessIndexers<TAccess>,
-    ProjectionAccessQueries<TAccess>,
-    TSignals,
-    TSignalQueues
-  >({
-    events: input.shape.events,
-    queues: input.shape.queues,
-    signals: input.shape.signals,
-    signalQueues: input.shape.signalQueues,
-    indexers: access.indexers,
-    queries: access.queries,
-  });
-
-  return {
-    model: definedModel.model,
-    access,
-  };
-}
-
-export function registerProjectedLedgerModel<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TProjectionSchema extends AnyProjectionSchema,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
->(
-  model: DefinedProjectedLedgerModel<
-    TEvents,
-    TQueues,
-    TProjectionSchema,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >,
-  register: RegisterFunction<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >,
-): RegisteredProjectedLedgerModel<
-  TEvents,
-  TQueues,
-  TProjectionSchema,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> {
-  const registered = registerLedgerModel(model, register);
-
-  return {
-    model: registered.model,
-    register: registered.register,
-    access: model.access,
-  };
-}
-
-export function bindProjectedLedgerModel<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TProjectionSchema extends AnyProjectionSchema,
-  TIndexers extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema>,
-  TSignalQueues extends Record<string, TSchema>,
->(
-  model: RegisteredProjectedLedgerModel<
-    TEvents,
-    TQueues,
-    TProjectionSchema,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues
-  >,
-): BoundLedgerModel<
-  TEvents,
-  TQueues,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> {
-  const implementations = model.access.implementations as LedgerImplementations<
-    TIndexers,
-    TQueries,
-    TEvents
-  >;
-
-  return bindLedgerModel(model, implementations);
-}
-
-function createLedgerProjectionSchemaBuilder<
-  TEventName extends string,
->(): LedgerProjectionSchemaBuilder<TEventName> {
-  const defineSchema = defineProjectionSchemaForEvents<TEventName>();
-
-  return {
-    schema: (factories) => {
-      return defineSchema(factories);
-    },
-  };
 }
 
 function createProjectionIndexerBuilder<

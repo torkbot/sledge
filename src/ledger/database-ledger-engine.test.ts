@@ -19,32 +19,39 @@ import {
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
-  bindLedgerModel,
-  defineLedgerModel as defineStaticLedgerModel,
-  registerLedgerModel,
   type BoundLedgerModel,
   type LedgerImplementations,
+  type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
-  type RegisteredLedgerModel,
 } from "./ledger.ts";
+import { defineProjectionSchema } from "./projections.ts";
 import { createTursoStorageRuntime } from "./turso-ledger.ts";
 
-type LegacyRegisteredLedgerModel<
+type EngineFixtureModel<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, TSchema> = {},
   TQueries extends Record<string, QuerySchema<TSchema, TSchema>> = {},
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
-> = RegisteredLedgerModel<
-  TEvents,
-  TQueues,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> & {
+> = {
+  readonly model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+  readonly register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
   bind(
     implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
   ): BoundLedgerModel<
@@ -57,7 +64,7 @@ type LegacyRegisteredLedgerModel<
   >;
 };
 
-function defineLedgerModel<
+function defineEngineFixtureModel<
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, TSchema> = {},
@@ -79,7 +86,7 @@ function defineLedgerModel<
     TSignals,
     TSignalQueues
   >;
-}): LegacyRegisteredLedgerModel<
+}): EngineFixtureModel<
   TEvents,
   TQueues,
   TIndexers,
@@ -87,20 +94,33 @@ function defineLedgerModel<
   TSignals,
   TSignalQueues
 > {
-  const definedModel = defineStaticLedgerModel({
+  const model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  > = {
     events: input.events,
-    signals: input.signals,
+    signals: input.signals ?? ({} as TSignals),
     queues: input.queues,
-    signalQueues: input.signalQueues,
-    indexers: input.indexers,
-    queries: input.queries,
-  });
-  const registeredModel = registerLedgerModel(definedModel, input.register);
+    signalQueues: input.signalQueues ?? ({} as TSignalQueues),
+    indexers: input.indexers ?? ({} as TIndexers),
+    queries: input.queries ?? ({} as TQueries),
+  };
+  const projections = defineProjectionSchema({});
 
   return {
-    ...registeredModel,
+    model,
+    register: input.register,
     bind(implementations) {
-      return bindLedgerModel(registeredModel, implementations);
+      return {
+        model,
+        projections,
+        register: input.register,
+        implementations,
+      };
     },
   };
 }
@@ -402,7 +422,7 @@ test("ledger queries do not block external write transactions", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -488,7 +508,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -533,7 +553,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
   const database = new Database(databaseUrl);
   let observedEvents = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -590,7 +610,7 @@ test("event-handler query actions expire after handler completion", async () => 
     | ((params: Record<string, never>) => Promise<{ count: number }>)
     | null = null;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -690,7 +710,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -758,7 +778,7 @@ test("ledger construction and emit do not start queue workers", async () => {
   const database = new Database(databaseUrl);
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -856,7 +876,7 @@ test("closing workers during a pending claim releases the claimed work", async (
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -923,7 +943,7 @@ test("idle workers discover work materialized by another ledger handle", async (
   const database = new Database(databaseUrl);
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1028,7 +1048,7 @@ test("ledger close waits for startup before closing storage", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {},
     queues: {},
     indexers: {},
@@ -1081,7 +1101,7 @@ test("ledger close closes storage after startup failure", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {},
     queues: {},
     indexers: {},
@@ -1149,7 +1169,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1213,7 +1233,7 @@ test("startWorkers rejects while workers are already running", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1257,7 +1277,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1328,7 +1348,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1421,7 +1441,7 @@ test("deduped emit does not replay projections or materialization", async () => 
   let projected = 0;
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -1513,7 +1533,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
   const database = new Database(databaseUrl);
   let enabled = false;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1614,7 +1634,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
     releaseSignal = resolve;
   });
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "response.generate": Type.Object({
         id: Type.Number(),
@@ -1770,7 +1790,7 @@ test("queue handlers publish signals immediately before handler completion", asy
   const gate = Promise.withResolvers<void>();
   let observerCount = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "response.generate": Type.Object({
         id: Type.Number(),
@@ -1848,7 +1868,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
 
   let attempts = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "response.generate": Type.Object({
         id: Type.Number(),
@@ -1957,7 +1977,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
 });
 
 function createBusyTestModel() {
-  return defineLedgerModel({
+  return defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2041,7 +2061,7 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
 
   let materializerStarted = false;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2116,7 +2136,7 @@ test("tailEvents does not expose rolled back events from a shared read/write sco
 
   let materializerStarted = false;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2191,7 +2211,7 @@ test("tailEvents yields last N events then follows new events", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2269,7 +2289,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
   const firstDatabase = new Database(databasePath);
   const secondDatabase = new Database(databasePath);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2345,7 +2365,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
   const firstDatabase = new Database(databasePath);
   const secondDatabase = new Database(databasePath);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2422,7 +2442,7 @@ test("resumeEvents continues from opaque cursor", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2516,7 +2536,7 @@ test("tail iterator return stops stream without external abort", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2568,7 +2588,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
   const database = new Database(databaseUrl);
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2657,7 +2677,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
     readonly workKey: string;
   } | null = null;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2751,7 +2771,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         mode: Type.Union([Type.Literal("cancel"), Type.Literal("dead")]),
@@ -2835,7 +2855,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2888,7 +2908,7 @@ test("listWork applies state filters before limit", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2942,7 +2962,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
   const handlerStarted = Promise.withResolvers<void>();
   const releaseHandler = Promise.withResolvers<void>();
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -3021,7 +3041,7 @@ test("work key migration adds column before creating ref index", async () => {
     );
   `);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({ id: Type.Number() }),
     },
@@ -3053,7 +3073,7 @@ test("enqueue rejects empty work keys", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({ id: Type.Number() }),
     },
