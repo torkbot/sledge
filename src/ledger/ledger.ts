@@ -4,10 +4,10 @@ import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import type { EventRef } from "./event-ref.ts";
 import {
   createProjectionAccess,
-  createProjectionAccessDefinitionBuilder,
+  createProjectionImplementations,
   type AnyProjectionSchema,
   type ProjectionAccess,
-  type ProjectionAccessDefinitionBuilder,
+  type ProjectionImplementationRegistration,
   type ProjectionIndexerDefinitions,
   type ProjectionIndexerSchemas,
   type ProjectionQueryDefinitions,
@@ -15,9 +15,12 @@ import {
 } from "./projection-access.ts";
 import {
   defineProjectionSchemaForEvents,
+  type ProjectionColumn,
   type ProjectionRelationBuilder,
   type ProjectionRelations,
   type ProjectionSchema,
+  type ProjectionSchemaEventName,
+  type ProjectionTableColumns,
   type ProjectionTableFactories,
   type ProjectionTablesForFactories,
 } from "./projections.ts";
@@ -29,16 +32,17 @@ const registeredLedgerModelBrand: unique symbol = Symbol(
 export type {
   ProjectionExecutableSelect,
   ProjectionExecutableWrite,
-  ProjectionAccessDefinitionBuilder,
-  ProjectionIndexerDefinition,
+  ProjectionIndexerContract,
   ProjectionIndexerDefinitions,
   ProjectionIndexerEvent,
+  ProjectionIndexerImplementations,
   ProjectionIndexerRunInput,
   ProjectionInsertBuilder,
   ProjectionInsertConflictBuilder,
   ProjectionInsertOnConflictBuilder,
-  ProjectionQueryDefinition,
+  ProjectionQueryContract,
   ProjectionQueryDefinitions,
+  ProjectionQueryImplementations,
   ProjectionQueryRunInput,
   ProjectionReadDatabase,
   ProjectionSelectBuilder,
@@ -559,6 +563,8 @@ export type RegisteredLedgerModel<
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
   TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly [registeredLedgerModelBrand]: true;
   readonly model: LedgerModel<
@@ -577,7 +583,12 @@ export type RegisteredLedgerModel<
     TQueries,
     TSignals,
     TSignalQueues
-  >;
+  > &
+    ProjectionImplementationRegistration<
+      TProjectionSchema,
+      TIndexerDefinitions,
+      TQueryDefinitions
+    >;
   readonly implementations: LedgerImplementations<TIndexers, TQueries, TEvents>;
 };
 
@@ -593,11 +604,30 @@ export type LedgerShape<
   readonly signalQueues: TSignalQueues;
 };
 
-export type LedgerProjectionDefinition<
+export type MaterializationSchema<
+  TNamespace extends string,
+  TVersion extends number,
+  TTables,
+  TRelations extends ProjectionRelations,
   TEventName extends string,
-  TFactories extends ProjectionTableFactories<TEventName>,
+> = ProjectionSchema<TTables, TRelations, TEventName> & {
+  readonly namespace: TNamespace;
+  readonly version: TVersion;
+};
+
+export type AnyMaterializationSchema = AnyProjectionSchema & {
+  readonly namespace: string;
+  readonly version: number;
+};
+
+export type MaterializationSchemaDefinition<
+  TNamespace extends string,
+  TVersion extends number,
+  TFactories extends ProjectionTableFactories<string>,
   TRelations extends ProjectionRelations,
 > = {
+  readonly namespace: TNamespace;
+  readonly version: TVersion;
   readonly tables: TFactories;
   readonly relations?: (
     relations: ProjectionRelationBuilder<
@@ -606,15 +636,138 @@ export type LedgerProjectionDefinition<
   ) => TRelations;
 };
 
-type LedgerProjectionSchemaFor<
-  TEvents extends Record<string, TSchema>,
-  TFactories extends ProjectionTableFactories<Extract<keyof TEvents, string>>,
-  TRelations extends ProjectionRelations,
-> = ProjectionSchema<
+type EventNameForProjectionColumn<TColumn> =
+  TColumn extends ProjectionColumn<
+    "event_ref",
+    EventRef<infer TEventName>,
+    boolean
+  >
+    ? TEventName
+    : never;
+
+type EventNameForProjectionTable<TTable> = {
+  readonly [TColumnName in keyof ProjectionTableColumns<TTable>]: EventNameForProjectionColumn<
+    ProjectionTableColumns<TTable>[TColumnName]
+  >;
+}[keyof ProjectionTableColumns<TTable>];
+
+type EventNameForProjectionTables<TTables> = {
+  readonly [TTableName in keyof TTables]: EventNameForProjectionTable<
+    TTables[TTableName]
+  >;
+}[keyof TTables] &
+  string;
+
+type MaterializationSchemaList = readonly [
+  AnyMaterializationSchema,
+  ...AnyMaterializationSchema[],
+];
+
+type EventNameForMaterializationSchemas<
+  TSchemas extends MaterializationSchemaList,
+> = {
+  readonly [TIndex in keyof TSchemas]: ProjectionSchemaEventName<
+    TSchemas[TIndex]
+  >;
+}[number] &
+  string;
+
+export type MaterializationMigrationHandle = {
+  readonly namespace: string;
+  readonly fromVersion: number;
+  readonly toVersion: number;
+};
+
+export type MaterializationMigration = {
+  readonly from: number;
+  readonly to: number;
+  up(handle: MaterializationMigrationHandle): void | Promise<void>;
+};
+
+export type Materializations<
+  TSchemas extends MaterializationSchemaList,
+  TCurrentSchema extends TSchemas[number],
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TQueryDefinitions extends ProjectionQueryDefinitions,
+> = {
+  readonly schemas: TSchemas;
+  readonly current: TCurrentSchema;
+  readonly migrations: readonly MaterializationMigration[];
+  readonly indexers: TIndexerDefinitions;
+  readonly queries: TQueryDefinitions;
+};
+
+export type MaterializationImplementationRegistration<
+  TMaterializationSchema extends AnyMaterializationSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TQueryDefinitions extends ProjectionQueryDefinitions,
+> = ProjectionImplementationRegistration<
+  TMaterializationSchema,
+  TIndexerDefinitions,
+  TQueryDefinitions
+>;
+
+export function defineMaterializationSchema<
+  const TNamespace extends string,
+  const TVersion extends number,
+  const TFactories extends ProjectionTableFactories<string>,
+  const TRelations extends ProjectionRelations = {},
+>(
+  definition: MaterializationSchemaDefinition<
+    TNamespace,
+    TVersion,
+    TFactories,
+    TRelations
+  >,
+): MaterializationSchema<
+  TNamespace,
+  TVersion,
   ProjectionTablesForFactories<TFactories>,
   TRelations,
-  Extract<keyof TEvents, string>
->;
+  EventNameForProjectionTables<ProjectionTablesForFactories<TFactories>>
+> {
+  validateMaterializationSchemaIdentity(
+    definition.namespace,
+    definition.version,
+  );
+  const schema = createMaterializationProjectionSchema(definition);
+
+  return Object.assign(schema, {
+    namespace: definition.namespace,
+    version: definition.version,
+  }) as MaterializationSchema<
+    TNamespace,
+    TVersion,
+    ProjectionTablesForFactories<TFactories>,
+    TRelations,
+    EventNameForProjectionTables<ProjectionTablesForFactories<TFactories>>
+  >;
+}
+
+export function defineMaterializations<
+  const TSchemas extends readonly [
+    AnyMaterializationSchema,
+    ...AnyMaterializationSchema[],
+  ],
+  const TCurrentSchema extends TSchemas[number],
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  const TQueryDefinitions extends ProjectionQueryDefinitions,
+>(input: {
+  readonly schemas: TSchemas;
+  readonly current: TCurrentSchema;
+  readonly migrations: readonly MaterializationMigration[];
+  readonly indexers: TIndexerDefinitions;
+  readonly queries: TQueryDefinitions;
+}): Materializations<
+  TSchemas,
+  TCurrentSchema,
+  TIndexerDefinitions,
+  TQueryDefinitions
+> {
+  validateMaterializationPlan(input);
+
+  return input;
+}
 
 export type DefinedLedgerShape<
   TEvents extends Record<string, TSchema>,
@@ -641,40 +794,6 @@ export type DefinedLedgerShape<
     TSignalQueues,
     ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>
   >;
-  withProjections<
-    const TFactories extends ProjectionTableFactories<
-      Extract<keyof TEvents, string>
-    >,
-    const TRelations extends ProjectionRelations = {},
-    const TIndexerDefinitions extends ProjectionIndexerDefinitions<
-      LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-    > = {},
-    const TQueryDefinitions extends ProjectionQueryDefinitions<
-      LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-    > = {},
-  >(
-    definition: LedgerProjectionDefinition<
-      Extract<keyof TEvents, string>,
-      TFactories,
-      TRelations
-    >,
-    defineAccess: (
-      projections: ProjectionAccessDefinitionBuilder<
-        LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-      >,
-    ) => {
-      readonly indexers: TIndexerDefinitions;
-      readonly queries: TQueryDefinitions;
-    },
-  ): DefinedLedgerModel<
-    TEvents,
-    TQueues,
-    LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>,
-    ProjectionIndexerSchemas<TIndexerDefinitions>,
-    ProjectionQuerySchemas<TQueryDefinitions>,
-    TSignals,
-    TSignalQueues
-  >;
 };
 
 export type DefinedLedgerModel<
@@ -685,6 +804,8 @@ export type DefinedLedgerModel<
   TQueries extends Record<string, AnyQuerySchema>,
   TSignals extends Record<string, TSchema>,
   TSignalQueues extends Record<string, TSchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly model: LedgerModel<
     TEvents,
@@ -703,7 +824,12 @@ export type DefinedLedgerModel<
       TQueries,
       TSignals,
       TSignalQueues
-    >,
+    > &
+      ProjectionImplementationRegistration<
+        TProjectionSchema,
+        TIndexerDefinitions,
+        TQueryDefinitions
+      >,
   ): RegisteredLedgerModel<
     TEvents,
     TQueues,
@@ -711,7 +837,9 @@ export type DefinedLedgerModel<
     TQueries,
     TSignals,
     TSignalQueues,
-    TProjectionSchema
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
 };
 
@@ -741,89 +869,269 @@ export function defineLedgerShape<
         access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
       }).register(register);
     },
-    withProjections: <
-      const TFactories extends ProjectionTableFactories<
-        Extract<keyof TEvents, string>
-      >,
-      const TRelations extends ProjectionRelations = {},
-      const TIndexerDefinitions extends ProjectionIndexerDefinitions<
-        LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-      > = {},
-      const TQueryDefinitions extends ProjectionQueryDefinitions<
-        LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-      > = {},
-    >(
-      definition: LedgerProjectionDefinition<
-        Extract<keyof TEvents, string>,
-        TFactories,
-        TRelations
-      >,
-      defineAccess: (
-        projections: ProjectionAccessDefinitionBuilder<
-          LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-        >,
-      ) => {
-        readonly indexers: TIndexerDefinitions;
-        readonly queries: TQueryDefinitions;
-      },
-    ) => {
-      const projections = createLedgerProjectionSchema<
-        Extract<keyof TEvents, string>,
-        TFactories,
-        TRelations
-      >(definition);
-      const accessDefinition = defineAccess(
-        createProjectionAccessDefinitionBuilder<
-          LedgerProjectionSchemaFor<TEvents, TFactories, TRelations>
-        >(),
-      );
-      const access = createProjectionAccess({
-        projections,
-        indexers: accessDefinition.indexers,
-        queries: accessDefinition.queries,
-      });
-
-      return createDefinedLedgerModel({
-        shape,
-        access,
-      });
-    },
   };
 }
 
-function createLedgerProjectionSchema<
-  TEventName extends string,
-  const TFactories extends ProjectionTableFactories<TEventName>,
+export function withMaterializations<
+  const TEvents extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema>,
+  const TSignals extends Record<string, TSchema>,
+  const TSignalQueues extends Record<string, TSchema>,
+  const TSchemas extends MaterializationSchemaList,
+  const TCurrentSchema extends TSchemas[number],
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<
+    Extract<keyof TEvents, string>
+  >,
+  const TQueryDefinitions extends ProjectionQueryDefinitions,
+>(
+  shape: DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
+  materializations: Materializations<
+    TSchemas,
+    TCurrentSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
+  > &
+    (Exclude<
+      EventNameForMaterializationSchemas<TSchemas>,
+      Extract<keyof TEvents, string>
+    > extends never
+      ? unknown
+      : never),
+): DefinedLedgerModel<
+  TEvents,
+  TQueues,
+  TCurrentSchema,
+  ProjectionIndexerSchemas<TIndexerDefinitions>,
+  ProjectionQuerySchemas<TQueryDefinitions>,
+  TSignals,
+  TSignalQueues,
+  TIndexerDefinitions,
+  TQueryDefinitions
+> {
+  validateMaterializationEvents(shape.shape, materializations);
+  const access = createProjectionAccess({
+    projections: materializations.current,
+    indexers: materializations.indexers,
+    queries: materializations.queries,
+  });
+
+  return createDefinedLedgerModel({
+    shape: shape.shape,
+    access,
+  });
+}
+
+function createMaterializationProjectionSchema<
+  const TFactories extends ProjectionTableFactories<string>,
   const TRelations extends ProjectionRelations,
 >(
-  definition: LedgerProjectionDefinition<TEventName, TFactories, TRelations>,
+  definition: MaterializationSchemaDefinition<
+    string,
+    number,
+    TFactories,
+    TRelations
+  >,
 ): ProjectionSchema<
   ProjectionTablesForFactories<TFactories>,
   TRelations,
-  TEventName
+  EventNameForProjectionTables<ProjectionTablesForFactories<TFactories>>
 > {
-  const defineSchema = defineProjectionSchemaForEvents<TEventName>();
+  const defineSchema = defineProjectionSchemaForEvents<string>();
   const schema = defineSchema(definition.tables);
 
   if (definition.relations === undefined) {
     return schema as ProjectionSchema<
       ProjectionTablesForFactories<TFactories>,
       TRelations,
-      TEventName
+      EventNameForProjectionTables<ProjectionTablesForFactories<TFactories>>
     >;
   }
 
-  return schema.relations(definition.relations);
+  return schema.relations(definition.relations) as ProjectionSchema<
+    ProjectionTablesForFactories<TFactories>,
+    TRelations,
+    EventNameForProjectionTables<ProjectionTablesForFactories<TFactories>>
+  >;
+}
+
+function validateMaterializationSchemaIdentity(
+  namespace: string,
+  version: number,
+): void {
+  if (namespace.length === 0) {
+    throw new Error("materialization schema namespace must not be empty");
+  }
+
+  if (!Number.isSafeInteger(version) || version <= 0) {
+    throw new Error(
+      "materialization schema version must be a positive integer",
+    );
+  }
+}
+
+function validateMaterializationPlan(input: {
+  readonly schemas: readonly [
+    AnyMaterializationSchema,
+    ...AnyMaterializationSchema[],
+  ];
+  readonly current: AnyMaterializationSchema;
+  readonly migrations: readonly MaterializationMigration[];
+}): void {
+  const namespace = input.current.namespace;
+  validateMaterializationSchemaIdentity(namespace, input.current.version);
+
+  const versions = new Set<number>();
+  let currentFound = false;
+
+  for (const schema of input.schemas) {
+    validateMaterializationSchemaIdentity(schema.namespace, schema.version);
+
+    if (schema.namespace !== namespace) {
+      throw new Error("materialization schemas must share one namespace");
+    }
+
+    if (versions.has(schema.version)) {
+      throw new Error(
+        `duplicate materialization schema version ${schema.version}`,
+      );
+    }
+
+    versions.add(schema.version);
+
+    if (schema.version === input.current.version) {
+      currentFound = true;
+    }
+  }
+
+  if (!currentFound) {
+    throw new Error("current materialization schema must be listed in schemas");
+  }
+
+  const sortedVersions = [...versions].sort((left, right) => left - right);
+  const latestVersion = sortedVersions[sortedVersions.length - 1];
+
+  if (latestVersion !== input.current.version) {
+    throw new Error(
+      "current materialization schema must have the latest version",
+    );
+  }
+
+  const migrationEdges = new Set<string>();
+
+  for (const migration of input.migrations) {
+    if (!Number.isSafeInteger(migration.from) || migration.from <= 0) {
+      throw new Error(
+        "materialization migration from must be a positive integer",
+      );
+    }
+
+    if (!Number.isSafeInteger(migration.to) || migration.to <= 0) {
+      throw new Error(
+        "materialization migration to must be a positive integer",
+      );
+    }
+
+    if (!versions.has(migration.from) || !versions.has(migration.to)) {
+      throw new Error(
+        "materialization migrations must reference known schemas",
+      );
+    }
+
+    if (migration.to !== migration.from + 1) {
+      throw new Error(
+        "materialization migrations must connect adjacent versions",
+      );
+    }
+
+    const edge = `${migration.from}:${migration.to}`;
+
+    if (migrationEdges.has(edge)) {
+      throw new Error(
+        `duplicate materialization migration ${migration.from} -> ${migration.to}`,
+      );
+    }
+
+    migrationEdges.add(edge);
+  }
+
+  for (let index = 1; index < sortedVersions.length; index += 1) {
+    const from = sortedVersions[index - 1];
+    const to = sortedVersions[index];
+
+    if (from === undefined || to === undefined) {
+      throw new Error("materialization schema versions must not be empty");
+    }
+
+    if (to !== from + 1) {
+      throw new Error("materialization schema versions must not have gaps");
+    }
+
+    const edge = `${from}:${to}`;
+
+    if (!migrationEdges.has(edge)) {
+      throw new Error(`missing materialization migration ${from} -> ${to}`);
+    }
+  }
+}
+
+function validateMaterializationEvents<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
+  TSchemas extends MaterializationSchemaList,
+  TCurrentSchema extends TSchemas[number],
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TQueryDefinitions extends ProjectionQueryDefinitions,
+>(
+  shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
+  materializations: Materializations<
+    TSchemas,
+    TCurrentSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
+  >,
+): void {
+  const eventNames = new Set(Object.keys(shape.events));
+
+  for (const schema of materializations.schemas) {
+    for (const table of Object.values(schema.metadata.tables)) {
+      for (const [columnName, column] of Object.entries(table.columns)) {
+        if (column.eventName === null) {
+          continue;
+        }
+
+        if (!eventNames.has(column.eventName)) {
+          throw new Error(
+            `materialization column ${table.name}.${columnName} references unknown event ${column.eventName}`,
+          );
+        }
+      }
+    }
+  }
+
+  for (const [indexerName, definition] of Object.entries(
+    materializations.indexers,
+  )) {
+    if (eventNames.has(definition.sourceEvent)) {
+      continue;
+    }
+
+    throw new Error(
+      `materialization indexer ${indexerName} references unknown source event ${definition.sourceEvent}`,
+    );
+  }
 }
 
 function createEmptyProjectionAccess<
   TEventName extends string,
->(): ProjectionAccess<ProjectionSchema<{}, {}, TEventName>, {}, {}> {
+>(): ProjectionAccess<ProjectionSchema<{}, {}, TEventName>, {}, {}, {}, {}> {
   return {
     projections: defineProjectionSchemaForEvents<TEventName>()({}),
     indexers: {},
     queries: {},
-    implementations: {},
+    indexerDefinitions: {},
+    queryDefinitions: {},
   };
 }
 
@@ -835,9 +1143,17 @@ function createDefinedLedgerModel<
   TQueries extends Record<string, AnyQuerySchema>,
   TSignals extends Record<string, TSchema>,
   TSignalQueues extends Record<string, TSchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
-  readonly access: ProjectionAccess<TProjectionSchema, TIndexers, TQueries>;
+  readonly access: ProjectionAccess<
+    TProjectionSchema,
+    TIndexers,
+    TQueries,
+    TIndexerDefinitions,
+    TQueryDefinitions
+  >;
 }): DefinedLedgerModel<
   TEvents,
   TQueues,
@@ -845,7 +1161,9 @@ function createDefinedLedgerModel<
   TIndexers,
   TQueries,
   TSignals,
-  TSignalQueues
+  TSignalQueues,
+  TIndexerDefinitions,
+  TQueryDefinitions
 > {
   const model: LedgerModel<
     TEvents,
@@ -867,8 +1185,12 @@ function createDefinedLedgerModel<
     model,
     projections: input.access.projections,
     register: (register) => {
-      const implementations = input.access
-        .implementations as LedgerImplementations<TIndexers, TQueries, TEvents>;
+      const implementations = createProjectionImplementations({
+        projections: input.access.projections,
+        indexers: input.access.indexerDefinitions,
+        queries: input.access.queryDefinitions,
+        register,
+      }) as LedgerImplementations<TIndexers, TQueries, TEvents>;
 
       return {
         [registeredLedgerModelBrand]: true,

@@ -4,17 +4,18 @@
 
 - Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /
   `bindLedgerModel` construction path with
-  `defineLedgerShape(...).withProjections(...).register(...)`.
+  `defineLedgerShape(...)`, `defineMaterializationSchema(...)`,
+  `defineMaterializations(...)`, `withMaterializations(...)`, and
+  `.register(...)`.
 - Breaking: storage adapters now receive a registered `model` instead of a
   `boundModel`.
-- Add v2 projection APIs: `@torkbot/sledge/ledger` records typed table-local
-  columns, indexes, semantic event references, and second-phase foreign-key
-  metadata, then infers typed projection indexers and queries from the
-  ledger-scoped projection schema.
-- Change projection attachment to a lifecycle-shaped definition callback:
-  `.withProjections({ tables, relations }, (p) => ({ indexers, queries }))`,
-  where `p.indexer(...)` and `p.query(...)` provide type inference without
-  staged fluent builders.
+- Add v2 materialization APIs: `@torkbot/sledge/ledger` records typed
+  table-local columns, indexes, semantic event references, second-phase
+  foreign-key metadata, schema namespace/version metadata, and materialization
+  migration metadata.
+- Split materialization contracts from implementations. `defineMaterializations`
+  declares plain-object indexer/query contracts, while `.register(...)` supplies
+  typed indexer/query implementations.
 - Add ledger-owned event refs on event envelopes so projection access callbacks
   can write semantic event references without exposing the internal events
   table.

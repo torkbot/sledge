@@ -9,8 +9,14 @@ import type {
   LedgerIndexerContext,
   LedgerStorageRow,
   LedgerStorageScope,
+  MaterializationImplementationRegistration,
 } from "./ledger.ts";
-import { defineLedgerShape } from "./ledger.ts";
+import {
+  defineLedgerShape,
+  defineMaterializationSchema,
+  defineMaterializations,
+  withMaterializations,
+} from "./ledger.ts";
 
 const UserCreatedSchema = Type.Object({
   userId: Type.String(),
@@ -26,73 +32,93 @@ const shape = defineLedgerShape({
   signalQueues: {},
 });
 
-const definedModel = shape.withProjections(
-  {
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-            source: t.eventRef("user.created").notNull(),
-          })
-          .primaryKey(["userId"]),
+const schema = defineMaterializationSchema({
+  namespace: "test",
+  version: 1,
+  tables: {
+    users: (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          email: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+  },
+});
+
+const materializations = defineMaterializations({
+  schemas: [schema],
+  current: schema,
+  migrations: [],
+  indexers: {
+    upsertUser: {
+      sourceEvent: "user.created",
+      input: Type.Object({
+        userId: Type.String(),
+        email: Type.String(),
+      }),
     },
   },
-  (p) => ({
-    indexers: {
-      upsertUser: p.indexer({
-        sourceEvent: "user.created",
-        input: Type.Object({
+  queries: {
+    userById: {
+      params: Type.Object({
+        userId: Type.String(),
+      }),
+      result: Type.Union([
+        Type.Null(),
+        Type.Object({
           userId: Type.String(),
           email: Type.String(),
-        }),
-        write: async ({ input, event, db }) => {
-          await db
-            .insertInto("users")
-            .values({
-              userId: input.userId,
-              email: input.email,
-              source: event.ref,
-            })
-            .onConflict(["userId"])
-            .doUpdateSet({
-              email: input.email,
-              source: event.ref,
-            })
-            .execute();
-        },
-      }),
-    },
-    queries: {
-      userById: p.query({
-        params: Type.Object({
-          userId: Type.String(),
-        }),
-        result: Type.Union([
-          Type.Null(),
-          Type.Object({
-            userId: Type.String(),
-            email: Type.String(),
-            source: Type.Object({
-              eventName: Type.Literal("user.created"),
-              eventId: Type.Number(),
-            }),
+          source: Type.Object({
+            eventName: Type.Literal("user.created"),
+            eventId: Type.Number(),
           }),
-        ]),
-        read: async ({ params, db }) => {
-          return await db
-            .selectFrom("users")
-            .select(["userId", "email", "source"])
-            .where("userId", "=", params.userId)
-            .executeTakeFirst();
-        },
-      }),
+        }),
+      ]),
     },
-  }),
-);
+  },
+});
 
-const registeredModelWithoutHandlers = definedModel.register({});
+const definedModel = withMaterializations(shape, materializations);
+
+const implementations = {
+  indexers: {
+    upsertUser: async ({ input, event, db }) => {
+      await db
+        .insertInto("users")
+        .values({
+          userId: input.userId,
+          email: input.email,
+          source: event.ref,
+        })
+        .onConflict(["userId"])
+        .doUpdateSet({
+          email: input.email,
+          source: event.ref,
+        })
+        .execute();
+    },
+  },
+  queries: {
+    userById: async ({ params, db }) => {
+      return await db
+        .selectFrom("users")
+        .select(["userId", "email", "source"])
+        .where("userId", "=", params.userId)
+        .executeTakeFirst();
+    },
+  },
+} satisfies MaterializationImplementationRegistration<
+  typeof schema,
+  typeof materializations.indexers,
+  typeof materializations.queries
+>;
+
+const registeredModelWithoutHandlers = definedModel.register({
+  indexers: implementations.indexers,
+  queries: implementations.queries,
+});
 
 type FakeStatementCall = {
   readonly method: "all" | "exec" | "get" | "run";
@@ -242,6 +268,8 @@ test("projection access compiles typed indexer and query definitions to storage 
 
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
   const registeredModel = definedModel.register({
+    indexers: implementations.indexers,
+    queries: implementations.queries,
     events: {
       "user.created": async ({ event, actions }) => {
         await actions.index("upsertUser", {
@@ -262,8 +290,8 @@ test("ledger projection construction feeds generated contracts and implementatio
     definedModel.model.queries.userById,
   );
   assert.equal(
-    registeredModel.implementations.indexers?.upsertUser,
-    registeredModelWithoutHandlers.implementations.indexers?.upsertUser,
+    typeof registeredModel.implementations.indexers?.upsertUser,
+    "function",
   );
   assert.equal(registeredModel.projections, definedModel.projections);
 });
@@ -287,30 +315,36 @@ test("ledger shape can register without projections", () => {
 });
 
 test("ledger projection definition applies relations over inferred tables", () => {
-  const model = shape.withProjections(
-    {
-      tables: {
-        users: (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        sessions: (t) =>
-          t
-            .columns({
-              sessionId: t.text().notNull(),
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["sessionId"]),
-      },
-      relations: (r) => ({
-        sessionUser: r
-          .foreignKey("sessions", ["userId"])
-          .references("users", ["userId"]),
-      }),
+  const relationSchema = defineMaterializationSchema({
+    namespace: "relations",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
     },
-    () => ({
+    relations: (r) => ({
+      sessionUser: r
+        .foreignKey("sessions", ["userId"])
+        .references("users", ["userId"]),
+    }),
+  });
+  const model = withMaterializations(
+    shape,
+    defineMaterializations({
+      schemas: [relationSchema],
+      current: relationSchema,
+      migrations: [],
       indexers: {},
       queries: {},
     }),
@@ -327,119 +361,277 @@ test("ledger projection definition applies relations over inferred tables", () =
   });
 });
 
-async function assertLedgerProjectionTypes(): Promise<void> {
-  shape.withProjections(
-    {
-      tables: {
-        sessions: (t) =>
-          t
-            .columns({
-              sessionId: t.text().notNull(),
-              // @ts-expect-error projection event refs must come from the ledger shape.
-              source: t.eventRef("session.created").notNull(),
-            })
-            .primaryKey(["sessionId"]),
-      },
+test("materialization plans validate schema versions and adjacent migrations", () => {
+  const schemaV1 = defineMaterializationSchema({
+    namespace: "plan",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
     },
-    () => ({
+  });
+  const schemaV2 = defineMaterializationSchema({
+    namespace: "plan",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+
+  assert.equal(
+    defineMaterializations({
+      schemas: [schemaV1, schemaV2],
+      current: schemaV2,
+      migrations: [
+        {
+          from: 1,
+          to: 2,
+          up: () => undefined,
+        },
+      ],
       indexers: {},
       queries: {},
-    }),
+    }).current,
+    schemaV2,
   );
 
-  shape.withProjections(
-    {
-      tables: {
-        users: (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-              email: t.text().notNull(),
-              source: t.eventRef("user.created").notNull(),
-            })
-            .primaryKey(["userId"]),
+  assert.throws(() => {
+    defineMaterializations({
+      schemas: [schemaV1, schemaV2],
+      current: schemaV2,
+      migrations: [],
+      indexers: {},
+      queries: {},
+    });
+  }, /missing materialization migration 1 -> 2/);
+
+  assert.throws(() => {
+    defineMaterializations({
+      schemas: [schemaV1, schemaV2],
+      current: schemaV1,
+      migrations: [
+        {
+          from: 1,
+          to: 2,
+          up: () => undefined,
+        },
+      ],
+      indexers: {},
+      queries: {},
+    });
+  }, /current materialization schema must have the latest version/);
+});
+
+test("withMaterializations rejects materialization event refs outside the ledger shape", () => {
+  const invalidSchema = defineMaterializationSchema({
+    namespace: "invalid-events",
+    version: 1,
+    tables: {
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            source: t.eventRef("session.created").notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    },
+  });
+  const invalidMaterializations = defineMaterializations({
+    schemas: [invalidSchema],
+    current: invalidSchema,
+    migrations: [],
+    indexers: {},
+    queries: {},
+  });
+
+  assert.throws(() => {
+    // @ts-expect-error runtime validation protects unchecked callers too.
+    withMaterializations(shape, invalidMaterializations);
+  }, /references unknown event session\.created/);
+
+  const validSchemaV2 = defineMaterializationSchema({
+    namespace: "invalid-events",
+    version: 2,
+    tables: {
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    },
+  });
+  const invalidHistoricalMaterializations = defineMaterializations({
+    schemas: [invalidSchema, validSchemaV2],
+    current: validSchemaV2,
+    migrations: [
+      {
+        from: 1,
+        to: 2,
+        up: () => undefined,
+      },
+    ],
+    indexers: {},
+    queries: {},
+  });
+
+  assert.throws(() => {
+    // @ts-expect-error runtime validation protects unchecked callers too.
+    withMaterializations(shape, invalidHistoricalMaterializations);
+  }, /references unknown event session\.created/);
+});
+
+test("withMaterializations rejects unchecked indexer source events outside the ledger shape", () => {
+  const invalidIndexerMaterializations = defineMaterializations({
+    schemas: [schema],
+    current: schema,
+    migrations: [],
+    indexers: {
+      invalidSource: {
+        sourceEvent: "session.created",
+        input: Type.Object({}),
       },
     },
-    (p) => ({
-      indexers: {
-        invalidSource: p.indexer({
-          // @ts-expect-error source events must come from the projection event-name union.
-          sourceEvent: "session.created",
-          input: Type.Object({}),
-          write: () => undefined,
-        }),
-        wrongEventRef: p.indexer({
-          sourceEvent: "user.created",
-          input: Type.Object({}),
-          write: async ({ db }) => {
-            await db
-              .insertInto("users")
-              .values({
-                userId: "u_123",
-                email: "alice@example.com",
-                // @ts-expect-error event_ref columns only accept matching event refs.
-                source: createEventRef("session.created", 1),
-              })
-              .execute();
-          },
-        }),
-        incompleteInsert: p.indexer({
-          sourceEvent: "user.created",
-          input: Type.Object({}),
-          write: async ({ db, event }) => {
-            await db
-              .insertInto("users")
-              // @ts-expect-error inserts must provide every projection column.
-              .values({
-                userId: "u_123",
-                source: event.ref,
-              })
-              .execute();
-          },
-        }),
-        nonKeyConflict: p.indexer({
-          sourceEvent: "user.created",
-          input: Type.Object({}),
-          write: async ({ db, event }) => {
-            await db
-              .insertInto("users")
-              .values({
-                userId: "u_123",
-                email: "alice@example.com",
-                source: event.ref,
-              })
-              // @ts-expect-error conflict targets must be primary or unique keys.
-              .onConflict(["email"])
-              .doNothing()
-              .execute();
-          },
-        }),
+    queries: {},
+  });
+
+  assert.throws(() => {
+    // @ts-expect-error runtime validation protects unchecked callers too.
+    withMaterializations(shape, invalidIndexerMaterializations);
+  }, /references unknown source event session\.created/);
+});
+
+async function assertLedgerProjectionTypes(): Promise<void> {
+  const typedSchema = defineMaterializationSchema({
+    namespace: "types",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+
+  const invalidSource = defineMaterializations({
+    schemas: [typedSchema],
+    current: typedSchema,
+    migrations: [],
+    indexers: {
+      invalidSource: {
+        sourceEvent: "session.created",
+        input: Type.Object({}),
       },
-      queries: {
-        selectedColumns: p.query({
-          params: Type.Object({}),
-          result: Type.Null(),
-          read: async ({ db }) => {
-            const row = await db
-              .selectFrom("users")
-              .select(["email"])
-              .executeTakeFirst();
+    },
+    queries: {},
+  });
 
-            if (row !== null) {
-              const email: string = row.email;
-              // @ts-expect-error only selected columns are available.
-              const userId: string = row.userId;
+  // @ts-expect-error indexer source events must come from the ledger shape.
+  withMaterializations(shape, invalidSource);
 
-              void email;
-              void userId;
-            }
-
-            return null;
-          },
-        }),
+  const typedMaterializations = defineMaterializations({
+    schemas: [typedSchema],
+    current: typedSchema,
+    migrations: [],
+    indexers: {
+      wrongEventRef: {
+        sourceEvent: "user.created",
+        input: Type.Object({}),
       },
-    }),
-  );
+      incompleteInsert: {
+        sourceEvent: "user.created",
+        input: Type.Object({}),
+      },
+      nonKeyConflict: {
+        sourceEvent: "user.created",
+        input: Type.Object({}),
+      },
+    },
+    queries: {
+      selectedColumns: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+    },
+  });
+
+  const typedImplementations = {
+    indexers: {
+      wrongEventRef: async ({ db }) => {
+        await db
+          .insertInto("users")
+          .values({
+            userId: "u_123",
+            email: "alice@example.com",
+            // @ts-expect-error event_ref columns only accept matching event refs.
+            source: createEventRef("session.created", 1),
+          })
+          .execute();
+      },
+      incompleteInsert: async ({ db, event }) => {
+        await db
+          .insertInto("users")
+          // @ts-expect-error inserts must provide every projection column.
+          .values({
+            userId: "u_123",
+            source: event.ref,
+          })
+          .execute();
+      },
+      nonKeyConflict: async ({ db, event }) => {
+        await db
+          .insertInto("users")
+          .values({
+            userId: "u_123",
+            email: "alice@example.com",
+            source: event.ref,
+          })
+          // @ts-expect-error conflict targets must be primary or unique keys.
+          .onConflict(["email"])
+          .doNothing()
+          .execute();
+      },
+    },
+    queries: {
+      selectedColumns: async ({ db }) => {
+        const row = await db
+          .selectFrom("users")
+          .select(["email"])
+          .executeTakeFirst();
+
+        if (row !== null) {
+          const email: string = row.email;
+          // @ts-expect-error only selected columns are available.
+          const userId: string = row.userId;
+
+          void email;
+          void userId;
+        }
+
+        return null;
+      },
+    },
+  } satisfies MaterializationImplementationRegistration<
+    typeof typedSchema,
+    typeof typedMaterializations.indexers,
+    typeof typedMaterializations.queries
+  >;
+
+  void typedImplementations;
 }
 
 void assertLedgerProjectionTypes;

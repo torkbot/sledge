@@ -2,8 +2,16 @@ import { Type } from "typebox";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { Ledger } from "./ledger.ts";
-import { defineLedgerShape } from "./ledger.ts";
+import type {
+  Ledger,
+  MaterializationImplementationRegistration,
+} from "./ledger.ts";
+import {
+  defineLedgerShape,
+  defineMaterializationSchema,
+  defineMaterializations,
+  withMaterializations,
+} from "./ledger.ts";
 
 export const MessageReceivedSchema = Type.Object({
   type: Type.Literal("message.received"),
@@ -84,139 +92,159 @@ const ledgerContractShape = defineLedgerShape({
   signalQueues: {},
 });
 
-const ledgerContractDefinition = ledgerContractShape.withProjections(
-  {
-    tables: {
-      contractProjection: (t) =>
-        t
-          .columns({
-            sourceEventId: t.integer().notNull(),
-            decisionAttempts: t.integer().notNull(),
-            dispatchCount: t.integer().notNull(),
-            plannedIntentEventId: t.integer(),
-          })
-          .primaryKey(["sourceEventId"]),
+const ledgerContractSchema = defineMaterializationSchema({
+  namespace: "contract",
+  version: 1,
+  tables: {
+    contractProjection: (t) =>
+      t
+        .columns({
+          sourceEventId: t.integer().notNull(),
+          decisionAttempts: t.integer().notNull(),
+          dispatchCount: t.integer().notNull(),
+          plannedIntentEventId: t.integer(),
+        })
+        .primaryKey(["sourceEventId"]),
+  },
+});
+
+const ledgerContractMaterializations = defineMaterializations({
+  schemas: [ledgerContractSchema],
+  current: ledgerContractSchema,
+  migrations: [],
+  indexers: {
+    upsertObserved: {
+      sourceEvent: "message.received",
+      input: UpsertObservedIndexerInputSchema,
+    },
+    incrementDecisionAttempts: {
+      sourceEvent: "decision.attempted",
+      input: IncrementDecisionAttemptsIndexerInputSchema,
+    },
+    setPlannedIntent: {
+      sourceEvent: "intent.planned",
+      input: SetPlannedIntentIndexerInputSchema,
+    },
+    incrementDispatchCount: {
+      sourceEvent: "dispatch.completed",
+      input: IncrementDispatchCountIndexerInputSchema,
     },
   },
-  (p) => ({
-    indexers: {
-      upsertObserved: p.indexer({
-        sourceEvent: "message.received",
-        input: UpsertObservedIndexerInputSchema,
-        write: async ({ input, db }) => {
-          await db
-            .insertInto("contractProjection")
-            .values({
-              sourceEventId: input.sourceEventId,
-              decisionAttempts: 0,
-              dispatchCount: 0,
-              plannedIntentEventId: null,
-            })
-            .onConflict(["sourceEventId"])
-            .doNothing()
-            .execute();
-        },
-      }),
-      incrementDecisionAttempts: p.indexer({
-        sourceEvent: "decision.attempted",
-        input: IncrementDecisionAttemptsIndexerInputSchema,
-        write: async ({ input, db }) => {
-          await db
-            .insertInto("contractProjection")
-            .values({
-              sourceEventId: input.sourceEventId,
-              decisionAttempts: input.attempt,
-              dispatchCount: 0,
-              plannedIntentEventId: null,
-            })
-            .onConflict(["sourceEventId"])
-            .doUpdateSet({
-              decisionAttempts: input.attempt,
-            })
-            .execute();
-        },
-      }),
-      setPlannedIntent: p.indexer({
-        sourceEvent: "intent.planned",
-        input: SetPlannedIntentIndexerInputSchema,
-        write: async ({ input, db }) => {
-          await db
-            .insertInto("contractProjection")
-            .values({
-              sourceEventId: input.sourceEventId,
-              decisionAttempts: 0,
-              dispatchCount: 0,
-              plannedIntentEventId: input.intentEventId,
-            })
-            .onConflict(["sourceEventId"])
-            .doUpdateSet({
-              plannedIntentEventId: input.intentEventId,
-            })
-            .execute();
-        },
-      }),
-      incrementDispatchCount: p.indexer({
-        sourceEvent: "dispatch.completed",
-        input: IncrementDispatchCountIndexerInputSchema,
-        write: async ({ input, db }) => {
-          await db
-            .insertInto("contractProjection")
-            .values({
-              sourceEventId: input.sourceEventId,
-              decisionAttempts: 0,
-              dispatchCount: input.dispatchCount,
-              plannedIntentEventId: null,
-            })
-            .onConflict(["sourceEventId"])
-            .doUpdateSet({
-              dispatchCount: input.dispatchCount,
-            })
-            .execute();
-        },
-      }),
+  queries: {
+    decisionAttempts: {
+      params: DecisionAttemptsQueryParamsSchema,
+      result: CountQueryResultSchema,
     },
-    queries: {
-      decisionAttempts: p.query({
-        params: DecisionAttemptsQueryParamsSchema,
-        result: CountQueryResultSchema,
-        read: async ({ params, db }) => {
-          const row = await db
-            .selectFrom("contractProjection")
-            .select(["decisionAttempts"])
-            .where("sourceEventId", "=", params.sourceEventId)
-            .executeTakeFirst();
-
-          return row?.decisionAttempts ?? 0;
-        },
-      }),
-      dispatchCount: p.query({
-        params: DispatchCountQueryParamsSchema,
-        result: CountQueryResultSchema,
-        read: async ({ params, db }) => {
-          const row = await db
-            .selectFrom("contractProjection")
-            .select(["dispatchCount"])
-            .where("sourceEventId", "=", params.sourceEventId)
-            .executeTakeFirst();
-
-          return row?.dispatchCount ?? 0;
-        },
-      }),
-      seenSourceEventIds: p.query({
-        params: SeenSourceEventIdsQueryParamsSchema,
-        result: SourceEventIdsResultSchema,
-        read: async ({ db }) => {
-          const rows = await db
-            .selectFrom("contractProjection")
-            .select(["sourceEventId"])
-            .execute();
-
-          return rows.map((row) => row.sourceEventId).sort((a, b) => a - b);
-        },
-      }),
+    dispatchCount: {
+      params: DispatchCountQueryParamsSchema,
+      result: CountQueryResultSchema,
     },
-  }),
+    seenSourceEventIds: {
+      params: SeenSourceEventIdsQueryParamsSchema,
+      result: SourceEventIdsResultSchema,
+    },
+  },
+});
+
+const ledgerContractDefinition = withMaterializations(
+  ledgerContractShape,
+  ledgerContractMaterializations,
 );
+
+const ledgerContractImplementations = {
+  indexers: {
+    upsertObserved: async ({ input, db }) => {
+      await db
+        .insertInto("contractProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          decisionAttempts: 0,
+          dispatchCount: 0,
+          plannedIntentEventId: null,
+        })
+        .onConflict(["sourceEventId"])
+        .doNothing()
+        .execute();
+    },
+    incrementDecisionAttempts: async ({ input, db }) => {
+      await db
+        .insertInto("contractProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          decisionAttempts: input.attempt,
+          dispatchCount: 0,
+          plannedIntentEventId: null,
+        })
+        .onConflict(["sourceEventId"])
+        .doUpdateSet({
+          decisionAttempts: input.attempt,
+        })
+        .execute();
+    },
+    setPlannedIntent: async ({ input, db }) => {
+      await db
+        .insertInto("contractProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          decisionAttempts: 0,
+          dispatchCount: 0,
+          plannedIntentEventId: input.intentEventId,
+        })
+        .onConflict(["sourceEventId"])
+        .doUpdateSet({
+          plannedIntentEventId: input.intentEventId,
+        })
+        .execute();
+    },
+    incrementDispatchCount: async ({ input, db }) => {
+      await db
+        .insertInto("contractProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          decisionAttempts: 0,
+          dispatchCount: input.dispatchCount,
+          plannedIntentEventId: null,
+        })
+        .onConflict(["sourceEventId"])
+        .doUpdateSet({
+          dispatchCount: input.dispatchCount,
+        })
+        .execute();
+    },
+  },
+  queries: {
+    decisionAttempts: async ({ params, db }) => {
+      const row = await db
+        .selectFrom("contractProjection")
+        .select(["decisionAttempts"])
+        .where("sourceEventId", "=", params.sourceEventId)
+        .executeTakeFirst();
+
+      return row?.decisionAttempts ?? 0;
+    },
+    dispatchCount: async ({ params, db }) => {
+      const row = await db
+        .selectFrom("contractProjection")
+        .select(["dispatchCount"])
+        .where("sourceEventId", "=", params.sourceEventId)
+        .executeTakeFirst();
+
+      return row?.dispatchCount ?? 0;
+    },
+    seenSourceEventIds: async ({ db }) => {
+      const rows = await db
+        .selectFrom("contractProjection")
+        .select(["sourceEventId"])
+        .execute();
+
+      return rows.map((row) => row.sourceEventId).sort((a, b) => a - b);
+    },
+  },
+} satisfies MaterializationImplementationRegistration<
+  typeof ledgerContractSchema,
+  typeof ledgerContractMaterializations.indexers,
+  typeof ledgerContractMaterializations.queries
+>;
 
 type LedgerContractEvents = typeof ledgerContractShape.shape.events;
 type LedgerContractQueries = typeof ledgerContractDefinition.model.queries;
@@ -255,6 +283,8 @@ export function createLedgerContractModel(input: {
   nowMs(): number;
 }): LedgerContractModel {
   return ledgerContractDefinition.register({
+    indexers: ledgerContractImplementations.indexers,
+    queries: ledgerContractImplementations.queries,
     events: {
       "message.received": async ({ event, actions }) => {
         await actions.index("upsertObserved", {

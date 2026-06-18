@@ -4,14 +4,14 @@ A SQLite-backed event and work engine for building durable, restart-safe
 workflows.
 
 Sledge stores events and durable work, runs event handlers transactionally, and
-lets applications define typed projection tables without handing raw SQL handles
-to indexer and query callbacks.
+lets applications define typed materialization tables without handing raw SQL
+handles to indexer and query callbacks.
 
 ## What You Get
 
 - Durable event append with producer idempotency through `dedupeKey`
-- Event -> projection -> work materialization in one transaction
-- Typed projection schema, event refs, indexers, and queries
+- Event -> materialization -> work in one transaction
+- Typed materialization schema, event refs, indexers, and queries
 - Durable queue work with leases, retries, dead-letter outcomes, and restart
   recovery
 - Durable event streams through `tailEvents(...)` and `resumeEvents(...)`
@@ -24,7 +24,12 @@ import Database from "better-sqlite3";
 import { Type } from "typebox";
 
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
-import { defineLedgerShape } from "@torkbot/sledge/ledger";
+import {
+  defineLedgerShape,
+  defineMaterializationSchema,
+  defineMaterializations,
+  withMaterializations,
+} from "@torkbot/sledge/ledger";
 import {
   NodeRuntimeScheduler,
   SystemRuntimeClock,
@@ -32,7 +37,7 @@ import {
 
 const databaseUrl = "./app.sqlite";
 
-// Projection migrations are still explicit in this v2 slice.
+// Materialization migrations are still explicit in this v2 slice.
 // Indexer/query callbacks below do not receive this database handle.
 const db = new Database(databaseUrl);
 db.exec(`
@@ -44,7 +49,7 @@ db.exec(`
 `);
 db.close();
 
-const definedModel = defineLedgerShape({
+const ledgerShape = defineLedgerShape({
   events: {
     "user.created": Type.Object({
       userId: Type.String(),
@@ -59,76 +64,88 @@ const definedModel = defineLedgerShape({
   },
   signals: {},
   signalQueues: {},
-}).withProjections(
-  {
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-            source: t.eventRef("user.created").notNull(),
-          })
-          .primaryKey(["userId"]),
+});
+
+const materializationSchema = defineMaterializationSchema({
+  namespace: "app",
+  version: 1,
+  tables: {
+    users: (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          email: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+  },
+});
+
+const materializations = defineMaterializations({
+  schemas: [materializationSchema],
+  current: materializationSchema,
+  migrations: [],
+  indexers: {
+    upsertUser: {
+      sourceEvent: "user.created",
+      input: Type.Object({
+        userId: Type.String(),
+        email: Type.String(),
+      }),
     },
   },
-  (p) => ({
-    indexers: {
-      upsertUser: p.indexer({
-        sourceEvent: "user.created",
-        input: Type.Object({
+  queries: {
+    userById: {
+      params: Type.Object({ userId: Type.String() }),
+      result: Type.Union([
+        Type.Null(),
+        Type.Object({
           userId: Type.String(),
           email: Type.String(),
         }),
-        write: async ({ input, event, db }) => {
-          await db
-            .insertInto("users")
-            .values({
-              userId: input.userId,
-              email: input.email,
-              source: event.ref,
-            })
-            .onConflict(["userId"])
-            .doUpdateSet({
-              email: input.email,
-              source: event.ref,
-            })
-            .execute();
-        },
-      }),
+      ]),
     },
-    queries: {
-      userById: p.query({
-        params: Type.Object({ userId: Type.String() }),
-        result: Type.Union([
-          Type.Null(),
-          Type.Object({
-            userId: Type.String(),
-            email: Type.String(),
-          }),
-        ]),
-        read: async ({ params, db }) => {
-          const row = await db
-            .selectFrom("users")
-            .select(["userId", "email"])
-            .where("userId", "=", params.userId)
-            .executeTakeFirst();
+  },
+});
 
-          if (row === null) {
-            return null;
-          }
-
-          return {
-            userId: row.userId,
-            email: row.email,
-          };
-        },
-      }),
-    },
-  }),
-);
+const definedModel = withMaterializations(ledgerShape, materializations);
 
 const model = definedModel.register({
+  indexers: {
+    upsertUser: async ({ input, event, db }) => {
+      await db
+        .insertInto("users")
+        .values({
+          userId: input.userId,
+          email: input.email,
+          source: event.ref,
+        })
+        .onConflict(["userId"])
+        .doUpdateSet({
+          email: input.email,
+          source: event.ref,
+        })
+        .execute();
+    },
+  },
+  queries: {
+    userById: async ({ params, db }) => {
+      const row = await db
+        .selectFrom("users")
+        .select(["userId", "email"])
+        .where("userId", "=", params.userId)
+        .executeTakeFirst();
+
+      if (row === null) {
+        return null;
+      }
+
+      return {
+        userId: row.userId,
+        email: row.email,
+      };
+    },
+  },
   events: {
     "user.created": async ({ event, actions }) => {
       await actions.index("upsertUser", {
@@ -188,15 +205,17 @@ console.log(user);
 All four fields are explicit. Use `{}` when a shape has no contracts in that
 category.
 
-### 2. Attach Projections
+### 2. Define Materialization Schemas
 
-Call `.withProjections({ tables, relations }, (p) => ({ indexers, queries }))`
-to attach projection tables and access callbacks to the ledger shape.
+Call `defineMaterializationSchema(...)` to define the complete table schema for
+one materialization namespace/version.
 
 Each table key owns one table-local builder function:
 
 ```ts
-{
+defineMaterializationSchema({
+  namespace: "app",
+  version: 1,
   tables: {
     users: (t) =>
       t
@@ -206,11 +225,11 @@ Each table key owns one table-local builder function:
         })
         .primaryKey(["userId"]),
   },
-}
+});
 ```
 
-Those table builders are scoped to the ledger event names, so semantic event refs
-must point at real events:
+Semantic event refs are first-class columns and must point at real ledger events
+when materializations are attached:
 
 ```ts
 source: t.eventRef("user.created").notNull();
@@ -227,62 +246,78 @@ relations: (r) => ({
 });
 ```
 
-Indexer and query definitions use the projection-local `p` handle:
+### 3. Define Materializations
+
+Call `defineMaterializations(...)` to collect schema versions, migrations,
+indexer contracts, and query contracts:
 
 ```ts
-(p) => ({
+const materializations = defineMaterializations({
+  schemas: [schemaV1, schemaV2],
+  current: schemaV2,
+  migrations: [
+    {
+      from: 1,
+      to: 2,
+      up: async (m) => {
+        void m;
+      },
+    },
+  ],
   indexers: {
-    upsertUser: p.indexer({
+    upsertUser: {
       sourceEvent: "user.created",
       input: Type.Object({ userId: Type.String() }),
-      write: async ({ input, event, db }) => {
-        await db
-          .insertInto("users")
-          .values({
-            userId: input.userId,
-            source: event.ref,
-          })
-          .execute();
-      },
-    }),
+    },
   },
   queries: {
-    userById: p.query({
+    userById: {
       params: Type.Object({ userId: Type.String() }),
       result: Type.Null(),
-      read: () => null,
-    }),
+    },
   },
 });
 ```
 
-These callbacks receive sledge-owned facades:
+Sledge validates that schemas share one namespace, versions are unique positive
+integers, `current` is the latest schema, and migrations connect adjacent
+versions without gaps.
+
+Attach materializations to the ledger shape with `withMaterializations(...)`:
+
+```ts
+const definedModel = withMaterializations(ledgerShape, materializations);
+```
+
+Ledgers without materialization tables can skip this step and call
+`defineLedgerShape(...).register(...)` directly.
+
+### 4. Register Orchestration
+
+Call `definedModel.register(...)` to attach indexer implementations, query
+implementations, event handlers, queue handlers, signal handlers, and
+signal-queue handlers.
+
+Indexer and query implementations receive sledge-owned facades:
 
 - indexers can `insertInto(...).values(...).onConflict(...).doUpdateSet(...)`
 - queries can `selectFrom(...).select(...).where(...).executeTakeFirst()`
 
-They do not receive a raw storage handle.
-
-Ledgers without projection tables can skip this step and call
-`defineLedgerShape(...).register(...)` directly.
-
-### 3. Register Orchestration
-
-Call `definedModel.register(...)` to attach event, queue, signal, and
-signal-queue handlers. Event handlers can `index`, `enqueue`, and `query`.
+They do not receive a raw storage handle. Event handlers can `index`, `enqueue`,
+and `query`.
 
 Registration returns the model passed to a storage adapter. There is no
-separate bind step: projection access definitions already compiled the indexer
-and query implementations.
+separate bind step.
 
-### 4. Run Database Hygiene
+### 5. Run Database Hygiene
 
-This v2 slice records projection metadata and typed relations, but does not yet
-run projection migrations. Applications must still create/update projection
-tables before opening the runtime. The intended lifecycle is internal migrations
-first, then projection migrations, then runtime.
+This v2 slice records materialization schema metadata, typed relations, and
+migration metadata, but does not yet run materialization migrations.
+Applications must still create/update materialization tables before opening the
+runtime. The intended lifecycle is internal migrations first, then
+materialization migrations, then runtime.
 
-### 5. Open a Runtime
+### 6. Open a Runtime
 
 Use one adapter to open the ledger:
 
