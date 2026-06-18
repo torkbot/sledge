@@ -496,14 +496,10 @@ import { Type } from "typebox";
 import {
   bindProjectedLedgerModel,
   defineLedgerShape,
-  defineProjectedLedgerModel,
-  defineProjectionAccess,
   registerProjectedLedgerModel,
-  type LedgerShapeEventName,
 } from "@torkbot/sledge/projected-ledger";
-import { defineProjectionSchemaForEvents } from "@torkbot/sledge/projections";
 
-const shape = defineLedgerShape({
+const definedModel = defineLedgerShape({
   events: {
     "user.created": Type.Object({
       userId: Type.String(),
@@ -513,82 +509,77 @@ const shape = defineLedgerShape({
   queues: {},
   signals: {},
   signalQueues: {},
-});
-
-const projections = defineProjectionSchemaForEvents<
-  LedgerShapeEventName<typeof shape>
->()({
-  users: (t) =>
-    t
-      .columns({
-        userId: t.text().notNull(),
-        email: t.text().notNull(),
-        source: t.eventRef("user.created").notNull(),
-      })
-      .primaryKey(["userId"]),
-});
-
-const access = defineProjectionAccess({
-  projections,
-  indexers: {
-    upsertUser: (i) =>
-      i
-        .sourceEvent("user.created")
-        .input(
-          Type.Object({
-            userId: Type.String(),
-            email: Type.String(),
-          }),
-        )
-        .write(async ({ input, event, db }) => {
-          await db
-            .insertInto("users")
-            .values({
-              userId: input.userId,
-              email: input.email,
-              source: event.ref,
-            })
-            .onConflict(["userId"])
-            .doUpdateSet({
-              email: input.email,
-              source: event.ref,
-            })
-            .execute();
-        }),
-  },
-  queries: {
-    userById: (q) =>
-      q
-        .params(Type.Object({ userId: Type.String() }))
-        .result(
-          Type.Union([
-            Type.Null(),
+}).withProjections(
+  (p) =>
+    p.schema({
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+    }),
+  {
+    indexers: {
+      upsertUser: (i) =>
+        i
+          .sourceEvent("user.created")
+          .input(
             Type.Object({
               userId: Type.String(),
               email: Type.String(),
             }),
-          ]),
-        )
-        .read(async ({ params, db }) => {
-          const row = await db
-            .selectFrom("users")
-            .select(["userId", "email"])
-            .where("userId", "=", params.userId)
-            .executeTakeFirst();
+          )
+          .write(async ({ input, event, db }) => {
+            await db
+              .insertInto("users")
+              .values({
+                userId: input.userId,
+                email: input.email,
+                source: event.ref,
+              })
+              .onConflict(["userId"])
+              .doUpdateSet({
+                email: input.email,
+                source: event.ref,
+              })
+              .execute();
+          }),
+    },
+    queries: {
+      userById: (q) =>
+        q
+          .params(Type.Object({ userId: Type.String() }))
+          .result(
+            Type.Union([
+              Type.Null(),
+              Type.Object({
+                userId: Type.String(),
+                email: Type.String(),
+              }),
+            ]),
+          )
+          .read(async ({ params, db }) => {
+            const row = await db
+              .selectFrom("users")
+              .select(["userId", "email"])
+              .where("userId", "=", params.userId)
+              .executeTakeFirst();
 
-          if (row === null) {
-            return null;
-          }
+            if (row === null) {
+              return null;
+            }
 
-          return {
-            userId: row.userId,
-            email: row.email,
-          };
-        }),
+            return {
+              userId: row.userId,
+              email: row.email,
+            };
+          }),
+    },
   },
-});
-
-const definedModel = defineProjectedLedgerModel({ shape, access });
+);
 const registeredModel = registerProjectedLedgerModel(definedModel, {
   events: {
     "user.created": async ({ event, actions }) => {
@@ -606,9 +597,10 @@ The intended v2 lifecycle is:
 
 1. Define the ledger shape with TypeBox event, queue, signal, and signal-queue
    contracts.
-2. Define projection schema separately with table-local relational builders.
-3. Define named indexers and queries over those projections using a sledge-owned
-   access facade.
+2. Attach projection schema with table-local relational builders through
+   `withProjections(...)`, so event refs are checked against the ledger shape.
+3. Define named indexers and queries in the same `withProjections(...)` call
+   using a sledge-owned access facade inferred from the projection schema.
 4. Establish a storage connection.
 5. Run database hygiene explicitly: internal migrations first, then projection
    migrations.

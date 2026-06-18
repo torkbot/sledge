@@ -13,12 +13,8 @@ import type {
 import {
   bindProjectedLedgerModel,
   defineLedgerShape,
-  defineProjectedLedgerModel,
-  defineProjectionAccess,
   registerProjectedLedgerModel,
-  type LedgerShapeEventName,
 } from "./projected-ledger.ts";
-import { defineProjectionSchemaForEvents } from "./projections.ts";
 
 const UserCreatedSchema = Type.Object({
   userId: Type.String(),
@@ -34,77 +30,78 @@ const shape = defineLedgerShape({
   signalQueues: {},
 });
 
-type ShapeEventName = LedgerShapeEventName<typeof shape>;
-
-const projections = defineProjectionSchemaForEvents<ShapeEventName>()({
-  users: (t) =>
-    t
-      .columns({
-        userId: t.text().notNull(),
-        email: t.text().notNull(),
-        source: t.eventRef("user.created").notNull(),
-      })
-      .primaryKey(["userId"]),
-});
-
-const access = defineProjectionAccess({
-  projections,
-  indexers: {
-    upsertUser: (i) =>
-      i
-        .sourceEvent("user.created")
-        .input(
-          Type.Object({
-            userId: Type.String(),
-            email: Type.String(),
-          }),
-        )
-        .write(async ({ input, event, db }) => {
-          await db
-            .insertInto("users")
-            .values({
-              userId: input.userId,
-              email: input.email,
-              source: event.ref,
-            })
-            .onConflict(["userId"])
-            .doUpdateSet({
-              email: input.email,
-              source: event.ref,
-            })
-            .execute();
-        }),
-  },
-  queries: {
-    userById: (q) =>
-      q
-        .params(
-          Type.Object({
-            userId: Type.String(),
-          }),
-        )
-        .result(
-          Type.Union([
-            Type.Null(),
+const definedModel = shape.withProjections(
+  (p) =>
+    p.schema({
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+    }),
+  {
+    indexers: {
+      upsertUser: (i) =>
+        i
+          .sourceEvent("user.created")
+          .input(
             Type.Object({
               userId: Type.String(),
               email: Type.String(),
-              source: Type.Object({
-                eventName: Type.Literal("user.created"),
-                eventId: Type.Number(),
-              }),
             }),
-          ]),
-        )
-        .read(async ({ params, db }) => {
-          return await db
-            .selectFrom("users")
-            .select(["userId", "email", "source"])
-            .where("userId", "=", params.userId)
-            .executeTakeFirst();
-        }),
+          )
+          .write(async ({ input, event, db }) => {
+            await db
+              .insertInto("users")
+              .values({
+                userId: input.userId,
+                email: input.email,
+                source: event.ref,
+              })
+              .onConflict(["userId"])
+              .doUpdateSet({
+                email: input.email,
+                source: event.ref,
+              })
+              .execute();
+          }),
+    },
+    queries: {
+      userById: (q) =>
+        q
+          .params(
+            Type.Object({
+              userId: Type.String(),
+            }),
+          )
+          .result(
+            Type.Union([
+              Type.Null(),
+              Type.Object({
+                userId: Type.String(),
+                email: Type.String(),
+                source: Type.Object({
+                  eventName: Type.Literal("user.created"),
+                  eventId: Type.Number(),
+                }),
+              }),
+            ]),
+          )
+          .read(async ({ params, db }) => {
+            return await db
+              .selectFrom("users")
+              .select(["userId", "email", "source"])
+              .where("userId", "=", params.userId)
+              .executeTakeFirst();
+          }),
+    },
   },
-});
+);
+
+const access = definedModel.access;
 
 type FakeStatementCall = {
   readonly method: "all" | "exec" | "get" | "run";
@@ -251,10 +248,6 @@ test("projection access compiles typed indexer and query builders to storage ope
 });
 
 test("projected ledger construction feeds generated contracts and implementations into the current runtime model", () => {
-  const definedModel = defineProjectedLedgerModel({
-    shape,
-    access,
-  });
   const registeredModel = registerProjectedLedgerModel(definedModel, {
     events: {
       "user.created": async ({ event, actions }) => {
@@ -280,122 +273,116 @@ test("projected ledger construction feeds generated contracts and implementation
 });
 
 async function assertProjectedLedgerTypes(): Promise<void> {
-  const incompatibleProjections =
-    defineProjectionSchemaForEvents<"session.created">()({
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            source: t.eventRef("session.created").notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    });
-  const incompatibleAccess = defineProjectionAccess({
-    projections: incompatibleProjections,
-    indexers: {
-      upsertSession: (i) =>
-        i
-          .sourceEvent("session.created")
-          .input(Type.Object({ sessionId: Type.String() }))
-          .write(async ({ input, event, db }) => {
-            await db
-              .insertInto("sessions")
-              .values({
-                sessionId: input.sessionId,
-                source: event.ref,
-              })
-              .execute();
-          }),
+  shape.withProjections(
+    (p) =>
+      p.schema({
+        sessions: (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              // @ts-expect-error projection event refs must come from the ledger shape.
+              source: t.eventRef("session.created").notNull(),
+            })
+            .primaryKey(["sessionId"]),
+      }),
+    {
+      indexers: {},
+      queries: {},
     },
-    queries: {},
-  });
+  );
 
-  defineProjectedLedgerModel({
-    shape,
-    // @ts-expect-error projection access event names must come from the ledger shape.
-    access: incompatibleAccess,
-  });
+  shape.withProjections(
+    (p) =>
+      p.schema({
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text().notNull(),
+              source: t.eventRef("user.created").notNull(),
+            })
+            .primaryKey(["userId"]),
+      }),
+    {
+      indexers: {
+        invalidSource: (i) =>
+          i
+            // @ts-expect-error source events must come from the projection event-name union.
+            .sourceEvent("session.created")
+            .input(Type.Object({}))
+            .write(() => undefined),
+        wrongEventRef: (i) =>
+          i
+            .sourceEvent("user.created")
+            .input(Type.Object({}))
+            .write(async ({ db }) => {
+              await db
+                .insertInto("users")
+                .values({
+                  userId: "u_123",
+                  email: "alice@example.com",
+                  // @ts-expect-error event_ref columns only accept matching event refs.
+                  source: createEventRef("session.created", 1),
+                })
+                .execute();
+            }),
+        incompleteInsert: (i) =>
+          i
+            .sourceEvent("user.created")
+            .input(Type.Object({}))
+            .write(async ({ db, event }) => {
+              await db
+                .insertInto("users")
+                // @ts-expect-error inserts must provide every projection column.
+                .values({
+                  userId: "u_123",
+                  source: event.ref,
+                })
+                .execute();
+            }),
+        nonKeyConflict: (i) =>
+          i
+            .sourceEvent("user.created")
+            .input(Type.Object({}))
+            .write(async ({ db, event }) => {
+              await db
+                .insertInto("users")
+                .values({
+                  userId: "u_123",
+                  email: "alice@example.com",
+                  source: event.ref,
+                })
+                // @ts-expect-error conflict targets must be primary or unique keys.
+                .onConflict(["email"])
+                .doNothing()
+                .execute();
+            }),
+      },
+      queries: {
+        selectedColumns: (q) =>
+          q
+            .params(Type.Object({}))
+            .result(Type.Null())
+            .read(async ({ db }) => {
+              const row = await db
+                .selectFrom("users")
+                .select(["email"])
+                .executeTakeFirst();
 
-  defineProjectionAccess({
-    projections,
-    indexers: {
-      invalidSource: (i) =>
-        i
-          // @ts-expect-error source events must come from the projection event-name union.
-          .sourceEvent("session.created")
-          .input(Type.Object({}))
-          .write(() => undefined),
-      wrongEventRef: (i) =>
-        i
-          .sourceEvent("user.created")
-          .input(Type.Object({}))
-          .write(async ({ db }) => {
-            await db
-              .insertInto("users")
-              .values({
-                userId: "u_123",
-                email: "alice@example.com",
-                // @ts-expect-error event_ref columns only accept matching event refs.
-                source: createEventRef("session.created", 1),
-              })
-              .execute();
-          }),
-      incompleteInsert: (i) =>
-        i
-          .sourceEvent("user.created")
-          .input(Type.Object({}))
-          .write(async ({ db, event }) => {
-            await db
-              .insertInto("users")
-              // @ts-expect-error inserts must provide every projection column.
-              .values({
-                userId: "u_123",
-                source: event.ref,
-              })
-              .execute();
-          }),
-      nonKeyConflict: (i) =>
-        i
-          .sourceEvent("user.created")
-          .input(Type.Object({}))
-          .write(async ({ db, event }) => {
-            await db
-              .insertInto("users")
-              .values({
-                userId: "u_123",
-                email: "alice@example.com",
-                source: event.ref,
-              })
-              // @ts-expect-error conflict targets must be primary or unique keys.
-              .onConflict(["email"])
-              .doNothing()
-              .execute();
-          }),
+              if (row !== null) {
+                const email: string = row.email;
+                // @ts-expect-error only selected columns are available.
+                const userId: string = row.userId;
+
+                void email;
+                void userId;
+              }
+
+              return null;
+            }),
+      },
     },
-    queries: {
-      selectedColumns: (q) =>
-        q
-          .params(Type.Object({}))
-          .result(Type.Null())
-          .read(async ({ db }) => {
-            const row = await db
-              .selectFrom("users")
-              .select(["email"])
-              .executeTakeFirst();
-
-            if (row !== null) {
-              const email: string = row.email;
-              // @ts-expect-error only selected columns are available.
-              const userId: string = row.userId;
-
-              void email;
-              void userId;
-            }
-
-            return null;
-          }),
-    },
-  });
+  );
 }
 
 void assertProjectedLedgerTypes;
