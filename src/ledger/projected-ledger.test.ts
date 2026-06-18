@@ -280,6 +280,42 @@ test("projected ledger construction feeds generated contracts and implementation
 });
 
 async function assertProjectedLedgerTypes(): Promise<void> {
+  const incompatibleProjections =
+    defineProjectionSchemaForEvents<"session.created">()({
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            source: t.eventRef("session.created").notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    });
+  const incompatibleAccess = defineProjectionAccess({
+    projections: incompatibleProjections,
+    indexers: {
+      upsertSession: (i) =>
+        i
+          .sourceEvent("session.created")
+          .input(Type.Object({ sessionId: Type.String() }))
+          .write(async ({ input, event, db }) => {
+            await db
+              .insertInto("sessions")
+              .values({
+                sessionId: input.sessionId,
+                source: event.ref,
+              })
+              .execute();
+          }),
+    },
+    queries: {},
+  });
+
+  defineProjectedLedgerModel({
+    shape,
+    // @ts-expect-error projection access event names must come from the ledger shape.
+    access: incompatibleAccess,
+  });
+
   defineProjectionAccess({
     projections,
     indexers: {

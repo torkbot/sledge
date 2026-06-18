@@ -394,6 +394,29 @@ export type ProjectionAccess<
   readonly implementations: LedgerImplementations<TIndexers, TQueries>;
 };
 
+export type ProjectionAccessSchema<TAccess> = TAccess extends {
+  readonly projections: infer TProjectionSchema;
+}
+  ? TProjectionSchema
+  : never;
+
+type ProjectionAccessEventName<TAccess> = ProjectionSchemaEventName<
+  ProjectionAccessSchema<TAccess>
+>;
+
+type ProjectionAccessCompatibleWithEvents<
+  TEvents extends Record<string, TSchema>,
+  TAccess,
+> =
+  Exclude<
+    ProjectionAccessEventName<TAccess>,
+    Extract<keyof TEvents, string>
+  > extends never
+    ? unknown
+    : {
+        readonly projectionEventNamesMustComeFromLedgerShape: never;
+      };
+
 export type ProjectionAccessIndexers<TAccess> = TAccess extends {
   readonly indexers: infer TIndexers;
 }
@@ -550,7 +573,8 @@ export function defineProjectedLedgerModel<
   >,
 >(input: {
   readonly shape: DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
-  readonly access: TAccess;
+  readonly access: TAccess &
+    ProjectionAccessCompatibleWithEvents<TEvents, TAccess>;
 }): DefinedProjectedLedgerModel<
   TEvents,
   TQueues,
