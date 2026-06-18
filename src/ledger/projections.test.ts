@@ -5,10 +5,36 @@ import {
   defineProjectionSchema,
   defineProjectionSchemaForEvents,
   type EventRef,
+  type ProjectionForeignKeyAction,
+  type ProjectionRelationDefinition,
   type ProjectionRow,
   type ProjectionSchemaTables,
+  type ProjectionTableBuilder,
   type ProjectionTableColumns,
+  type ProjectionTableMetadata,
 } from "./projections.ts";
+
+type RuntimeProjectionTable = {
+  readonly metadata: ProjectionTableMetadata;
+};
+
+type RuntimeProjectionTableFactory = (
+  table: ProjectionTableBuilder<string>,
+) => RuntimeProjectionTable;
+
+type RuntimeReferenceBuilder = {
+  references(
+    tableName: string,
+    columns: readonly string[],
+  ): ProjectionRelationDefinition;
+};
+
+type RuntimeRelationBuilder = {
+  foreignKey(
+    tableName: string,
+    columns: readonly string[],
+  ): RuntimeReferenceBuilder;
+};
 
 const defineEventProjectionSchema = defineProjectionSchemaForEvents<
   "session.created" | "user.created"
@@ -34,29 +60,40 @@ const projections = defineEventProjectionSchema({
       })
       .primaryKey(["sessionId"])
       .index("sessions_by_user", ["userId"]),
+  optionalSessions: (t) =>
+    t
+      .columns({
+        optionalSessionId: t.text().notNull(),
+        userId: t.text(),
+      })
+      .primaryKey(["optionalSessionId"]),
 }).relations((r) => ({
   sessionUser: r
     .foreignKey("sessions", ["userId"])
     .references("users", ["userId"])
     .onDelete("cascade"),
+  optionalSessionUser: r
+    .foreignKey("optionalSessions", ["userId"])
+    .references("users", ["userId"])
+    .onDelete("set_null"),
 }));
 
 type Tables = ProjectionSchemaTables<typeof projections>;
 type UserColumns = ProjectionTableColumns<Tables["users"]>;
 type UserRow = ProjectionRow<UserColumns>;
 
-const validUserRow: UserRow = {
-  userId: "u_123",
-  email: "alice@example.com",
-  source: {
-    eventName: "user.created",
-    eventId: 1,
-  },
-};
+function assertPositiveProjectionTypes(source: EventRef<"user.created">): void {
+  const validUserRow: UserRow = {
+    userId: "u_123",
+    email: "alice@example.com",
+    source,
+  };
+  const validUserSource: EventRef<"user.created"> = validUserRow.source;
 
-const validUserSource: EventRef<"user.created"> = validUserRow.source;
+  void validUserSource;
+}
 
-void validUserSource;
+void assertPositiveProjectionTypes;
 
 test("defineProjectionSchema records table, column, index, and relation metadata", () => {
   assert.deepEqual(projections.metadata, {
@@ -81,6 +118,18 @@ test("defineProjectionSchema records table, column, index, and relation metadata
           },
         },
         primaryKey: ["userId"],
+        keys: [
+          {
+            columns: ["userId"],
+            kind: "primary",
+            name: null,
+          },
+          {
+            columns: ["email"],
+            kind: "unique",
+            name: "users_email_unique",
+          },
+        ],
         indexes: [
           {
             name: "users_email_unique",
@@ -114,6 +163,13 @@ test("defineProjectionSchema records table, column, index, and relation metadata
           },
         },
         primaryKey: ["sessionId"],
+        keys: [
+          {
+            columns: ["sessionId"],
+            kind: "primary",
+            name: null,
+          },
+        ],
         indexes: [
           {
             name: "sessions_by_user",
@@ -121,6 +177,30 @@ test("defineProjectionSchema records table, column, index, and relation metadata
             unique: false,
           },
         ],
+      },
+      optionalSessions: {
+        name: "optionalSessions",
+        columns: {
+          optionalSessionId: {
+            kind: "text",
+            nullable: false,
+            eventName: null,
+          },
+          userId: {
+            kind: "text",
+            nullable: true,
+            eventName: null,
+          },
+        },
+        primaryKey: ["optionalSessionId"],
+        keys: [
+          {
+            columns: ["optionalSessionId"],
+            kind: "primary",
+            name: null,
+          },
+        ],
+        indexes: [],
       },
     },
     relations: {
@@ -130,6 +210,13 @@ test("defineProjectionSchema records table, column, index, and relation metadata
         toTable: "users",
         toColumns: ["userId"],
         onDelete: "cascade",
+      },
+      optionalSessionUser: {
+        fromTable: "optionalSessions",
+        fromColumns: ["userId"],
+        toTable: "users",
+        toColumns: ["userId"],
+        onDelete: "set_null",
       },
     },
   });
@@ -152,6 +239,23 @@ test("projection builders validate runtime metadata", () => {
   assert.throws(
     () =>
       defineProjectionSchema({
+        users: ((t) => {
+          const draft = t.columns({
+            userId: t.text(),
+          });
+          const primaryKey = draft.primaryKey as unknown as (
+            columns: readonly string[],
+          ) => RuntimeProjectionTable;
+
+          return primaryKey(["userId"]);
+        }) satisfies RuntimeProjectionTableFactory,
+      }),
+    /primary key column userId must be not null/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
         "": (t) =>
           t
             .columns({
@@ -165,10 +269,7 @@ test("projection builders validate runtime metadata", () => {
   assert.throws(
     () =>
       projections.relations((r) => {
-        const foreignKey = r.foreignKey as (
-          tableName: string,
-          columns: readonly string[],
-        ) => ReturnType<typeof r.foreignKey>;
+        const foreignKey = (r as unknown as RuntimeRelationBuilder).foreignKey;
 
         return {
           invalidTable: foreignKey("missing", ["userId"]).references("users", [
@@ -182,15 +283,7 @@ test("projection builders validate runtime metadata", () => {
   assert.throws(
     () =>
       projections.relations((r) => {
-        const foreignKey = r.foreignKey as (
-          tableName: string,
-          columns: readonly string[],
-        ) => {
-          references(
-            tableName: string,
-            columns: readonly string[],
-          ): ReturnType<ReturnType<typeof r.foreignKey>["references"]>;
-        };
+        const foreignKey = (r as unknown as RuntimeRelationBuilder).foreignKey;
 
         return {
           incompatibleReference: foreignKey("sessions", [
@@ -200,9 +293,47 @@ test("projection builders validate runtime metadata", () => {
       }),
     /foreign key reference columns must have matching types/,
   );
+
+  assert.throws(
+    () =>
+      projections.relations((r) => {
+        const foreignKey = (r as unknown as RuntimeRelationBuilder).foreignKey;
+
+        return {
+          nonKeyReference: foreignKey("sessions", ["userId"]).references(
+            "sessions",
+            ["userId"],
+          ),
+        };
+      }),
+    /foreign key reference must target a primary or unique key on sessions/,
+  );
+
+  assert.throws(() => {
+    projections.relations((r) => {
+      const relation = r
+        .foreignKey("sessions", ["userId"])
+        .references("users", ["userId"]);
+      const onDelete = relation.onDelete as unknown as (
+        action: ProjectionForeignKeyAction,
+      ) => ProjectionRelationDefinition;
+
+      return {
+        invalidSetNull: onDelete("set_null"),
+      };
+    });
+  }, /foreign key onDelete set_null requires nullable source columns/);
 });
 
 function assertProjectionTypes(): void {
+  // @ts-expect-error durable event references are ledger-owned opaque values.
+  const constructedRef: EventRef<"user.created"> = {
+    eventName: "user.created",
+    eventId: 1,
+  };
+
+  void constructedRef;
+
   defineProjectionSchemaForEvents<"user.created">()({
     users: (t) =>
       t
@@ -211,6 +342,16 @@ function assertProjectionTypes(): void {
           // @ts-expect-error unknown durable event names cannot be referenced.
           source: t.eventRef("session.created").notNull(),
         })
+        .primaryKey(["userId"]),
+  });
+
+  defineProjectionSchema({
+    users: (t) =>
+      t
+        .columns({
+          userId: t.text(),
+        })
+        // @ts-expect-error primary keys must use not-null columns.
         .primaryKey(["userId"]),
   });
 
@@ -232,6 +373,13 @@ function assertProjectionTypes(): void {
   }));
 
   projections.relations((r) => ({
+    nonKeyReference: r
+      .foreignKey("sessions", ["userId"])
+      // @ts-expect-error referenced columns must be primary or unique keys.
+      .references("sessions", ["userId"]),
+  }));
+
+  projections.relations((r) => ({
     invalidColumn: r
       // @ts-expect-error foreign keys must start from declared columns.
       .foreignKey("sessions", ["missing"])
@@ -243,6 +391,14 @@ function assertProjectionTypes(): void {
       .foreignKey("sessions", ["createdAtMs"])
       // @ts-expect-error referenced columns must have compatible scalar types.
       .references("users", ["userId"]),
+  }));
+
+  projections.relations((r) => ({
+    invalidSetNull: r
+      .foreignKey("sessions", ["userId"])
+      .references("users", ["userId"])
+      // @ts-expect-error set_null requires nullable source columns.
+      .onDelete("set_null"),
   }));
 }
 

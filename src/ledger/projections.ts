@@ -1,6 +1,17 @@
+declare const eventRefBrand: unique symbol;
+declare const projectionColumnValueBrand: unique symbol;
+declare const projectionSchemaRelationsBrand: unique symbol;
+declare const projectionSchemaTablesBrand: unique symbol;
+declare const projectionTableColumnsBrand: unique symbol;
+declare const projectionTablePrimaryKeyBrand: unique symbol;
+declare const projectionTableUniqueKeysBrand: unique symbol;
+
 export type EventRef<TEventName extends string> = {
   readonly eventName: TEventName;
   readonly eventId: number;
+  readonly [eventRefBrand]: {
+    readonly eventName: TEventName;
+  };
 };
 
 export type ProjectionColumnKind =
@@ -26,7 +37,7 @@ export type ProjectionColumn<
     readonly nullable: TNullable;
   };
   notNull(): ProjectionColumn<TKind, TValue, false>;
-  readonly __value?: TValue;
+  readonly [projectionColumnValueBrand]?: TValue;
 };
 
 export type ProjectionColumns = Record<
@@ -57,26 +68,20 @@ export type ProjectionSchemaTables<TSchema> =
     : never;
 
 export type ProjectionTableColumns<TTable> = TTable extends {
-  readonly __columns?: infer TColumns;
+  readonly [projectionTableColumnsBrand]?: infer TColumns;
 }
   ? TColumns extends ProjectionColumns
     ? TColumns
     : never
   : never;
 
-type AnyProjectionTableDefinition = ProjectionTableDefinition<
-  ProjectionColumns,
-  readonly string[]
->;
+type ProjectionTableDefinitionLike = {
+  readonly metadata: ProjectionTableMetadata;
+};
 
-type AnyProjectionTableFactory<TEventName extends string> = (
+type ProjectionTableFactory<TEventName extends string> = (
   table: ProjectionTableBuilder<TEventName>,
-) => AnyProjectionTableDefinition;
-
-type AnyProjectionTableFactories<TEventName extends string> = Record<
-  string,
-  AnyProjectionTableFactory<TEventName>
->;
+) => ProjectionTableDefinitionLike;
 
 export type ProjectionIndexMetadata = {
   readonly name: string;
@@ -84,11 +89,18 @@ export type ProjectionIndexMetadata = {
   readonly unique: boolean;
 };
 
+export type ProjectionKeyMetadata = {
+  readonly columns: readonly string[];
+  readonly kind: "primary" | "unique";
+  readonly name: string | null;
+};
+
 export type ProjectionTableMetadata = {
   readonly name: string;
   readonly columns: Readonly<Record<string, ProjectionColumnMetadata>>;
   readonly primaryKey: readonly string[];
   readonly indexes: readonly ProjectionIndexMetadata[];
+  readonly keys: readonly ProjectionKeyMetadata[];
 };
 
 type ProjectionColumnName<TColumns extends ProjectionColumns> = Extract<
@@ -96,33 +108,56 @@ type ProjectionColumnName<TColumns extends ProjectionColumns> = Extract<
   string
 >;
 
+type NotNullProjectionColumnName<TColumns extends ProjectionColumns> = {
+  readonly [TColumnName in ProjectionColumnName<TColumns>]: TColumns[TColumnName] extends ProjectionColumn<
+    ProjectionColumnKind,
+    unknown,
+    false
+  >
+    ? TColumnName
+    : never;
+}[ProjectionColumnName<TColumns>];
+
+type ProjectionColumnList<TColumns extends ProjectionColumns> =
+  readonly ProjectionColumnName<TColumns>[];
+
+type ProjectionNotNullColumnList<TColumns extends ProjectionColumns> =
+  readonly NotNullProjectionColumnName<TColumns>[];
+
+type ProjectionKeyList<TColumns extends ProjectionColumns> =
+  readonly ProjectionColumnList<TColumns>[];
+
 export type ProjectionTableDefinition<
   TColumns extends ProjectionColumns,
-  TPrimaryKey extends readonly ProjectionColumnName<TColumns>[],
+  TPrimaryKey extends ProjectionNotNullColumnList<TColumns>,
+  TUniqueKeys extends ProjectionKeyList<TColumns>,
 > = {
   readonly metadata: ProjectionTableMetadata;
-  readonly __columns?: TColumns;
-  readonly __primaryKey?: TPrimaryKey;
+  readonly [projectionTableColumnsBrand]?: TColumns;
+  readonly [projectionTablePrimaryKeyBrand]?: TPrimaryKey;
+  readonly [projectionTableUniqueKeysBrand]?: TUniqueKeys;
   index<
     const TColumnsToIndex extends readonly ProjectionColumnName<TColumns>[],
   >(
     name: string,
     columns: TColumnsToIndex,
-  ): ProjectionTableDefinition<TColumns, TPrimaryKey>;
+  ): ProjectionTableDefinition<TColumns, TPrimaryKey, TUniqueKeys>;
   unique<
     const TColumnsToIndex extends readonly ProjectionColumnName<TColumns>[],
   >(
     name: string,
     columns: TColumnsToIndex,
-  ): ProjectionTableDefinition<TColumns, TPrimaryKey>;
+  ): ProjectionTableDefinition<
+    TColumns,
+    TPrimaryKey,
+    readonly [...TUniqueKeys, TColumnsToIndex]
+  >;
 };
 
 export type ProjectionTableDraft<TColumns extends ProjectionColumns> = {
-  primaryKey<
-    const TPrimaryKey extends readonly ProjectionColumnName<TColumns>[],
-  >(
+  primaryKey<const TPrimaryKey extends ProjectionNotNullColumnList<TColumns>>(
     columns: TPrimaryKey,
-  ): ProjectionTableDefinition<TColumns, TPrimaryKey>;
+  ): ProjectionTableDefinition<TColumns, TPrimaryKey, readonly [TPrimaryKey]>;
 };
 
 export type ProjectionTableBuilder<TEventName extends string> = {
@@ -138,22 +173,20 @@ export type ProjectionTableBuilder<TEventName extends string> = {
   ): ProjectionTableDraft<TColumns>;
 };
 
-export type ProjectionTableFactory<TEventName extends string> = (
-  table: ProjectionTableBuilder<TEventName>,
-) => ProjectionTableDefinition<ProjectionColumns, readonly string[]>;
-
 export type ProjectionTableFactories<TEventName extends string> = Record<
   string,
   ProjectionTableFactory<TEventName>
 >;
 
-type InferProjectionTables<
-  TFactories extends ProjectionTableFactories<TEventName>,
-  TEventName extends string,
-> = {
-  readonly [TTableName in Extract<keyof TFactories, string>]: ReturnType<
-    TFactories[TTableName]
-  >;
+type InferProjectionTables<TFactories> = {
+  readonly [TTableName in Extract<
+    keyof TFactories,
+    string
+  >]: TFactories[TTableName] extends (
+    table: ProjectionTableBuilder<string>,
+  ) => infer TTable
+    ? TTable
+    : never;
 };
 
 type ProjectionTableName<TTables> = Extract<keyof TTables, string>;
@@ -162,6 +195,17 @@ type ProjectionTableColumnName<TTable> = Extract<
   keyof ProjectionTableColumns<TTable>,
   string
 >;
+
+type ProjectionTableKeys<TTable> = TTable extends {
+  readonly [projectionTableUniqueKeysBrand]?: infer TUniqueKeys;
+}
+  ? TUniqueKeys extends readonly (readonly string[])[]
+    ? TUniqueKeys
+    : never
+  : never;
+
+type ProjectionTableKey<TTable> = ProjectionTableKeys<TTable>[number] &
+  readonly ProjectionTableColumnName<TTable>[];
 
 type ProjectionColumnScalar<TColumn> =
   TColumn extends ProjectionColumn<ProjectionColumnKind, infer TValue, boolean>
@@ -200,6 +244,26 @@ type CompatibleReferenceColumns<
     : never;
 } & { readonly length: TFromColumns["length"] };
 
+type ProjectionColumnNullable<TColumn> =
+  TColumn extends ProjectionColumn<
+    ProjectionColumnKind,
+    unknown,
+    infer TNullable
+  >
+    ? TNullable
+    : never;
+
+type ProjectionColumnsAllowSetNull<
+  TTable,
+  TColumns extends readonly ProjectionTableColumnName<TTable>[],
+> = false extends {
+  readonly [TIndex in keyof TColumns]: TColumns[TIndex] extends ProjectionTableColumnName<TTable>
+    ? ProjectionColumnNullable<ProjectionTableColumns<TTable>[TColumns[TIndex]]>
+    : false;
+}[number]
+  ? false
+  : true;
+
 export type ProjectionForeignKeyAction =
   | "cascade"
   | "no_action"
@@ -226,16 +290,32 @@ export type ProjectionReferenceBuilder<
     TTables[TFromTableName]
   >[],
 > = {
-  references<const TToTableName extends ProjectionTableName<TTables>>(
+  references<
+    const TToTableName extends ProjectionTableName<TTables>,
+    const TToColumns extends ProjectionTableKey<TTables[TToTableName]>,
+  >(
     tableName: TToTableName,
-    columns: CompatibleReferenceColumns<
-      TTables,
-      TFromTableName,
-      TFromColumns,
-      TToTableName
-    >,
-  ): ProjectionRelationDefinition;
+    columns: TToColumns &
+      CompatibleReferenceColumns<
+        TTables,
+        TFromTableName,
+        TFromColumns,
+        TToTableName
+      >,
+  ): ProjectionRelationDefinitionForSource<
+    ProjectionColumnsAllowSetNull<TTables[TFromTableName], TFromColumns>
+  >;
 };
+
+export type ProjectionRelationDefinitionForSource<TCanSetNull extends boolean> =
+  {
+    readonly metadata: ProjectionForeignKeyMetadata;
+    onDelete(
+      action: TCanSetNull extends true
+        ? ProjectionForeignKeyAction
+        : Exclude<ProjectionForeignKeyAction, "set_null">,
+    ): ProjectionRelationDefinitionForSource<TCanSetNull>;
+  };
 
 export type ProjectionRelationBuilder<TTables> = {
   foreignKey<
@@ -261,44 +341,105 @@ export type ProjectionSchema<
   TRelations extends ProjectionRelations,
 > = {
   readonly metadata: ProjectionSchemaMetadata;
-  readonly __tables?: TTables;
-  readonly __relations?: TRelations;
+  readonly [projectionSchemaTablesBrand]?: TTables;
+  readonly [projectionSchemaRelationsBrand]?: TRelations;
   relations<const TNextRelations extends ProjectionRelations>(
     build: (relations: ProjectionRelationBuilder<TTables>) => TNextRelations,
   ): ProjectionSchema<TTables, TNextRelations>;
 };
 
 export function defineProjectionSchema<
-  const TFactories extends AnyProjectionTableFactories<string>,
+  const TFactories extends ProjectionTableFactories<string>,
 >(
   factories: TFactories,
-): ProjectionSchema<InferProjectionTables<TFactories, string>, {}> {
+): ProjectionSchema<InferProjectionTables<TFactories>, {}> {
   return defineProjectionSchemaInternal(factories);
 }
 
 export function defineProjectionSchemaForEvents<TEventName extends string>() {
-  return <const TFactories extends AnyProjectionTableFactories<TEventName>>(
+  return <const TFactories extends ProjectionTableFactories<TEventName>>(
     factories: TFactories,
-  ): ProjectionSchema<InferProjectionTables<TFactories, TEventName>, {}> => {
+  ): ProjectionSchema<InferProjectionTables<TFactories>, {}> => {
     return defineProjectionSchemaInternal(factories);
   };
 }
 
 function defineProjectionSchemaInternal<
   TEventName extends string,
-  const TFactories extends AnyProjectionTableFactories<TEventName>,
+  const TFactories extends ProjectionTableFactories<TEventName>,
 >(
   factories: TFactories,
-): ProjectionSchema<InferProjectionTables<TFactories, TEventName>, {}> {
+): ProjectionSchema<InferProjectionTables<TFactories>, {}> {
   const tableBuilder = createProjectionTableBuilder<TEventName>();
   const tableMetadata: Record<string, ProjectionTableMetadata> = {};
 
   for (const [tableName, factory] of Object.entries(factories)) {
-    const table = factory(tableBuilder);
-    tableMetadata[tableName] = renameTableMetadata(table.metadata, tableName);
+    if (typeof factory !== "function") {
+      throw new Error(
+        `projection table ${tableName} factory must be a function`,
+      );
+    }
+
+    const tableFactory = factory as (
+      table: ProjectionTableBuilder<TEventName>,
+    ) => unknown;
+    const table = tableFactory(tableBuilder);
+    const metadata = readProjectionTableMetadata(table, tableName);
+    tableMetadata[tableName] = renameTableMetadata(metadata, tableName);
   }
 
   return createProjectionSchema(tableMetadata, {});
+}
+
+function readProjectionTableMetadata(
+  table: unknown,
+  tableName: string,
+): ProjectionTableMetadata {
+  if (typeof table !== "object" || table === null || Array.isArray(table)) {
+    throw new Error(
+      `projection table ${tableName} factory must return a table definition`,
+    );
+  }
+
+  const metadata = (table as { readonly metadata?: unknown }).metadata;
+
+  if (!isProjectionTableMetadata(metadata)) {
+    throw new Error(
+      `projection table ${tableName} factory must return a table definition`,
+    );
+  }
+
+  return metadata;
+}
+
+function isProjectionTableMetadata(
+  metadata: unknown,
+): metadata is ProjectionTableMetadata {
+  if (
+    typeof metadata !== "object" ||
+    metadata === null ||
+    Array.isArray(metadata)
+  ) {
+    return false;
+  }
+
+  const maybeMetadata = metadata as {
+    readonly columns?: unknown;
+    readonly indexes?: unknown;
+    readonly keys?: unknown;
+    readonly name?: unknown;
+    readonly primaryKey?: unknown;
+  };
+
+  return (
+    typeof maybeMetadata.name === "string" &&
+    typeof maybeMetadata.columns === "object" &&
+    maybeMetadata.columns !== null &&
+    !Array.isArray(maybeMetadata.columns) &&
+    Array.isArray(maybeMetadata.primaryKey) &&
+    Array.isArray(maybeMetadata.indexes) &&
+    Array.isArray(maybeMetadata.keys)
+  );
 }
 
 function createProjectionTableBuilder<
@@ -339,11 +480,19 @@ function createTableDraft<TColumns extends ProjectionColumns>(
   return {
     primaryKey: (primaryKey) => {
       validateColumns("primary key", columns, primaryKey);
+      validateNotNullColumns("primary key", columns, primaryKey);
       return createTableDefinition({
         name: "",
         columns: metadataForColumns(columns),
         primaryKey,
         indexes: [],
+        keys: [
+          {
+            columns: primaryKey,
+            kind: "primary",
+            name: null,
+          },
+        ],
       });
     },
   };
@@ -351,10 +500,11 @@ function createTableDraft<TColumns extends ProjectionColumns>(
 
 function createTableDefinition<
   TColumns extends ProjectionColumns,
-  TPrimaryKey extends readonly ProjectionColumnName<TColumns>[],
+  TPrimaryKey extends ProjectionNotNullColumnList<TColumns>,
+  TUniqueKeys extends ProjectionKeyList<TColumns>,
 >(
   metadata: ProjectionTableMetadata,
-): ProjectionTableDefinition<TColumns, TPrimaryKey> {
+): ProjectionTableDefinition<TColumns, TPrimaryKey, TUniqueKeys> {
   return {
     metadata,
     index: (name, columns) => {
@@ -383,6 +533,14 @@ function createTableDefinition<
             name,
             columns,
             unique: true,
+          },
+        ],
+        keys: [
+          ...metadata.keys,
+          {
+            columns,
+            kind: "unique",
+            name,
           },
         ],
       });
@@ -429,19 +587,23 @@ function createRelationBuilder<TTables>(
             String(toTable),
             toColumns,
           );
+          validateRelationReferencesKey(tables, String(toTable), toColumns);
 
           validateRelationColumnCompatibility(
             fromColumnsMetadata,
             toColumnsMetadata,
           );
 
-          return createRelationDefinition({
-            fromTable,
-            fromColumns,
-            toTable,
-            toColumns,
-            onDelete: "restrict",
-          });
+          return createRelationDefinition(
+            {
+              fromTable: String(fromTable),
+              fromColumns,
+              toTable: String(toTable),
+              toColumns,
+              onDelete: "restrict",
+            },
+            fromColumnsMetadata,
+          );
         },
       };
     },
@@ -450,14 +612,20 @@ function createRelationBuilder<TTables>(
 
 function createRelationDefinition(
   metadata: ProjectionForeignKeyMetadata,
+  fromColumns: readonly ProjectionColumnMetadata[],
 ): ProjectionRelationDefinition {
   return {
     metadata,
     onDelete: (action) => {
-      return createRelationDefinition({
-        ...metadata,
-        onDelete: action,
-      });
+      validateOnDeleteAction(action, fromColumns);
+
+      return createRelationDefinition(
+        {
+          ...metadata,
+          onDelete: action,
+        },
+        fromColumns,
+      );
     },
   };
 }
@@ -518,6 +686,26 @@ function validateColumns(
   }
 }
 
+function validateNotNullColumns(
+  context: string,
+  columns: Readonly<
+    Record<string, ProjectionColumn<ProjectionColumnKind, unknown, boolean>>
+  >,
+  selectedColumns: readonly string[],
+): void {
+  for (const columnName of selectedColumns) {
+    const column = columns[columnName];
+
+    if (column === undefined) {
+      throw new Error(`${context} references unknown column ${columnName}`);
+    }
+
+    if (column.metadata.nullable) {
+      throw new Error(`${context} column ${columnName} must be not null`);
+    }
+  }
+}
+
 function validateRelationEndpoint(
   context: string,
   tables: Readonly<Record<string, ProjectionTableMetadata>>,
@@ -568,6 +756,58 @@ function validateRelationColumnCompatibility(
       throw new Error("foreign key reference columns must have matching types");
     }
   }
+}
+
+function validateRelationReferencesKey(
+  tables: Readonly<Record<string, ProjectionTableMetadata>>,
+  tableName: string,
+  columns: readonly string[],
+): void {
+  const table = tables[tableName];
+
+  if (table === undefined) {
+    throw new Error(
+      `foreign key reference references unknown table ${tableName}`,
+    );
+  }
+
+  const referencesKey = table.keys.some((key) => {
+    return equalColumnLists(key.columns, columns);
+  });
+
+  if (!referencesKey) {
+    throw new Error(
+      `foreign key reference must target a primary or unique key on ${tableName}`,
+    );
+  }
+}
+
+function validateOnDeleteAction(
+  action: ProjectionForeignKeyAction,
+  fromColumns: readonly ProjectionColumnMetadata[],
+): void {
+  if (action !== "set_null") {
+    return;
+  }
+
+  const allColumnsNullable = fromColumns.every((column) => column.nullable);
+
+  if (!allColumnsNullable) {
+    throw new Error(
+      "foreign key onDelete set_null requires nullable source columns",
+    );
+  }
+}
+
+function equalColumnLists(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((columnName, index) => columnName === right[index]);
 }
 
 function validateIndexName(name: string): void {
