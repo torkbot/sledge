@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 
 import { createEventRef } from "./event-ref.ts";
 import type {
-  BoundLedgerModel,
+  RegisteredLedgerModel,
   EventEnvelope,
   Ledger,
   LedgerCursor,
@@ -90,7 +90,7 @@ type OpenDatabaseLedgerEngineInput<
   TIndexers extends Record<string, AnyIndexerDef>,
   TQueries extends Record<string, AnyQueryDef>,
 > = {
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -111,7 +111,7 @@ export type CreateDatabaseLedgerInput<
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
   readonly storage: StorageRuntime;
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -140,7 +140,7 @@ export function createDatabaseLedger<
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
-    boundModel: input.boundModel,
+    model: input.model,
     timing: input.timing,
     storage: input.storage,
   });
@@ -365,9 +365,9 @@ function openDatabaseLedgerEngine<
 ): Ledger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
   const storage = input.storage;
-  const model = input.boundModel.model;
-  const implementations = input.boundModel.implementations;
-  const registration = input.boundModel.register;
+  const model = input.model.model;
+  const implementations = input.model.implementations;
+  const registration = input.model.register;
 
   let closed = false;
   let activeWorker: WorkerRuntimeState | null = null;

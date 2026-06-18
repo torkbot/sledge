@@ -28,7 +28,7 @@ const shape = defineLedgerShape({
 
 const definedModel = shape.withProjections(
   (p) =>
-    p.schema({
+    p.tables({
       users: (t) =>
         t
           .columns({
@@ -97,7 +97,7 @@ const definedModel = shape.withProjections(
   },
 );
 
-const boundModelWithoutHandlers = definedModel.register({});
+const registeredModelWithoutHandlers = definedModel.register({});
 
 type FakeStatementCall = {
   readonly method: "all" | "exec" | "get" | "run";
@@ -190,8 +190,9 @@ function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
 
 test("projection access compiles typed indexer and query builders to storage operations", async () => {
   const indexer =
-    boundModelWithoutHandlers.implementations.indexers?.upsertUser;
-  const query = boundModelWithoutHandlers.implementations.queries?.userById;
+    registeredModelWithoutHandlers.implementations.indexers?.upsertUser;
+  const query =
+    registeredModelWithoutHandlers.implementations.queries?.userById;
 
   if (indexer === undefined) {
     throw new Error("expected upsertUser indexer implementation");
@@ -232,7 +233,7 @@ test("projection access compiles typed indexer and query builders to storage ope
   assert.deepEqual(fake.calls[1], {
     method: "get",
     params: ["u_123"],
-    sql: 'SELECT "userId", "email", "source" FROM "users" WHERE "userId" = ? LIMIT 1',
+    sql: 'SELECT "userId" AS "userId", "email" AS "email", "source" AS "source" FROM "users" WHERE "userId" = ? LIMIT 1',
   });
   assert.deepEqual(row, {
     userId: "u_123",
@@ -245,7 +246,7 @@ test("projection access compiles typed indexer and query builders to storage ope
 });
 
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
-  const boundModel = definedModel.register({
+  const registeredModel = definedModel.register({
     events: {
       "user.created": async ({ event, actions }) => {
         await actions.index("upsertUser", {
@@ -256,26 +257,44 @@ test("ledger projection construction feeds generated contracts and implementatio
     },
   });
 
-  assert.equal(boundModel.model.events["user.created"], UserCreatedSchema);
+  assert.equal(registeredModel.model.events["user.created"], UserCreatedSchema);
   assert.equal(
-    boundModel.model.indexers.upsertUser,
+    registeredModel.model.indexers.upsertUser,
     definedModel.model.indexers.upsertUser,
   );
   assert.equal(
-    boundModel.model.queries.userById,
+    registeredModel.model.queries.userById,
     definedModel.model.queries.userById,
   );
   assert.equal(
-    boundModel.implementations.indexers?.upsertUser,
-    boundModelWithoutHandlers.implementations.indexers?.upsertUser,
+    registeredModel.implementations.indexers?.upsertUser,
+    registeredModelWithoutHandlers.implementations.indexers?.upsertUser,
   );
-  assert.equal(boundModel.projections, definedModel.projections);
+  assert.equal(registeredModel.projections, definedModel.projections);
+});
+
+test("ledger shape can register without projections", () => {
+  const registeredModel = shape.register({
+    events: {
+      "user.created": ({ event }) => {
+        void event.payload.userId;
+      },
+    },
+  });
+
+  assert.equal(registeredModel.model.events["user.created"], UserCreatedSchema);
+  assert.deepEqual(registeredModel.model.indexers, {});
+  assert.deepEqual(registeredModel.model.queries, {});
+  assert.deepEqual(registeredModel.projections.metadata, {
+    tables: {},
+    relations: {},
+  });
 });
 
 async function assertLedgerProjectionTypes(): Promise<void> {
   shape.withProjections(
     (p) =>
-      p.schema({
+      p.tables({
         sessions: (t) =>
           t
             .columns({
@@ -293,7 +312,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
 
   shape.withProjections(
     (p) =>
-      p.schema({
+      p.tables({
         users: (t) =>
           t
             .columns({

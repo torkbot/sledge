@@ -61,7 +61,7 @@ const definedModel = defineLedgerShape({
   signalQueues: {},
 }).withProjections(
   (p) =>
-    p.schema({
+    p.tables({
       users: (t) =>
         t
           .columns({
@@ -158,7 +158,7 @@ const model = definedModel.register({
 
 await using ledger = createBetterSqliteLedger({
   databaseUrl,
-  boundModel: model,
+  model,
   timing: {
     clock: new SystemRuntimeClock(),
   },
@@ -193,7 +193,7 @@ category.
 
 ### 2. Attach Projections
 
-Call `.withProjections(schemaBuilderFn, { indexers, queries })` to attach
+Call `.withProjections((p) => p.tables(...), { indexers, queries })` to attach
 projection tables and access callbacks to the ledger shape.
 
 The schema builder is scoped to the ledger event names, so semantic event refs
@@ -210,12 +210,15 @@ The access callbacks receive sledge-owned facades:
 
 They do not receive a raw storage handle.
 
+Ledgers without projection tables can skip this step and call
+`defineLedgerShape(...).register(...)` directly.
+
 ### 3. Register Orchestration
 
 Call `definedModel.register(...)` to attach event, queue, signal, and
 signal-queue handlers. Event handlers can `index`, `enqueue`, and `query`.
 
-Registration returns the bound model passed to a storage adapter. There is no
+Registration returns the model passed to a storage adapter. There is no
 separate bind step: projection access definitions already compiled the indexer
 and query implementations.
 
@@ -328,7 +331,6 @@ Cursor values are opaque. Persist and reuse them as-is.
 ## Package Exports
 
 - `@torkbot/sledge/ledger`
-- `@torkbot/sledge/projections`
 - `@torkbot/sledge/database-ledger-engine`
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`

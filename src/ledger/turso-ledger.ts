@@ -8,7 +8,7 @@ import {
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import type {
-  BoundLedgerModel,
+  RegisteredLedgerModel,
   Ledger,
   LedgerTiming,
   QuerySchema,
@@ -26,7 +26,7 @@ type CreateTursoLedgerInput<
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
   readonly databaseUrl: string;
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -63,7 +63,7 @@ export async function createTursoLedger<
     TSignalQueues
   > = {
     storage: await createTursoStorageRuntime(input.databaseUrl),
-    boundModel: input.boundModel,
+    model: input.model,
     timing: input.timing,
   };
 

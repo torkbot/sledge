@@ -3,7 +3,7 @@ import type { TSchema } from "typebox";
 
 import type {
   Ledger,
-  BoundLedgerModel,
+  RegisteredLedgerModel,
   LedgerTiming,
   QuerySchema,
 } from "./ledger.ts";
@@ -30,7 +30,7 @@ type CreateBetterSqliteLedgerInput<
   TSignalQueues extends Record<string, TSchema> = {},
 > = {
   readonly databaseUrl: string;
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -67,7 +67,7 @@ export function createBetterSqliteLedger<
     TSignalQueues
   > = {
     storage: createBetterSqliteStorageRuntime(input.databaseUrl),
-    boundModel: input.boundModel,
+    model: input.model,
     timing: input.timing,
   };
 

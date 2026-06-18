@@ -751,7 +751,12 @@ function buildSelectSql(
   selectedColumns: readonly string[],
   whereClauses: readonly ProjectionWhereClause[],
 ): string {
-  const selectedSql = selectedColumns.map(quoteIdentifier).join(", ");
+  const selectedSql = selectedColumns
+    .map((columnName) => {
+      const quotedColumnName = quoteIdentifier(columnName);
+      return `${quotedColumnName} AS ${quotedColumnName}`;
+    })
+    .join(", ");
   let sql = `SELECT ${selectedSql} FROM ${quoteIdentifier(table.name)}`;
 
   if (whereClauses.length === 0) {

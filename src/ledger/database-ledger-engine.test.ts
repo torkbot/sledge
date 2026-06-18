@@ -19,7 +19,7 @@ import {
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
-  type BoundLedgerModel,
+  type RegisteredLedgerModel,
   type LedgerImplementations,
   type LedgerModel,
   type QuerySchema,
@@ -52,9 +52,9 @@ type EngineFixtureModel<
     TSignals,
     TSignalQueues
   >;
-  bind(
+  withImplementations(
     implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
-  ): BoundLedgerModel<
+  ): RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -114,13 +114,22 @@ function defineEngineFixtureModel<
   return {
     model,
     register: input.register,
-    bind(implementations) {
+    withImplementations(implementations) {
+      // Engine tests exercise custom storage hooks that the public v2
+      // construction path deliberately no longer exposes.
       return {
         model,
         projections,
         register: input.register,
         implementations,
-      };
+      } as unknown as RegisteredLedgerModel<
+        TEvents,
+        TQueues,
+        TIndexers,
+        TQueries,
+        TSignals,
+        TSignalQueues
+      >;
     },
   };
 }
@@ -441,7 +450,7 @@ test("ledger queries do not block external write transactions", async () => {
 
   await using ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(serializedStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         slow: async () => {
@@ -522,7 +531,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
 
   await using ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(serializedStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -579,7 +588,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
 
   await using ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         eventCount: async () => {
@@ -637,7 +646,7 @@ test("event-handler query actions expire after handler completion", async () => 
 
   await using ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         eventCount: async () => {
@@ -735,7 +744,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
 
   await using ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(serializedStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         slow: async () => {
@@ -813,7 +822,7 @@ test("ledger construction and emit do not start queue workers", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -902,7 +911,7 @@ test("closing workers during a pending claim releases the claimed work", async (
 
   await using ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(blockingStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -979,7 +988,7 @@ test("idle workers discover work materialized by another ledger handle", async (
   try {
     await using workerLedger = createBetterSqliteLedger({
       databaseUrl,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -990,7 +999,7 @@ test("idle workers discover work materialized by another ledger handle", async (
 
     await using emitterLedger = createBetterSqliteLedger({
       databaseUrl,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -1059,7 +1068,7 @@ test("ledger close waits for startup before closing storage", async () => {
   try {
     await using ledger = createDatabaseLedger({
       storage,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -1111,7 +1120,7 @@ test("ledger close closes storage after startup failure", async () => {
 
   const ledger = createDatabaseLedger({
     storage,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1195,7 +1204,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
 
   const ledger = createDatabaseLedger({
     storage: singleConnectionStorageRuntime(failingStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1251,7 +1260,7 @@ test("startWorkers rejects while workers are already running", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1306,7 +1315,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1392,7 +1401,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1481,7 +1490,7 @@ test("deduped emit does not replay projections or materialization", async () => 
   try {
     await using ledger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {
           trackProjection: async () => {
             projected += 1;
@@ -1571,7 +1580,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         "config.enabled": async () => enabled,
@@ -1703,7 +1712,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1833,7 +1842,7 @@ test("queue handlers publish signals immediately before handler completion", asy
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1933,7 +1942,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2003,7 +2012,7 @@ test("emit fails fast when busy retries are disabled", async () => {
 
   const ledger = createBetterSqliteLedger({
     databaseUrl: databasePath,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2084,7 +2093,7 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2162,7 +2171,7 @@ test("tailEvents does not expose rolled back events from a shared read/write sco
       storage: singleConnectionStorageRuntime(
         wrapBetterSqliteDatabase(database),
       ),
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2225,7 +2234,7 @@ test("tailEvents yields last N events then follows new events", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2304,7 +2313,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
   try {
     await using firstLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2315,7 +2324,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
 
     await using secondLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2380,7 +2389,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
   try {
     await using firstLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2391,7 +2400,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
 
     await using secondLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2456,7 +2465,7 @@ test("resumeEvents continues from opaque cursor", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2550,7 +2559,7 @@ test("tail iterator return stops stream without external abort", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2623,7 +2632,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2734,7 +2743,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2806,7 +2815,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2879,7 +2888,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -2938,7 +2947,7 @@ test("listWork applies state filters before limit", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -2990,7 +2999,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -3053,7 +3062,7 @@ test("work key migration adds column before creating ref index", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -3093,7 +3102,7 @@ test("enqueue rejects empty work keys", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 

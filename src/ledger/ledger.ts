@@ -21,6 +21,29 @@ import {
   type ProjectionTablesForFactories,
 } from "./projections.ts";
 
+const registeredLedgerModelBrand: unique symbol = Symbol(
+  "sledge.registeredLedgerModel",
+);
+
+export type {
+  ProjectionExecutableSelect,
+  ProjectionExecutableWrite,
+  ProjectionIndexerBuilder,
+  ProjectionIndexerEvent,
+  ProjectionIndexerRunInput,
+  ProjectionInsertBuilder,
+  ProjectionInsertConflictBuilder,
+  ProjectionInsertOnConflictBuilder,
+  ProjectionQueryBuilder,
+  ProjectionQueryRunInput,
+  ProjectionReadDatabase,
+  ProjectionSelectBuilder,
+  ProjectionSelectedRow,
+  ProjectionUpdateRow,
+  ProjectionWriteDatabase,
+  ProjectionWriteRow,
+} from "./projection-access.ts";
+
 /**
  * Optional knobs for producer-side event emission.
  */
@@ -524,7 +547,7 @@ export type LedgerTiming = {
   readonly clock: RuntimeClock;
 };
 
-export type BoundLedgerModel<
+export type RegisteredLedgerModel<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, TSchema> = {},
@@ -533,6 +556,7 @@ export type BoundLedgerModel<
   TSignalQueues extends Record<string, TSchema> = {},
   TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
 > = {
+  readonly [registeredLedgerModelBrand]: true;
   readonly model: LedgerModel<
     TEvents,
     TQueues,
@@ -566,7 +590,7 @@ export type LedgerShape<
 };
 
 export type LedgerProjectionSchemaBuilder<TEventName extends string> = {
-  schema<const TFactories extends ProjectionTableFactories<TEventName>>(
+  tables<const TFactories extends ProjectionTableFactories<TEventName>>(
     factories: TFactories,
   ): ProjectionSchema<ProjectionTablesForFactories<TFactories>, {}, TEventName>;
 };
@@ -591,6 +615,24 @@ export type DefinedLedgerShape<
   TSignalQueues extends Record<string, TSchema>,
 > = {
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
+  register(
+    register: RegisterFunction<
+      TEvents,
+      TQueues,
+      {},
+      {},
+      TSignals,
+      TSignalQueues
+    >,
+  ): RegisteredLedgerModel<
+    TEvents,
+    TQueues,
+    {},
+    {},
+    TSignals,
+    TSignalQueues,
+    ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>
+  >;
   withProjections<
     const TProjectionSchema extends AnyProjectionSchema,
     const TIndexerFactories extends
@@ -648,7 +690,7 @@ export type DefinedLedgerModel<
       TSignals,
       TSignalQueues
     >,
-  ): BoundLedgerModel<
+  ): RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -679,6 +721,12 @@ export function defineLedgerShape<
 
   return {
     shape,
+    register: (register) => {
+      return createDefinedLedgerModel({
+        shape,
+        access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
+      }).register(register);
+    },
     withProjections: (defineSchema, accessDefinition) => {
       const projections = defineSchema(
         createLedgerProjectionSchemaBuilder<Extract<keyof TEvents, string>>(),
@@ -703,9 +751,20 @@ function createLedgerProjectionSchemaBuilder<
   const defineSchema = defineProjectionSchemaForEvents<TEventName>();
 
   return {
-    schema: (factories) => {
+    tables: (factories) => {
       return defineSchema(factories);
     },
+  };
+}
+
+function createEmptyProjectionAccess<
+  TEventName extends string,
+>(): ProjectionAccess<ProjectionSchema<{}, {}, TEventName>, {}, {}> {
+  return {
+    projections: defineProjectionSchemaForEvents<TEventName>()({}),
+    indexers: {},
+    queries: {},
+    implementations: {},
   };
 }
 
@@ -753,6 +812,7 @@ function createDefinedLedgerModel<
         .implementations as LedgerImplementations<TIndexers, TQueries, TEvents>;
 
       return {
+        [registeredLedgerModelBrand]: true,
         model,
         projections: input.access.projections,
         register,
@@ -774,7 +834,7 @@ export interface LedgerEngineFactory {
     TSignals extends Record<string, TSchema> = {},
     TSignalQueues extends Record<string, TSchema> = {},
   >(input: {
-    readonly boundModel: BoundLedgerModel<
+    readonly model: RegisteredLedgerModel<
       TEvents,
       TQueues,
       TIndexers,
@@ -794,7 +854,7 @@ export function createLedger<
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
 >(input: {
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -806,7 +866,7 @@ export function createLedger<
   readonly timing: LedgerTiming;
 }): Ledger<TEvents, TQueries, TSignals> {
   return input.engineFactory.openLedger({
-    boundModel: input.boundModel,
+    model: input.model,
     timing: input.timing,
   });
 }
