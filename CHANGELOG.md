@@ -2,10 +2,14 @@
 
 ## Unreleased
 
-- Add `@torkbot/sledge/projections` as an exploratory typed projection-schema
-  surface for v2 design work. It records table-local columns, indexes, semantic
-  event references, and second-phase cross-table foreign-key metadata without
-  changing the existing runtime.
+- Add exploratory v2 projection APIs: `@torkbot/sledge/projections` records
+  typed table-local columns, indexes, semantic event references, and
+  second-phase foreign-key metadata, while `@torkbot/sledge/projected-ledger`
+  wires projection access definitions into the existing ledger construction
+  path.
+- Add ledger-owned event refs on event envelopes so projection access callbacks
+  can write semantic event references without exposing the internal events
+  table.
 
 ## 0.9.0 - 2026-05-20
 

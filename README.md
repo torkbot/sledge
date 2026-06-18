@@ -482,28 +482,42 @@ Available options when starting workers:
 
 Start simple; tune only when you observe contention/throughput issues.
 
-## Typed projection schema exploration
+## Typed projection access exploration
 
 Sledge v2 is exploring a stricter separation between ledger shape, projection
-schema, access definitions, storage hygiene, and runtime use. The first building
-block is `@torkbot/sledge/projections`, which records projection tables,
-table-local indexes, semantic event references, and cross-table foreign keys as
-typed metadata.
+schema, access definitions, storage hygiene, and runtime use. The current
+exploratory surface splits the TypeBox ledger shape from relational projection
+DDL, then binds typed projection indexers and queries back into the existing
+runtime model.
 
 ```ts
+import { Type } from "typebox";
+
 import {
-  defineProjectionSchemaForEvents,
-  type EventRef,
-  type ProjectionRow,
-  type ProjectionSchemaTables,
-  type ProjectionTableColumns,
-} from "@torkbot/sledge/projections";
+  bindProjectedLedgerModel,
+  defineLedgerShape,
+  defineProjectedLedgerModel,
+  defineProjectionAccess,
+  registerProjectedLedgerModel,
+  type LedgerShapeEventName,
+} from "@torkbot/sledge/projected-ledger";
+import { defineProjectionSchemaForEvents } from "@torkbot/sledge/projections";
 
-const defineProjections = defineProjectionSchemaForEvents<
-  "session.created" | "user.created"
->();
+const shape = defineLedgerShape({
+  events: {
+    "user.created": Type.Object({
+      userId: Type.String(),
+      email: Type.String(),
+    }),
+  },
+  queues: {},
+  signals: {},
+  signalQueues: {},
+});
 
-const projections = defineProjections({
+const projections = defineProjectionSchemaForEvents<
+  LedgerShapeEventName<typeof shape>
+>()({
   users: (t) =>
     t
       .columns({
@@ -511,53 +525,98 @@ const projections = defineProjections({
         email: t.text().notNull(),
         source: t.eventRef("user.created").notNull(),
       })
-      .primaryKey(["userId"])
-      .unique("users_email_unique", ["email"]),
+      .primaryKey(["userId"]),
+});
 
-  sessions: (t) =>
-    t
-      .columns({
-        sessionId: t.text().notNull(),
-        userId: t.text().notNull(),
-        source: t.eventRef("session.created").notNull(),
-      })
-      .primaryKey(["sessionId"])
-      .index("sessions_by_user", ["userId"]),
-}).relations((r) => ({
-  sessionUser: r
-    .foreignKey("sessions", ["userId"])
-    .references("users", ["userId"])
-    .onDelete("cascade"),
-}));
+const access = defineProjectionAccess({
+  projections,
+  indexers: {
+    upsertUser: (i) =>
+      i
+        .sourceEvent("user.created")
+        .input(
+          Type.Object({
+            userId: Type.String(),
+            email: Type.String(),
+          }),
+        )
+        .write(async ({ input, event, db }) => {
+          await db
+            .insertInto("users")
+            .values({
+              userId: input.userId,
+              email: input.email,
+              source: event.ref,
+            })
+            .onConflict(["userId"])
+            .doUpdateSet({
+              email: input.email,
+              source: event.ref,
+            })
+            .execute();
+        }),
+  },
+  queries: {
+    userById: (q) =>
+      q
+        .params(Type.Object({ userId: Type.String() }))
+        .result(
+          Type.Union([
+            Type.Null(),
+            Type.Object({
+              userId: Type.String(),
+              email: Type.String(),
+            }),
+          ]),
+        )
+        .read(async ({ params, db }) => {
+          const row = await db
+            .selectFrom("users")
+            .select(["userId", "email"])
+            .where("userId", "=", params.userId)
+            .executeTakeFirst();
 
-type Tables = ProjectionSchemaTables<typeof projections>;
-type UserRow = ProjectionRow<ProjectionTableColumns<Tables["users"]>>;
+          if (row === null) {
+            return null;
+          }
 
-const source: EventRef<"user.created"> = {
-  eventName: "user.created",
-  eventId: 1,
-};
-const row: UserRow = {
-  userId: "u_123",
-  email: "alice@example.com",
-  source,
-};
+          return {
+            userId: row.userId,
+            email: row.email,
+          };
+        }),
+  },
+});
+
+const definedModel = defineProjectedLedgerModel({ shape, access });
+const registeredModel = registerProjectedLedgerModel(definedModel, {
+  events: {
+    "user.created": async ({ event, actions }) => {
+      await actions.index("upsertUser", {
+        userId: event.payload.userId,
+        email: event.payload.email,
+      });
+    },
+  },
+});
+const boundModel = bindProjectedLedgerModel(registeredModel);
 ```
 
 The intended v2 lifecycle is:
 
-1. Define the ledger shape with TypeBox event, queue, signal, indexer, and query
+1. Define the ledger shape with TypeBox event, queue, signal, and signal-queue
    contracts.
 2. Define projection schema separately with table-local relational builders.
 3. Define named indexers and queries over those projections using a sledge-owned
-   query facade.
+   access facade.
 4. Establish a storage connection.
 5. Run database hygiene explicitly: internal migrations first, then projection
    migrations.
 6. Open a tenant-scoped runtime ledger.
 
-This projection API is metadata-only today. It does not yet compile migrations,
-execute queries, or change the current SQLite/Turso runtime behavior.
+The access facade compiles a deliberately small insert/upsert/select DSL to the
+current storage scope, so callbacks in this path do not receive raw SQL handles.
+Projection migrations and a Postgres runtime are still future work.
 
 ---
 
@@ -565,6 +624,7 @@ execute queries, or change the current SQLite/Turso runtime behavior.
 
 - `@torkbot/sledge/ledger`
 - `@torkbot/sledge/projections`
+- `@torkbot/sledge/projected-ledger`
 - `@torkbot/sledge/database-ledger-engine`
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`

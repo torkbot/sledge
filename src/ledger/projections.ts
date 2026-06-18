@@ -1,18 +1,14 @@
-declare const eventRefBrand: unique symbol;
+import type { EventRef } from "./event-ref.ts";
+
+export type { EventRef } from "./event-ref.ts";
+
 declare const projectionColumnValueBrand: unique symbol;
+declare const projectionSchemaEventNamesBrand: unique symbol;
 declare const projectionSchemaRelationsBrand: unique symbol;
 declare const projectionSchemaTablesBrand: unique symbol;
 declare const projectionTableColumnsBrand: unique symbol;
 declare const projectionTablePrimaryKeyBrand: unique symbol;
 declare const projectionTableUniqueKeysBrand: unique symbol;
-
-export type EventRef<TEventName extends string> = {
-  readonly eventName: TEventName;
-  readonly eventId: number;
-  readonly [eventRefBrand]: {
-    readonly eventName: TEventName;
-  };
-};
 
 export type ProjectionColumnKind =
   | "boolean"
@@ -62,10 +58,19 @@ export type ProjectionRow<TColumns extends ProjectionColumns> = {
   >;
 };
 
-export type ProjectionSchemaTables<TSchema> =
-  TSchema extends ProjectionSchema<infer TTables, ProjectionRelations>
-    ? TTables
-    : never;
+export type ProjectionSchemaTables<TSchema> = TSchema extends {
+  readonly [projectionSchemaTablesBrand]?: infer TTables;
+}
+  ? TTables
+  : never;
+
+export type ProjectionSchemaEventName<TSchema> = TSchema extends {
+  readonly [projectionSchemaEventNamesBrand]?: infer TEventName;
+}
+  ? TEventName extends string
+    ? TEventName
+    : never
+  : never;
 
 export type ProjectionTableColumns<TTable> = TTable extends {
   readonly [projectionTableColumnsBrand]?: infer TColumns;
@@ -189,9 +194,9 @@ type InferProjectionTables<TFactories> = {
     : never;
 };
 
-type ProjectionTableName<TTables> = Extract<keyof TTables, string>;
+export type ProjectionTableName<TTables> = Extract<keyof TTables, string>;
 
-type ProjectionTableColumnName<TTable> = Extract<
+export type ProjectionTableColumnName<TTable> = Extract<
   keyof ProjectionTableColumns<TTable>,
   string
 >;
@@ -204,7 +209,7 @@ type ProjectionTableKeys<TTable> = TTable extends {
     : never
   : never;
 
-type ProjectionTableKey<TTable> = ProjectionTableKeys<TTable>[number] &
+export type ProjectionTableKey<TTable> = ProjectionTableKeys<TTable>[number] &
   readonly ProjectionTableColumnName<TTable>[];
 
 type ProjectionColumnScalar<TColumn> =
@@ -339,27 +344,29 @@ export type ProjectionSchemaMetadata = {
 export type ProjectionSchema<
   TTables,
   TRelations extends ProjectionRelations,
+  TEventName extends string = string,
 > = {
   readonly metadata: ProjectionSchemaMetadata;
+  readonly [projectionSchemaEventNamesBrand]?: TEventName;
   readonly [projectionSchemaTablesBrand]?: TTables;
   readonly [projectionSchemaRelationsBrand]?: TRelations;
   relations<const TNextRelations extends ProjectionRelations>(
     build: (relations: ProjectionRelationBuilder<TTables>) => TNextRelations,
-  ): ProjectionSchema<TTables, TNextRelations>;
+  ): ProjectionSchema<TTables, TNextRelations, TEventName>;
 };
 
 export function defineProjectionSchema<
   const TFactories extends ProjectionTableFactories<string>,
 >(
   factories: TFactories,
-): ProjectionSchema<InferProjectionTables<TFactories>, {}> {
+): ProjectionSchema<InferProjectionTables<TFactories>, {}, string> {
   return defineProjectionSchemaInternal(factories);
 }
 
 export function defineProjectionSchemaForEvents<TEventName extends string>() {
   return <const TFactories extends ProjectionTableFactories<TEventName>>(
     factories: TFactories,
-  ): ProjectionSchema<InferProjectionTables<TFactories>, {}> => {
+  ): ProjectionSchema<InferProjectionTables<TFactories>, {}, TEventName> => {
     return defineProjectionSchemaInternal(factories);
   };
 }
@@ -369,7 +376,7 @@ function defineProjectionSchemaInternal<
   const TFactories extends ProjectionTableFactories<TEventName>,
 >(
   factories: TFactories,
-): ProjectionSchema<InferProjectionTables<TFactories>, {}> {
+): ProjectionSchema<InferProjectionTables<TFactories>, {}, TEventName> {
   const tableBuilder = createProjectionTableBuilder<TEventName>();
   const tableMetadata: Record<string, ProjectionTableMetadata> = {};
 
@@ -388,7 +395,11 @@ function defineProjectionSchemaInternal<
     tableMetadata[tableName] = renameTableMetadata(metadata, tableName);
   }
 
-  return createProjectionSchema(tableMetadata, {});
+  return createProjectionSchema<
+    InferProjectionTables<TFactories>,
+    {},
+    TEventName
+  >(tableMetadata, {});
 }
 
 function readProjectionTableMetadata(
@@ -551,18 +562,24 @@ function createTableDefinition<
 function createProjectionSchema<
   TTables,
   TRelations extends ProjectionRelations,
+  TEventName extends string,
 >(
   tables: Readonly<Record<string, ProjectionTableMetadata>>,
   relations: TRelations,
-): ProjectionSchema<TTables, TRelations> {
+): ProjectionSchema<TTables, TRelations, TEventName> {
   return {
     metadata: {
       tables,
       relations: metadataForRelations(relations),
     },
-    relations: (build) => {
+    relations: <const TNextRelations extends ProjectionRelations>(
+      build: (relations: ProjectionRelationBuilder<TTables>) => TNextRelations,
+    ) => {
       const relationDefinitions = build(createRelationBuilder<TTables>(tables));
-      return createProjectionSchema(tables, relationDefinitions);
+      return createProjectionSchema<TTables, TNextRelations, TEventName>(
+        tables,
+        relationDefinitions,
+      );
     },
   };
 }

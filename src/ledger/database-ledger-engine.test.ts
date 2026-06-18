@@ -46,7 +46,7 @@ type LegacyRegisteredLedgerModel<
   TSignalQueues
 > & {
   bind(
-    implementations: LedgerImplementations<TIndexers, TQueries>,
+    implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
   ): BoundLedgerModel<
     TEvents,
     TQueues,

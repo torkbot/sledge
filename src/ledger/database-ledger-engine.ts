@@ -4,6 +4,8 @@ import { Type, type Static, type TSchema } from "typebox";
 
 import Sqids from "sqids";
 import { Value } from "typebox/value";
+
+import { createEventRef } from "./event-ref.ts";
 import type {
   BoundLedgerModel,
   EventEnvelope,
@@ -14,6 +16,7 @@ import type {
   LedgerStorageStatement,
   LedgerStorageRow,
   LedgerTiming,
+  LedgerIndexerContext,
   LedgerWorkerOptions,
   LedgerWorkers,
   QuerySchema,
@@ -331,6 +334,10 @@ function readEventEnvelopeFromRow<
 
   return {
     eventId: decodedRow.event_id,
+    ref: createEventRef(
+      String(eventName) as Extract<TEventName, string>,
+      decodedRow.event_id,
+    ),
     tsMs: decodedRow.ts_ms,
     eventName,
     payload,
@@ -377,6 +384,7 @@ function openDatabaseLedgerEngine<
     readonly index: <const TIndexName extends keyof TIndexers>(
       indexName: TIndexName,
       input: Static<TIndexers[TIndexName]>,
+      context: LedgerIndexerContext<TEvents>,
     ) => Promise<void>;
   };
 
@@ -825,6 +833,7 @@ function openDatabaseLedgerEngine<
     database: StorageDatabase,
     indexName: TIndexName,
     indexInput: Static<TIndexers[TIndexName]>,
+    context: LedgerIndexerContext<TEvents>,
   ) {
     const schema = model.indexers[indexName];
 
@@ -840,7 +849,7 @@ function openDatabaseLedgerEngine<
 
     const decodedInput = decodeValue(schema, indexInput);
 
-    await implementation(database, decodedInput as never);
+    await implementation(database, decodedInput as never, context);
   }
 
   function createTransactionScope(database: StorageDatabase): TransactionScope {
@@ -848,8 +857,8 @@ function openDatabaseLedgerEngine<
       query: async (queryName, params) => {
         return await runQueryImplementation(database, queryName, params);
       },
-      index: async (indexName, input) => {
-        await runIndexerImplementation(database, indexName, input);
+      index: async (indexName, input, context) => {
+        await runIndexerImplementation(database, indexName, input, context);
       },
     };
   }
@@ -920,6 +929,10 @@ function openDatabaseLedgerEngine<
 
     const envelope: EventEnvelope<TEvents, keyof TEvents> = {
       eventId,
+      ref: createEventRef(
+        String(eventName) as Extract<keyof TEvents, string>,
+        eventId,
+      ),
       tsMs: eventInput.nowMs,
       eventName,
       payload: decodedPayload,
@@ -988,7 +1001,9 @@ function openDatabaseLedgerEngine<
           actions: {
             index: (indexName, indexInput) => {
               return trackAction(async () => {
-                await tx.index(indexName, indexInput);
+                await tx.index(indexName, indexInput, {
+                  event: envelope,
+                });
               });
             },
             enqueue: (queueName, payload, options) => {
@@ -1144,6 +1159,10 @@ function openDatabaseLedgerEngine<
 
     const envelope: EventEnvelope<TSignals, keyof TSignals> = {
       eventId,
+      ref: createEventRef(
+        String(signalName) as Extract<keyof TSignals, string>,
+        eventId,
+      ),
       tsMs: signalInput.nowMs,
       eventName: signalName,
       payload: decodedPayload,

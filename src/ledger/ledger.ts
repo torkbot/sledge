@@ -1,6 +1,7 @@
 import type { Static, TSchema } from "typebox";
 
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
+import type { EventRef } from "./event-ref.ts";
 
 /**
  * Optional knobs for producer-side event emission.
@@ -51,11 +52,18 @@ export type EventEnvelope<
   TEventName extends keyof TEvents,
 > = {
   readonly eventId: number;
+  readonly ref: EventRef<Extract<TEventName, string>>;
   readonly tsMs: number;
   readonly eventName: TEventName;
   readonly payload: Static<TEvents[TEventName]>;
   readonly causationEventId: number | null;
   readonly dedupeKey: string | null;
+};
+
+export type LedgerIndexerContext<
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+> = {
+  readonly event: EventEnvelope<TEvents, keyof TEvents>;
 };
 
 /**
@@ -114,11 +122,13 @@ export interface LedgerStorageScope {
 export type LedgerImplementations<
   TIndexers extends Record<string, TSchema> = {},
   TQueries extends Record<string, AnyQuerySchema> = {},
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = {
   readonly indexers?: {
     readonly [TIndexName in keyof TIndexers]: (
       scope: LedgerStorageScope,
       input: Static<TIndexers[TIndexName]>,
+      context: LedgerIndexerContext<TEvents>,
     ) => void | Promise<void>;
   };
 
@@ -564,7 +574,7 @@ export type BoundLedgerModel<
     TSignals,
     TSignalQueues
   >;
-  readonly implementations: LedgerImplementations<TIndexers, TQueries>;
+  readonly implementations: LedgerImplementations<TIndexers, TQueries, TEvents>;
 };
 
 export function defineLedgerModel<
@@ -664,7 +674,7 @@ export function bindLedgerModel<
     TSignals,
     TSignalQueues
   >,
-  implementations: LedgerImplementations<TIndexers, TQueries>,
+  implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
 ): BoundLedgerModel<
   TEvents,
   TQueues,
