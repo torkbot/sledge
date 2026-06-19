@@ -878,6 +878,7 @@ function openDatabaseLedgerEngine<
 
     let created = false;
     let eventId = 0;
+    let envelope: EventEnvelope<TEvents, keyof TEvents> | null = null;
 
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
@@ -914,7 +915,12 @@ function openDatabaseLedgerEngine<
         eventId = Number(eventInsert.lastInsertRowid);
       } else {
         const existing = await database
-          .prepare(`SELECT event_id FROM events WHERE dedupe_key = ?`)
+          .prepare(
+            `SELECT event_id, ts_ms, event_name, payload_json, causation_event_id, dedupe_key
+             FROM events
+             WHERE dedupe_key = ?
+               AND signal = 0`,
+          )
           .get(eventInput.dedupeKey);
 
         if (existing === undefined) {
@@ -923,11 +929,22 @@ function openDatabaseLedgerEngine<
           );
         }
 
-        eventId = decodeRow(existing, EventIdRowSchema).event_id;
+        const existingRow = decodeRow(existing, EventEnvelopeRowSchema);
+
+        if (existingRow.event_name !== eventInput.eventName) {
+          throw new Error(
+            `dedupe key ${eventInput.dedupeKey} already belongs to event ${existingRow.event_name}`,
+          );
+        }
+
+        envelope = readEventEnvelopeFromRow(existing, {
+          events: model.events,
+        });
+        eventId = envelope.eventId;
       }
     }
 
-    const envelope: EventEnvelope<TEvents, keyof TEvents> = {
+    envelope ??= {
       eventId,
       ref: createEventRef(
         String(eventName) as Extract<keyof TEvents, string>,

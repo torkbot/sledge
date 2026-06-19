@@ -430,6 +430,30 @@ test("materialization plans validate schema versions and adjacent migrations", (
       queries: {},
     });
   }, /current materialization schema must have the latest version/);
+
+  const differentSchemaV1 = defineMaterializationSchema({
+    namespace: "plan",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+
+  assert.throws(() => {
+    defineMaterializations({
+      schemas: [schemaV1],
+      current: differentSchemaV1 as unknown as typeof schemaV1,
+      migrations: [],
+      indexers: {},
+      queries: {},
+    });
+  }, /current materialization schema must be listed in schemas/);
 });
 
 test("withMaterializations rejects materialization event refs outside the ledger shape", () => {

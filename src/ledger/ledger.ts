@@ -998,7 +998,7 @@ function validateMaterializationPlan(input: {
 
     versions.add(schema.version);
 
-    if (schema.version === input.current.version) {
+    if (schema === input.current) {
       currentFound = true;
     }
   }

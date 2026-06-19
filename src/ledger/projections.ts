@@ -10,6 +10,8 @@ declare const projectionTableColumnsBrand: unique symbol;
 declare const projectionTablePrimaryKeyBrand: unique symbol;
 declare const projectionTableUniqueKeysBrand: unique symbol;
 
+const reservedProjectionTableNames = new Set(["events", "work"]);
+
 export type ProjectionColumnKind =
   | "boolean"
   | "event_ref"
@@ -683,6 +685,12 @@ function renameTableMetadata(
 ): ProjectionTableMetadata {
   if (name.length === 0) {
     throw new Error("projection table name must be non-empty");
+  }
+
+  if (reservedProjectionTableNames.has(name.toLowerCase())) {
+    throw new Error(
+      `projection table name ${name} is reserved for ledger storage`,
+    );
   }
 
   return {

@@ -268,6 +268,19 @@ test("projection builders validate runtime metadata", () => {
 
   assert.throws(
     () =>
+      defineProjectionSchema({
+        Events: (t) =>
+          t
+            .columns({
+              eventId: t.integer().notNull(),
+            })
+            .primaryKey(["eventId"]),
+      }),
+    /projection table name Events is reserved for ledger storage/,
+  );
+
+  assert.throws(
+    () =>
       projections.relations((r) => {
         const foreignKey = (r as unknown as RuntimeRelationBuilder).foreignKey;
 

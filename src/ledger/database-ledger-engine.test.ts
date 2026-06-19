@@ -1455,6 +1455,9 @@ test("deduped emit does not replay projections or materialization", async () => 
       "message.received": Type.Object({
         id: Type.Number(),
       }),
+      "message.updated": Type.Object({
+        id: Type.Number(),
+      }),
     },
     queues: {
       "message.process": Type.Object({
@@ -1506,7 +1509,7 @@ test("deduped emit does not replay projections or materialization", async () => 
       scheduler: runtime.scheduler,
     });
 
-    await ledger.emit(
+    const first = await ledger.emit(
       "message.received",
       {
         id: 42,
@@ -1516,14 +1519,33 @@ test("deduped emit does not replay projections or materialization", async () => 
       },
     );
 
-    await ledger.emit(
+    const second = await ledger.emit(
       "message.received",
       {
-        id: 42,
+        id: 43,
       },
       {
         dedupeKey: "message:42",
       },
+    );
+
+    assert.equal(second.eventId, first.eventId);
+    assert.deepEqual(second.payload, {
+      id: 42,
+    });
+
+    await assert.rejects(
+      async () =>
+        await ledger.emit(
+          "message.updated",
+          {
+            id: 42,
+          },
+          {
+            dedupeKey: "message:42",
+          },
+        ),
+      /dedupe key message:42 already belongs to event message\.received/,
     );
 
     await waitFor(runtime, () => processed === 1);
