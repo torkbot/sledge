@@ -5,14 +5,17 @@
 - Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /
   `bindLedgerModel` construction path with
   `defineLedgerShape(...)`, `defineMaterializationSchema(...)`,
-  `defineMaterializations(...)`, `withMaterializations(...)`, and
-  `.register(...)`.
+  `defineMaterializationHistory(...)`, `defineMaterializations(...)`,
+  `withMaterializations(...)`, and `.register(...)`.
 - Breaking: storage adapters now receive a registered `model` instead of a
   `boundModel`.
 - Add v2 materialization APIs: `@torkbot/sledge/ledger` records typed
   table-local columns, indexes, semantic event references, second-phase
   foreign-key metadata, schema namespace/version metadata, and materialization
-  migration metadata.
+  migration history metadata.
+- Add a typed materialization migration DSL for ordered schema-change history:
+  create table, add column, create index, create unique index, and add foreign
+  key operations are recorded as data instead of `from` / `to` callbacks.
 - Split materialization contracts from implementations. `defineMaterializations`
   declares plain-object indexer/query contracts, while `.register(...)` supplies
   typed indexer/query implementations.

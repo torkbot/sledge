@@ -26,6 +26,7 @@ import { Type } from "typebox";
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
   defineLedgerShape,
+  defineMaterializationHistory,
   defineMaterializationSchema,
   defineMaterializations,
   withMaterializations,
@@ -81,10 +82,25 @@ const materializationSchema = defineMaterializationSchema({
   },
 });
 
+const materializationHistory = defineMaterializationHistory(
+  materializationSchema,
+  (m) => [
+    m.migration(1, "create app tables", (s) => [
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    ]),
+  ],
+);
+
 const materializations = defineMaterializations({
-  schemas: [materializationSchema],
-  current: materializationSchema,
-  migrations: [],
+  history: materializationHistory,
   indexers: {
     upsertUser: {
       sourceEvent: "user.created",
@@ -246,24 +262,47 @@ relations: (r) => ({
 });
 ```
 
-### 3. Define Materializations
+### 3. Define Migration History
 
-Call `defineMaterializations(...)` to collect schema versions, migrations,
-indexer contracts, and query contracts:
+Call `defineMaterializationHistory(...)` to describe the schema-change history
+for the current materialization schema. The current DDL remains the canonical
+typed shape for indexers and queries; the history records the ordered database
+operations Sledge can later execute during hygiene.
+
+```ts
+const history = defineMaterializationHistory(schemaV2, (m) => [
+  m.migration(1, "create users", (s) => [
+    s.createTable("users", (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+        })
+        .primaryKey(["userId"]),
+    ),
+  ]),
+  m.migration(2, "add user email", (s) => [
+    s.addColumn("users", "email", (t) => t.text().notNull()),
+    s.createIndex("usersByEmail", "users", ["email"]),
+  ]),
+]);
+```
+
+Migration steps are typed against the current schema's known tables, columns,
+and semantic event references. This slice records operation metadata but does
+not yet execute it.
+
+Sledge validates that the history starts at version 1, versions are unique
+positive integers, versions have no gaps, and the latest migration version
+matches the current schema version.
+
+### 4. Define Materializations
+
+Call `defineMaterializations(...)` to collect migration history, indexer
+contracts, and query contracts:
 
 ```ts
 const materializations = defineMaterializations({
-  schemas: [schemaV1, schemaV2],
-  current: schemaV2,
-  migrations: [
-    {
-      from: 1,
-      to: 2,
-      up: async (m) => {
-        void m;
-      },
-    },
-  ],
+  history,
   indexers: {
     upsertUser: {
       sourceEvent: "user.created",
@@ -279,10 +318,6 @@ const materializations = defineMaterializations({
 });
 ```
 
-Sledge validates that schemas share one namespace, versions are unique positive
-integers, `current` is the latest schema, and migrations connect adjacent
-versions without gaps.
-
 Attach materializations to the ledger shape with `withMaterializations(...)`:
 
 ```ts
@@ -292,7 +327,7 @@ const definedModel = withMaterializations(ledgerShape, materializations);
 Ledgers without materialization tables can skip this step and call
 `defineLedgerShape(...).register(...)` directly.
 
-### 4. Register Orchestration
+### 5. Register Orchestration
 
 Call `definedModel.register(...)` to attach indexer implementations, query
 implementations, event handlers, queue handlers, signal handlers, and
@@ -309,15 +344,16 @@ and `query`.
 Registration returns the model passed to a storage adapter. There is no
 separate bind step.
 
-### 5. Run Database Hygiene
+### 6. Run Database Hygiene
 
 This v2 slice records materialization schema metadata, typed relations, and
-migration metadata, but does not yet run materialization migrations.
+typed migration operation metadata, but does not yet run materialization
+migrations.
 Applications must still create/update materialization tables before opening the
 runtime. The intended lifecycle is internal migrations first, then
 materialization migrations, then runtime.
 
-### 6. Open a Runtime
+### 7. Open a Runtime
 
 Use one adapter to open the ledger:
 

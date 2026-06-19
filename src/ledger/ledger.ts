@@ -16,12 +16,22 @@ import {
 import {
   defineProjectionSchemaForEvents,
   type ProjectionColumn,
+  type ProjectionColumnKind,
+  type ProjectionColumnMetadata,
+  type ProjectionForeignKeyMetadata,
+  type ProjectionIndexMetadata,
   type ProjectionRelationBuilder,
+  type ProjectionRelationDefinition,
   type ProjectionRelations,
   type ProjectionSchema,
   type ProjectionSchemaEventName,
+  type ProjectionSchemaTables,
+  type ProjectionTableBuilder,
+  type ProjectionTableColumnName,
   type ProjectionTableColumns,
   type ProjectionTableFactories,
+  type ProjectionTableMetadata,
+  type ProjectionTableName,
   type ProjectionTablesForFactories,
 } from "./projections.ts";
 
@@ -658,41 +668,185 @@ type EventNameForProjectionTables<TTables> = {
 }[keyof TTables] &
   string;
 
-type MaterializationSchemaList = readonly [
-  AnyMaterializationSchema,
-  ...AnyMaterializationSchema[],
+type MaterializationTableName<TSchema extends AnyProjectionSchema> =
+  ProjectionTableName<ProjectionSchemaTables<TSchema>>;
+
+type MaterializationColumnName<
+  TSchema extends AnyProjectionSchema,
+  TTableName extends MaterializationTableName<TSchema>,
+> = ProjectionTableColumnName<ProjectionSchemaTables<TSchema>[TTableName]>;
+
+type MaterializationTableForName<
+  TSchema extends AnyProjectionSchema,
+  TTableName extends MaterializationTableName<TSchema>,
+> = ProjectionSchemaTables<TSchema>[TTableName];
+
+type MaterializationSchemaWithRelations<TSchema extends AnyProjectionSchema> =
+  TSchema & {
+    relations<const TNextRelations extends ProjectionRelations>(
+      build: (
+        relations: ProjectionRelationBuilder<ProjectionSchemaTables<TSchema>>,
+      ) => TNextRelations,
+    ): ProjectionSchema<
+      ProjectionSchemaTables<TSchema>,
+      TNextRelations,
+      ProjectionSchemaEventName<TSchema>
+    >;
+  };
+
+export type MaterializationMigrationColumnBuilder<TEventName extends string> =
+  Pick<
+    ProjectionTableBuilder<TEventName>,
+    "boolean" | "eventRef" | "integer" | "json" | "text"
+  >;
+
+export type MaterializationMigrationOperation =
+  | {
+      readonly kind: "create_table";
+      readonly table: ProjectionTableMetadata;
+      readonly tableName: string;
+    }
+  | {
+      readonly column: ProjectionColumnMetadata;
+      readonly columnName: string;
+      readonly kind: "add_column";
+      readonly tableName: string;
+    }
+  | {
+      readonly index: ProjectionIndexMetadata;
+      readonly kind: "create_index";
+      readonly tableName: string;
+    }
+  | {
+      readonly foreignKey: ProjectionForeignKeyMetadata;
+      readonly kind: "add_foreign_key";
+      readonly name: string;
+    };
+
+export type MaterializationMigrationOperations = readonly [
+  MaterializationMigrationOperation,
+  ...MaterializationMigrationOperation[],
 ];
 
-type EventNameForMaterializationSchemas<
-  TSchemas extends MaterializationSchemaList,
+export type MaterializationMigration<
+  TVersion extends number = number,
+  TDescription extends string = string,
+  TOperations extends MaterializationMigrationOperations =
+    MaterializationMigrationOperations,
 > = {
-  readonly [TIndex in keyof TSchemas]: ProjectionSchemaEventName<
-    TSchemas[TIndex]
-  >;
-}[number] &
-  string;
-
-export type MaterializationMigrationHandle = {
-  readonly namespace: string;
-  readonly fromVersion: number;
-  readonly toVersion: number;
+  readonly description: TDescription;
+  readonly operations: TOperations;
+  readonly version: TVersion;
 };
 
-export type MaterializationMigration = {
-  readonly from: number;
-  readonly to: number;
-  up(handle: MaterializationMigrationHandle): void | Promise<void>;
+export type MaterializationMigrationList = readonly [
+  MaterializationMigration,
+  ...MaterializationMigration[],
+];
+
+export type MaterializationMigrationStepBuilder<
+  TCurrentSchema extends AnyMaterializationSchema,
+> = {
+  addColumn<
+    const TTableName extends MaterializationTableName<TCurrentSchema>,
+    const TColumnName extends MaterializationColumnName<
+      TCurrentSchema,
+      TTableName
+    >,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+    build: (
+      columns: MaterializationMigrationColumnBuilder<
+        ProjectionSchemaEventName<TCurrentSchema>
+      >,
+    ) => ProjectionTableColumns<
+      MaterializationTableForName<TCurrentSchema, TTableName>
+    >[TColumnName],
+  ): MaterializationMigrationOperation;
+
+  addForeignKey<const TName extends string>(
+    name: TName,
+    build: (
+      relations: ProjectionRelationBuilder<
+        ProjectionSchemaTables<TCurrentSchema>
+      >,
+    ) => ProjectionRelationDefinition,
+  ): MaterializationMigrationOperation;
+
+  createIndex<
+    const TTableName extends MaterializationTableName<TCurrentSchema>,
+    const TColumnNames extends readonly MaterializationColumnName<
+      TCurrentSchema,
+      TTableName
+    >[],
+  >(
+    name: string,
+    tableName: TTableName,
+    columns: TColumnNames,
+  ): MaterializationMigrationOperation;
+
+  createTable<
+    const TTableName extends MaterializationTableName<TCurrentSchema>,
+  >(
+    tableName: TTableName,
+    build: (
+      table: ProjectionTableBuilder<ProjectionSchemaEventName<TCurrentSchema>>,
+    ) => {
+      readonly metadata: ProjectionTableMetadata;
+    },
+  ): MaterializationMigrationOperation;
+
+  createUniqueIndex<
+    const TTableName extends MaterializationTableName<TCurrentSchema>,
+    const TColumnNames extends readonly MaterializationColumnName<
+      TCurrentSchema,
+      TTableName
+    >[],
+  >(
+    name: string,
+    tableName: TTableName,
+    columns: TColumnNames,
+  ): MaterializationMigrationOperation;
 };
+
+export type MaterializationHistoryBuilder<
+  TCurrentSchema extends AnyMaterializationSchema,
+> = {
+  migration<
+    const TVersion extends number,
+    const TDescription extends string,
+    const TOperations extends MaterializationMigrationOperations,
+  >(
+    version: TVersion,
+    description: TDescription,
+    build: (
+      steps: MaterializationMigrationStepBuilder<TCurrentSchema>,
+    ) => TOperations,
+  ): MaterializationMigration<TVersion, TDescription, TOperations>;
+};
+
+export type MaterializationHistory<
+  TCurrentSchema extends AnyMaterializationSchema,
+  TMigrations extends MaterializationMigrationList,
+> = {
+  readonly current: TCurrentSchema;
+  readonly currentVersion: TCurrentSchema["version"];
+  readonly migrations: TMigrations;
+  readonly namespace: TCurrentSchema["namespace"];
+};
+
+export type AnyMaterializationHistory = MaterializationHistory<
+  AnyMaterializationSchema,
+  MaterializationMigrationList
+>;
 
 export type Materializations<
-  TSchemas extends MaterializationSchemaList,
-  TCurrentSchema extends TSchemas[number],
+  THistory extends AnyMaterializationHistory,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
 > = {
-  readonly schemas: TSchemas;
-  readonly current: TCurrentSchema;
-  readonly migrations: readonly MaterializationMigration[];
+  readonly history: THistory;
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
 };
@@ -744,27 +898,40 @@ export function defineMaterializationSchema<
   >;
 }
 
+export function defineMaterializationHistory<
+  const TCurrentSchema extends AnyMaterializationSchema,
+  const TMigrations extends MaterializationMigrationList,
+>(
+  current: TCurrentSchema,
+  build: (
+    history: MaterializationHistoryBuilder<TCurrentSchema>,
+  ) => TMigrations,
+): MaterializationHistory<TCurrentSchema, TMigrations> {
+  validateMaterializationSchemaIdentity(current.namespace, current.version);
+  const migrations = build(createMaterializationHistoryBuilder(current));
+  validateMaterializationHistory(current, migrations);
+
+  return {
+    current,
+    currentVersion: current.version,
+    migrations,
+    namespace: current.namespace,
+  };
+}
+
 export function defineMaterializations<
-  const TSchemas extends readonly [
-    AnyMaterializationSchema,
-    ...AnyMaterializationSchema[],
-  ],
-  const TCurrentSchema extends TSchemas[number],
+  const THistory extends AnyMaterializationHistory,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   const TQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
-  readonly schemas: TSchemas;
-  readonly current: TCurrentSchema;
-  readonly migrations: readonly MaterializationMigration[];
+  readonly history: THistory;
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
-}): Materializations<
-  TSchemas,
-  TCurrentSchema,
-  TIndexerDefinitions,
-  TQueryDefinitions
-> {
-  validateMaterializationPlan(input);
+}): Materializations<THistory, TIndexerDefinitions, TQueryDefinitions> {
+  validateMaterializationHistory(
+    input.history.current,
+    input.history.migrations,
+  );
 
   return input;
 }
@@ -877,8 +1044,7 @@ export function withMaterializations<
   const TQueues extends Record<string, TSchema>,
   const TSignals extends Record<string, TSchema>,
   const TSignalQueues extends Record<string, TSchema>,
-  const TSchemas extends MaterializationSchemaList,
-  const TCurrentSchema extends TSchemas[number],
+  const THistory extends AnyMaterializationHistory,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<
     Extract<keyof TEvents, string>
   >,
@@ -886,13 +1052,12 @@ export function withMaterializations<
 >(
   shape: DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
   materializations: Materializations<
-    TSchemas,
-    TCurrentSchema,
+    THistory,
     TIndexerDefinitions,
     TQueryDefinitions
   > &
     (Exclude<
-      EventNameForMaterializationSchemas<TSchemas>,
+      ProjectionSchemaEventName<THistory["current"]>,
       Extract<keyof TEvents, string>
     > extends never
       ? unknown
@@ -900,7 +1065,7 @@ export function withMaterializations<
 ): DefinedLedgerModel<
   TEvents,
   TQueues,
-  TCurrentSchema,
+  THistory["current"],
   ProjectionIndexerSchemas<TIndexerDefinitions>,
   ProjectionQuerySchemas<TQueryDefinitions>,
   TSignals,
@@ -910,7 +1075,7 @@ export function withMaterializations<
 > {
   validateMaterializationEvents(shape.shape, materializations);
   const access = createProjectionAccess({
-    projections: materializations.current,
+    projections: materializations.history.current,
     indexers: materializations.indexers,
     queries: materializations.queries,
   });
@@ -954,6 +1119,201 @@ function createMaterializationProjectionSchema<
   >;
 }
 
+function createMaterializationHistoryBuilder<
+  TCurrentSchema extends AnyMaterializationSchema,
+>(current: TCurrentSchema): MaterializationHistoryBuilder<TCurrentSchema> {
+  return {
+    migration: (version, description, build) => {
+      const operations = build(
+        createMaterializationMigrationStepBuilder(current),
+      );
+
+      return {
+        description,
+        operations,
+        version,
+      };
+    },
+  };
+}
+
+function createMaterializationMigrationStepBuilder<
+  TCurrentSchema extends AnyMaterializationSchema,
+>(
+  current: TCurrentSchema,
+): MaterializationMigrationStepBuilder<TCurrentSchema> {
+  return {
+    addColumn: (tableName, columnName, build) => {
+      readMaterializationTable(
+        current,
+        String(tableName),
+        "materialization add column",
+      );
+      validateMaterializationColumnName(
+        current,
+        String(tableName),
+        String(columnName),
+        "materialization add column",
+      );
+      const column = build(
+        createMaterializationMigrationColumnBuilder<
+          ProjectionSchemaEventName<TCurrentSchema>
+        >(),
+      );
+      const metadata = readMaterializationColumnMetadata(
+        column,
+        `materialization add column ${String(tableName)}.${String(columnName)}`,
+      );
+
+      return {
+        column: metadata,
+        columnName: String(columnName),
+        kind: "add_column",
+        tableName: String(tableName),
+      };
+    },
+    addForeignKey: (name, build) => {
+      validateMaterializationIdentifier(
+        "materialization foreign key name",
+        name,
+      );
+      const relationSchema =
+        current as MaterializationSchemaWithRelations<TCurrentSchema>;
+      const schemaWithRelation = relationSchema.relations((relations) => {
+        return {
+          [name]: build(relations),
+        };
+      });
+      const foreignKey = schemaWithRelation.metadata.relations[name];
+
+      if (foreignKey === undefined) {
+        throw new Error(`materialization foreign key ${name} was not defined`);
+      }
+
+      return {
+        foreignKey,
+        kind: "add_foreign_key",
+        name,
+      };
+    },
+    createIndex: (name, tableName, columns) => {
+      const table = readMaterializationTable(
+        current,
+        String(tableName),
+        "materialization create index",
+      );
+      validateMaterializationIdentifier("materialization index name", name);
+      validateMaterializationColumnNames(
+        table,
+        columns.map(String),
+        "materialization create index",
+      );
+
+      return {
+        index: {
+          columns: columns.map(String),
+          name,
+          unique: false,
+        },
+        kind: "create_index",
+        tableName: String(tableName),
+      };
+    },
+    createTable: (tableName, build) => {
+      readMaterializationTable(
+        current,
+        String(tableName),
+        "materialization create table",
+      );
+      const schema = defineProjectionSchemaForEvents<
+        ProjectionSchemaEventName<TCurrentSchema>
+      >()({
+        [tableName]: build,
+      });
+      const table = schema.metadata.tables[String(tableName)];
+
+      if (table === undefined) {
+        throw new Error(
+          `materialization create table ${String(tableName)} was not defined`,
+        );
+      }
+
+      return {
+        kind: "create_table",
+        table,
+        tableName: String(tableName),
+      };
+    },
+    createUniqueIndex: (name, tableName, columns) => {
+      const table = readMaterializationTable(
+        current,
+        String(tableName),
+        "materialization create unique index",
+      );
+      validateMaterializationIdentifier(
+        "materialization unique index name",
+        name,
+      );
+      validateMaterializationColumnNames(
+        table,
+        columns.map(String),
+        "materialization create unique index",
+      );
+
+      return {
+        index: {
+          columns: columns.map(String),
+          name,
+          unique: true,
+        },
+        kind: "create_index",
+        tableName: String(tableName),
+      };
+    },
+  };
+}
+
+function createMaterializationMigrationColumnBuilder<
+  TEventName extends string,
+>(): MaterializationMigrationColumnBuilder<TEventName> {
+  return {
+    boolean: () => createMaterializationMigrationColumn("boolean", null, true),
+    eventRef: (eventName) => {
+      return createMaterializationMigrationColumn("event_ref", eventName, true);
+    },
+    integer: () => createMaterializationMigrationColumn("integer", null, true),
+    json: <TValue>() => {
+      return createMaterializationMigrationColumn<"json", TValue, true>(
+        "json",
+        null,
+        true,
+      );
+    },
+    text: () => createMaterializationMigrationColumn("text", null, true),
+  };
+}
+
+function createMaterializationMigrationColumn<
+  TKind extends ProjectionColumnKind,
+  TValue,
+  TNullable extends boolean,
+>(
+  kind: TKind,
+  eventName: string | null,
+  nullable: TNullable,
+): ProjectionColumn<TKind, TValue, TNullable> {
+  return {
+    metadata: {
+      eventName,
+      kind,
+      nullable,
+    },
+    notNull: () => {
+      return createMaterializationMigrationColumn(kind, eventName, false);
+    },
+  };
+}
+
 function validateMaterializationSchemaIdentity(
   namespace: string,
   version: number,
@@ -969,107 +1329,173 @@ function validateMaterializationSchemaIdentity(
   }
 }
 
-function validateMaterializationPlan(input: {
-  readonly schemas: readonly [
-    AnyMaterializationSchema,
-    ...AnyMaterializationSchema[],
-  ];
-  readonly current: AnyMaterializationSchema;
-  readonly migrations: readonly MaterializationMigration[];
-}): void {
-  const namespace = input.current.namespace;
-  validateMaterializationSchemaIdentity(namespace, input.current.version);
+function validateMaterializationIdentifier(
+  context: string,
+  value: string,
+): void {
+  if (value.length === 0) {
+    throw new Error(`${context} must not be empty`);
+  }
+}
+
+function readMaterializationTable(
+  schema: AnyMaterializationSchema,
+  tableName: string,
+  context: string,
+): ProjectionTableMetadata {
+  const table = schema.metadata.tables[tableName];
+
+  if (table === undefined) {
+    throw new Error(`${context} references unknown table ${tableName}`);
+  }
+
+  return table;
+}
+
+function validateMaterializationColumnName(
+  schema: AnyMaterializationSchema,
+  tableName: string,
+  columnName: string,
+  context: string,
+): void {
+  const table = readMaterializationTable(schema, tableName, context);
+  validateMaterializationColumnNames(table, [columnName], context);
+}
+
+function validateMaterializationColumnNames(
+  table: ProjectionTableMetadata,
+  columnNames: readonly string[],
+  context: string,
+): void {
+  if (columnNames.length === 0) {
+    throw new Error(`${context} must reference at least one column`);
+  }
+
+  for (const columnName of columnNames) {
+    if (table.columns[columnName] === undefined) {
+      throw new Error(`${context} references unknown column ${columnName}`);
+    }
+  }
+}
+
+function readMaterializationColumnMetadata(
+  column: unknown,
+  context: string,
+): ProjectionColumnMetadata {
+  if (typeof column !== "object" || column === null || Array.isArray(column)) {
+    throw new Error(`${context} must return a materialization column`);
+  }
+
+  const metadata = (column as { readonly metadata?: unknown }).metadata;
+
+  if (!isMaterializationColumnMetadata(metadata)) {
+    throw new Error(`${context} must return a materialization column`);
+  }
+
+  return metadata;
+}
+
+function isMaterializationColumnMetadata(
+  metadata: unknown,
+): metadata is ProjectionColumnMetadata {
+  if (
+    typeof metadata !== "object" ||
+    metadata === null ||
+    Array.isArray(metadata)
+  ) {
+    return false;
+  }
+
+  const maybeMetadata = metadata as {
+    readonly eventName?: unknown;
+    readonly kind?: unknown;
+    readonly nullable?: unknown;
+  };
+
+  return (
+    isMaterializationColumnKind(maybeMetadata.kind) &&
+    (typeof maybeMetadata.eventName === "string" ||
+      maybeMetadata.eventName === null) &&
+    typeof maybeMetadata.nullable === "boolean"
+  );
+}
+
+function isMaterializationColumnKind(
+  kind: unknown,
+): kind is ProjectionColumnKind {
+  return (
+    kind === "boolean" ||
+    kind === "event_ref" ||
+    kind === "integer" ||
+    kind === "json" ||
+    kind === "text"
+  );
+}
+
+function validateMaterializationHistory(
+  current: AnyMaterializationSchema,
+  migrations: readonly MaterializationMigration[],
+): void {
+  validateMaterializationSchemaIdentity(current.namespace, current.version);
+
+  if (migrations.length === 0) {
+    throw new Error("materialization history must include migrations");
+  }
 
   const versions = new Set<number>();
-  let currentFound = false;
 
-  for (const schema of input.schemas) {
-    validateMaterializationSchemaIdentity(schema.namespace, schema.version);
-
-    if (schema.namespace !== namespace) {
-      throw new Error("materialization schemas must share one namespace");
-    }
-
-    if (versions.has(schema.version)) {
+  for (const migration of migrations) {
+    if (!Number.isSafeInteger(migration.version) || migration.version <= 0) {
       throw new Error(
-        `duplicate materialization schema version ${schema.version}`,
+        "materialization migration version must be a positive integer",
       );
     }
 
-    versions.add(schema.version);
-
-    if (schema === input.current) {
-      currentFound = true;
+    if (migration.description.length === 0) {
+      throw new Error(
+        "materialization migration description must not be empty",
+      );
     }
-  }
 
-  if (!currentFound) {
-    throw new Error("current materialization schema must be listed in schemas");
+    if (migration.operations.length === 0) {
+      throw new Error(
+        "materialization migration must include at least one operation",
+      );
+    }
+
+    if (versions.has(migration.version)) {
+      throw new Error(
+        `duplicate materialization migration version ${migration.version}`,
+      );
+    }
+
+    versions.add(migration.version);
   }
 
   const sortedVersions = [...versions].sort((left, right) => left - right);
+  const firstVersion = sortedVersions[0];
   const latestVersion = sortedVersions[sortedVersions.length - 1];
 
-  if (latestVersion !== input.current.version) {
+  if (firstVersion !== 1) {
+    throw new Error("materialization history must start at version 1");
+  }
+
+  if (latestVersion !== current.version) {
     throw new Error(
-      "current materialization schema must have the latest version",
+      "materialization history latest migration must match current schema version",
     );
   }
 
-  const migrationEdges = new Set<string>();
-
-  for (const migration of input.migrations) {
-    if (!Number.isSafeInteger(migration.from) || migration.from <= 0) {
-      throw new Error(
-        "materialization migration from must be a positive integer",
-      );
-    }
-
-    if (!Number.isSafeInteger(migration.to) || migration.to <= 0) {
-      throw new Error(
-        "materialization migration to must be a positive integer",
-      );
-    }
-
-    if (!versions.has(migration.from) || !versions.has(migration.to)) {
-      throw new Error(
-        "materialization migrations must reference known schemas",
-      );
-    }
-
-    if (migration.to !== migration.from + 1) {
-      throw new Error(
-        "materialization migrations must connect adjacent versions",
-      );
-    }
-
-    const edge = `${migration.from}:${migration.to}`;
-
-    if (migrationEdges.has(edge)) {
-      throw new Error(
-        `duplicate materialization migration ${migration.from} -> ${migration.to}`,
-      );
-    }
-
-    migrationEdges.add(edge);
-  }
-
   for (let index = 1; index < sortedVersions.length; index += 1) {
-    const from = sortedVersions[index - 1];
-    const to = sortedVersions[index];
+    const previousVersion = sortedVersions[index - 1];
+    const version = sortedVersions[index];
 
-    if (from === undefined || to === undefined) {
-      throw new Error("materialization schema versions must not be empty");
+    if (previousVersion === undefined || version === undefined) {
+      throw new Error("materialization history versions must not be empty");
     }
 
-    if (to !== from + 1) {
-      throw new Error("materialization schema versions must not have gaps");
-    }
-
-    const edge = `${from}:${to}`;
-
-    if (!migrationEdges.has(edge)) {
-      throw new Error(`missing materialization migration ${from} -> ${to}`);
+    if (version !== previousVersion + 1) {
+      throw new Error("materialization history versions must not have gaps");
     }
   }
 }
@@ -1079,36 +1505,24 @@ function validateMaterializationEvents<
   TQueues extends Record<string, TSchema>,
   TSignals extends Record<string, TSchema>,
   TSignalQueues extends Record<string, TSchema>,
-  TSchemas extends MaterializationSchemaList,
-  TCurrentSchema extends TSchemas[number],
+  THistory extends AnyMaterializationHistory,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
 >(
   shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
   materializations: Materializations<
-    TSchemas,
-    TCurrentSchema,
+    THistory,
     TIndexerDefinitions,
     TQueryDefinitions
   >,
 ): void {
   const eventNames = new Set(Object.keys(shape.events));
 
-  for (const schema of materializations.schemas) {
-    for (const table of Object.values(schema.metadata.tables)) {
-      for (const [columnName, column] of Object.entries(table.columns)) {
-        if (column.eventName === null) {
-          continue;
-        }
-
-        if (!eventNames.has(column.eventName)) {
-          throw new Error(
-            `materialization column ${table.name}.${columnName} references unknown event ${column.eventName}`,
-          );
-        }
-      }
-    }
-  }
+  validateMaterializationSchemaEventRefs(
+    materializations.history.current,
+    eventNames,
+  );
+  validateMaterializationHistoryEventRefs(materializations.history, eventNames);
 
   for (const [indexerName, definition] of Object.entries(
     materializations.indexers,
@@ -1120,6 +1534,68 @@ function validateMaterializationEvents<
     throw new Error(
       `materialization indexer ${indexerName} references unknown source event ${definition.sourceEvent}`,
     );
+  }
+}
+
+function validateMaterializationSchemaEventRefs(
+  schema: AnyMaterializationSchema,
+  eventNames: ReadonlySet<string>,
+): void {
+  for (const table of Object.values(schema.metadata.tables)) {
+    for (const [columnName, column] of Object.entries(table.columns)) {
+      validateMaterializationColumnEventRef(
+        column,
+        `materialization column ${table.name}.${columnName}`,
+        eventNames,
+      );
+    }
+  }
+}
+
+function validateMaterializationHistoryEventRefs(
+  history: AnyMaterializationHistory,
+  eventNames: ReadonlySet<string>,
+): void {
+  for (const migration of history.migrations) {
+    for (const operation of migration.operations) {
+      switch (operation.kind) {
+        case "add_column":
+          validateMaterializationColumnEventRef(
+            operation.column,
+            `materialization migration ${migration.version} column ${operation.tableName}.${operation.columnName}`,
+            eventNames,
+          );
+          break;
+        case "add_foreign_key":
+        case "create_index":
+          break;
+        case "create_table":
+          for (const [columnName, column] of Object.entries(
+            operation.table.columns,
+          )) {
+            validateMaterializationColumnEventRef(
+              column,
+              `materialization migration ${migration.version} column ${operation.table.name}.${columnName}`,
+              eventNames,
+            );
+          }
+          break;
+      }
+    }
+  }
+}
+
+function validateMaterializationColumnEventRef(
+  column: ProjectionColumnMetadata,
+  context: string,
+  eventNames: ReadonlySet<string>,
+): void {
+  if (column.eventName === null) {
+    return;
+  }
+
+  if (!eventNames.has(column.eventName)) {
+    throw new Error(`${context} references unknown event ${column.eventName}`);
   }
 }
 

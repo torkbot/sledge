@@ -8,6 +8,7 @@ import type {
 } from "./ledger.ts";
 import {
   defineLedgerShape,
+  defineMaterializationHistory,
   defineMaterializationSchema,
   defineMaterializations,
   withMaterializations,
@@ -109,9 +110,20 @@ const ledgerContractSchema = defineMaterializationSchema({
 });
 
 const ledgerContractMaterializations = defineMaterializations({
-  schemas: [ledgerContractSchema],
-  current: ledgerContractSchema,
-  migrations: [],
+  history: defineMaterializationHistory(ledgerContractSchema, (m) => [
+    m.migration(1, "create contract projection", (s) => [
+      s.createTable("contractProjection", (t) =>
+        t
+          .columns({
+            sourceEventId: t.integer().notNull(),
+            decisionAttempts: t.integer().notNull(),
+            dispatchCount: t.integer().notNull(),
+            plannedIntentEventId: t.integer(),
+          })
+          .primaryKey(["sourceEventId"]),
+      ),
+    ]),
+  ]),
   indexers: {
     upsertObserved: {
       sourceEvent: "message.received",

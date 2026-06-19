@@ -13,6 +13,7 @@ import type {
 } from "./ledger.ts";
 import {
   defineLedgerShape,
+  defineMaterializationHistory,
   defineMaterializationSchema,
   defineMaterializations,
   withMaterializations,
@@ -47,10 +48,22 @@ const schema = defineMaterializationSchema({
   },
 });
 
+const history = defineMaterializationHistory(schema, (m) => [
+  m.migration(1, "create users", (s) => [
+    s.createTable("users", (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          email: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+    ),
+  ]),
+]);
+
 const materializations = defineMaterializations({
-  schemas: [schema],
-  current: schema,
-  migrations: [],
+  history,
   indexers: {
     upsertUser: {
       sourceEvent: "user.created",
@@ -342,9 +355,30 @@ test("ledger projection definition applies relations over inferred tables", () =
   const model = withMaterializations(
     shape,
     defineMaterializations({
-      schemas: [relationSchema],
-      current: relationSchema,
-      migrations: [],
+      history: defineMaterializationHistory(relationSchema, (m) => [
+        m.migration(1, "create relation tables", (s) => [
+          s.createTable("users", (t) =>
+            t
+              .columns({
+                userId: t.text().notNull(),
+              })
+              .primaryKey(["userId"]),
+          ),
+          s.createTable("sessions", (t) =>
+            t
+              .columns({
+                sessionId: t.text().notNull(),
+                userId: t.text().notNull(),
+              })
+              .primaryKey(["sessionId"]),
+          ),
+          s.addForeignKey("sessionUser", (r) =>
+            r
+              .foreignKey("sessions", ["userId"])
+              .references("users", ["userId"]),
+          ),
+        ]),
+      ]),
       indexers: {},
       queries: {},
     }),
@@ -361,19 +395,7 @@ test("ledger projection definition applies relations over inferred tables", () =
   });
 });
 
-test("materialization plans validate schema versions and adjacent migrations", () => {
-  const schemaV1 = defineMaterializationSchema({
-    namespace: "plan",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
+test("materialization histories validate versions and record typed operations", () => {
   const schemaV2 = defineMaterializationSchema({
     namespace: "plan",
     version: 2,
@@ -388,72 +410,100 @@ test("materialization plans validate schema versions and adjacent migrations", (
     },
   });
 
-  assert.equal(
-    defineMaterializations({
-      schemas: [schemaV1, schemaV2],
-      current: schemaV2,
-      migrations: [
-        {
-          from: 1,
-          to: 2,
-          up: () => undefined,
-        },
-      ],
-      indexers: {},
-      queries: {},
-    }).current,
-    schemaV2,
-  );
-
-  assert.throws(() => {
-    defineMaterializations({
-      schemas: [schemaV1, schemaV2],
-      current: schemaV2,
-      migrations: [],
-      indexers: {},
-      queries: {},
-    });
-  }, /missing materialization migration 1 -> 2/);
-
-  assert.throws(() => {
-    defineMaterializations({
-      schemas: [schemaV1, schemaV2],
-      current: schemaV1,
-      migrations: [
-        {
-          from: 1,
-          to: 2,
-          up: () => undefined,
-        },
-      ],
-      indexers: {},
-      queries: {},
-    });
-  }, /current materialization schema must have the latest version/);
-
-  const differentSchemaV1 = defineMaterializationSchema({
-    namespace: "plan",
-    version: 1,
-    tables: {
-      users: (t) =>
+  const historyV2 = defineMaterializationHistory(schemaV2, (m) => [
+    m.migration(1, "create users", (s) => [
+      s.createTable("users", (t) =>
         t
           .columns({
             userId: t.text().notNull(),
-            email: t.text(),
           })
           .primaryKey(["userId"]),
-    },
-  });
+      ),
+    ]),
+    m.migration(2, "add user email", (s) => [
+      s.addColumn("users", "email", (t) => t.text()),
+      s.createIndex("usersByEmail", "users", ["email"]),
+      s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
+    ]),
+  ]);
 
-  assert.throws(() => {
+  assert.equal(
     defineMaterializations({
-      schemas: [schemaV1],
-      current: differentSchemaV1 as unknown as typeof schemaV1,
-      migrations: [],
+      history: historyV2,
       indexers: {},
       queries: {},
-    });
-  }, /current materialization schema must be listed in schemas/);
+    }).history.current,
+    schemaV2,
+  );
+  assert.deepEqual(historyV2.migrations[1]?.operations, [
+    {
+      column: {
+        eventName: null,
+        kind: "text",
+        nullable: true,
+      },
+      columnName: "email",
+      kind: "add_column",
+      tableName: "users",
+    },
+    {
+      index: {
+        columns: ["email"],
+        name: "usersByEmail",
+        unique: false,
+      },
+      kind: "create_index",
+      tableName: "users",
+    },
+    {
+      index: {
+        columns: ["email"],
+        name: "usersByEmailUnique",
+        unique: true,
+      },
+      kind: "create_index",
+      tableName: "users",
+    },
+  ]);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]);
+  }, /latest migration must match current schema version/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(2, "add user email", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+      ]),
+    ]);
+  }, /must start at version 1/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(1, "duplicate", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+      ]),
+    ]);
+  }, /duplicate materialization migration version 1/);
 });
 
 test("withMaterializations rejects materialization event refs outside the ledger shape", () => {
@@ -471,9 +521,18 @@ test("withMaterializations rejects materialization event refs outside the ledger
     },
   });
   const invalidMaterializations = defineMaterializations({
-    schemas: [invalidSchema],
-    current: invalidSchema,
-    migrations: [],
+    history: defineMaterializationHistory(invalidSchema, (m) => [
+      m.migration(1, "create invalid sessions", (s) => [
+        s.createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              source: t.eventRef("session.created").notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        ),
+      ]),
+    ]),
     indexers: {},
     queries: {},
   });
@@ -495,31 +554,36 @@ test("withMaterializations rejects materialization event refs outside the ledger
           .primaryKey(["sessionId"]),
     },
   });
+  const invalidHistory = defineMaterializationHistory(validSchemaV2, (m) => [
+    m.migration(1, "create sessions", (s) => [
+      s.createTable("sessions", (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            // @ts-expect-error runtime validation protects unchecked callers too.
+            source: t.eventRef("session.created").notNull(),
+          })
+          .primaryKey(["sessionId"]),
+      ),
+    ]),
+    m.migration(2, "index sessions", (s) => [
+      s.createIndex("sessionsBySessionId", "sessions", ["sessionId"]),
+    ]),
+  ]);
   const invalidHistoricalMaterializations = defineMaterializations({
-    schemas: [invalidSchema, validSchemaV2],
-    current: validSchemaV2,
-    migrations: [
-      {
-        from: 1,
-        to: 2,
-        up: () => undefined,
-      },
-    ],
+    history: invalidHistory,
     indexers: {},
     queries: {},
   });
 
   assert.throws(() => {
-    // @ts-expect-error runtime validation protects unchecked callers too.
     withMaterializations(shape, invalidHistoricalMaterializations);
   }, /references unknown event session\.created/);
 });
 
 test("withMaterializations rejects unchecked indexer source events outside the ledger shape", () => {
   const invalidIndexerMaterializations = defineMaterializations({
-    schemas: [schema],
-    current: schema,
-    migrations: [],
+    history,
     indexers: {
       invalidSource: {
         sourceEvent: "session.created",
@@ -551,10 +615,40 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     },
   });
 
+  const typedHistory = defineMaterializationHistory(typedSchema, (m) => [
+    m.migration(1, "create users", (s) => [
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    ]),
+  ]);
+
+  const invalidMigrationHistory = defineMaterializationHistory(
+    typedSchema,
+    (m) => [
+      m.migration(1, "invalid", (s) => [
+        // @ts-expect-error migration operations only reference known tables.
+        s.createIndex("missing", "sessions", ["sessionId"]),
+        // @ts-expect-error migration operations only reference known columns.
+        s.addColumn("users", "missing", (t) => t.text()),
+        s.addColumn("users", "source", (t) =>
+          // @ts-expect-error migration event refs must come from the current schema.
+          t.eventRef("session.created").notNull(),
+        ),
+      ]),
+    ],
+  );
+
+  void invalidMigrationHistory;
+
   const invalidSource = defineMaterializations({
-    schemas: [typedSchema],
-    current: typedSchema,
-    migrations: [],
+    history: typedHistory,
     indexers: {
       invalidSource: {
         sourceEvent: "session.created",
@@ -568,9 +662,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
   withMaterializations(shape, invalidSource);
 
   const typedMaterializations = defineMaterializations({
-    schemas: [typedSchema],
-    current: typedSchema,
-    migrations: [],
+    history: typedHistory,
     indexers: {
       wrongEventRef: {
         sourceEvent: "user.created",
