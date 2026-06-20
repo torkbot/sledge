@@ -13,6 +13,14 @@ import type {
   QuerySchema,
 } from "./ledger.ts";
 import {
+  createSqliteProjectionStatementCompiler,
+  type ProjectionCompiledSql,
+  type ProjectionCompilerAssignment,
+  type ProjectionCompilerExpression,
+  type ProjectionCompilerOrderClause,
+  type ProjectionCompilerWhereClause,
+} from "./projection-sql-compiler.ts";
+import {
   type ProjectionColumnMetadata,
   type ProjectionColumnValue,
   type ProjectionRow,
@@ -27,6 +35,7 @@ import {
 
 type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
 declare const projectionExpressionBrand: unique symbol;
+const projectionStatementCompiler = createSqliteProjectionStatementCompiler();
 
 const ProjectionEventRowSchema = Type.Object({
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
@@ -1103,39 +1112,13 @@ function createProjectionReadDatabase<
   };
 }
 
-type ProjectionWhereClause =
-  | {
-      readonly columnName: string;
-      readonly kind: "comparison";
-      readonly operator: ProjectionWhereOperator;
-      readonly value: unknown;
-    }
-  | {
-      readonly columnName: string;
-      readonly kind: "in";
-      readonly values: readonly unknown[];
-    }
-  | {
-      readonly columnName: string;
-      readonly kind: "null";
-      readonly not: boolean;
-    };
+type ProjectionWhereClause = ProjectionCompilerWhereClause;
 
-type ProjectionOrderClause = {
-  readonly columnName: string;
-  readonly direction: ProjectionOrderDirection;
-};
+type ProjectionOrderClause = ProjectionCompilerOrderClause;
 
-type CompiledProjectionSql = {
-  readonly params: readonly unknown[];
-  readonly text: string;
-};
+type CompiledProjectionSql = ProjectionCompiledSql;
 
-type ProjectionUpdateAssignment = {
-  readonly columnName: string;
-  readonly params: readonly unknown[];
-  readonly sql: string;
-};
+type ProjectionUpdateAssignment = ProjectionCompilerAssignment;
 
 function createProjectionExecutableSelect<
   TTable,
@@ -1429,29 +1412,26 @@ function readProjectionUpdateAssignments(
     const value = updateValuesByColumn[columnName];
 
     if (isProjectionExpression(value)) {
-      const compiled = compileProjectionExpression(
-        table,
-        value.metadata,
-        allowExcluded,
-      );
-
       return {
         columnName,
-        params: compiled.params,
-        sql: compiled.text,
+        value: compileProjectionExpression(
+          table,
+          value.metadata,
+          allowExcluded,
+        ),
       };
     }
 
     return {
       columnName,
-      params: [
-        serializeProjectionColumnValue(
+      value: {
+        kind: "value",
+        value: serializeProjectionColumnValue(
           table.columns[columnName],
           value,
           `${table.name}.${columnName}`,
         ),
-      ],
-      sql: "?",
+      },
     };
   });
 }
@@ -1460,7 +1440,7 @@ function compileProjectionExpression(
   table: ProjectionTableMetadata,
   expression: ProjectionExpressionMetadata,
   allowExcluded: boolean,
-): CompiledProjectionSql {
+): ProjectionCompilerExpression {
   switch (expression.kind) {
     case "coalesce": {
       validateProjectionColumns("coalesce column", table, [
@@ -1473,8 +1453,9 @@ function compileProjectionExpression(
       );
 
       return {
-        params: value.params,
-        text: `COALESCE(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+        columnName: expression.columnName,
+        kind: "coalesce",
+        value,
       };
     }
     case "column":
@@ -1482,8 +1463,8 @@ function compileProjectionExpression(
         expression.columnName,
       ]);
       return {
-        params: [],
-        text: quoteIdentifier(expression.columnName),
+        columnName: expression.columnName,
+        kind: "column",
       };
     case "excluded":
       if (!allowExcluded) {
@@ -1496,8 +1477,8 @@ function compileProjectionExpression(
         expression.columnName,
       ]);
       return {
-        params: [],
-        text: `excluded.${quoteIdentifier(expression.columnName)}`,
+        columnName: expression.columnName,
+        kind: "excluded",
       };
     case "max": {
       validateProjectionColumns("max column", table, [expression.columnName]);
@@ -1508,8 +1489,9 @@ function compileProjectionExpression(
       );
 
       return {
-        params: value.params,
-        text: `MAX(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+        columnName: expression.columnName,
+        kind: "max",
+        value,
       };
     }
   }
@@ -1519,7 +1501,7 @@ function compileProjectionExpressionOperand(
   table: ProjectionTableMetadata,
   operand: ProjectionExpressionOperandMetadata,
   allowExcluded: boolean,
-): CompiledProjectionSql {
+): ProjectionCompilerExpression {
   if (operand.kind !== "value") {
     return compileProjectionExpression(table, operand, allowExcluded);
   }
@@ -1529,14 +1511,12 @@ function compileProjectionExpressionOperand(
   ]);
 
   return {
-    params: [
-      serializeProjectionColumnValue(
-        table.columns[operand.columnName],
-        operand.value,
-        `${table.name}.${operand.columnName}`,
-      ),
-    ],
-    text: "?",
+    kind: "value",
+    value: serializeProjectionColumnValue(
+      table.columns[operand.columnName],
+      operand.value,
+      `${table.name}.${operand.columnName}`,
+    ),
   };
 }
 
@@ -1555,45 +1535,23 @@ function buildInsertSql(
         readonly updateAssignments: readonly ProjectionUpdateAssignment[];
       },
 ): CompiledProjectionSql {
-  const columnSql = insertColumns.map(quoteIdentifier).join(", ");
-  const valuesSql = insertColumns.map(() => "?").join(", ");
-  let sql = `INSERT INTO ${quoteIdentifier(table.name)} (${columnSql}) VALUES (${valuesSql})`;
-
-  if (conflict === null) {
-    return {
-      params: [],
-      text: sql,
-    };
-  }
-
-  const conflictSql = conflict.conflictColumns.map(quoteIdentifier).join(", ");
-
-  if (conflict.kind === "do_nothing") {
-    sql += ` ON CONFLICT (${conflictSql}) DO NOTHING`;
-    return {
-      params: [],
-      text: sql,
-    };
-  }
-
-  if (conflict.updateAssignments.length === 0) {
-    throw new Error("update values must include at least one column");
-  }
-
-  const updateSql = conflict.updateAssignments
-    .map(
-      (assignment) =>
-        `${quoteIdentifier(assignment.columnName)} = ${assignment.sql}`,
-    )
-    .join(", ");
-  sql += ` ON CONFLICT (${conflictSql}) DO UPDATE SET ${updateSql}`;
-
-  return {
-    params: conflict.updateAssignments.flatMap((assignment) => [
-      ...assignment.params,
-    ]),
-    text: sql,
-  };
+  return projectionStatementCompiler.compileInsert({
+    columns: insertColumns,
+    conflict:
+      conflict === null
+        ? null
+        : conflict.kind === "do_nothing"
+          ? {
+              conflictColumns: conflict.conflictColumns,
+              kind: "do_nothing",
+            }
+          : {
+              assignments: conflict.updateAssignments,
+              conflictColumns: conflict.conflictColumns,
+              kind: "do_update",
+            },
+    tableName: table.name,
+  });
 }
 
 function buildSelectSql(
@@ -1603,39 +1561,13 @@ function buildSelectSql(
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
 ): CompiledProjectionSql {
-  const selectedSql = selectedColumns
-    .map((columnName) => {
-      const quotedColumnName = quoteIdentifier(columnName);
-      return `${quotedColumnName} AS ${quotedColumnName}`;
-    })
-    .join(", ");
-  let sql = `SELECT ${selectedSql} FROM ${quoteIdentifier(table.name)}`;
-  const params: unknown[] = [];
-
-  const whereSql = buildWhereSql(whereClauses);
-  if (whereSql.text.length > 0) {
-    sql += ` WHERE ${whereSql.text}`;
-    params.push(...whereSql.params);
-  }
-
-  if (orderClauses.length > 0) {
-    const orderSql = orderClauses
-      .map((clause) => {
-        return `${quoteIdentifier(clause.columnName)} ${clause.direction.toUpperCase()}`;
-      })
-      .join(", ");
-    sql += ` ORDER BY ${orderSql}`;
-  }
-
-  if (limitClause !== null) {
-    sql += " LIMIT ?";
-    params.push(limitClause);
-  }
-
-  return {
-    params,
-    text: sql,
-  };
+  return projectionStatementCompiler.compileSelect({
+    columns: selectedColumns,
+    limit: limitClause,
+    orderBy: orderClauses,
+    tableName: table.name,
+    where: whereClauses,
+  });
 }
 
 function buildUpdateSql(
@@ -1643,84 +1575,21 @@ function buildUpdateSql(
   assignments: readonly ProjectionUpdateAssignment[],
   whereClauses: readonly ProjectionWhereClause[],
 ): CompiledProjectionSql {
-  if (assignments.length === 0) {
-    throw new Error("update values must include at least one column");
-  }
-
-  const params: unknown[] = [];
-  const setSql = assignments
-    .map((assignment) => {
-      params.push(...assignment.params);
-      return `${quoteIdentifier(assignment.columnName)} = ${assignment.sql}`;
-    })
-    .join(", ");
-  let sql = `UPDATE ${quoteIdentifier(table.name)} SET ${setSql}`;
-  const whereSql = buildWhereSql(whereClauses);
-
-  if (whereSql.text.length > 0) {
-    sql += ` WHERE ${whereSql.text}`;
-    params.push(...whereSql.params);
-  }
-
-  return {
-    params,
-    text: sql,
-  };
+  return projectionStatementCompiler.compileUpdate({
+    assignments,
+    tableName: table.name,
+    where: whereClauses,
+  });
 }
 
 function buildDeleteSql(
   table: ProjectionTableMetadata,
   whereClauses: readonly ProjectionWhereClause[],
 ): CompiledProjectionSql {
-  let sql = `DELETE FROM ${quoteIdentifier(table.name)}`;
-  const whereSql = buildWhereSql(whereClauses);
-
-  if (whereSql.text.length > 0) {
-    sql += ` WHERE ${whereSql.text}`;
-  }
-
-  return {
-    params: whereSql.params,
-    text: sql,
-  };
-}
-
-function buildWhereSql(
-  whereClauses: readonly ProjectionWhereClause[],
-): CompiledProjectionSql {
-  if (whereClauses.length === 0) {
-    return {
-      params: [],
-      text: "",
-    };
-  }
-
-  const params: unknown[] = [];
-  const text = whereClauses
-    .map((clause) => {
-      switch (clause.kind) {
-        case "comparison":
-          params.push(clause.value);
-          return `${quoteIdentifier(clause.columnName)} ${clause.operator} ?`;
-        case "in":
-          if (clause.values.length === 0) {
-            return "0 = 1";
-          }
-
-          params.push(...clause.values);
-          return `${quoteIdentifier(clause.columnName)} IN (${clause.values
-            .map(() => "?")
-            .join(", ")})`;
-        case "null":
-          return `${quoteIdentifier(clause.columnName)} IS ${clause.not ? "NOT " : ""}NULL`;
-      }
-    })
-    .join(" AND ");
-
-  return {
-    params,
-    text,
-  };
+  return projectionStatementCompiler.compileDelete({
+    tableName: table.name,
+    where: whereClauses,
+  });
 }
 
 function createProjectionComparisonWhereClause(
@@ -2237,10 +2106,6 @@ function parseJson(value: unknown, context: string): unknown {
       cause: error,
     });
   }
-}
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`;
 }
 
 function equalColumnLists(

@@ -1,0 +1,330 @@
+export type ProjectionCompiledSql = {
+  readonly params: readonly unknown[];
+  readonly text: string;
+};
+
+export type ProjectionCompilerExpression =
+  | {
+      readonly kind: "coalesce";
+      readonly columnName: string;
+      readonly value: ProjectionCompilerExpression;
+    }
+  | {
+      readonly kind: "column";
+      readonly columnName: string;
+    }
+  | {
+      readonly kind: "excluded";
+      readonly columnName: string;
+    }
+  | {
+      readonly kind: "max";
+      readonly columnName: string;
+      readonly value: ProjectionCompilerExpression;
+    }
+  | {
+      readonly kind: "value";
+      readonly value: unknown;
+    };
+
+export type ProjectionCompilerAssignment = {
+  readonly columnName: string;
+  readonly value: ProjectionCompilerExpression;
+};
+
+export type ProjectionCompilerWhereOperator =
+  | "!="
+  | "<"
+  | "<="
+  | "="
+  | ">"
+  | ">=";
+
+export type ProjectionCompilerWhereClause =
+  | {
+      readonly columnName: string;
+      readonly kind: "comparison";
+      readonly operator: ProjectionCompilerWhereOperator;
+      readonly value: unknown;
+    }
+  | {
+      readonly columnName: string;
+      readonly kind: "in";
+      readonly values: readonly unknown[];
+    }
+  | {
+      readonly columnName: string;
+      readonly kind: "null";
+      readonly not: boolean;
+    };
+
+export type ProjectionCompilerOrderClause = {
+  readonly columnName: string;
+  readonly direction: "asc" | "desc";
+};
+
+export type ProjectionCompilerInsertStatement = {
+  readonly conflict:
+    | null
+    | {
+        readonly conflictColumns: readonly string[];
+        readonly kind: "do_nothing";
+      }
+    | {
+        readonly assignments: readonly ProjectionCompilerAssignment[];
+        readonly conflictColumns: readonly string[];
+        readonly kind: "do_update";
+      };
+  readonly columns: readonly string[];
+  readonly tableName: string;
+};
+
+export type ProjectionCompilerSelectStatement = {
+  readonly columns: readonly string[];
+  readonly limit: number | null;
+  readonly orderBy: readonly ProjectionCompilerOrderClause[];
+  readonly tableName: string;
+  readonly where: readonly ProjectionCompilerWhereClause[];
+};
+
+export type ProjectionCompilerUpdateStatement = {
+  readonly assignments: readonly ProjectionCompilerAssignment[];
+  readonly tableName: string;
+  readonly where: readonly ProjectionCompilerWhereClause[];
+};
+
+export type ProjectionCompilerDeleteStatement = {
+  readonly tableName: string;
+  readonly where: readonly ProjectionCompilerWhereClause[];
+};
+
+export type ProjectionStatementCompiler = {
+  compileDelete(
+    statement: ProjectionCompilerDeleteStatement,
+  ): ProjectionCompiledSql;
+  compileInsert(
+    statement: ProjectionCompilerInsertStatement,
+  ): ProjectionCompiledSql;
+  compileSelect(
+    statement: ProjectionCompilerSelectStatement,
+  ): ProjectionCompiledSql;
+  compileUpdate(
+    statement: ProjectionCompilerUpdateStatement,
+  ): ProjectionCompiledSql;
+};
+
+export function createSqliteProjectionStatementCompiler(): ProjectionStatementCompiler {
+  return {
+    compileDelete: compileDeleteStatement,
+    compileInsert: compileInsertStatement,
+    compileSelect: compileSelectStatement,
+    compileUpdate: compileUpdateStatement,
+  };
+}
+
+function compileInsertStatement(
+  statement: ProjectionCompilerInsertStatement,
+): ProjectionCompiledSql {
+  const columnSql = statement.columns.map(quoteIdentifier).join(", ");
+  const valuesSql = statement.columns.map(() => "?").join(", ");
+  let text = `INSERT INTO ${quoteIdentifier(statement.tableName)} (${columnSql}) VALUES (${valuesSql})`;
+
+  if (statement.conflict === null) {
+    return {
+      params: [],
+      text,
+    };
+  }
+
+  const conflictSql = statement.conflict.conflictColumns
+    .map(quoteIdentifier)
+    .join(", ");
+
+  if (statement.conflict.kind === "do_nothing") {
+    text += ` ON CONFLICT (${conflictSql}) DO NOTHING`;
+    return {
+      params: [],
+      text,
+    };
+  }
+
+  if (statement.conflict.assignments.length === 0) {
+    throw new Error("update values must include at least one column");
+  }
+
+  const params: unknown[] = [];
+  const updateSql = statement.conflict.assignments
+    .map((assignment) => {
+      const expression = compileExpression(assignment.value);
+      params.push(...expression.params);
+      return `${quoteIdentifier(assignment.columnName)} = ${expression.text}`;
+    })
+    .join(", ");
+  text += ` ON CONFLICT (${conflictSql}) DO UPDATE SET ${updateSql}`;
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileSelectStatement(
+  statement: ProjectionCompilerSelectStatement,
+): ProjectionCompiledSql {
+  const selectedSql = statement.columns
+    .map((columnName) => {
+      const quotedColumnName = quoteIdentifier(columnName);
+      return `${quotedColumnName} AS ${quotedColumnName}`;
+    })
+    .join(", ");
+  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.tableName)}`;
+  const params: unknown[] = [];
+  const whereSql = compileWhere(statement.where);
+
+  if (whereSql.text.length > 0) {
+    text += ` WHERE ${whereSql.text}`;
+    params.push(...whereSql.params);
+  }
+
+  if (statement.orderBy.length > 0) {
+    const orderSql = statement.orderBy
+      .map((clause) => {
+        return `${quoteIdentifier(clause.columnName)} ${clause.direction.toUpperCase()}`;
+      })
+      .join(", ");
+    text += ` ORDER BY ${orderSql}`;
+  }
+
+  if (statement.limit !== null) {
+    text += " LIMIT ?";
+    params.push(statement.limit);
+  }
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileUpdateStatement(
+  statement: ProjectionCompilerUpdateStatement,
+): ProjectionCompiledSql {
+  if (statement.assignments.length === 0) {
+    throw new Error("update values must include at least one column");
+  }
+
+  const params: unknown[] = [];
+  const setSql = statement.assignments
+    .map((assignment) => {
+      const expression = compileExpression(assignment.value);
+      params.push(...expression.params);
+      return `${quoteIdentifier(assignment.columnName)} = ${expression.text}`;
+    })
+    .join(", ");
+  let text = `UPDATE ${quoteIdentifier(statement.tableName)} SET ${setSql}`;
+  const whereSql = compileWhere(statement.where);
+
+  if (whereSql.text.length > 0) {
+    text += ` WHERE ${whereSql.text}`;
+    params.push(...whereSql.params);
+  }
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileDeleteStatement(
+  statement: ProjectionCompilerDeleteStatement,
+): ProjectionCompiledSql {
+  let text = `DELETE FROM ${quoteIdentifier(statement.tableName)}`;
+  const whereSql = compileWhere(statement.where);
+
+  if (whereSql.text.length > 0) {
+    text += ` WHERE ${whereSql.text}`;
+  }
+
+  return {
+    params: whereSql.params,
+    text,
+  };
+}
+
+function compileWhere(
+  whereClauses: readonly ProjectionCompilerWhereClause[],
+): ProjectionCompiledSql {
+  if (whereClauses.length === 0) {
+    return {
+      params: [],
+      text: "",
+    };
+  }
+
+  const params: unknown[] = [];
+  const text = whereClauses
+    .map((clause) => {
+      switch (clause.kind) {
+        case "comparison":
+          params.push(clause.value);
+          return `${quoteIdentifier(clause.columnName)} ${clause.operator} ?`;
+        case "in":
+          if (clause.values.length === 0) {
+            return "0 = 1";
+          }
+
+          params.push(...clause.values);
+          return `${quoteIdentifier(clause.columnName)} IN (${clause.values
+            .map(() => "?")
+            .join(", ")})`;
+        case "null":
+          return `${quoteIdentifier(clause.columnName)} IS ${clause.not ? "NOT " : ""}NULL`;
+      }
+    })
+    .join(" AND ");
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileExpression(
+  expression: ProjectionCompilerExpression,
+): ProjectionCompiledSql {
+  switch (expression.kind) {
+    case "coalesce": {
+      const value = compileExpression(expression.value);
+      return {
+        params: value.params,
+        text: `COALESCE(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+      };
+    }
+    case "column":
+      return {
+        params: [],
+        text: quoteIdentifier(expression.columnName),
+      };
+    case "excluded":
+      return {
+        params: [],
+        text: `excluded.${quoteIdentifier(expression.columnName)}`,
+      };
+    case "max": {
+      const value = compileExpression(expression.value);
+      return {
+        params: value.params,
+        text: `MAX(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+      };
+    }
+    case "value":
+      return {
+        params: [expression.value],
+        text: "?",
+      };
+  }
+}
+
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
+}

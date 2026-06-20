@@ -36,6 +36,7 @@ test("package exports expose only supported public modules", async () => {
     "./database-ledger-engine",
     "./internal-storage",
     "./projection-access",
+    "./projection-sql-compiler",
   ]) {
     assert.equal(Object.hasOwn(packageJson.exports, exportName), false);
   }

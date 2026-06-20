@@ -30,6 +30,9 @@
 - Declare `kysely` as the internal SQL compiler substrate for the v2
   materialization facade while keeping public indexer/query callbacks on
   Sledge-owned handles.
+- Route materialization facade execution through an internal statement compiler
+  boundary so future Kysely lowering does not change the public indexer/query
+  API.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and
