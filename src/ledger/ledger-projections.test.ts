@@ -859,6 +859,252 @@ test("projection access supports stateful indexers and ordered range queries", a
   });
 });
 
+test("projection access supports typed disjunction predicate groups", async () => {
+  const followupSchema = defineMaterializationSchema({
+    namespace: "followups",
+    version: 1,
+    tables: {
+      followups: (t) =>
+        t
+          .columns({
+            followupId: t.text().notNull(),
+            targetRunId: t.text().notNull(),
+            state: t.text().notNull(),
+            requestedAtMs: t.integer().notNull(),
+            nextAttemptAfterMs: t.integer(),
+          })
+          .primaryKey(["followupId"])
+          .index("followups_by_state", ["state", "requestedAtMs"]),
+    },
+  });
+  const followupMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(followupSchema, (m) => [
+      m.migration(1, "create followups", (s) => [
+        s.createTable("followups", (t) =>
+          t
+            .columns({
+              followupId: t.text().notNull(),
+              targetRunId: t.text().notNull(),
+              state: t.text().notNull(),
+              requestedAtMs: t.integer().notNull(),
+              nextAttemptAfterMs: t.integer(),
+            })
+            .primaryKey(["followupId"])
+            .index("followups_by_state", ["state", "requestedAtMs"]),
+        ),
+      ]),
+    ]),
+    indexers: {
+      removeFollowups: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          followupId: Type.String(),
+          targetRunId: Type.String(),
+        }),
+      },
+      resolveFollowups: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          followupId: Type.String(),
+          targetRunId: Type.String(),
+        }),
+      },
+    },
+    queries: {
+      dueFollowups: {
+        params: Type.Object({
+          limit: Type.Number(),
+          nowMs: Type.Number(),
+          targetRunId: Type.String(),
+        }),
+        result: Type.Array(
+          Type.Object({
+            followupId: Type.String(),
+            targetRunId: Type.String(),
+            state: Type.String(),
+            requestedAtMs: Type.Number(),
+            nextAttemptAfterMs: Type.Union([Type.Null(), Type.Number()]),
+          }),
+        ),
+      },
+    },
+  });
+  const followupModel = withMaterializations(
+    shape,
+    followupMaterializations,
+  ).register({
+    indexers: {
+      removeFollowups: async ({ input, db }) => {
+        await db
+          .deleteFrom("followups")
+          .whereAny([
+            {
+              columnName: "followupId",
+              kind: "comparison",
+              operator: "=",
+              value: input.followupId,
+            },
+            {
+              columnName: "targetRunId",
+              kind: "comparison",
+              operator: "=",
+              value: input.targetRunId,
+            },
+          ])
+          .execute();
+      },
+      resolveFollowups: async ({ input, db }) => {
+        await db
+          .updateTable("followups")
+          .set({
+            state: "resolved",
+          })
+          .whereAny([
+            {
+              columnName: "followupId",
+              kind: "comparison",
+              operator: "=",
+              value: input.followupId,
+            },
+            {
+              columnName: "targetRunId",
+              kind: "comparison",
+              operator: "=",
+              value: input.targetRunId,
+            },
+          ])
+          .execute();
+      },
+    },
+    queries: {
+      dueFollowups: async ({ params, db }) => {
+        const rows = await db
+          .selectFrom("followups")
+          .select([
+            "followupId",
+            "targetRunId",
+            "state",
+            "requestedAtMs",
+            "nextAttemptAfterMs",
+          ])
+          .whereIn("state", ["active", "needs_attention"])
+          .whereAny([
+            {
+              columnName: "targetRunId",
+              kind: "comparison",
+              operator: "=",
+              value: params.targetRunId,
+            },
+            {
+              columnName: "targetRunId",
+              kind: "comparison",
+              operator: "=",
+              value: "",
+            },
+          ])
+          .whereAny([
+            {
+              columnName: "nextAttemptAfterMs",
+              kind: "is_null",
+            },
+            {
+              columnName: "nextAttemptAfterMs",
+              kind: "comparison",
+              operator: "<=",
+              value: params.nowMs,
+            },
+          ])
+          .orderBy("requestedAtMs", "asc")
+          .orderBy("followupId", "asc")
+          .limit(params.limit)
+          .execute();
+
+        return [...rows];
+      },
+    },
+  });
+  const implementations = readTestLedgerImplementations(followupModel);
+  const removeFollowups = implementations.indexers?.removeFollowups;
+  const resolveFollowups = implementations.indexers?.resolveFollowups;
+  const dueFollowups = implementations.queries?.dueFollowups;
+
+  if (removeFollowups === undefined) {
+    throw new Error("expected removeFollowups indexer implementation");
+  }
+
+  if (resolveFollowups === undefined) {
+    throw new Error("expected resolveFollowups indexer implementation");
+  }
+
+  if (dueFollowups === undefined) {
+    throw new Error("expected dueFollowups query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        followupId: "f_1",
+        targetRunId: "run_1",
+        state: "active",
+        requestedAtMs: 1_000,
+        nextAttemptAfterMs: null,
+      },
+    ],
+    getRow: undefined,
+  });
+
+  const rows = await dueFollowups(fake.scope, {
+    limit: 25,
+    nowMs: 2_000,
+    targetRunId: "run_1",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "all",
+    params: ["active", "needs_attention", "run_1", "", 2_000, 25],
+    sql: 'SELECT "followupId" AS "followupId", "targetRunId" AS "targetRunId", "state" AS "state", "requestedAtMs" AS "requestedAtMs", "nextAttemptAfterMs" AS "nextAttemptAfterMs" FROM "followups" WHERE "state" IN (?, ?) AND ("targetRunId" = ? OR "targetRunId" = ?) AND ("nextAttemptAfterMs" IS NULL OR "nextAttemptAfterMs" <= ?) ORDER BY "requestedAtMs" ASC, "followupId" ASC LIMIT ?',
+  });
+  assert.deepEqual(rows, [
+    {
+      followupId: "f_1",
+      targetRunId: "run_1",
+      state: "active",
+      requestedAtMs: 1_000,
+      nextAttemptAfterMs: null,
+    },
+  ]);
+
+  await resolveFollowups(
+    fake.scope,
+    {
+      followupId: "f_1",
+      targetRunId: "run_1",
+    },
+    createUserCreatedContext(42),
+  );
+
+  assert.deepEqual(fake.calls[1], {
+    method: "run",
+    params: ["resolved", "f_1", "run_1"],
+    sql: 'UPDATE "followups" SET "state" = ? WHERE ("followupId" = ? OR "targetRunId" = ?)',
+  });
+
+  await removeFollowups(
+    fake.scope,
+    {
+      followupId: "f_1",
+      targetRunId: "run_1",
+    },
+    createUserCreatedContext(43),
+  );
+
+  assert.deepEqual(fake.calls[2], {
+    method: "run",
+    params: ["f_1", "run_1"],
+    sql: 'DELETE FROM "followups" WHERE ("followupId" = ? OR "targetRunId" = ?)',
+  });
+});
+
 test("projection access hydrates semantic event references without exposing events table", async () => {
   const eventMaterializations = defineMaterializations({
     history,
@@ -1803,6 +2049,37 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           const userId: string = event.payload.userId;
           void userId;
         }
+
+        db.selectFrom("users")
+          .select(["email"])
+          .whereAny([
+            {
+              columnName: "email",
+              kind: "comparison",
+              operator: "=",
+              value: "alice@example.com",
+            },
+          ]);
+        db.selectFrom("users")
+          .select(["email"])
+          .whereAny([
+            {
+              columnName: "email",
+              kind: "comparison",
+              operator: "=",
+              // @ts-expect-error whereAny comparison values must match column types.
+              value: 123,
+            },
+          ]);
+        db.selectFrom("users")
+          .select(["email"])
+          .whereAny([
+            {
+              // @ts-expect-error whereAny conditions must reference known columns.
+              columnName: "missing",
+              kind: "is_null",
+            },
+          ]);
 
         // @ts-expect-error queries cannot mutate materialization tables.
         db.updateTable("users");

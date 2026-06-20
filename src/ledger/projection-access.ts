@@ -162,6 +162,35 @@ type ProjectionWhereValue<
 
 export type ProjectionWhereOperator = "=" | "!=" | "<" | "<=" | ">" | ">=";
 
+export type ProjectionWhereCondition<TTable> =
+  | {
+      readonly [TColumnName in ProjectionTableColumnName<TTable>]: {
+        readonly columnName: TColumnName;
+        readonly kind: "comparison";
+        readonly operator: ProjectionWhereOperator;
+        readonly value: ProjectionWhereValue<TTable, TColumnName>;
+      };
+    }[ProjectionTableColumnName<TTable>]
+  | {
+      readonly [TColumnName in ProjectionTableColumnName<TTable>]: {
+        readonly columnName: TColumnName;
+        readonly kind: "in";
+        readonly values: readonly ProjectionWhereValue<TTable, TColumnName>[];
+      };
+    }[ProjectionTableColumnName<TTable>]
+  | {
+      readonly [TColumnName in ProjectionTableColumnName<TTable>]: {
+        readonly columnName: TColumnName;
+        readonly kind: "is_not_null";
+      };
+    }[ProjectionTableColumnName<TTable>]
+  | {
+      readonly [TColumnName in ProjectionTableColumnName<TTable>]: {
+        readonly columnName: TColumnName;
+        readonly kind: "is_null";
+      };
+    }[ProjectionTableColumnName<TTable>];
+
 export type ProjectionOrderDirection = "asc" | "desc";
 
 export type ProjectionSelectedRow<
@@ -242,6 +271,9 @@ export type ProjectionUpdateBuilder<TTable> = {
 };
 
 export type ProjectionUpdateWhereBuilder<TTable> = ProjectionExecutableWrite & {
+  whereAny(
+    conditions: readonly ProjectionWhereCondition<TTable>[],
+  ): ProjectionUpdateWhereBuilder<TTable>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     operator: ProjectionWhereOperator,
@@ -260,6 +292,9 @@ export type ProjectionUpdateWhereBuilder<TTable> = ProjectionExecutableWrite & {
 };
 
 export type ProjectionDeleteBuilder<TTable> = ProjectionExecutableWrite & {
+  whereAny(
+    conditions: readonly ProjectionWhereCondition<TTable>[],
+  ): ProjectionDeleteBuilder<TTable>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     operator: ProjectionWhereOperator,
@@ -293,6 +328,9 @@ export type ProjectionExecutableSelect<
   orderBy<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     direction?: ProjectionOrderDirection,
+  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  whereAny(
+    conditions: readonly ProjectionWhereCondition<TTable>[],
   ): ProjectionExecutableSelect<TTable, TColumnNames>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
@@ -952,6 +990,15 @@ function createProjectionUpdateWhereBuilder<TTable>(
   return {
     execute: () => executable().execute(),
     executeExpectingOne: () => executable().executeExpectingOne(),
+    whereAny: (conditions) => {
+      return createProjectionUpdateWhereBuilder(
+        scope,
+        table,
+        updateAssignments,
+        [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
+        trackWrite,
+      );
+    },
     where: (columnName, operator, value) => {
       return createProjectionUpdateWhereBuilder(
         scope,
@@ -1027,6 +1074,14 @@ function createProjectionDeleteBuilder<TTable>(
   return {
     execute: () => executable().execute(),
     executeExpectingOne: () => executable().executeExpectingOne(),
+    whereAny: (conditions) => {
+      return createProjectionDeleteBuilder(
+        scope,
+        table,
+        [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
+        trackWrite,
+      );
+    },
     where: (columnName, operator, value) => {
       return createProjectionDeleteBuilder(
         scope,
@@ -1159,6 +1214,16 @@ function createProjectionExecutableSelect<
             direction,
           },
         ],
+        limitClause,
+      );
+    },
+    whereAny: (conditions) => {
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
+        orderClauses,
         limitClause,
       );
     },
@@ -1590,6 +1655,55 @@ function buildDeleteSql(
     tableName: table.name,
     where: whereClauses,
   });
+}
+
+function createProjectionAnyWhereClause<TTable>(
+  table: ProjectionTableMetadata,
+  conditions: readonly ProjectionWhereCondition<TTable>[],
+): ProjectionWhereClause {
+  if (conditions.length === 0) {
+    throw new Error("any predicate group must include at least one condition");
+  }
+
+  return {
+    clauses: conditions.map((condition) => {
+      return createProjectionWhereClauseFromCondition(table, condition);
+    }),
+    kind: "any",
+  };
+}
+
+function createProjectionWhereClauseFromCondition<TTable>(
+  table: ProjectionTableMetadata,
+  condition: ProjectionWhereCondition<TTable>,
+): ProjectionWhereClause {
+  switch (condition.kind) {
+    case "comparison":
+      return createProjectionComparisonWhereClause(
+        table,
+        String(condition.columnName),
+        condition.operator,
+        condition.value,
+      );
+    case "in":
+      return createProjectionInWhereClause(
+        table,
+        String(condition.columnName),
+        condition.values,
+      );
+    case "is_not_null":
+      return createProjectionNullWhereClause(
+        table,
+        String(condition.columnName),
+        true,
+      );
+    case "is_null":
+      return createProjectionNullWhereClause(
+        table,
+        String(condition.columnName),
+        false,
+      );
+  }
 }
 
 function createProjectionComparisonWhereClause(

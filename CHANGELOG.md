@@ -33,6 +33,8 @@
 - Route materialization facade execution through an internal statement compiler
   boundary so future Kysely lowering does not change the public indexer/query
   API.
+- Add typed `whereAny([...])` disjunction groups to projection read, update,
+  and delete builders so common OR predicates do not require raw SQL.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and

@@ -42,6 +42,10 @@ export type ProjectionCompilerWhereOperator =
 
 export type ProjectionCompilerWhereClause =
   | {
+      readonly clauses: readonly ProjectionCompilerWhereClause[];
+      readonly kind: "any";
+    }
+  | {
       readonly columnName: string;
       readonly kind: "comparison";
       readonly operator: ProjectionCompilerWhereOperator;
@@ -264,22 +268,10 @@ function compileWhere(
   const params: unknown[] = [];
   const text = whereClauses
     .map((clause) => {
-      switch (clause.kind) {
-        case "comparison":
-          params.push(clause.value);
-          return `${quoteIdentifier(clause.columnName)} ${clause.operator} ?`;
-        case "in":
-          if (clause.values.length === 0) {
-            return "0 = 1";
-          }
+      const compiled = compileWhereClause(clause);
+      params.push(...compiled.params);
 
-          params.push(...clause.values);
-          return `${quoteIdentifier(clause.columnName)} IN (${clause.values
-            .map(() => "?")
-            .join(", ")})`;
-        case "null":
-          return `${quoteIdentifier(clause.columnName)} IS ${clause.not ? "NOT " : ""}NULL`;
-      }
+      return compiled.text;
     })
     .join(" AND ");
 
@@ -287,6 +279,57 @@ function compileWhere(
     params,
     text,
   };
+}
+
+function compileWhereClause(
+  clause: ProjectionCompilerWhereClause,
+): ProjectionCompiledSql {
+  switch (clause.kind) {
+    case "any": {
+      if (clause.clauses.length === 0) {
+        throw new Error("any predicate group must include at least one clause");
+      }
+
+      const params: unknown[] = [];
+      const text = clause.clauses
+        .map((childClause) => {
+          const compiled = compileWhereClause(childClause);
+          params.push(...compiled.params);
+
+          return compiled.text;
+        })
+        .join(" OR ");
+
+      return {
+        params,
+        text: `(${text})`,
+      };
+    }
+    case "comparison":
+      return {
+        params: [clause.value],
+        text: `${quoteIdentifier(clause.columnName)} ${clause.operator} ?`,
+      };
+    case "in":
+      if (clause.values.length === 0) {
+        return {
+          params: [],
+          text: "0 = 1",
+        };
+      }
+
+      return {
+        params: clause.values,
+        text: `${quoteIdentifier(clause.columnName)} IN (${clause.values
+          .map(() => "?")
+          .join(", ")})`,
+      };
+    case "null":
+      return {
+        params: [],
+        text: `${quoteIdentifier(clause.columnName)} IS ${clause.not ? "NOT " : ""}NULL`,
+      };
+  }
 }
 
 function compileExpression(

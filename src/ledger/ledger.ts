@@ -74,6 +74,7 @@ export type {
   ProjectionUpdateWhereBuilder,
   ProjectionUpsertExpressionBuilder,
   ProjectionUpsertUpdateSet,
+  ProjectionWhereCondition,
   ProjectionWhereOperator,
   ProjectionWriteDatabase,
   ProjectionWriteRow,

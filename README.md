@@ -340,8 +340,9 @@ Indexer and query implementations receive sledge-owned facades:
   `updateTable(...)`, and `deleteFrom(...)`
 - queries can `selectFrom(...)` and `readEvent(ref)`, but cannot mutate
   materialization tables
-- reads support typed predicates, null predicates, `orderBy(...)`,
-  `limit(...)`, `execute()`, `executeTakeFirst()`, and `stream()`
+- reads support typed predicates, null predicates, typed `whereAny([...])`
+  disjunction groups, `orderBy(...)`, `limit(...)`, `execute()`,
+  `executeTakeFirst()`, and `stream()`
 - writes return affected-row metadata and support typed `MAX(...)`,
   `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
