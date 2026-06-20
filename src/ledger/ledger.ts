@@ -700,9 +700,16 @@ export type MaterializationMigrationColumnBuilder<TEventName extends string> =
 type MaterializationMigrationWhereValue<
   TTable,
   TColumnName extends ProjectionTableColumnName<TTable>,
-> = NonNullable<
-  ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
->;
+> =
+  ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
+    "json",
+    infer TValue,
+    boolean
+  >
+    ? TValue
+    : NonNullable<
+        ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+      >;
 
 export type MaterializationMigrationSelectedRow<
   TTable,
@@ -1282,6 +1289,12 @@ function createMaterializationMigrationStepBuilder<
         column,
         `materialization add column ${String(tableName)}.${String(columnName)}`,
       );
+
+      if (!metadata.nullable) {
+        throw new Error(
+          `materialization add column ${String(tableName)}.${String(columnName)} cannot add a non-null column without a default`,
+        );
+      }
 
       return {
         column: metadata,

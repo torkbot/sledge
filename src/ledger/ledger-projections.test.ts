@@ -678,7 +678,28 @@ test("projection access rejects non-serializable JSON values before storage", as
         }),
       },
     },
-    queries: {},
+    queries: {
+      jsonByMetadata: {
+        params: Type.Object({
+          metadata: Type.Unknown(),
+        }),
+        result: Type.Array(
+          Type.Object({
+            userId: Type.String(),
+          }),
+        ),
+      },
+      jsonByMetadataIn: {
+        params: Type.Object({
+          values: Type.Array(Type.Unknown()),
+        }),
+        result: Type.Array(
+          Type.Object({
+            userId: Type.String(),
+          }),
+        ),
+      },
+    },
   });
   const registeredJsonModel = withMaterializations(
     shape,
@@ -710,11 +731,33 @@ test("projection access rejects non-serializable JSON values before storage", as
           .execute();
       },
     },
+    queries: {
+      jsonByMetadata: async ({ params, db }) => {
+        const rows = await db
+          .selectFrom("jsonRows")
+          .select(["userId"])
+          .where("metadata", "=", params.metadata)
+          .execute();
+
+        return [...rows];
+      },
+      jsonByMetadataIn: async ({ params, db }) => {
+        const rows = await db
+          .selectFrom("jsonRows")
+          .select(["userId"])
+          .whereIn("metadata", params.values)
+          .execute();
+
+        return [...rows];
+      },
+    },
   });
   const jsonImplementations =
     readTestLedgerImplementations(registeredJsonModel);
   const insertJson = jsonImplementations.indexers?.insertJson;
   const updateJson = jsonImplementations.indexers?.updateJson;
+  const jsonByMetadata = jsonImplementations.queries?.jsonByMetadata;
+  const jsonByMetadataIn = jsonImplementations.queries?.jsonByMetadataIn;
 
   if (insertJson === undefined) {
     throw new Error("expected insertJson indexer implementation");
@@ -722,6 +765,10 @@ test("projection access rejects non-serializable JSON values before storage", as
 
   if (updateJson === undefined) {
     throw new Error("expected updateJson indexer implementation");
+  }
+
+  if (jsonByMetadata === undefined || jsonByMetadataIn === undefined) {
+    throw new Error("expected JSON query implementations");
   }
 
   const validFake = createFakeScope({
@@ -773,6 +820,44 @@ test("projection access rejects non-serializable JSON values before storage", as
     method: "run",
     params: ["u_null", "null"],
     sql: 'INSERT INTO "jsonRows" ("userId", "metadata") VALUES (?, ?)',
+  });
+
+  const nullJsonPredicateFake = createFakeScope({
+    allRows: [
+      {
+        userId: "u_null",
+      },
+    ],
+    getRow: undefined,
+  });
+
+  await jsonByMetadata(nullJsonPredicateFake.scope, {
+    metadata: null,
+  });
+
+  assert.deepEqual(nullJsonPredicateFake.calls[0], {
+    method: "all",
+    params: ["null"],
+    sql: 'SELECT "userId" AS "userId" FROM "jsonRows" WHERE "metadata" = ?',
+  });
+
+  const nullJsonInPredicateFake = createFakeScope({
+    allRows: [
+      {
+        userId: "u_null",
+      },
+    ],
+    getRow: undefined,
+  });
+
+  await jsonByMetadataIn(nullJsonInPredicateFake.scope, {
+    values: [null],
+  });
+
+  assert.deepEqual(nullJsonInPredicateFake.calls[0], {
+    method: "all",
+    params: ["null"],
+    sql: 'SELECT "userId" AS "userId" FROM "jsonRows" WHERE "metadata" IN (?)',
   });
 
   const expressionShapedJsonFake = createFakeScope({
@@ -2381,6 +2466,37 @@ test("materialization histories validate versions and record typed operations", 
     kind: "create_index",
     tableName: "users",
   });
+
+  const requiredColumnSchemaV2 = defineMaterializationSchema({
+    namespace: "required-plan",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+
+  assert.throws(() => {
+    defineMaterializationHistory(requiredColumnSchemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(2, "add required user email", (s) => [
+        s.addColumn("users", "email", (t) => t.text().notNull()),
+      ]),
+    ]);
+  }, /materialization add column users\.email cannot add a non-null column without a default/);
 
   assert.throws(() => {
     defineMaterializationHistory(schemaV2, (m) => [

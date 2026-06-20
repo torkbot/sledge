@@ -165,9 +165,16 @@ export type ProjectionUpsertUpdateSet<TTable> =
 type ProjectionWhereValue<
   TTable,
   TColumnName extends ProjectionTableColumnName<TTable>,
-> = NonNullable<
-  ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
->;
+> =
+  ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
+    "json",
+    infer TValue,
+    boolean
+  >
+    ? TValue
+    : NonNullable<
+        ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+      >;
 
 export type ProjectionWhereOperator = "=" | "!=" | "<" | "<=" | ">" | ">=";
 
@@ -3004,14 +3011,16 @@ function serializeProjectionPredicateValue(
   columnName: string,
   value: unknown,
 ): unknown {
-  if (value === null) {
+  const column = table.columns[columnName];
+
+  if (value === null && column?.kind !== "json") {
     throw new Error(
       `${table.name}.${columnName} predicate value cannot be null; use whereNull or whereNotNull`,
     );
   }
 
   return serializeProjectionColumnValue(
-    table.columns[columnName],
+    column,
     value,
     `${table.name}.${columnName}`,
   );

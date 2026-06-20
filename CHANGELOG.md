@@ -80,6 +80,9 @@
 - Preserve JSON objects that look like projection-expression metadata during
   update/upsert serialization, and chunk batched semantic event reads below
   SQLite bind-variable limits.
+- Preserve JSON `null` values in JSON equality/`whereIn` predicates and reject
+  non-null `addColumn` migration steps until the migration DSL supports
+  defaults or two-phase constraints.
 
 ## 0.9.0 - 2026-05-20
 
