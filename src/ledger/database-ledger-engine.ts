@@ -35,6 +35,11 @@ import type {
   WorkSnapshot,
   WorkState,
 } from "./ledger.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -89,6 +94,9 @@ type OpenDatabaseLedgerEngineInput<
   TSignalQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, AnyIndexerDef>,
   TQueries extends Record<string, AnyQueryDef>,
+  TProjectionSchema extends AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TQueryDefinitions extends ProjectionQueryDefinitions,
 > = {
   readonly model: RegisteredLedgerModel<
     TEvents,
@@ -96,7 +104,10 @@ type OpenDatabaseLedgerEngineInput<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly timing: LedgerTiming;
   readonly storage: StorageRuntime;
@@ -109,6 +120,9 @@ export type CreateDatabaseLedgerInput<
   TQueries extends Record<string, AnyQueryDef>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly storage: StorageRuntime;
   readonly model: RegisteredLedgerModel<
@@ -117,7 +131,10 @@ export type CreateDatabaseLedgerInput<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly timing: LedgerTiming;
 };
@@ -129,6 +146,9 @@ export function createDatabaseLedger<
   const TQueries extends Record<string, AnyQueryDef>,
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(
   input: CreateDatabaseLedgerInput<
     TEvents,
@@ -136,7 +156,10 @@ export function createDatabaseLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
@@ -353,6 +376,9 @@ function openDatabaseLedgerEngine<
   const TSignalQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, AnyIndexerDef>,
   const TQueries extends Record<string, AnyQueryDef>,
+  const TProjectionSchema extends AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  const TQueryDefinitions extends ProjectionQueryDefinitions,
 >(
   input: OpenDatabaseLedgerEngineInput<
     TEvents,
@@ -360,7 +386,10 @@ function openDatabaseLedgerEngine<
     TQueues,
     TSignalQueues,
     TIndexers,
-    TQueries
+    TQueries,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
@@ -1018,9 +1047,13 @@ function openDatabaseLedgerEngine<
           actions: {
             index: (indexName, indexInput) => {
               return trackAction(async () => {
-                await tx.index(indexName, indexInput, {
-                  event: envelope,
-                });
+                await tx.index(
+                  String(indexName) as keyof TIndexers,
+                  indexInput as Static<TIndexers[keyof TIndexers]>,
+                  {
+                    event: envelope,
+                  },
+                );
               });
             },
             enqueue: (queueName, payload, options) => {

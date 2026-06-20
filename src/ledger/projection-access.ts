@@ -240,6 +240,29 @@ export type ProjectionIndexerSchemas<TDefinitions> = {
     : never;
 };
 
+export type ProjectionIndexerSchemasForEvent<
+  TDefinitions,
+  TEventName extends string,
+> = {
+  readonly [TName in Extract<
+    keyof TDefinitions,
+    string
+  > as TDefinitions[TName] extends {
+    readonly input: infer TInputSchema;
+    readonly sourceEvent: TEventName;
+  }
+    ? TInputSchema extends TSchema
+      ? TName
+      : never
+    : never]: TDefinitions[TName] extends {
+    readonly input: infer TInputSchema;
+  }
+    ? TInputSchema extends TSchema
+      ? TInputSchema
+      : never
+    : never;
+};
+
 export type ProjectionQuerySchemas<TDefinitions> = {
   readonly [TName in Extract<
     keyof TDefinitions,

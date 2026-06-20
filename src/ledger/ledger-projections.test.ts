@@ -683,6 +683,40 @@ test("materialization histories validate versions and record typed operations", 
       ]),
     ]);
   }, /duplicate materialization migration version 1/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(2, "add user email", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+      ]),
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]);
+  }, /ascending version order/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(2, "forget user email", (s) => [
+        s.createIndex("usersByUserId", "users", ["userId"]),
+      ]),
+    ]);
+  }, /materialization history table users must match current schema columns/);
 });
 
 test("withMaterializations rejects materialization event refs outside the ledger shape", () => {
@@ -733,31 +767,24 @@ test("withMaterializations rejects materialization event refs outside the ledger
           .primaryKey(["sessionId"]),
     },
   });
-  const invalidHistory = defineMaterializationHistory(validSchemaV2, (m) => [
-    m.migration(1, "create sessions", (s) => [
-      s.createTable("sessions", (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            // @ts-expect-error runtime validation protects unchecked callers too.
-            source: t.eventRef("session.created").notNull(),
-          })
-          .primaryKey(["sessionId"]),
-      ),
-    ]),
-    m.migration(2, "index sessions", (s) => [
-      s.createIndex("sessionsBySessionId", "sessions", ["sessionId"]),
-    ]),
-  ]);
-  const invalidHistoricalMaterializations = defineMaterializations({
-    history: invalidHistory,
-    indexers: {},
-    queries: {},
-  });
-
   assert.throws(() => {
-    withMaterializations(shape, invalidHistoricalMaterializations);
-  }, /references unknown event session\.created/);
+    defineMaterializationHistory(validSchemaV2, (m) => [
+      m.migration(1, "create sessions", (s) => [
+        s.createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              // @ts-expect-error runtime validation protects unchecked callers too.
+              source: t.eventRef("session.created").notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        ),
+      ]),
+      m.migration(2, "index sessions", (s) => [
+        s.createIndex("sessionsBySessionId", "sessions", ["sessionId"]),
+      ]),
+    ]);
+  }, /materialization history table sessions must match current schema columns/);
 });
 
 test("withMaterializations rejects unchecked indexer source events outside the ledger shape", () => {
@@ -779,6 +806,75 @@ test("withMaterializations rejects unchecked indexer source events outside the l
 });
 
 async function assertLedgerProjectionTypes(): Promise<void> {
+  const multiEventShape = defineLedgerShape({
+    events: {
+      "session.created": Type.Object({
+        sessionId: Type.String(),
+      }),
+      "user.created": UserCreatedSchema,
+    },
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const multiEventSchema = defineMaterializationSchema({
+    namespace: "source-events",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+  const multiEventMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(multiEventSchema, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]),
+    indexers: {
+      upsertUser: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          userId: Type.String(),
+        }),
+      },
+    },
+    queries: {},
+  });
+  const multiEventModel = withMaterializations(
+    multiEventShape,
+    multiEventMaterializations,
+  );
+
+  multiEventModel.register({
+    indexers: {
+      upsertUser: () => undefined,
+    },
+    events: {
+      "session.created": async ({ actions }) => {
+        // @ts-expect-error event handlers can only call indexers for their event.
+        await actions.index("upsertUser", {
+          userId: "u_123",
+        });
+      },
+      "user.created": async ({ actions }) => {
+        await actions.index("upsertUser", {
+          userId: "u_123",
+        });
+      },
+    },
+  });
+
   const typedSchema = defineMaterializationSchema({
     namespace: "types",
     version: 1,

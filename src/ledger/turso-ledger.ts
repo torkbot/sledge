@@ -13,6 +13,11 @@ import type {
   LedgerTiming,
   QuerySchema,
 } from "./ledger.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -24,6 +29,9 @@ type CreateTursoLedgerInput<
   TQueries extends Record<string, AnyQueryDef>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly databaseUrl: string;
   readonly model: RegisteredLedgerModel<
@@ -32,7 +40,10 @@ type CreateTursoLedgerInput<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly timing: LedgerTiming;
 };
@@ -44,6 +55,9 @@ export async function createTursoLedger<
   const TQueries extends Record<string, AnyQueryDef> = {},
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(
   input: CreateTursoLedgerInput<
     TEvents,
@@ -51,7 +65,10 @@ export async function createTursoLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >,
 ): Promise<Ledger<TEvents, TQueries, TSignals>> {
   const sharedInput: CreateDatabaseLedgerInput<
@@ -60,7 +77,10 @@ export async function createTursoLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   > = {
     storage: await createTursoStorageRuntime(input.databaseUrl),
     model: input.model,

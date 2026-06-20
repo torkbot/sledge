@@ -25,6 +25,11 @@
   table.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
+- Preserve materialization definition types through ledger construction and
+  adapter inputs so event handlers can only call indexers for their source
+  event.
+- Reject out-of-order materialization histories and histories whose replayed
+  table shape does not match the current materialization schema.
 
 ## 0.9.0 - 2026-05-20
 

@@ -10,6 +10,7 @@ import {
   type ProjectionImplementationRegistration,
   type ProjectionIndexerDefinitions,
   type ProjectionIndexerSchemas,
+  type ProjectionIndexerSchemasForEvent,
   type ProjectionInsertBuilder,
   type ProjectionQueryDefinitions,
   type ProjectionQuerySchemas,
@@ -254,6 +255,14 @@ export interface ProjectionActions<TIndexers extends Record<string, TSchema>> {
   ): Promise<void>;
 }
 
+type EventProjectionActionIndexers<
+  TIndexers extends Record<string, TSchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TEventName extends string,
+> = keyof TIndexerDefinitions extends never
+  ? TIndexers
+  : ProjectionIndexerSchemasForEvent<TIndexerDefinitions, TEventName>;
+
 export type QueueHandlerRetryOptions = {
   readonly retryAtMs?: number;
 };
@@ -302,9 +311,16 @@ export type EventHandlerFunction<
   TIndexers extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQuerySchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
 > = (input: {
   readonly event: EventEnvelope<TEvents, TEventName>;
-  readonly actions: ProjectionActions<TIndexers> & {
+  readonly actions: ProjectionActions<
+    EventProjectionActionIndexers<
+      TIndexers,
+      TIndexerDefinitions,
+      Extract<TEventName, string>
+    >
+  > & {
     readonly enqueue: <const TQueueName extends keyof TQueues>(
       queueName: TQueueName,
       payload: Static<TQueues[TQueueName]>,
@@ -377,6 +393,7 @@ export type RegisterFunction<
   TQueries extends Record<string, AnyQuerySchema>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
 > = {
   readonly events?: {
     readonly [TEventName in keyof TEvents]?: EventHandlerFunction<
@@ -384,7 +401,8 @@ export type RegisterFunction<
       TEventName,
       TIndexers,
       TQueues,
-      TQueries
+      TQueries,
+      TIndexerDefinitions
     >;
   };
   readonly signals?: {
@@ -595,7 +613,8 @@ export type RegisteredLedgerModel<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TIndexerDefinitions
   > &
     ProjectionImplementationRegistration<
       TProjectionSchema,
@@ -1069,7 +1088,8 @@ export type DefinedLedgerShape<
       {},
       {},
       TSignals,
-      TSignalQueues
+      TSignalQueues,
+      {}
     >,
   ): RegisteredLedgerModel<
     TEvents,
@@ -1109,7 +1129,8 @@ export type DefinedLedgerModel<
       TIndexers,
       TQueries,
       TSignals,
-      TSignalQueues
+      TSignalQueues,
+      TIndexerDefinitions
     > &
       ProjectionImplementationRegistration<
         TProjectionSchema,
@@ -1509,6 +1530,66 @@ function validateMaterializationColumnNames(
   }
 }
 
+function validateMaterializationTableMetadataMatch(
+  context: string,
+  expected: ProjectionTableMetadata,
+  actual: ProjectionTableMetadata,
+): void {
+  if (
+    !equalStringLists(
+      Object.keys(expected.columns),
+      Object.keys(actual.columns),
+    )
+  ) {
+    throw new Error(`${context} must match current schema columns`);
+  }
+
+  for (const [columnName, expectedColumn] of Object.entries(expected.columns)) {
+    const actualColumn = actual.columns[columnName];
+
+    if (
+      actualColumn === undefined ||
+      !equalMaterializationColumnMetadata(expectedColumn, actualColumn)
+    ) {
+      throw new Error(
+        `${context} must match current schema column ${columnName}`,
+      );
+    }
+  }
+
+  if (!equalStringLists(expected.primaryKey, actual.primaryKey)) {
+    throw new Error(`${context} must match current schema primary key`);
+  }
+}
+
+function equalMaterializationColumnMetadata(
+  left: ProjectionColumnMetadata,
+  right: ProjectionColumnMetadata,
+): boolean {
+  return (
+    left.kind === right.kind &&
+    left.nullable === right.nullable &&
+    left.eventName === right.eventName
+  );
+}
+
+function equalStringLists(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function readMaterializationColumnMetadata(
   column: unknown,
   context: string,
@@ -1574,6 +1655,7 @@ function validateMaterializationHistory(
   }
 
   const versions = new Set<number>();
+  let previousVersion = 0;
 
   for (const migration of migrations) {
     if (!Number.isSafeInteger(migration.version) || migration.version <= 0) {
@@ -1604,6 +1686,13 @@ function validateMaterializationHistory(
       );
     }
 
+    if (migration.version <= previousVersion) {
+      throw new Error(
+        "materialization history migrations must be in ascending version order",
+      );
+    }
+
+    previousVersion = migration.version;
     versions.add(migration.version);
   }
 
@@ -1632,6 +1721,104 @@ function validateMaterializationHistory(
     if (version !== previousVersion + 1) {
       throw new Error("materialization history versions must not have gaps");
     }
+  }
+
+  validateMaterializationHistoryResult(current, migrations);
+}
+
+function validateMaterializationHistoryResult(
+  current: AnyMaterializationSchema,
+  migrations: readonly MaterializationMigration[],
+): void {
+  const tables = new Map<string, ProjectionTableMetadata>();
+
+  for (const migration of migrations) {
+    for (const operation of migration.operations) {
+      applyMaterializationMigrationOperation(tables, operation);
+    }
+  }
+
+  if (
+    !equalStringLists([...tables.keys()], Object.keys(current.metadata.tables))
+  ) {
+    throw new Error("materialization history must match current schema tables");
+  }
+
+  for (const [tableName, expectedTable] of Object.entries(
+    current.metadata.tables,
+  )) {
+    const actualTable = tables.get(tableName);
+
+    if (actualTable === undefined) {
+      throw new Error(
+        `materialization history must create current schema table ${tableName}`,
+      );
+    }
+
+    validateMaterializationTableMetadataMatch(
+      `materialization history table ${tableName}`,
+      expectedTable,
+      actualTable,
+    );
+  }
+}
+
+function applyMaterializationMigrationOperation(
+  tables: Map<string, ProjectionTableMetadata>,
+  operation: MaterializationMigrationOperation,
+): void {
+  switch (operation.kind) {
+    case "create_table":
+      if (tables.has(operation.tableName)) {
+        throw new Error(
+          `materialization history creates duplicate table ${operation.tableName}`,
+        );
+      }
+
+      tables.set(operation.tableName, operation.table);
+      return;
+    case "add_column": {
+      const table = tables.get(operation.tableName);
+
+      if (table === undefined) {
+        throw new Error(
+          `materialization history adds column to unknown table ${operation.tableName}`,
+        );
+      }
+
+      if (table.columns[operation.columnName] !== undefined) {
+        throw new Error(
+          `materialization history adds duplicate column ${operation.tableName}.${operation.columnName}`,
+        );
+      }
+
+      tables.set(operation.tableName, {
+        ...table,
+        columns: {
+          ...table.columns,
+          [operation.columnName]: operation.column,
+        },
+      });
+      return;
+    }
+    case "create_index": {
+      const table = tables.get(operation.tableName);
+
+      if (table === undefined) {
+        throw new Error(
+          `materialization history creates index on unknown table ${operation.tableName}`,
+        );
+      }
+
+      tables.set(operation.tableName, {
+        ...table,
+        indexes: [...table.indexes, operation.index],
+      });
+      return;
+    }
+    case "add_foreign_key":
+    case "data":
+      return;
   }
 }
 
@@ -1851,6 +2038,9 @@ export interface LedgerEngineFactory {
     TQueries extends Record<string, AnyQuerySchema>,
     TSignals extends Record<string, TSchema> = {},
     TSignalQueues extends Record<string, TSchema> = {},
+    TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+    TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+    TQueryDefinitions extends ProjectionQueryDefinitions = {},
   >(input: {
     readonly model: RegisteredLedgerModel<
       TEvents,
@@ -1858,7 +2048,10 @@ export interface LedgerEngineFactory {
       TIndexers,
       TQueries,
       TSignals,
-      TSignalQueues
+      TSignalQueues,
+      TProjectionSchema,
+      TIndexerDefinitions,
+      TQueryDefinitions
     >;
     readonly timing: LedgerTiming;
   }): Ledger<TEvents, TQueries, TSignals>;
@@ -1871,6 +2064,9 @@ export function createLedger<
   const TQueries extends Record<string, AnyQuerySchema>,
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(input: {
   readonly model: RegisteredLedgerModel<
     TEvents,
@@ -1878,7 +2074,10 @@ export function createLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly engineFactory: LedgerEngineFactory;
   readonly timing: LedgerTiming;

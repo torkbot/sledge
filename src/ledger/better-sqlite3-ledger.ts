@@ -7,6 +7,11 @@ import type {
   LedgerTiming,
   QuerySchema,
 } from "./ledger.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
@@ -28,6 +33,9 @@ type CreateBetterSqliteLedgerInput<
   TQueries extends Record<string, AnyQueryDef>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly databaseUrl: string;
   readonly model: RegisteredLedgerModel<
@@ -36,7 +44,10 @@ type CreateBetterSqliteLedgerInput<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly timing: LedgerTiming;
 };
@@ -48,6 +59,9 @@ export function createBetterSqliteLedger<
   const TQueries extends Record<string, AnyQueryDef>,
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(
   input: CreateBetterSqliteLedgerInput<
     TEvents,
@@ -55,7 +69,10 @@ export function createBetterSqliteLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const sharedInput: CreateDatabaseLedgerInput<
@@ -64,7 +81,10 @@ export function createBetterSqliteLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   > = {
     storage: createBetterSqliteStorageRuntime(input.databaseUrl),
     model: input.model,
