@@ -70,9 +70,10 @@
 - Export `createEventRef(...)` from `@torkbot/sledge/ledger` and reject invalid
   event-ref IDs at construction time.
 - Harden materialization/projection validation for migration-order data steps,
-  foreign-key target keys, duplicate index names, case-only duplicate columns,
-  null predicate values, unsupported same-table joins, and late projection
-  writes after indexer completion.
+  data steps before declared keys/relations, foreign-key target keys, duplicate
+  index names, SQLite-internal object names, case-only duplicate columns, null
+  predicate values, unsupported same-table joins, and late projection writes
+  after indexer completion.
 - Reject projection table/index names that would collide under SQLite's
   identifier rules or share SQLite's table/index namespace, enable SQLite
   foreign-key enforcement on adapter connections, and preserve JSON `null`
@@ -83,6 +84,8 @@
 - Preserve JSON `null` values in JSON equality/`whereIn` predicates and reject
   non-null `addColumn` migration steps until the migration DSL supports
   defaults or two-phase constraints.
+- Compile write `max(...)` expressions null-safely so nullable operands do not
+  overwrite an existing non-null value with SQL `NULL`.
 - Reject SQLite URI `databaseUrl` values before opening adapter connections.
   This prevents shared-memory URI strings such as
   `file:sledge?mode=memory&cache=shared` from being treated as literal

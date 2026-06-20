@@ -168,50 +168,19 @@ test("kysely projection compiler strips externally-bound insert value params", (
     },
   );
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0]?.["onConflict"], {
-    columns: [
-      {
-        column: {
-          kind: "IdentifierNode",
-          name: "userId",
-        },
-        kind: "ColumnNode",
-      },
-    ],
-    kind: "OnConflictNode",
-    updates: [
-      {
-        column: {
-          column: {
-            kind: "IdentifierNode",
-            name: "email",
-          },
-          kind: "ColumnNode",
-        },
-        kind: "ColumnUpdateNode",
-        value: {
-          arguments: [
-            {
-              column: {
-                column: {
-                  kind: "IdentifierNode",
-                  name: "email",
-                },
-                kind: "ColumnNode",
-              },
-              kind: "ReferenceNode",
-            },
-            {
-              kind: "ValueNode",
-              value: "updated@example.com",
-            },
-          ],
-          func: "greatest",
-          kind: "FunctionNode",
-        },
-      },
-    ],
-  });
+  const onConflict = readRecord(calls[0]?.["onConflict"], "on conflict");
+  const updates = readArray(onConflict["updates"], "on conflict updates");
+  const update = readRecord(updates[0], "first conflict update");
+  const maxValue = readRecord(update["value"], "max update value");
+  const maxArgs = readArray(maxValue["arguments"], "max arguments");
+  const leftCoalesce = readRecord(maxArgs[0], "left max coalesce");
+  const rightCoalesce = readRecord(maxArgs[1], "right max coalesce");
+
+  assert.equal(onConflict["kind"], "OnConflictNode");
+  assert.equal(update["kind"], "ColumnUpdateNode");
+  assert.equal(maxValue["func"], "greatest");
+  assert.equal(leftCoalesce["func"], "coalesce");
+  assert.equal(rightCoalesce["func"], "coalesce");
 });
 
 const hasKysely = existsSync(

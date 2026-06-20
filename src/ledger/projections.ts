@@ -12,6 +12,7 @@ declare const projectionTableUniqueKeysBrand: unique symbol;
 
 const reservedProjectionTableNames = new Set(["events", "work"]);
 const reservedProjectionIndexNames = new Set(["idx_work_due", "idx_work_ref"]);
+const sqliteInternalNamePrefix = "sqlite_";
 
 export type ProjectionColumnKind =
   | "boolean"
@@ -700,7 +701,12 @@ function renameTableMetadata(
     throw new Error("projection table name must be non-empty");
   }
 
-  if (reservedProjectionTableNames.has(name.toLowerCase())) {
+  const normalized = normalizeSqliteIdentifier(name);
+
+  if (
+    reservedProjectionTableNames.has(normalized) ||
+    normalized.startsWith(sqliteInternalNamePrefix)
+  ) {
     throw new Error(
       `projection table name ${name} is reserved for ledger storage`,
     );
@@ -856,6 +862,12 @@ function validateIndexName(name: string): void {
   if (name.length === 0) {
     throw new Error("index name must be non-empty");
   }
+
+  if (normalizeSqliteIdentifier(name).startsWith(sqliteInternalNamePrefix)) {
+    throw new Error(
+      `projection index name ${name} is reserved for ledger storage`,
+    );
+  }
 }
 
 function validateProjectionSchemaIndexNames(
@@ -876,7 +888,8 @@ function validateProjectionSchemaIndexNames(
       const normalized = normalizeSqliteIdentifier(index.name);
       if (
         reservedProjectionIndexNames.has(normalized) ||
-        reservedProjectionTableNames.has(normalized)
+        reservedProjectionTableNames.has(normalized) ||
+        normalized.startsWith(sqliteInternalNamePrefix)
       ) {
         throw new Error(
           `projection index name ${index.name} is reserved for ledger storage`,

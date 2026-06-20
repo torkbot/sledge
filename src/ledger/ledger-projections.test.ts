@@ -1101,7 +1101,7 @@ test("projection access supports stateful indexers and ordered range queries", a
   assert.deepEqual(fake.calls[1], {
     method: "run",
     params: ["run_1", 10, "hello"],
-    sql: 'INSERT INTO "runState" ("runId", "latestInputEventId", "messageJson") VALUES (?, ?, ?) ON CONFLICT ("runId") DO UPDATE SET "latestInputEventId" = MAX("latestInputEventId", excluded."latestInputEventId"), "messageJson" = COALESCE("messageJson", excluded."messageJson")',
+    sql: 'INSERT INTO "runState" ("runId", "latestInputEventId", "messageJson") VALUES (?, ?, ?) ON CONFLICT ("runId") DO UPDATE SET "latestInputEventId" = MAX(COALESCE("latestInputEventId", excluded."latestInputEventId"), COALESCE(excluded."latestInputEventId", "latestInputEventId")), "messageJson" = COALESCE("messageJson", excluded."messageJson")',
   });
 
   const rows = await due(fake.scope, {
@@ -2399,6 +2399,8 @@ test("materialization histories validate versions and record typed operations", 
     ]),
     m.migration(2, "add user email", (s) => [
       s.addColumn("users", "email", (t) => t.text()),
+      s.createIndex("usersByEmail", "users", ["email"]),
+      s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
       s.data("backfill user email", async ({ db }) => {
         for await (const row of db
           .selectFrom("users")
@@ -2413,8 +2415,6 @@ test("materialization histories validate versions and record typed operations", 
             .execute();
         }
       }),
-      s.createIndex("usersByEmail", "users", ["email"]),
-      s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
     ]),
   ]);
 
@@ -2440,15 +2440,7 @@ test("materialization histories validate versions and record typed operations", 
     tableName: "users",
   });
 
-  const dataOperation = secondMigration.operations[1];
-
-  if (dataOperation.kind !== "data") {
-    throw new Error("expected data migration operation");
-  }
-
-  assert.equal(dataOperation.description, "backfill user email");
-  assert.equal(typeof dataOperation.run, "function");
-  assert.deepEqual(secondMigration.operations[2], {
+  assert.deepEqual(secondMigration.operations[1], {
     index: {
       columns: ["email"],
       name: "usersByEmail",
@@ -2457,7 +2449,7 @@ test("materialization histories validate versions and record typed operations", 
     kind: "create_index",
     tableName: "users",
   });
-  assert.deepEqual(secondMigration.operations[3], {
+  assert.deepEqual(secondMigration.operations[2], {
     index: {
       columns: ["email"],
       name: "usersByEmailUnique",
@@ -2466,6 +2458,15 @@ test("materialization histories validate versions and record typed operations", 
     kind: "create_index",
     tableName: "users",
   });
+
+  const dataOperation = secondMigration.operations[3];
+
+  if (dataOperation.kind !== "data") {
+    throw new Error("expected data migration operation");
+  }
+
+  assert.equal(dataOperation.description, "backfill user email");
+  assert.equal(typeof dataOperation.run, "function");
 
   const requiredColumnSchemaV2 = defineMaterializationSchema({
     namespace: "required-plan",
@@ -2606,6 +2607,26 @@ test("materialization histories validate versions and record typed operations", 
       ]),
     ]);
   }, /materialization data operation requires current schema table users columns/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(2, "add user email", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+        s.data("premature keyed backfill", () => undefined),
+        s.createIndex("usersByEmail", "users", ["email"]),
+        s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
+      ]),
+    ]);
+  }, /materialization data operation requires current schema table users keys/);
 
   assert.throws(() => {
     defineMaterializationHistory(schemaV2, (m) => [

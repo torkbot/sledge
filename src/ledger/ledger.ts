@@ -2015,6 +2015,55 @@ function validateMaterializationDataReplay(
         );
       }
     }
+
+    if (!equalStringLists(expectedTable.primaryKey, actualTable.primaryKey)) {
+      throw new Error(
+        `materialization data operation requires current schema table ${tableName} primary key`,
+      );
+    }
+
+    if (!equalProjectionKeys(expectedTable.keys, actualTable.keys)) {
+      throw new Error(
+        `materialization data operation requires current schema table ${tableName} keys`,
+      );
+    }
+
+    if (!equalProjectionIndexes(expectedTable.indexes, actualTable.indexes)) {
+      throw new Error(
+        `materialization data operation requires current schema table ${tableName} indexes`,
+      );
+    }
+  }
+
+  validateMaterializationDataRelationsReplay(current, state);
+}
+
+function validateMaterializationDataRelationsReplay(
+  current: AnyMaterializationSchema,
+  state: MaterializationHistoryReplayState,
+): void {
+  const expectedNames = Object.keys(current.metadata.relations).sort();
+  const actualNames = [...state.relations.keys()].sort();
+
+  if (!equalStringLists(expectedNames, actualNames)) {
+    throw new Error(
+      "materialization data operation requires current schema relations",
+    );
+  }
+
+  for (const relationName of expectedNames) {
+    const expectedRelation = current.metadata.relations[relationName];
+    const actualRelation = state.relations.get(relationName);
+
+    if (
+      expectedRelation === undefined ||
+      actualRelation === undefined ||
+      !equalProjectionForeignKeyMetadata(expectedRelation, actualRelation)
+    ) {
+      throw new Error(
+        `materialization data operation requires current schema relation ${relationName}`,
+      );
+    }
   }
 }
 

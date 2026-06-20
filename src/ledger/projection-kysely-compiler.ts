@@ -418,13 +418,26 @@ function expressionNode(
     case "excluded":
       return referenceNode("excluded", expression.columnName);
     case "max":
-      return functionNode(scalarMaxFunctionName(dialect), [
-        referenceNode(null, expression.columnName),
-        expressionNode(dialect, expression.value),
-      ]);
+      return nullSafeScalarMaxNode(dialect, expression);
     case "value":
       return valueNode(expression.value);
   }
+}
+
+function nullSafeScalarMaxNode(
+  dialect: KyselyProjectionDialect,
+  expression: Extract<ProjectionCompilerExpression, { readonly kind: "max" }>,
+): KyselyProjectionOperationNode {
+  return functionNode(scalarMaxFunctionName(dialect), [
+    functionNode("coalesce", [
+      referenceNode(null, expression.columnName),
+      expressionNode(dialect, expression.value),
+    ]),
+    functionNode("coalesce", [
+      expressionNode(dialect, expression.value),
+      referenceNode(null, expression.columnName),
+    ]),
+  ]);
 }
 
 function scalarMaxFunctionName(dialect: KyselyProjectionDialect): string {

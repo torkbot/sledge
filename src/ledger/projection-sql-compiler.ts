@@ -640,10 +640,11 @@ function compileExpression(
         text: `excluded.${quoteIdentifier(expression.columnName)}`,
       };
     case "max": {
-      const value = compileExpression(expression.value);
+      const leftValue = compileExpression(expression.value);
+      const rightValue = compileExpression(expression.value);
       return {
-        params: value.params,
-        text: `MAX(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+        params: [...leftValue.params, ...rightValue.params],
+        text: `MAX(COALESCE(${quoteIdentifier(expression.columnName)}, ${leftValue.text}), COALESCE(${rightValue.text}, ${quoteIdentifier(expression.columnName)}))`,
       };
     }
     case "value":

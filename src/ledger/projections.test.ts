@@ -282,6 +282,19 @@ test("projection builders validate runtime metadata", () => {
   assert.throws(
     () =>
       defineProjectionSchema({
+        sqlite_sequence: (t) =>
+          t
+            .columns({
+              eventId: t.integer().notNull(),
+            })
+            .primaryKey(["eventId"]),
+      }),
+    /projection table name sqlite_sequence is reserved for ledger storage/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
         Users: (t) =>
           t
             .columns({
@@ -347,6 +360,20 @@ test("projection builders validate runtime metadata", () => {
             .index("idx_work_due", ["userId"]),
       }),
     /projection index name idx_work_due is reserved for ledger storage/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"])
+            .index("sqlite_autoindex_users_1", ["userId"]),
+      }),
+    /projection index name sqlite_autoindex_users_1 is reserved for ledger storage/,
   );
 
   assert.throws(
