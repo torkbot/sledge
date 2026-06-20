@@ -18,7 +18,7 @@ import {
   type StorageDatabase,
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
-import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
+import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -89,7 +89,7 @@ export function createBetterSqliteLedger<
   > = {
     storage: createBetterSqliteStorageRuntime(input.databaseUrl),
     model: input.model,
-    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
     timing: input.timing,
   };
 

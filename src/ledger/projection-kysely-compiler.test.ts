@@ -5,6 +5,7 @@ import test from "node:test";
 import { defineMaterializationSchema } from "./ledger.ts";
 import {
   createKyselyProjectionStatementCompiler,
+  createKyselySqliteProjectionStatementCompiler,
   type KyselyProjectionOperationNode,
   type KyselyProjectionQueryCompiler,
 } from "./projection-kysely-compiler.ts";
@@ -181,6 +182,41 @@ test("kysely projection compiler strips externally-bound insert value params", (
   assert.equal(maxValue["func"], "greatest");
   assert.equal(leftCoalesce["func"], "coalesce");
   assert.equal(rightCoalesce["func"], "coalesce");
+});
+
+test("kysely sqlite projection compiler uses the supplied query compiler constructor", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+
+  class FakeSqliteQueryCompiler implements KyselyProjectionQueryCompiler {
+    compileQuery(node: KyselyProjectionOperationNode): {
+      readonly parameters: readonly unknown[];
+      readonly sql: string;
+    } {
+      calls.push(node);
+
+      return {
+        parameters: [],
+        sql: `sqlite:${node.kind}`,
+      };
+    }
+  }
+
+  const compiler = createKyselySqliteProjectionStatementCompiler({
+    SqliteQueryCompiler: FakeSqliteQueryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileDelete({
+      tableName: "users",
+      where: [],
+    }),
+    {
+      params: [],
+      text: "sqlite:DeleteQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.kind, "DeleteQueryNode");
 });
 
 const hasKysely = existsSync(

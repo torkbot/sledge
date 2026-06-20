@@ -13,7 +13,7 @@ import type {
   LedgerTiming,
   QuerySchema,
 } from "./ledger.ts";
-import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
+import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
@@ -85,7 +85,7 @@ export async function createTursoLedger<
   > = {
     storage: await createTursoStorageRuntime(input.databaseUrl),
     model: input.model,
-    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
     timing: input.timing,
   };
 

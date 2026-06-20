@@ -33,6 +33,8 @@
 - Route materialization facade execution through an internal statement compiler
   boundary and add a non-public Kysely-backed lowerer without changing the
   public indexer/query API.
+- Use the Kysely-backed SQLite statement compiler from the SQLite storage
+  adapters while keeping Kysely out of the public callback surfaces.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

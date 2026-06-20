@@ -43,9 +43,16 @@ export type KyselyProjectionQueryCompiler = {
   ): KyselyProjectionCompiledQuery;
 };
 
+export type KyselyProjectionQueryCompilerConstructor =
+  new () => KyselyProjectionQueryCompiler;
+
 export type KyselyProjectionStatementCompilerInput = {
   readonly dialect: KyselyProjectionDialect;
   readonly queryCompiler: KyselyProjectionQueryCompiler;
+};
+
+export type KyselySqliteProjectionStatementCompilerInput = {
+  readonly SqliteQueryCompiler: KyselyProjectionQueryCompilerConstructor;
 };
 
 const insertValuePlaceholder = Symbol("sledge.projection.insertValue");
@@ -67,6 +74,15 @@ export function createKyselyProjectionStatementCompiler(
     compileSelect: (statement) => compileSelectStatement(input, statement),
     compileUpdate: (statement) => compileUpdateStatement(input, statement),
   };
+}
+
+export function createKyselySqliteProjectionStatementCompiler(
+  input: KyselySqliteProjectionStatementCompilerInput,
+): ProjectionStatementCompiler {
+  return createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler: new input.SqliteQueryCompiler(),
+  });
 }
 
 function compileAggregateStatement(
