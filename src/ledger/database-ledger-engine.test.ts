@@ -337,6 +337,34 @@ test("storage runtimes reject non-shared in-memory database URLs", async () => {
   );
 });
 
+test("turso runtime enables foreign key enforcement on every connection", async () => {
+  const databaseUrl = createTempDatabasePath();
+  const storage = await createTursoStorageRuntime(databaseUrl);
+
+  try {
+    assert.equal(
+      await storage.write(async (database) => {
+        return await readForeignKeyPragma(database);
+      }),
+      1,
+    );
+    assert.equal(
+      await storage.read(async (database) => {
+        return await readForeignKeyPragma(database);
+      }),
+      1,
+    );
+  } finally {
+    await storage.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+    await rm(`${databaseUrl}-wal`, {
+      force: true,
+    });
+  }
+});
+
 test("better-sqlite runtime close waits for in-flight reads", async () => {
   const databaseUrl = createTempDatabasePath();
   const storage = createBetterSqliteStorageRuntime(databaseUrl);
@@ -365,6 +393,18 @@ test("better-sqlite runtime close waits for in-flight reads", async () => {
     });
   }
 });
+
+async function readForeignKeyPragma(
+  database: StorageDatabase,
+): Promise<unknown> {
+  const row = await database.prepare("PRAGMA foreign_keys").get();
+
+  if (row === undefined) {
+    throw new Error("PRAGMA foreign_keys did not return a row");
+  }
+
+  return row.foreign_keys;
+}
 
 test("turso runtime close waits for in-flight reads", async () => {
   const databaseUrl = createTempDatabasePath();

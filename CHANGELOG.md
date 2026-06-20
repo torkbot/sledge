@@ -46,6 +46,9 @@
 - Harden materialization/projection validation for migration-order data steps,
   foreign-key target keys, duplicate index names, case-only duplicate columns,
   and unawaited projection writes.
+- Reject projection table/index names that would collide under SQLite's
+  identifier rules, enable SQLite foreign-key enforcement on adapter
+  connections, and preserve JSON `null` values in JSON projection columns.
 
 ## 0.9.0 - 2026-05-20
 

@@ -282,6 +282,25 @@ test("projection builders validate runtime metadata", () => {
   assert.throws(
     () =>
       defineProjectionSchema({
+        Users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+      }),
+    /projection table name users conflicts with Users/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
         users: (t) =>
           t
             .columns({
@@ -314,6 +333,20 @@ test("projection builders validate runtime metadata", () => {
             .index("LOOKUP", ["userId"]),
       }),
     /projection index name LOOKUP conflicts with lookup/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"])
+            .index("idx_work_due", ["userId"]),
+      }),
+    /projection index name idx_work_due is reserved for ledger storage/,
   );
 
   assert.throws(

@@ -596,6 +596,26 @@ test("projection access rejects non-serializable JSON values before storage", as
     sql: 'INSERT INTO "jsonRows" ("userId", "metadata") VALUES (?, ?)',
   });
 
+  const nullJsonFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await insertJson(
+    nullJsonFake.scope,
+    {
+      userId: "u_null",
+      metadata: null,
+    },
+    createUserCreatedContext(43),
+  );
+
+  assert.deepEqual(nullJsonFake.calls[0], {
+    method: "run",
+    params: ["u_null", "null"],
+    sql: 'INSERT INTO "jsonRows" ("userId", "metadata") VALUES (?, ?)',
+  });
+
   const invalidInsertFake = createFakeScope({
     allRows: [],
     getRow: undefined,
@@ -608,7 +628,7 @@ test("projection access rejects non-serializable JSON values before storage", as
         userId: "u_json",
         metadata: undefined,
       },
-      createUserCreatedContext(43),
+      createUserCreatedContext(44),
     );
   }, /jsonRows\.metadata must be JSON-serializable/);
   assert.deepEqual(invalidInsertFake.calls, []);
@@ -627,7 +647,7 @@ test("projection access rejects non-serializable JSON values before storage", as
           nested: () => undefined,
         },
       },
-      createUserCreatedContext(44),
+      createUserCreatedContext(45),
     );
   }, /jsonRows\.metadata\.nested must be JSON-serializable/);
   assert.deepEqual(invalidUpdateFake.calls, []);

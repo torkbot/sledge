@@ -100,15 +100,20 @@ export function createBetterSqliteStorageRuntime(
   validateDatabaseUrl(databaseUrl);
 
   const writer = new Database(databaseUrl, connectionOptions);
-  const journalMode = writer.pragma("journal_mode = WAL", {
-    simple: true,
-  });
+  try {
+    enableForeignKeys(writer);
+    const journalMode = writer.pragma("journal_mode = WAL", {
+      simple: true,
+    });
 
-  if (journalMode !== "wal") {
+    if (journalMode !== "wal") {
+      throw new Error(
+        `databaseUrl must support WAL journal mode, received ${String(journalMode)}`,
+      );
+    }
+  } catch (error: unknown) {
     writer.close();
-    throw new Error(
-      `databaseUrl must support WAL journal mode, received ${String(journalMode)}`,
-    );
+    throw error;
   }
 
   const writerStorage = wrapBetterSqliteDatabase(writer);
@@ -121,7 +126,15 @@ export function createBetterSqliteStorageRuntime(
       throw new Error("storage runtime is closed");
     }
 
-    return new Database(databaseUrl, connectionOptions);
+    const database = new Database(databaseUrl, connectionOptions);
+
+    try {
+      enableForeignKeys(database);
+      return database;
+    } catch (error: unknown) {
+      database.close();
+      throw error;
+    }
   };
 
   const closeConnection = (database: Database.Database): void => {
@@ -258,4 +271,17 @@ function wrapBetterSqliteDatabase(
       };
     },
   };
+}
+
+function enableForeignKeys(database: Database.Database): void {
+  database.pragma("foreign_keys = ON");
+  const enabled = database.pragma("foreign_keys", {
+    simple: true,
+  });
+
+  if (enabled !== 1) {
+    throw new Error(
+      `database connection must enable foreign key enforcement, received ${String(enabled)}`,
+    );
+  }
 }

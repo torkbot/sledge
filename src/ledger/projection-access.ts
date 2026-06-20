@@ -863,6 +863,10 @@ function serializeProjectionColumnValue(
     throw new Error(`${context} references unknown column metadata`);
   }
 
+  if (column.kind === "json") {
+    return serializeJson(value, context);
+  }
+
   if (value === null) {
     if (!column.nullable) {
       throw new Error(`${context} cannot be null`);
@@ -878,8 +882,6 @@ function serializeProjectionColumnValue(
       return serializeEventRef(column, value, context);
     case "integer":
       return serializeNumber(value, context);
-    case "json":
-      return serializeJson(value, context);
     case "text":
       return serializeString(value, context);
   }

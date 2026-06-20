@@ -11,6 +11,7 @@ declare const projectionTablePrimaryKeyBrand: unique symbol;
 declare const projectionTableUniqueKeysBrand: unique symbol;
 
 const reservedProjectionTableNames = new Set(["events", "work"]);
+const reservedProjectionIndexNames = new Set(["idx_work_due", "idx_work_ref"]);
 
 export type ProjectionColumnKind =
   | "boolean"
@@ -385,6 +386,11 @@ function defineProjectionSchemaInternal<
 ): ProjectionSchema<ProjectionTablesForFactories<TFactories>, {}, TEventName> {
   const tableBuilder = createProjectionTableBuilder<TEventName>();
   const tableMetadata: Record<string, ProjectionTableMetadata> = {};
+
+  validateUniqueSqliteIdentifiers(
+    "projection table name",
+    Object.keys(factories),
+  );
 
   for (const [tableName, factory] of Object.entries(factories)) {
     if (typeof factory !== "function") {
@@ -860,6 +866,12 @@ function validateProjectionSchemaIndexNames(
   for (const table of Object.values(tables)) {
     for (const index of table.indexes) {
       const normalized = normalizeSqliteIdentifier(index.name);
+      if (reservedProjectionIndexNames.has(normalized)) {
+        throw new Error(
+          `projection index name ${index.name} is reserved for ledger storage`,
+        );
+      }
+
       const existing = indexNames.get(normalized);
 
       if (existing !== undefined) {

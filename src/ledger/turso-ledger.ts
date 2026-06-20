@@ -96,6 +96,13 @@ export async function createTursoStorageRuntime(
   validateDatabaseUrl(databaseUrl);
 
   const writer = await connect(databaseUrl);
+  try {
+    await enableForeignKeys(writer);
+  } catch (error: unknown) {
+    await writer.close();
+    throw error;
+  }
+
   const writerStorage = wrapTursoPromiseDatabase(writer);
   const activeReads = new Set<Promise<void>>();
   let closed = false;
@@ -106,7 +113,15 @@ export async function createTursoStorageRuntime(
       throw new Error("storage runtime is closed");
     }
 
-    return await connect(databaseUrl);
+    const database = await connect(databaseUrl);
+
+    try {
+      await enableForeignKeys(database);
+      return database;
+    } catch (error: unknown) {
+      await database.close();
+      throw error;
+    }
   };
 
   const closeConnection = async (database: Database): Promise<void> => {
@@ -241,4 +256,8 @@ function wrapTursoPromiseDatabase(database: Database): StorageDatabase {
       };
     },
   };
+}
+
+async function enableForeignKeys(database: Database): Promise<void> {
+  await database.exec("PRAGMA foreign_keys = ON");
 }
