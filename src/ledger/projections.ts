@@ -863,10 +863,21 @@ function validateProjectionSchemaIndexNames(
 ): void {
   const indexNames = new Map<string, string>();
 
+  for (const reservedTableName of reservedProjectionTableNames) {
+    indexNames.set(reservedTableName, reservedTableName);
+  }
+
+  for (const table of Object.values(tables)) {
+    indexNames.set(normalizeSqliteIdentifier(table.name), table.name);
+  }
+
   for (const table of Object.values(tables)) {
     for (const index of table.indexes) {
       const normalized = normalizeSqliteIdentifier(index.name);
-      if (reservedProjectionIndexNames.has(normalized)) {
+      if (
+        reservedProjectionIndexNames.has(normalized) ||
+        reservedProjectionTableNames.has(normalized)
+      ) {
         throw new Error(
           `projection index name ${index.name} is reserved for ledger storage`,
         );

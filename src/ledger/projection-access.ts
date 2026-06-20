@@ -1108,7 +1108,12 @@ async function runProjectionIndexer(
 ): Promise<void> {
   const event = createProjectionIndexerEvent(definition.sourceEvent, context);
   const pendingWrites = new Set<Promise<unknown>>();
+  let acceptingWrites = true;
   const trackWrite: ProjectionWriteTracker = (run) => {
+    if (!acceptingWrites) {
+      return Promise.reject(new Error("projection write scope is closed"));
+    }
+
     let tracked: Promise<unknown>;
     const runPromise = run();
     tracked = runPromise.finally(() => {
@@ -1136,6 +1141,7 @@ async function runProjectionIndexer(
     implementationError = error;
   }
 
+  acceptingWrites = false;
   const writeError = await settleProjectionWrites(pendingWrites);
 
   if (implementationError !== null) {

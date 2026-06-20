@@ -351,6 +351,34 @@ test("projection builders validate runtime metadata", () => {
 
   assert.throws(
     () =>
+      defineProjectionSchema({
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"])
+            .index("USERS", ["userId"]),
+      }),
+    /projection index name USERS conflicts with users/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
+        users: (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"])
+            .index("events", ["userId"]),
+      }),
+    /projection index name events is reserved for ledger storage/,
+  );
+
+  assert.throws(
+    () =>
       projections.relations((r) => {
         const foreignKey = (r as unknown as RuntimeRelationBuilder).foreignKey;
 

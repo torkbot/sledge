@@ -476,6 +476,61 @@ test("projection access waits for unawaited writes before completing indexers", 
   ]);
 });
 
+test("projection access rejects writes started after indexer completion", async () => {
+  const lateWrite = {
+    current: null as (() => Promise<unknown>) | null,
+  };
+  const lateWriteModel = withMaterializations(shape, materializations).register(
+    {
+      indexers: {
+        upsertUser: ({ input, event, db }) => {
+          lateWrite.current = async () => {
+            return await db
+              .insertInto("users")
+              .values({
+                userId: input.userId,
+                email: input.email,
+                source: event.ref,
+              })
+              .execute();
+          };
+        },
+      },
+      queries: implementations.queries,
+    },
+  );
+  const indexer =
+    readTestLedgerImplementations(lateWriteModel).indexers?.upsertUser;
+
+  if (indexer === undefined) {
+    throw new Error("expected upsertUser indexer implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await indexer(
+    fake.scope,
+    {
+      userId: "u_123",
+      email: "alice@example.com",
+    },
+    createUserCreatedContext(42),
+  );
+
+  const runLateWrite = lateWrite.current;
+  if (runLateWrite === null) {
+    throw new Error("expected late write closure");
+  }
+
+  await assert.rejects(async () => {
+    await runLateWrite();
+  }, /projection write scope is closed/);
+  assert.deepEqual(fake.calls, []);
+});
+
 test("projection access rejects non-serializable JSON values before storage", async () => {
   const jsonSchema = defineMaterializationSchema({
     namespace: "json",
