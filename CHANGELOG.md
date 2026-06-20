@@ -83,6 +83,10 @@
 - Preserve JSON `null` values in JSON equality/`whereIn` predicates and reject
   non-null `addColumn` migration steps until the migration DSL supports
   defaults or two-phase constraints.
+- Reject SQLite URI `databaseUrl` values before opening adapter connections.
+  This prevents shared-memory URI strings such as
+  `file:sledge?mode=memory&cache=shared` from being treated as literal
+  filesystem paths by the underlying drivers.
 
 ## 0.9.0 - 2026-05-20
 

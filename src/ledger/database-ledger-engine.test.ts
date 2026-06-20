@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -315,31 +315,31 @@ test("better-sqlite runtime enables WAL and fail-fast lock handling", async () =
   }
 });
 
-test("storage runtimes reject non-shared in-memory database URLs", async () => {
+test("storage runtimes reject in-memory database URLs", async () => {
   assert.throws(
     () => createBetterSqliteStorageRuntime(":memory:"),
-    /non-shared in-memory/,
+    /in-memory SQLite database URLs are not supported/,
   );
   assert.throws(
     () => createBetterSqliteStorageRuntime("file::memory:"),
-    /non-shared in-memory/,
+    /in-memory SQLite database URLs are not supported/,
   );
   assert.throws(
     () => createBetterSqliteStorageRuntime("file:ledger?mode=memory"),
-    /non-shared in-memory/,
+    /in-memory SQLite database URLs are not supported/,
   );
 
   await assert.rejects(
     async () => await createTursoStorageRuntime(":memory:"),
-    /non-shared in-memory/,
+    /in-memory SQLite database URLs are not supported/,
   );
   await assert.rejects(
     async () => await createTursoStorageRuntime("file::memory:"),
-    /non-shared in-memory/,
+    /in-memory SQLite database URLs are not supported/,
   );
   await assert.rejects(
     async () => await createTursoStorageRuntime("file:ledger?mode=memory"),
-    /non-shared in-memory/,
+    /in-memory SQLite database URLs are not supported/,
   );
 });
 
@@ -368,6 +368,45 @@ test("turso runtime enables foreign key enforcement on every connection", async 
     await rm(`${databaseUrl}-wal`, {
       force: true,
     });
+  }
+});
+
+test("storage runtimes reject SQLite URI database URLs", async () => {
+  assert.throws(
+    () => createBetterSqliteStorageRuntime("file:ledger.sqlite?mode=rwc"),
+    /SQLite URI databaseUrl values are not supported/,
+  );
+
+  await assert.rejects(
+    async () => await createTursoStorageRuntime("file:ledger.sqlite?mode=rwc"),
+    /SQLite URI databaseUrl values are not supported/,
+  );
+});
+
+test("storage runtimes do not persist literal files for shared memory URLs", async () => {
+  const filePrefix = `file:sledge-${Date.now()}-${Math.random()}`;
+  const databaseUrl = `${filePrefix}?mode=memory&cache=shared`;
+  const before = new Set(await readdir(process.cwd()));
+
+  try {
+    assert.throws(
+      () => createBetterSqliteStorageRuntime(databaseUrl),
+      /in-memory/,
+    );
+    await assert.rejects(
+      async () => await createTursoStorageRuntime(databaseUrl),
+      /in-memory/,
+    );
+  } finally {
+    const createdEntries = (await readdir(process.cwd())).filter((entry) => {
+      return !before.has(entry) && entry.startsWith(filePrefix);
+    });
+
+    for (const entry of createdEntries) {
+      await rm(entry, { force: true });
+    }
+
+    assert.deepEqual(createdEntries, []);
   }
 });
 

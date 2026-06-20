@@ -404,9 +404,14 @@ Use one adapter to open the ledger:
 - `createBetterSqliteLedger(...)`
 - `createTursoLedger(...)`
 
-Adapters take a `databaseUrl`; Sledge owns the connections it opens. Plain
-`:memory:` URLs are rejected because they cannot support the required
-multi-connection read/write model.
+Adapters take a `databaseUrl` filesystem path and Sledge owns the database
+connections it opens. SQLite in-memory URLs (`:memory:` and `file:...mode=memory`
+forms) are rejected because they cannot provide Sledge's required
+multi-connection read/write semantics through these adapters. SQLite URI strings
+starting with `file:` are also rejected because the current drivers do not parse
+them as SQLite URI filenames consistently. Pass a normal filesystem path for
+local SQLite. The `better-sqlite3` adapter verifies that the opened database
+actually enters WAL journal mode and rejects databases that cannot.
 
 ## Runtime API
 
