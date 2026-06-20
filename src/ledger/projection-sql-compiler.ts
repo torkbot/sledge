@@ -73,10 +73,17 @@ export type ProjectionCompilerWhereClause =
       readonly tableName: string;
     };
 
-export type ProjectionCompilerOrderClause = {
-  readonly column: ProjectionCompilerColumnReference;
-  readonly direction: "asc" | "desc";
-};
+export type ProjectionCompilerOrderClause =
+  | {
+      readonly column: ProjectionCompilerColumnReference;
+      readonly direction: "asc" | "desc";
+      readonly kind: "column";
+    }
+  | {
+      readonly column: ProjectionCompilerColumnReference;
+      readonly kind: "value_list";
+      readonly values: readonly unknown[];
+    };
 
 export type ProjectionCompilerJoinClause = {
   readonly kind: "inner";
@@ -314,11 +321,9 @@ function compileSelectStatement(
   }
 
   if (statement.orderBy.length > 0) {
-    const orderSql = statement.orderBy
-      .map((clause) => {
-        return `${compileColumnReference(clause.column)} ${clause.direction.toUpperCase()}`;
-      })
-      .join(", ");
+    const orderBySql = compileOrderBy(statement.orderBy);
+    params.push(...orderBySql.params);
+    const orderSql = orderBySql.text;
     text += ` ORDER BY ${orderSql}`;
   }
 
@@ -326,6 +331,40 @@ function compileSelectStatement(
     text += " LIMIT ?";
     params.push(statement.limit);
   }
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileOrderBy(
+  orderClauses: readonly ProjectionCompilerOrderClause[],
+): ProjectionCompiledSql {
+  const params: unknown[] = [];
+  const text = orderClauses
+    .map((clause) => {
+      switch (clause.kind) {
+        case "column":
+          return `${compileColumnReference(clause.column)} ${clause.direction.toUpperCase()}`;
+        case "value_list": {
+          if (clause.values.length === 0) {
+            throw new Error("value-list order clause must include values");
+          }
+
+          const cases = clause.values
+            .map((value, index) => {
+              params.push(value, index);
+              return "WHEN ? THEN ?";
+            })
+            .join(" ");
+          params.push(clause.values.length);
+
+          return `CASE ${compileColumnReference(clause.column)} ${cases} ELSE ? END ASC`;
+        }
+      }
+    })
+    .join(", ");
 
   return {
     params,

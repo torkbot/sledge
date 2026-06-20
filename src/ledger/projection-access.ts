@@ -493,6 +493,10 @@ export type ProjectionExecutableSelect<
     columnName: TColumnName,
     direction?: ProjectionOrderDirection,
   ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
+  orderByList<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTable, TColumnName>[],
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   whereAny(
     conditions: readonly ProjectionWhereCondition<TTable>[],
   ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
@@ -643,6 +647,19 @@ export type ProjectionExecutableJoinedSelect<
     tableName: TTableName,
     columnName: TColumnName,
     direction?: ProjectionOrderDirection,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  orderByList<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionTableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTables[TTableName], TColumnName>[],
   ): ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
@@ -1881,7 +1898,30 @@ function createProjectionExecutableSelect<
           {
             column: createProjectionColumnReference(null, String(columnName)),
             direction,
+            kind: "column",
           },
+        ],
+        limitClause,
+      );
+    },
+    orderByList: (columnName, values) => {
+      return createProjectionExecutableSelect(
+        metadata,
+        scope,
+        fromTable,
+        table,
+        selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
+        whereClauses,
+        [
+          ...orderClauses,
+          createProjectionValueListOrderClause(
+            table,
+            String(columnName),
+            values,
+            null,
+          ),
         ],
         limitClause,
       );
@@ -2152,7 +2192,30 @@ function createProjectionExecutableJoinedSelect<
               String(columnName),
             ),
             direction,
+            kind: "column",
           },
+        ],
+        limitClause,
+      );
+    },
+    orderByList: (tableName, columnName, values) => {
+      const orderTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+
+      return createNext(
+        whereClauses,
+        [
+          ...orderClauses,
+          createProjectionValueListOrderClause(
+            orderTable,
+            String(columnName),
+            values,
+            orderTable.name,
+          ),
         ],
         limitClause,
       );
@@ -2847,6 +2910,31 @@ function createProjectionNullWhereClause(
     column: createProjectionColumnReference(tableName, columnName),
     kind: "null",
     not,
+  };
+}
+
+function createProjectionValueListOrderClause(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  values: readonly unknown[],
+  tableName: string | null,
+): ProjectionOrderClause {
+  validateProjectionColumns("order column", table, [columnName]);
+
+  if (values.length === 0) {
+    throw new Error("value-list order clause must include values");
+  }
+
+  return {
+    column: createProjectionColumnReference(tableName, columnName),
+    kind: "value_list",
+    values: values.map((value) => {
+      return serializeProjectionColumnValue(
+        table.columns[columnName],
+        value,
+        `${table.name}.${columnName}`,
+      );
+    }),
   };
 }
 

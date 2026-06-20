@@ -859,6 +859,98 @@ test("projection access supports stateful indexers and ordered range queries", a
   });
 });
 
+test("projection access supports typed application-defined ordering", async () => {
+  const profileSchema = defineMaterializationSchema({
+    namespace: "profile-docs",
+    version: 1,
+    tables: {
+      profileDocs: (t) =>
+        t
+          .columns({
+            docId: t.text().notNull(),
+            version: t.integer().notNull(),
+            content: t.text().notNull(),
+          })
+          .primaryKey(["docId"]),
+    },
+  });
+  const profileMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(profileSchema, (m) => [
+      m.migration(1, "create profile docs", (s) => [
+        s.createTable("profileDocs", (t) =>
+          t
+            .columns({
+              docId: t.text().notNull(),
+              version: t.integer().notNull(),
+              content: t.text().notNull(),
+            })
+            .primaryKey(["docId"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      list: {
+        params: Type.Object({}),
+        result: Type.Array(
+          Type.Object({
+            docId: Type.String(),
+            version: Type.Number(),
+            content: Type.String(),
+          }),
+        ),
+      },
+    },
+  });
+  const profileModel = withMaterializations(
+    shape,
+    profileMaterializations,
+  ).register({
+    queries: {
+      list: async ({ db }) => {
+        const rows = await db
+          .selectFrom("profileDocs")
+          .select(["docId", "version", "content"])
+          .orderByList("docId", ["SOUL", "IDENTITY", "USER"])
+          .execute();
+
+        return [...rows];
+      },
+    },
+  });
+  const list = readTestLedgerImplementations(profileModel).queries?.list;
+
+  if (list === undefined) {
+    throw new Error("expected list query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        content: "soul",
+        docId: "SOUL",
+        version: 1,
+      },
+    ],
+    getRow: undefined,
+  });
+
+  const rows = await list(fake.scope, {});
+
+  assert.deepEqual(fake.calls[0], {
+    method: "all",
+    params: ["SOUL", 0, "IDENTITY", 1, "USER", 2, 3],
+    sql: 'SELECT "docId" AS "docId", "version" AS "version", "content" AS "content" FROM "profileDocs" ORDER BY CASE "docId" WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? ELSE ? END ASC',
+  });
+  assert.deepEqual(rows, [
+    {
+      content: "soul",
+      docId: "SOUL",
+      version: 1,
+    },
+  ]);
+});
+
 test("projection access supports typed disjunction predicate groups", async () => {
   const followupSchema = defineMaterializationSchema({
     namespace: "followups",
@@ -2498,6 +2590,21 @@ async function assertLedgerProjectionTypes(): Promise<void> {
             toColumn: "parentId",
           })
           .selectFrom("parents", ["rank"])
+          .orderByList("parents", "rank", [1, 2]);
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
+          // @ts-expect-error joined orderByList values must match the qualified column type.
+          .orderByList("parents", "rank", ["1"]);
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
           .where("parents", "rank", ">", 0);
         db.selectFrom("children")
           .innerJoin("parents", {
@@ -2648,6 +2755,18 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           void email;
           void userId;
         }
+
+        db.selectFrom("users")
+          .select(["email"])
+          .orderByList("email", ["alice@example.com"]);
+        db.selectFrom("users")
+          .select(["email"])
+          // @ts-expect-error orderByList values must match the ordered column type.
+          .orderByList("email", [1]);
+        db.selectFrom("users")
+          .select(["email"])
+          // @ts-expect-error orderByList must reference known columns.
+          .orderByList("missing", ["alice@example.com"]);
 
         const event = await db.readEvent(createEventRef("user.created", 1));
 

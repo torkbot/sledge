@@ -344,8 +344,8 @@ Indexer and query implementations receive sledge-owned facades:
   disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
   typed `whereNotExists(...)` anti-joins, typed aggregate reads with
   `count(...)`, `countNotNull(...)`, `min(...)`, and `max(...)`,
-  `orderBy(...)`, `limit(...)`, `execute()`, `executeTakeFirst()`, and
-  `stream()`
+  `orderBy(...)`, domain-specific `orderByList(...)` value ordering,
+  `limit(...)`, `execute()`, `executeTakeFirst()`, and `stream()`
 - writes return affected-row metadata and support typed `MAX(...)`,
   `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
@@ -355,6 +355,16 @@ one storage round trip per row:
 
 ```ts
 const events = await db.readEvents(rows.map((row) => row.source));
+```
+
+Application-defined row priority can be expressed without raw `CASE` SQL:
+
+```ts
+const docs = await db
+  .selectFrom("profileDocs")
+  .select(["docId", "version", "content"])
+  .orderByList("docId", ["SOUL", "IDENTITY", "USER"])
+  .execute();
 ```
 
 Aggregate reads return a single typed object keyed by the declared aliases:
