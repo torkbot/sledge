@@ -3,6 +3,11 @@ export type ProjectionCompiledSql = {
   readonly text: string;
 };
 
+export type ProjectionCompilerColumnReference = {
+  readonly columnName: string;
+  readonly tableName: string | null;
+};
+
 export type ProjectionCompilerExpression =
   | {
       readonly kind: "coalesce";
@@ -46,25 +51,32 @@ export type ProjectionCompilerWhereClause =
       readonly kind: "any";
     }
   | {
-      readonly columnName: string;
+      readonly column: ProjectionCompilerColumnReference;
       readonly kind: "comparison";
       readonly operator: ProjectionCompilerWhereOperator;
       readonly value: unknown;
     }
   | {
-      readonly columnName: string;
+      readonly column: ProjectionCompilerColumnReference;
       readonly kind: "in";
       readonly values: readonly unknown[];
     }
   | {
-      readonly columnName: string;
+      readonly column: ProjectionCompilerColumnReference;
       readonly kind: "null";
       readonly not: boolean;
     };
 
 export type ProjectionCompilerOrderClause = {
-  readonly columnName: string;
+  readonly column: ProjectionCompilerColumnReference;
   readonly direction: "asc" | "desc";
+};
+
+export type ProjectionCompilerJoinClause = {
+  readonly kind: "inner";
+  readonly left: ProjectionCompilerColumnReference;
+  readonly right: ProjectionCompilerColumnReference;
+  readonly tableName: string;
 };
 
 export type ProjectionCompilerInsertStatement = {
@@ -84,10 +96,11 @@ export type ProjectionCompilerInsertStatement = {
 };
 
 export type ProjectionCompilerSelectStatement = {
-  readonly columns: readonly string[];
+  readonly columns: readonly ProjectionCompilerColumnReference[];
+  readonly fromTableName: string;
+  readonly joins: readonly ProjectionCompilerJoinClause[];
   readonly limit: number | null;
   readonly orderBy: readonly ProjectionCompilerOrderClause[];
-  readonly tableName: string;
   readonly where: readonly ProjectionCompilerWhereClause[];
 };
 
@@ -176,13 +189,26 @@ function compileSelectStatement(
   statement: ProjectionCompilerSelectStatement,
 ): ProjectionCompiledSql {
   const selectedSql = statement.columns
-    .map((columnName) => {
-      const quotedColumnName = quoteIdentifier(columnName);
-      return `${quotedColumnName} AS ${quotedColumnName}`;
+    .map((column) => {
+      const quotedColumnName = quoteIdentifier(column.columnName);
+      return `${compileColumnReference(column)} AS ${quotedColumnName}`;
     })
     .join(", ");
-  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.tableName)}`;
+  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.fromTableName)}`;
   const params: unknown[] = [];
+
+  if (statement.joins.length > 0) {
+    const joinsSql = statement.joins
+      .map((join) => {
+        switch (join.kind) {
+          case "inner":
+            return `INNER JOIN ${quoteIdentifier(join.tableName)} ON ${compileColumnReference(join.left)} = ${compileColumnReference(join.right)}`;
+        }
+      })
+      .join(" ");
+    text += ` ${joinsSql}`;
+  }
+
   const whereSql = compileWhere(statement.where);
 
   if (whereSql.text.length > 0) {
@@ -193,7 +219,7 @@ function compileSelectStatement(
   if (statement.orderBy.length > 0) {
     const orderSql = statement.orderBy
       .map((clause) => {
-        return `${quoteIdentifier(clause.columnName)} ${clause.direction.toUpperCase()}`;
+        return `${compileColumnReference(clause.column)} ${clause.direction.toUpperCase()}`;
       })
       .join(", ");
     text += ` ORDER BY ${orderSql}`;
@@ -308,7 +334,7 @@ function compileWhereClause(
     case "comparison":
       return {
         params: [clause.value],
-        text: `${quoteIdentifier(clause.columnName)} ${clause.operator} ?`,
+        text: `${compileColumnReference(clause.column)} ${clause.operator} ?`,
       };
     case "in":
       if (clause.values.length === 0) {
@@ -320,14 +346,14 @@ function compileWhereClause(
 
       return {
         params: clause.values,
-        text: `${quoteIdentifier(clause.columnName)} IN (${clause.values
+        text: `${compileColumnReference(clause.column)} IN (${clause.values
           .map(() => "?")
           .join(", ")})`,
       };
     case "null":
       return {
         params: [],
-        text: `${quoteIdentifier(clause.columnName)} IS ${clause.not ? "NOT " : ""}NULL`,
+        text: `${compileColumnReference(clause.column)} IS ${clause.not ? "NOT " : ""}NULL`,
       };
   }
 }
@@ -370,4 +396,14 @@ function compileExpression(
 
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function compileColumnReference(
+  reference: ProjectionCompilerColumnReference,
+): string {
+  if (reference.tableName === null) {
+    return quoteIdentifier(reference.columnName);
+  }
+
+  return `${quoteIdentifier(reference.tableName)}.${quoteIdentifier(reference.columnName)}`;
 }

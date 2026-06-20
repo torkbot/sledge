@@ -16,12 +16,16 @@ import {
   createSqliteProjectionStatementCompiler,
   type ProjectionCompiledSql,
   type ProjectionCompilerAssignment,
+  type ProjectionCompilerColumnReference,
   type ProjectionCompilerExpression,
+  type ProjectionCompilerJoinClause,
   type ProjectionCompilerOrderClause,
   type ProjectionCompilerWhereClause,
 } from "./projection-sql-compiler.ts";
 import {
+  type ProjectionColumn,
   type ProjectionColumnMetadata,
+  type ProjectionColumnKind,
   type ProjectionColumnValue,
   type ProjectionRow,
   type ProjectionSchemaMetadata,
@@ -162,6 +166,23 @@ type ProjectionWhereValue<
 
 export type ProjectionWhereOperator = "=" | "!=" | "<" | "<=" | ">" | ">=";
 
+type ProjectionColumnScalar<TColumn> =
+  TColumn extends ProjectionColumn<ProjectionColumnKind, infer TValue, boolean>
+    ? NonNullable<TValue>
+    : never;
+
+type ProjectionCompatibleColumnNames<TTable, TValue> = {
+  readonly [TColumnName in ProjectionTableColumnName<TTable>]: ProjectionColumnScalar<
+    ProjectionTableColumns<TTable>[TColumnName]
+  > extends TValue
+    ? TValue extends ProjectionColumnScalar<
+        ProjectionTableColumns<TTable>[TColumnName]
+      >
+      ? TColumnName
+      : never
+    : never;
+}[ProjectionTableColumnName<TTable>];
+
 export type ProjectionWhereCondition<TTable> =
   | {
       readonly [TColumnName in ProjectionTableColumnName<TTable>]: {
@@ -190,6 +211,82 @@ export type ProjectionWhereCondition<TTable> =
         readonly kind: "is_null";
       };
     }[ProjectionTableColumnName<TTable>];
+
+export type ProjectionQualifiedWhereCondition<
+  TTables,
+  TTableNames extends ProjectionTableName<TTables>,
+> =
+  | {
+      readonly [TTableName in TTableNames]: {
+        readonly [TColumnName in ProjectionTableColumnName<
+          TTables[TTableName]
+        >]: {
+          readonly columnName: TColumnName;
+          readonly kind: "comparison";
+          readonly operator: ProjectionWhereOperator;
+          readonly tableName: TTableName;
+          readonly value: ProjectionWhereValue<
+            TTables[TTableName],
+            TColumnName
+          >;
+        };
+      }[ProjectionTableColumnName<TTables[TTableName]>];
+    }[TTableNames]
+  | {
+      readonly [TTableName in TTableNames]: {
+        readonly [TColumnName in ProjectionTableColumnName<
+          TTables[TTableName]
+        >]: {
+          readonly columnName: TColumnName;
+          readonly kind: "in";
+          readonly tableName: TTableName;
+          readonly values: readonly ProjectionWhereValue<
+            TTables[TTableName],
+            TColumnName
+          >[];
+        };
+      }[ProjectionTableColumnName<TTables[TTableName]>];
+    }[TTableNames]
+  | {
+      readonly [TTableName in TTableNames]: {
+        readonly [TColumnName in ProjectionTableColumnName<
+          TTables[TTableName]
+        >]: {
+          readonly columnName: TColumnName;
+          readonly kind: "is_not_null";
+          readonly tableName: TTableName;
+        };
+      }[ProjectionTableColumnName<TTables[TTableName]>];
+    }[TTableNames]
+  | {
+      readonly [TTableName in TTableNames]: {
+        readonly [TColumnName in ProjectionTableColumnName<
+          TTables[TTableName]
+        >]: {
+          readonly columnName: TColumnName;
+          readonly kind: "is_null";
+          readonly tableName: TTableName;
+        };
+      }[ProjectionTableColumnName<TTables[TTableName]>];
+    }[TTableNames];
+
+export type ProjectionJoinCondition<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+  TJoinedTableName extends ProjectionTableName<TTables>,
+> = {
+  readonly [TFromColumnName in ProjectionTableColumnName<
+    TTables[TFromTableName]
+  >]: {
+    readonly fromColumn: TFromColumnName;
+    readonly toColumn: ProjectionCompatibleColumnNames<
+      TTables[TJoinedTableName],
+      ProjectionColumnScalar<
+        ProjectionTableColumns<TTables[TFromTableName]>[TFromColumnName]
+      >
+    >;
+  };
+}[ProjectionTableColumnName<TTables[TFromTableName]>];
 
 export type ProjectionOrderDirection = "asc" | "desc";
 
@@ -312,12 +409,46 @@ export type ProjectionDeleteBuilder<TTable> = ProjectionExecutableWrite & {
   ): ProjectionDeleteBuilder<TTable>;
 };
 
-export type ProjectionSelectBuilder<TTable> = {
+export type ProjectionSelectBuilder<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+> = {
+  innerJoin<const TJoinedTableName extends ProjectionTableName<TTables>>(
+    tableName: TJoinedTableName,
+    condition: ProjectionJoinCondition<
+      TTables,
+      TFromTableName,
+      TJoinedTableName
+    >,
+  ): ProjectionJoinedSelectBuilder<TTables, TFromTableName, TJoinedTableName>;
   select<
-    const TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
+    const TColumnNames extends readonly ProjectionTableColumnName<
+      TTables[TFromTableName]
+    >[],
   >(
     columns: TColumnNames,
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTables[TFromTableName], TColumnNames>;
+};
+
+export type ProjectionJoinedSelectBuilder<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+  TJoinedTableName extends ProjectionTableName<TTables>,
+> = {
+  selectFrom<
+    const TSelectedTableName extends TFromTableName | TJoinedTableName,
+    const TColumnNames extends readonly ProjectionTableColumnName<
+      TTables[TSelectedTableName]
+    >[],
+  >(
+    tableName: TSelectedTableName,
+    columns: TColumnNames,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TFromTableName | TJoinedTableName,
+    TSelectedTableName,
+    TColumnNames
+  >;
 };
 
 export type ProjectionExecutableSelect<
@@ -355,6 +486,109 @@ export type ProjectionExecutableSelect<
   stream(): AsyncIterable<ProjectionSelectedRow<TTable, TColumnNames>>;
 };
 
+export type ProjectionExecutableJoinedSelect<
+  TTables,
+  TTableNames extends ProjectionTableName<TTables>,
+  TSelectedTableName extends TTableNames,
+  TColumnNames extends readonly ProjectionTableColumnName<
+    TTables[TSelectedTableName]
+  >[],
+> = {
+  limit(
+    limit: number,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  orderBy<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionTableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+    direction?: ProjectionOrderDirection,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  whereAny(
+    conditions: readonly ProjectionQualifiedWhereCondition<
+      TTables,
+      TTableNames
+    >[],
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  where<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionTableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+    operator: ProjectionWhereOperator,
+    value: ProjectionWhereValue<TTables[TTableName], TColumnName>,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  whereIn<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionTableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTables[TTableName], TColumnName>[],
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  whereNotNull<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionTableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  whereNull<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionTableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  execute(): Promise<
+    readonly ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>[]
+  >;
+  executeTakeFirst(): Promise<ProjectionSelectedRow<
+    TTables[TSelectedTableName],
+    TColumnNames
+  > | null>;
+  stream(): AsyncIterable<
+    ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>
+  >;
+};
+
 export type ProjectionReadDatabase<
   TProjectionSchema extends AnyProjectionSchema,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
@@ -369,7 +603,8 @@ export type ProjectionReadDatabase<
   >(
     tableName: TTableName,
   ): ProjectionSelectBuilder<
-    ProjectionSchemaTables<TProjectionSchema>[TTableName]
+    ProjectionSchemaTables<TProjectionSchema>,
+    TTableName
   >;
 };
 
@@ -1011,6 +1246,7 @@ function createProjectionUpdateWhereBuilder<TTable>(
             String(columnName),
             operator,
             value,
+            null,
           ),
         ],
         trackWrite,
@@ -1023,7 +1259,12 @@ function createProjectionUpdateWhereBuilder<TTable>(
         updateAssignments,
         [
           ...whereClauses,
-          createProjectionInWhereClause(table, String(columnName), values),
+          createProjectionInWhereClause(
+            table,
+            String(columnName),
+            values,
+            null,
+          ),
         ],
         trackWrite,
       );
@@ -1035,7 +1276,12 @@ function createProjectionUpdateWhereBuilder<TTable>(
         updateAssignments,
         [
           ...whereClauses,
-          createProjectionNullWhereClause(table, String(columnName), true),
+          createProjectionNullWhereClause(
+            table,
+            String(columnName),
+            true,
+            null,
+          ),
         ],
         trackWrite,
       );
@@ -1047,7 +1293,12 @@ function createProjectionUpdateWhereBuilder<TTable>(
         updateAssignments,
         [
           ...whereClauses,
-          createProjectionNullWhereClause(table, String(columnName), false),
+          createProjectionNullWhereClause(
+            table,
+            String(columnName),
+            false,
+            null,
+          ),
         ],
         trackWrite,
       );
@@ -1093,6 +1344,7 @@ function createProjectionDeleteBuilder<TTable>(
             String(columnName),
             operator,
             value,
+            null,
           ),
         ],
         trackWrite,
@@ -1104,7 +1356,12 @@ function createProjectionDeleteBuilder<TTable>(
         table,
         [
           ...whereClauses,
-          createProjectionInWhereClause(table, String(columnName), values),
+          createProjectionInWhereClause(
+            table,
+            String(columnName),
+            values,
+            null,
+          ),
         ],
         trackWrite,
       );
@@ -1115,7 +1372,12 @@ function createProjectionDeleteBuilder<TTable>(
         table,
         [
           ...whereClauses,
-          createProjectionNullWhereClause(table, String(columnName), true),
+          createProjectionNullWhereClause(
+            table,
+            String(columnName),
+            true,
+            null,
+          ),
         ],
         trackWrite,
       );
@@ -1126,7 +1388,12 @@ function createProjectionDeleteBuilder<TTable>(
         table,
         [
           ...whereClauses,
-          createProjectionNullWhereClause(table, String(columnName), false),
+          createProjectionNullWhereClause(
+            table,
+            String(columnName),
+            false,
+            null,
+          ),
         ],
         trackWrite,
       );
@@ -1150,13 +1417,34 @@ function createProjectionReadDatabase<
       const table = readProjectionTable(metadata, String(tableName));
 
       return {
+        innerJoin: (joinedTableName, condition) => {
+          const joinedTable = readProjectionTable(
+            metadata,
+            String(joinedTableName),
+          );
+          const joinClause = createProjectionInnerJoinClause(
+            table,
+            joinedTable,
+            String(condition.fromColumn),
+            String(condition.toColumn),
+          );
+
+          return createProjectionJoinedSelectBuilder(metadata, scope, table, [
+            joinClause,
+          ]);
+        },
         select: (columns) => {
           validateProjectionColumns("selected columns", table, columns);
 
           return createProjectionExecutableSelect(
             scope,
             table,
+            table,
             columns,
+            columns.map((columnName) =>
+              createProjectionColumnReference(null, String(columnName)),
+            ),
+            [],
             [],
             [],
             null,
@@ -1171,17 +1459,65 @@ type ProjectionWhereClause = ProjectionCompilerWhereClause;
 
 type ProjectionOrderClause = ProjectionCompilerOrderClause;
 
+type ProjectionColumnReference = ProjectionCompilerColumnReference;
+
+type ProjectionJoinClause = ProjectionCompilerJoinClause;
+
 type CompiledProjectionSql = ProjectionCompiledSql;
 
 type ProjectionUpdateAssignment = ProjectionCompilerAssignment;
+
+function createProjectionJoinedSelectBuilder<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+  TJoinedTableName extends ProjectionTableName<TTables>,
+>(
+  metadata: ProjectionSchemaMetadata,
+  scope: LedgerStorageScope,
+  fromTable: ProjectionTableMetadata,
+  joinClauses: readonly ProjectionJoinClause[],
+): ProjectionJoinedSelectBuilder<TTables, TFromTableName, TJoinedTableName> {
+  return {
+    selectFrom: (tableName, columns) => {
+      const selectedTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+      validateProjectionColumns("selected columns", selectedTable, columns);
+
+      return createProjectionExecutableJoinedSelect(
+        metadata,
+        scope,
+        fromTable,
+        selectedTable,
+        columns,
+        columns.map((columnName) =>
+          createProjectionColumnReference(
+            selectedTable.name,
+            String(columnName),
+          ),
+        ),
+        joinClauses,
+        [],
+        [],
+        null,
+      );
+    },
+  };
+}
 
 function createProjectionExecutableSelect<
   TTable,
   const TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
 >(
   scope: LedgerStorageScope,
+  fromTable: ProjectionTableMetadata,
   table: ProjectionTableMetadata,
   selectedColumns: TColumnNames,
+  selectedColumnReferences: readonly ProjectionColumnReference[],
+  joinClauses: readonly ProjectionJoinClause[],
   whereClauses: readonly ProjectionWhereClause[],
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
@@ -1191,8 +1527,11 @@ function createProjectionExecutableSelect<
       validateProjectionLimit(limit);
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         whereClauses,
         orderClauses,
         limit,
@@ -1204,13 +1543,16 @@ function createProjectionExecutableSelect<
 
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         whereClauses,
         [
           ...orderClauses,
           {
-            columnName: String(columnName),
+            column: createProjectionColumnReference(null, String(columnName)),
             direction,
           },
         ],
@@ -1220,8 +1562,11 @@ function createProjectionExecutableSelect<
     whereAny: (conditions) => {
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
         orderClauses,
         limitClause,
@@ -1230,8 +1575,11 @@ function createProjectionExecutableSelect<
     where: (columnName, operator, value) => {
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         [
           ...whereClauses,
           createProjectionComparisonWhereClause(
@@ -1239,6 +1587,7 @@ function createProjectionExecutableSelect<
             String(columnName),
             operator,
             value,
+            null,
           ),
         ],
         orderClauses,
@@ -1248,11 +1597,19 @@ function createProjectionExecutableSelect<
     whereIn: (columnName, values) => {
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         [
           ...whereClauses,
-          createProjectionInWhereClause(table, String(columnName), values),
+          createProjectionInWhereClause(
+            table,
+            String(columnName),
+            values,
+            null,
+          ),
         ],
         orderClauses,
         limitClause,
@@ -1261,11 +1618,19 @@ function createProjectionExecutableSelect<
     whereNotNull: (columnName) => {
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         [
           ...whereClauses,
-          createProjectionNullWhereClause(table, String(columnName), true),
+          createProjectionNullWhereClause(
+            table,
+            String(columnName),
+            true,
+            null,
+          ),
         ],
         orderClauses,
         limitClause,
@@ -1274,11 +1639,19 @@ function createProjectionExecutableSelect<
     whereNull: (columnName) => {
       return createProjectionExecutableSelect(
         scope,
+        fromTable,
         table,
         selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
         [
           ...whereClauses,
-          createProjectionNullWhereClause(table, String(columnName), false),
+          createProjectionNullWhereClause(
+            table,
+            String(columnName),
+            false,
+            null,
+          ),
         ],
         orderClauses,
         limitClause,
@@ -1286,8 +1659,9 @@ function createProjectionExecutableSelect<
     },
     execute: async () => {
       const sql = buildSelectSql(
-        table,
-        selectedColumns,
+        fromTable,
+        selectedColumnReferences,
+        joinClauses,
         whereClauses,
         orderClauses,
         limitClause,
@@ -1305,8 +1679,9 @@ function createProjectionExecutableSelect<
     },
     executeTakeFirst: async () => {
       const sql = buildSelectSql(
-        table,
-        selectedColumns,
+        fromTable,
+        selectedColumnReferences,
+        joinClauses,
         whereClauses,
         orderClauses,
         1,
@@ -1325,8 +1700,9 @@ function createProjectionExecutableSelect<
     },
     stream: async function* () {
       const sql = buildSelectSql(
-        table,
-        selectedColumns,
+        fromTable,
+        selectedColumnReferences,
+        joinClauses,
         whereClauses,
         orderClauses,
         limitClause,
@@ -1339,6 +1715,253 @@ function createProjectionExecutableSelect<
           selectedColumns,
           row,
         ) as ProjectionSelectedRow<TTable, TColumnNames>;
+      }
+    },
+  };
+}
+
+function createProjectionExecutableJoinedSelect<
+  TTables,
+  TTableNames extends ProjectionTableName<TTables>,
+  TSelectedTableName extends TTableNames,
+  const TColumnNames extends readonly ProjectionTableColumnName<
+    TTables[TSelectedTableName]
+  >[],
+>(
+  metadata: ProjectionSchemaMetadata,
+  scope: LedgerStorageScope,
+  fromTable: ProjectionTableMetadata,
+  table: ProjectionTableMetadata,
+  selectedColumns: TColumnNames,
+  selectedColumnReferences: readonly ProjectionColumnReference[],
+  joinClauses: readonly ProjectionJoinClause[],
+  whereClauses: readonly ProjectionWhereClause[],
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
+): ProjectionExecutableJoinedSelect<
+  TTables,
+  TTableNames,
+  TSelectedTableName,
+  TColumnNames
+> {
+  const createNext = (
+    nextWhereClauses: readonly ProjectionWhereClause[],
+    nextOrderClauses: readonly ProjectionOrderClause[],
+    nextLimitClause: number | null,
+  ) => {
+    return createProjectionExecutableJoinedSelect<
+      TTables,
+      TTableNames,
+      TSelectedTableName,
+      TColumnNames
+    >(
+      metadata,
+      scope,
+      fromTable,
+      table,
+      selectedColumns,
+      selectedColumnReferences,
+      joinClauses,
+      nextWhereClauses,
+      nextOrderClauses,
+      nextLimitClause,
+    );
+  };
+
+  return {
+    limit: (limit) => {
+      validateProjectionLimit(limit);
+
+      return createNext(whereClauses, orderClauses, limit);
+    },
+    orderBy: (tableName, columnName, direction = "asc") => {
+      const orderTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+      validateProjectionColumns("order column", orderTable, [
+        String(columnName),
+      ]);
+      validateProjectionOrderDirection(direction);
+
+      return createNext(
+        whereClauses,
+        [
+          ...orderClauses,
+          {
+            column: createProjectionColumnReference(
+              orderTable.name,
+              String(columnName),
+            ),
+            direction,
+          },
+        ],
+        limitClause,
+      );
+    },
+    whereAny: (conditions) => {
+      return createNext(
+        [
+          ...whereClauses,
+          createProjectionQualifiedAnyWhereClause(
+            metadata,
+            fromTable,
+            joinClauses,
+            conditions,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    where: (tableName, columnName, operator, value) => {
+      const whereTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+
+      return createNext(
+        [
+          ...whereClauses,
+          createProjectionComparisonWhereClause(
+            whereTable,
+            String(columnName),
+            operator,
+            value,
+            whereTable.name,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    whereIn: (tableName, columnName, values) => {
+      const whereTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+
+      return createNext(
+        [
+          ...whereClauses,
+          createProjectionInWhereClause(
+            whereTable,
+            String(columnName),
+            values,
+            whereTable.name,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    whereNotNull: (tableName, columnName) => {
+      const whereTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+
+      return createNext(
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(
+            whereTable,
+            String(columnName),
+            true,
+            whereTable.name,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    whereNull: (tableName, columnName) => {
+      const whereTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+
+      return createNext(
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(
+            whereTable,
+            String(columnName),
+            false,
+            whereTable.name,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    execute: async () => {
+      const sql = buildSelectSql(
+        fromTable,
+        selectedColumnReferences,
+        joinClauses,
+        whereClauses,
+        orderClauses,
+        limitClause,
+      );
+      const rows = await scope.prepare(sql.text).all(...sql.params);
+
+      return rows.map((row) => {
+        return decodeProjectionSelectedRow(
+          table,
+          selectedColumns,
+          row,
+        ) as ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
+      });
+    },
+    executeTakeFirst: async () => {
+      const sql = buildSelectSql(
+        fromTable,
+        selectedColumnReferences,
+        joinClauses,
+        whereClauses,
+        orderClauses,
+        1,
+      );
+      const row = await scope.prepare(sql.text).get(...sql.params);
+
+      if (row === undefined) {
+        return null;
+      }
+
+      return decodeProjectionSelectedRow(
+        table,
+        selectedColumns,
+        row,
+      ) as ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
+    },
+    stream: async function* () {
+      const sql = buildSelectSql(
+        fromTable,
+        selectedColumnReferences,
+        joinClauses,
+        whereClauses,
+        orderClauses,
+        limitClause,
+      );
+      const rows = await scope.prepare(sql.text).all(...sql.params);
+
+      for (const row of rows) {
+        yield decodeProjectionSelectedRow(
+          table,
+          selectedColumns,
+          row,
+        ) as ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
       }
     },
   };
@@ -1621,16 +2244,18 @@ function buildInsertSql(
 
 function buildSelectSql(
   table: ProjectionTableMetadata,
-  selectedColumns: readonly string[],
+  selectedColumns: readonly ProjectionColumnReference[],
+  joinClauses: readonly ProjectionJoinClause[],
   whereClauses: readonly ProjectionWhereClause[],
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
 ): CompiledProjectionSql {
   return projectionStatementCompiler.compileSelect({
     columns: selectedColumns,
+    fromTableName: table.name,
+    joins: joinClauses,
     limit: limitClause,
     orderBy: orderClauses,
-    tableName: table.name,
     where: whereClauses,
   });
 }
@@ -1667,7 +2292,7 @@ function createProjectionAnyWhereClause<TTable>(
 
   return {
     clauses: conditions.map((condition) => {
-      return createProjectionWhereClauseFromCondition(table, condition);
+      return createProjectionWhereClauseFromCondition(table, condition, null);
     }),
     kind: "any",
   };
@@ -1676,6 +2301,7 @@ function createProjectionAnyWhereClause<TTable>(
 function createProjectionWhereClauseFromCondition<TTable>(
   table: ProjectionTableMetadata,
   condition: ProjectionWhereCondition<TTable>,
+  tableName: string | null,
 ): ProjectionWhereClause {
   switch (condition.kind) {
     case "comparison":
@@ -1684,24 +2310,106 @@ function createProjectionWhereClauseFromCondition<TTable>(
         String(condition.columnName),
         condition.operator,
         condition.value,
+        tableName,
       );
     case "in":
       return createProjectionInWhereClause(
         table,
         String(condition.columnName),
         condition.values,
+        tableName,
       );
     case "is_not_null":
       return createProjectionNullWhereClause(
         table,
         String(condition.columnName),
         true,
+        tableName,
       );
     case "is_null":
       return createProjectionNullWhereClause(
         table,
         String(condition.columnName),
         false,
+        tableName,
+      );
+  }
+}
+
+function createProjectionQualifiedAnyWhereClause<
+  TTables,
+  TTableNames extends ProjectionTableName<TTables>,
+>(
+  metadata: ProjectionSchemaMetadata,
+  fromTable: ProjectionTableMetadata,
+  joinClauses: readonly ProjectionJoinClause[],
+  conditions: readonly ProjectionQualifiedWhereCondition<
+    TTables,
+    TTableNames
+  >[],
+): ProjectionWhereClause {
+  if (conditions.length === 0) {
+    throw new Error("any predicate group must include at least one condition");
+  }
+
+  return {
+    clauses: conditions.map((condition) => {
+      return createProjectionQualifiedWhereClauseFromCondition(
+        metadata,
+        fromTable,
+        joinClauses,
+        condition,
+      );
+    }),
+    kind: "any",
+  };
+}
+
+function createProjectionQualifiedWhereClauseFromCondition<
+  TTables,
+  TTableNames extends ProjectionTableName<TTables>,
+>(
+  metadata: ProjectionSchemaMetadata,
+  fromTable: ProjectionTableMetadata,
+  joinClauses: readonly ProjectionJoinClause[],
+  condition: ProjectionQualifiedWhereCondition<TTables, TTableNames>,
+): ProjectionWhereClause {
+  const table = readProjectionJoinedTable(
+    metadata,
+    fromTable,
+    joinClauses,
+    String(condition.tableName),
+  );
+
+  switch (condition.kind) {
+    case "comparison":
+      return createProjectionComparisonWhereClause(
+        table,
+        String(condition.columnName),
+        condition.operator,
+        condition.value,
+        table.name,
+      );
+    case "in":
+      return createProjectionInWhereClause(
+        table,
+        String(condition.columnName),
+        condition.values,
+        table.name,
+      );
+    case "is_not_null":
+      return createProjectionNullWhereClause(
+        table,
+        String(condition.columnName),
+        true,
+        table.name,
+      );
+    case "is_null":
+      return createProjectionNullWhereClause(
+        table,
+        String(condition.columnName),
+        false,
+        table.name,
       );
   }
 }
@@ -1711,12 +2419,13 @@ function createProjectionComparisonWhereClause(
   columnName: string,
   operator: ProjectionWhereOperator,
   value: unknown,
+  tableName: string | null,
 ): ProjectionWhereClause {
   validateProjectionColumns("where column", table, [columnName]);
   validateProjectionWhereOperator(operator);
 
   return {
-    columnName,
+    column: createProjectionColumnReference(tableName, columnName),
     kind: "comparison",
     operator,
     value: serializeProjectionColumnValue(
@@ -1731,11 +2440,12 @@ function createProjectionInWhereClause(
   table: ProjectionTableMetadata,
   columnName: string,
   values: readonly unknown[],
+  tableName: string | null,
 ): ProjectionWhereClause {
   validateProjectionColumns("where column", table, [columnName]);
 
   return {
-    columnName,
+    column: createProjectionColumnReference(tableName, columnName),
     kind: "in",
     values: values.map((value) => {
       return serializeProjectionColumnValue(
@@ -1751,14 +2461,59 @@ function createProjectionNullWhereClause(
   table: ProjectionTableMetadata,
   columnName: string,
   not: boolean,
+  tableName: string | null,
 ): ProjectionWhereClause {
   validateProjectionColumns("where column", table, [columnName]);
 
   return {
-    columnName,
+    column: createProjectionColumnReference(tableName, columnName),
     kind: "null",
     not,
   };
+}
+
+function createProjectionColumnReference(
+  tableName: string | null,
+  columnName: string,
+): ProjectionColumnReference {
+  return {
+    columnName,
+    tableName,
+  };
+}
+
+function createProjectionInnerJoinClause(
+  fromTable: ProjectionTableMetadata,
+  joinedTable: ProjectionTableMetadata,
+  fromColumn: string,
+  toColumn: string,
+): ProjectionJoinClause {
+  validateProjectionColumns("join source column", fromTable, [fromColumn]);
+  validateProjectionColumns("join target column", joinedTable, [toColumn]);
+  validateProjectionJoinColumns(fromTable, fromColumn, joinedTable, toColumn);
+
+  return {
+    kind: "inner",
+    left: createProjectionColumnReference(fromTable.name, fromColumn),
+    right: createProjectionColumnReference(joinedTable.name, toColumn),
+    tableName: joinedTable.name,
+  };
+}
+
+function readProjectionJoinedTable(
+  metadata: ProjectionSchemaMetadata,
+  fromTable: ProjectionTableMetadata,
+  joinClauses: readonly ProjectionJoinClause[],
+  tableName: string,
+): ProjectionTableMetadata {
+  if (
+    tableName !== fromTable.name &&
+    !joinClauses.some((joinClause) => joinClause.tableName === tableName)
+  ) {
+    throw new Error(`projection join does not include table ${tableName}`);
+  }
+
+  return readProjectionTable(metadata, tableName);
 }
 
 function readProjectionTable(
@@ -1818,6 +2573,27 @@ function validateProjectionColumns(
     if (table.columns[columnName] === undefined) {
       throw new Error(`${context} references unknown column ${columnName}`);
     }
+  }
+}
+
+function validateProjectionJoinColumns(
+  fromTable: ProjectionTableMetadata,
+  fromColumnName: string,
+  joinedTable: ProjectionTableMetadata,
+  joinedColumnName: string,
+): void {
+  const fromColumn = fromTable.columns[fromColumnName];
+  const joinedColumn = joinedTable.columns[joinedColumnName];
+
+  if (fromColumn === undefined || joinedColumn === undefined) {
+    throw new Error("join columns must reference known columns");
+  }
+
+  if (
+    fromColumn.kind !== joinedColumn.kind ||
+    fromColumn.eventName !== joinedColumn.eventName
+  ) {
+    throw new Error("join columns must have compatible types");
   }
 }
 

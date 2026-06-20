@@ -35,6 +35,8 @@
   API.
 - Add typed `whereAny([...])` disjunction groups to projection read, update,
   and delete builders so common OR predicates do not require raw SQL.
+- Add typed `innerJoin(...).selectFrom(...)` projection reads for
+  association-table lookups without exposing raw SQL or storage handles.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and

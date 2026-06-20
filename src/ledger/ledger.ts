@@ -47,6 +47,7 @@ const registeredLedgerModelBrand: unique symbol = Symbol(
 
 export type {
   ProjectionExecutableSelect,
+  ProjectionExecutableJoinedSelect,
   ProjectionExecutableWrite,
   ProjectionDatabase,
   ProjectionDeleteBuilder,
@@ -60,7 +61,10 @@ export type {
   ProjectionInsertBuilder,
   ProjectionInsertConflictBuilder,
   ProjectionInsertOnConflictBuilder,
+  ProjectionJoinCondition,
+  ProjectionJoinedSelectBuilder,
   ProjectionOrderDirection,
+  ProjectionQualifiedWhereCondition,
   ProjectionQueryContract,
   ProjectionQueryDefinitions,
   ProjectionQueryImplementations,

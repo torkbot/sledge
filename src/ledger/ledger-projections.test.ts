@@ -1105,6 +1105,156 @@ test("projection access supports typed disjunction predicate groups", async () =
   });
 });
 
+test("projection access supports typed inner joins between materialization tables", async () => {
+  const networkSchema = defineMaterializationSchema({
+    namespace: "network",
+    version: 1,
+    tables: {
+      policyPromptRequests: (t) =>
+        t
+          .columns({
+            policyPromptId: t.text().notNull(),
+            requestId: t.text().notNull(),
+          })
+          .primaryKey(["policyPromptId", "requestId"])
+          .index("policy_prompt_requests_by_request", ["requestId"]),
+      requests: (t) =>
+        t
+          .columns({
+            requestId: t.text().notNull(),
+            instanceId: t.text().notNull(),
+            runId: t.text().notNull(),
+            requestedAtMs: t.integer().notNull(),
+            resolvedAtMs: t.integer(),
+            summary: t.text().notNull(),
+          })
+          .primaryKey(["requestId"])
+          .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
+    },
+  });
+  const networkMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(networkSchema, (m) => [
+      m.migration(1, "create network request tables", (s) => [
+        s.createTable("policyPromptRequests", (t) =>
+          t
+            .columns({
+              policyPromptId: t.text().notNull(),
+              requestId: t.text().notNull(),
+            })
+            .primaryKey(["policyPromptId", "requestId"])
+            .index("policy_prompt_requests_by_request", ["requestId"]),
+        ),
+        s.createTable("requests", (t) =>
+          t
+            .columns({
+              requestId: t.text().notNull(),
+              instanceId: t.text().notNull(),
+              runId: t.text().notNull(),
+              requestedAtMs: t.integer().notNull(),
+              resolvedAtMs: t.integer(),
+              summary: t.text().notNull(),
+            })
+            .primaryKey(["requestId"])
+            .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      promptRequests: {
+        params: Type.Object({
+          policyPromptId: Type.String(),
+        }),
+        result: Type.Array(
+          Type.Object({
+            requestId: Type.String(),
+            instanceId: Type.String(),
+            runId: Type.String(),
+            requestedAtMs: Type.Number(),
+            resolvedAtMs: Type.Union([Type.Null(), Type.Number()]),
+            summary: Type.String(),
+          }),
+        ),
+      },
+    },
+  });
+  const networkModel = withMaterializations(
+    shape,
+    networkMaterializations,
+  ).register({
+    queries: {
+      promptRequests: async ({ params, db }) => {
+        const rows = await db
+          .selectFrom("policyPromptRequests")
+          .innerJoin("requests", {
+            fromColumn: "requestId",
+            toColumn: "requestId",
+          })
+          .selectFrom("requests", [
+            "requestId",
+            "instanceId",
+            "runId",
+            "requestedAtMs",
+            "resolvedAtMs",
+            "summary",
+          ])
+          .where(
+            "policyPromptRequests",
+            "policyPromptId",
+            "=",
+            params.policyPromptId,
+          )
+          .whereNull("requests", "resolvedAtMs")
+          .orderBy("requests", "requestedAtMs", "asc")
+          .orderBy("requests", "requestId", "asc")
+          .execute();
+
+        return [...rows];
+      },
+    },
+  });
+  const promptRequests =
+    readTestLedgerImplementations(networkModel).queries?.promptRequests;
+
+  if (promptRequests === undefined) {
+    throw new Error("expected promptRequests query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        requestId: "req_1",
+        instanceId: "instance_1",
+        runId: "run_1",
+        requestedAtMs: 1_000,
+        resolvedAtMs: null,
+        summary: "network access",
+      },
+    ],
+    getRow: undefined,
+  });
+
+  const rows = await promptRequests(fake.scope, {
+    policyPromptId: "prompt_1",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "all",
+    params: ["prompt_1"],
+    sql: 'SELECT "requests"."requestId" AS "requestId", "requests"."instanceId" AS "instanceId", "requests"."runId" AS "runId", "requests"."requestedAtMs" AS "requestedAtMs", "requests"."resolvedAtMs" AS "resolvedAtMs", "requests"."summary" AS "summary" FROM "policyPromptRequests" INNER JOIN "requests" ON "policyPromptRequests"."requestId" = "requests"."requestId" WHERE "policyPromptRequests"."policyPromptId" = ? AND "requests"."resolvedAtMs" IS NULL ORDER BY "requests"."requestedAtMs" ASC, "requests"."requestId" ASC',
+  });
+  assert.deepEqual(rows, [
+    {
+      requestId: "req_1",
+      instanceId: "instance_1",
+      runId: "run_1",
+      requestedAtMs: 1_000,
+      resolvedAtMs: null,
+      summary: "network access",
+    },
+  ]);
+});
+
 test("projection access hydrates semantic event references without exposing events table", async () => {
   const eventMaterializations = defineMaterializations({
     history,
@@ -1954,6 +2104,96 @@ async function assertLedgerProjectionTypes(): Promise<void> {
 
   // @ts-expect-error indexer source events must come from the ledger shape.
   withMaterializations(shape, invalidSource);
+
+  const joinSchema = defineMaterializationSchema({
+    namespace: "join-types",
+    version: 1,
+    tables: {
+      children: (t) =>
+        t
+          .columns({
+            childId: t.text().notNull(),
+            parentId: t.text().notNull(),
+          })
+          .primaryKey(["childId"]),
+      parents: (t) =>
+        t
+          .columns({
+            parentId: t.text().notNull(),
+            rank: t.integer().notNull(),
+          })
+          .primaryKey(["parentId"]),
+    },
+  });
+  const joinHistory = defineMaterializationHistory(joinSchema, (m) => [
+    m.migration(1, "create join tables", (s) => [
+      s.createTable("children", (t) =>
+        t
+          .columns({
+            childId: t.text().notNull(),
+            parentId: t.text().notNull(),
+          })
+          .primaryKey(["childId"]),
+      ),
+      s.createTable("parents", (t) =>
+        t
+          .columns({
+            parentId: t.text().notNull(),
+            rank: t.integer().notNull(),
+          })
+          .primaryKey(["parentId"]),
+      ),
+    ]),
+  ]);
+  const joinMaterializations = defineMaterializations({
+    history: joinHistory,
+    indexers: {},
+    queries: {
+      joined: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+    },
+  });
+
+  withMaterializations(shape, joinMaterializations).register({
+    queries: {
+      joined: ({ db }) => {
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
+          .where("parents", "rank", ">", 0);
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            // @ts-expect-error joined columns must have compatible value types.
+            toColumn: "rank",
+          })
+          .selectFrom("parents", ["rank"]);
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
+          // @ts-expect-error joined where values must match the qualified column type.
+          .where("parents", "rank", ">", "0");
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
+          // @ts-expect-error joined where clauses only reference joined tables.
+          .where("users", "userId", "=", "u_123");
+
+        return null;
+      },
+    },
+  });
 
   const typedMaterializations = defineMaterializations({
     history: typedHistory,
