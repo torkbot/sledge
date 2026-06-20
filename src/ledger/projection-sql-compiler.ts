@@ -127,6 +127,11 @@ export type ProjectionCompilerAggregateStatement = {
   readonly where: readonly ProjectionCompilerWhereClause[];
 };
 
+export type ProjectionCompilerEventReadStatement = {
+  readonly eventIds: readonly number[];
+  readonly eventName: string;
+};
+
 export type ProjectionCompilerUpdateStatement = {
   readonly assignments: readonly ProjectionCompilerAssignment[];
   readonly tableName: string;
@@ -145,6 +150,9 @@ export type ProjectionStatementCompiler = {
   compileDelete(
     statement: ProjectionCompilerDeleteStatement,
   ): ProjectionCompiledSql;
+  compileEventRead(
+    statement: ProjectionCompilerEventReadStatement,
+  ): ProjectionCompiledSql;
   compileInsert(
     statement: ProjectionCompilerInsertStatement,
   ): ProjectionCompiledSql;
@@ -160,6 +168,7 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
   return {
     compileAggregate: compileAggregateStatement,
     compileDelete: compileDeleteStatement,
+    compileEventRead: compileEventReadStatement,
     compileInsert: compileInsertStatement,
     compileSelect: compileSelectStatement,
     compileUpdate: compileUpdateStatement,
@@ -195,6 +204,21 @@ function compileAggregateStatement(
   return {
     params: whereSql.params,
     text,
+  };
+}
+
+function compileEventReadStatement(
+  statement: ProjectionCompilerEventReadStatement,
+): ProjectionCompiledSql {
+  if (statement.eventIds.length === 0) {
+    throw new Error("event read must include at least one event id");
+  }
+
+  const eventIdsSql = statement.eventIds.map(() => "?").join(", ");
+
+  return {
+    params: [statement.eventName, 0, ...statement.eventIds],
+    text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
   };
 }
 

@@ -1505,6 +1505,12 @@ test("projection access hydrates semantic event references without exposing even
         }),
         result: Type.Union([Type.Null(), UserCreatedSchema]),
       },
+      sourceEvents: {
+        params: Type.Object({
+          eventIds: Type.Array(Type.Number()),
+        }),
+        result: Type.Array(Type.Union([Type.Null(), UserCreatedSchema])),
+      },
     },
   });
   const eventModel = withMaterializations(
@@ -1519,28 +1525,46 @@ test("projection access hydrates semantic event references without exposing even
 
         return event === null ? null : event.payload;
       },
+      sourceEvents: async ({ params, db }) => {
+        const events = await db.readEvents(
+          params.eventIds.map((eventId) => {
+            return createEventRef("user.created", eventId);
+          }),
+        );
+
+        return events.map((event) => {
+          return event === null ? null : event.payload;
+        });
+      },
     },
   });
-  const sourceEvent =
-    readTestLedgerImplementations(eventModel).queries?.sourceEvent;
+  const eventQueries = readTestLedgerImplementations(eventModel).queries;
+  const sourceEvent = eventQueries?.sourceEvent;
+  const sourceEvents = eventQueries?.sourceEvents;
 
   if (sourceEvent === undefined) {
     throw new Error("expected sourceEvent query implementation");
   }
 
+  if (sourceEvents === undefined) {
+    throw new Error("expected sourceEvents query implementation");
+  }
+
   const fake = createFakeScope({
-    allRows: [],
-    getRow: {
-      causation_event_id: null,
-      dedupe_key: null,
-      event_id: 42,
-      event_name: "user.created",
-      payload_json: JSON.stringify({
-        userId: "u_123",
-        email: "alice@example.com",
-      }),
-      ts_ms: 1_000,
-    },
+    allRows: [
+      {
+        causation_event_id: null,
+        dedupe_key: null,
+        event_id: 42,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_123",
+          email: "alice@example.com",
+        }),
+        ts_ms: 1_000,
+      },
+    ],
+    getRow: undefined,
   });
 
   const payload = await sourceEvent(fake.scope, {
@@ -1548,18 +1572,78 @@ test("projection access hydrates semantic event references without exposing even
   });
 
   assert.deepEqual(fake.calls[0], {
-    method: "get",
-    params: [42, "user.created"],
-    sql: `SELECT event_id, ts_ms, event_name, payload_json, causation_event_id, dedupe_key
-       FROM events
-       WHERE event_id = ?
-         AND event_name = ?
-         AND signal = 0`,
+    method: "all",
+    params: ["user.created", 0, 42],
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?)',
   });
   assert.deepEqual(payload, {
     userId: "u_123",
     email: "alice@example.com",
   });
+
+  const batchFake = createFakeScope({
+    allRows: [
+      {
+        causation_event_id: null,
+        dedupe_key: null,
+        event_id: 42,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_123",
+          email: "alice@example.com",
+        }),
+        ts_ms: 1_000,
+      },
+      {
+        causation_event_id: null,
+        dedupe_key: null,
+        event_id: 43,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_456",
+          email: "bob@example.com",
+        }),
+        ts_ms: 1_100,
+      },
+    ],
+    getRow: undefined,
+  });
+
+  const payloads = await sourceEvents(batchFake.scope, {
+    eventIds: [43, 42, 99, 42],
+  });
+
+  assert.deepEqual(batchFake.calls[0], {
+    method: "all",
+    params: ["user.created", 0, 43, 42, 99],
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?, ?, ?)',
+  });
+  assert.deepEqual(payloads, [
+    {
+      userId: "u_456",
+      email: "bob@example.com",
+    },
+    {
+      userId: "u_123",
+      email: "alice@example.com",
+    },
+    null,
+    {
+      userId: "u_123",
+      email: "alice@example.com",
+    },
+  ]);
+
+  const emptyBatchFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  assert.deepEqual(
+    await sourceEvents(emptyBatchFake.scope, { eventIds: [] }),
+    [],
+  );
+  assert.deepEqual(emptyBatchFake.calls, []);
 });
 
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
@@ -2544,6 +2628,17 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           const userId: string = event.payload.userId;
           void userId;
         }
+
+        const events = await db.readEvents([createEventRef("user.created", 1)]);
+        const firstEvent = events[0] ?? null;
+
+        if (firstEvent !== null) {
+          const userId: string = firstEvent.payload.userId;
+          void userId;
+        }
+
+        // @ts-expect-error batch event reads must reference known ledger events.
+        db.readEvents([createEventRef("session.created", 1)]);
 
         const aggregateRow = await db
           .selectFrom("users")

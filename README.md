@@ -348,6 +348,14 @@ Indexer and query implementations receive sledge-owned facades:
 - writes return affected-row metadata and support typed `MAX(...)`,
   `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
+Semantic event refs can be hydrated one at a time with `readEvent(ref)` or in
+batches with `readEvents(refs)`. Batch reads preserve the input order and avoid
+one storage round trip per row:
+
+```ts
+const events = await db.readEvents(rows.map((row) => row.source));
+```
+
 Aggregate reads return a single typed object keyed by the declared aliases:
 
 ```ts

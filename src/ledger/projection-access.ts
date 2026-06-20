@@ -679,6 +679,9 @@ export type ProjectionReadDatabase<
   readEvent<const TEventName extends Extract<keyof TEvents, string>>(
     ref: EventRef<TEventName>,
   ): Promise<EventEnvelope<TEvents, TEventName> | null>;
+  readEvents<const TEventName extends Extract<keyof TEvents, string>>(
+    refs: readonly EventRef<TEventName>[],
+  ): Promise<readonly (EventEnvelope<TEvents, TEventName> | null)[]>;
   selectFrom<
     const TTableName extends ProjectionTableName<
       ProjectionSchemaTables<TProjectionSchema>
@@ -1495,6 +1498,9 @@ function createProjectionReadDatabase<
   return {
     readEvent: async (ref) => {
       return await readProjectionEvent(scope, events, ref);
+    },
+    readEvents: async (refs) => {
+      return await readProjectionEvents(scope, events, refs);
     },
     selectFrom: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
@@ -2523,6 +2529,16 @@ function buildAggregateSql(
   });
 }
 
+function buildReadProjectionEventsSql(
+  eventName: string,
+  eventIds: readonly number[],
+): CompiledProjectionSql {
+  return projectionStatementCompiler.compileEventRead({
+    eventIds,
+    eventName,
+  });
+}
+
 function buildUpdateSql(
   table: ProjectionTableMetadata,
   assignments: readonly ProjectionUpdateAssignment[],
@@ -2994,29 +3010,115 @@ async function readProjectionEvent<
   events: TEvents,
   ref: EventRef<TEventName>,
 ): Promise<EventEnvelope<TEvents, TEventName> | null> {
-  const eventName = ref.eventName;
-  const eventSchema = events[eventName];
+  const eventResults = await readProjectionEvents(scope, events, [ref]);
 
-  if (eventSchema === undefined) {
+  return eventResults[0] ?? null;
+}
+
+type ProjectionEventReadGroup<TEventName extends string> = {
+  readonly eventName: TEventName;
+  readonly eventIds: number[];
+  readonly seenEventIds: Set<number>;
+};
+
+type AnyProjectionEventEnvelope<TEvents extends Record<string, TSchema>> =
+  EventEnvelope<TEvents, Extract<keyof TEvents, string>>;
+
+async function readProjectionEvents<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  scope: LedgerStorageScope,
+  events: TEvents,
+  refs: readonly EventRef<TEventName>[],
+): Promise<readonly (EventEnvelope<TEvents, TEventName> | null)[]> {
+  const normalizedRefs = refs.map((ref) => {
+    return validateProjectionEventRef(events, ref);
+  });
+
+  if (normalizedRefs.length === 0) {
+    return [];
+  }
+
+  const groups = new Map<TEventName, ProjectionEventReadGroup<TEventName>>();
+
+  for (const ref of normalizedRefs) {
+    let group = groups.get(ref.eventName);
+
+    if (group === undefined) {
+      group = {
+        eventIds: [],
+        eventName: ref.eventName,
+        seenEventIds: new Set<number>(),
+      };
+      groups.set(ref.eventName, group);
+    }
+
+    if (!group.seenEventIds.has(ref.eventId)) {
+      group.eventIds.push(ref.eventId);
+      group.seenEventIds.add(ref.eventId);
+    }
+  }
+
+  const eventsByRef = new Map<string, AnyProjectionEventEnvelope<TEvents>>();
+
+  for (const group of groups.values()) {
+    const eventSchema = events[group.eventName];
+
+    if (eventSchema === undefined) {
+      throw new Error(
+        `projection event ref references unknown event ${group.eventName}`,
+      );
+    }
+
+    const sql = buildReadProjectionEventsSql(group.eventName, group.eventIds);
+    const rows = await scope.prepare(sql.text).all(...sql.params);
+
+    for (const row of rows) {
+      const event = decodeProjectionEventRow(
+        eventSchema,
+        group.eventName,
+        row,
+      ) as AnyProjectionEventEnvelope<TEvents>;
+      eventsByRef.set(
+        createProjectionEventReadKey(event.eventName, event.eventId),
+        event,
+      );
+    }
+  }
+
+  return normalizedRefs.map((ref) => {
+    return (
+      eventsByRef.get(
+        createProjectionEventReadKey(ref.eventName, ref.eventId),
+      ) ?? null
+    );
+  }) as readonly (EventEnvelope<TEvents, TEventName> | null)[];
+}
+
+function validateProjectionEventRef<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(events: TEvents, ref: EventRef<TEventName>): EventRef<TEventName> {
+  if (events[ref.eventName] === undefined) {
     throw new Error(
-      `projection event ref references unknown event ${eventName}`,
+      `projection event ref references unknown event ${ref.eventName}`,
     );
   }
 
-  const row = await scope
-    .prepare(
-      `SELECT event_id, ts_ms, event_name, payload_json, causation_event_id, dedupe_key
-       FROM events
-       WHERE event_id = ?
-         AND event_name = ?
-         AND signal = 0`,
-    )
-    .get(ref.eventId, eventName);
+  createEventRef(ref.eventName, ref.eventId);
 
-  if (row === undefined) {
-    return null;
-  }
+  return ref;
+}
 
+function decodeProjectionEventRow<
+  TEventName extends string,
+  TEventSchema extends TSchema,
+>(
+  eventSchema: TEventSchema,
+  eventName: TEventName,
+  row: LedgerStorageRow,
+): EventEnvelope<Record<TEventName, TEventSchema>, TEventName> {
   const decodedRow = Value.Decode(ProjectionEventRowSchema, row);
 
   if (decodedRow.event_name !== eventName) {
@@ -3028,8 +3130,10 @@ async function readProjectionEvent<
   const payload = Value.Decode(
     eventSchema,
     parseJson(decodedRow.payload_json, "events.payload_json"),
-  ) as Static<TEvents[TEventName]>;
-  const typedRef = ref as EventRef<Extract<TEventName, string>>;
+  ) as Static<TEventSchema>;
+  const typedRef = createEventRef(eventName, decodedRow.event_id) as EventRef<
+    Extract<TEventName, string>
+  >;
 
   return {
     causationEventId: decodedRow.causation_event_id,
@@ -3040,6 +3144,13 @@ async function readProjectionEvent<
     ref: typedRef,
     tsMs: decodedRow.ts_ms,
   };
+}
+
+function createProjectionEventReadKey(
+  eventName: string,
+  eventId: number,
+): string {
+  return `${eventName}\u0000${eventId}`;
 }
 
 function decodeProjectionSelectedRow(
