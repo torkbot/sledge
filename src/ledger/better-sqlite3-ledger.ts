@@ -160,18 +160,24 @@ export function createBetterSqliteStorageRuntime(
 }
 
 function validateDatabaseUrl(databaseUrl: string): void {
-  if (isUnsupportedInMemoryUrl(databaseUrl)) {
-    throw new Error(
-      "non-shared in-memory databases are not supported; use a shared memory URL such as file:sledge?mode=memory&cache=shared",
-    );
-  }
-
   if (databaseUrl.length === 0) {
     throw new Error("databaseUrl must be non-empty");
   }
+
+  if (isInMemoryDatabaseUrl(databaseUrl)) {
+    throw new Error(
+      "in-memory SQLite database URLs are not supported by the better-sqlite3 adapter; pass a durable filesystem path",
+    );
+  }
+
+  if (isSqliteUriDatabaseUrl(databaseUrl)) {
+    throw new Error(
+      "SQLite URI databaseUrl values are not supported by the better-sqlite3 adapter; pass a filesystem path",
+    );
+  }
 }
 
-function isUnsupportedInMemoryUrl(databaseUrl: string): boolean {
+function isInMemoryDatabaseUrl(databaseUrl: string): boolean {
   if (databaseUrl === ":memory:") {
     return true;
   }
@@ -192,7 +198,11 @@ function isUnsupportedInMemoryUrl(databaseUrl: string): boolean {
   const usesMemory =
     fileTarget === ":memory:" || params.get("mode") === "memory";
 
-  return usesMemory && params.get("cache") !== "shared";
+  return usesMemory;
+}
+
+function isSqliteUriDatabaseUrl(databaseUrl: string): boolean {
+  return databaseUrl.startsWith("file:");
 }
 
 function wrapBetterSqliteDatabase(

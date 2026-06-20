@@ -213,13 +213,14 @@ You choose a backend adapter and open the durable ledger:
 - `createBetterSqliteLedger(...)`
 - `createTursoLedger(...)`
 
-Adapters take a `databaseUrl` and Sledge owns the database connections it opens.
-Plain `:memory:` URLs are rejected because they cannot support more than one
-connection. Use a real database file for local SQLite, or a backend-specific
-shared-memory URL only where the driver can still provide the required
-multi-connection read/write semantics. The `better-sqlite3` adapter verifies
-that the opened database actually enters WAL journal mode and rejects databases
-that cannot.
+Adapters take a `databaseUrl` filesystem path and Sledge owns the database
+connections it opens. SQLite in-memory URLs (`:memory:` and `file:...mode=memory`
+forms) are rejected because they cannot provide Sledge's required
+multi-connection read/write semantics through these adapters. SQLite URI strings
+starting with `file:` are also rejected because the current drivers do not parse
+them as SQLite URI filenames consistently. Pass a normal filesystem path for
+local SQLite. The `better-sqlite3` adapter verifies that the opened database
+actually enters WAL journal mode and rejects databases that cannot.
 
 Sledge assumes a single process owns writes to a ledger database. Its
 multi-connection support is for Sledge-managed read/write scopes inside that
