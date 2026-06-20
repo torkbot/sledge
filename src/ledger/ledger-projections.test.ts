@@ -862,6 +862,43 @@ test("materialization histories replay foreign keys against current state", () =
   }, /materialization history must match current schema relations/);
 });
 
+test("materialization histories compare replayed columns by name", () => {
+  const reorderedSchema = defineMaterializationSchema({
+    namespace: "column-order",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            displayName: t.text(),
+            email: t.text(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+  const reorderedHistory = defineMaterializationHistory(
+    reorderedSchema,
+    (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(2, "add display name", (s) => [
+        s.addColumn("users", "displayName", (t) => t.text()),
+      ]),
+    ],
+  );
+
+  assert.equal(reorderedHistory.current, reorderedSchema);
+});
+
 test("withMaterializations rejects materialization event refs outside the ledger shape", () => {
   const invalidSchema = defineMaterializationSchema({
     namespace: "invalid-events",

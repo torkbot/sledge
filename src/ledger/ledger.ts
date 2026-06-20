@@ -1537,8 +1537,8 @@ function validateMaterializationTableMetadataMatch(
 ): void {
   if (
     !equalStringLists(
-      Object.keys(expected.columns),
-      Object.keys(actual.columns),
+      Object.keys(expected.columns).sort(),
+      Object.keys(actual.columns).sort(),
     )
   ) {
     throw new Error(`${context} must match current schema columns`);
