@@ -12,6 +12,7 @@ import {
   type LedgerStorageScope,
   type LedgerStorageStatement,
 } from "./internal-storage.ts";
+import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
   RegisteredLedgerModel,
   EventEnvelope,
@@ -38,14 +39,7 @@ import type {
   WorkSnapshot,
   WorkState,
 } from "./ledger.ts";
-import type {
-  ProjectionColumnMetadata,
-  ProjectionForeignKeyAction,
-  ProjectionForeignKeyMetadata,
-  ProjectionIndexMetadata,
-  ProjectionSchemaMetadata,
-  ProjectionTableMetadata,
-} from "./projections.ts";
+import type { ProjectionSchemaMetadata } from "./projections.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
@@ -120,6 +114,7 @@ type OpenDatabaseLedgerEngineInput<
     TIndexerDefinitions,
     TQueryDefinitions
   >;
+  readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
   readonly storage: StorageRuntime;
 };
@@ -147,6 +142,7 @@ export type CreateDatabaseLedgerInput<
     TIndexerDefinitions,
     TQueryDefinitions
   >;
+  readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
 };
 
@@ -175,6 +171,7 @@ export function createDatabaseLedger<
 ): Ledger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
     model: input.model,
+    projectionCompiler: input.projectionCompiler,
     timing: input.timing,
     storage: input.storage,
   });
@@ -410,7 +407,9 @@ function openDatabaseLedgerEngine<
     TIndexers,
     TQueries,
     TEvents
-  >(input.model);
+  >(input.model, {
+    statementCompiler: input.projectionCompiler,
+  });
   const registration = input.model.register;
 
   let closed = false;
@@ -784,107 +783,22 @@ function openDatabaseLedgerEngine<
     metadata: ProjectionSchemaMetadata,
   ): Promise<void> {
     for (const table of Object.values(metadata.tables)) {
-      await database.exec(buildCreateProjectionTableSql(table, metadata));
+      const sql = input.projectionCompiler.compileCreateTable({
+        metadata,
+        table,
+      });
+      await database.exec(sql.text);
     }
 
     for (const table of Object.values(metadata.tables)) {
       for (const index of table.indexes) {
-        await database.exec(buildCreateProjectionIndexSql(table, index));
+        const sql = input.projectionCompiler.compileCreateIndex({
+          index,
+          tableName: table.name,
+        });
+        await database.exec(sql.text);
       }
     }
-  }
-
-  function buildCreateProjectionTableSql(
-    table: ProjectionTableMetadata,
-    metadata: ProjectionSchemaMetadata,
-  ): string {
-    const columnDefinitions = Object.entries(table.columns).map(
-      ([columnName, column]) => {
-        return `${quoteIdentifier(columnName)} ${projectionColumnSqlType(
-          column,
-        )}${column.nullable ? "" : " NOT NULL"}`;
-      },
-    );
-    const constraints: string[] = [];
-
-    if (table.primaryKey.length > 0) {
-      constraints.push(
-        `PRIMARY KEY (${table.primaryKey.map(quoteIdentifier).join(", ")})`,
-      );
-    }
-
-    for (const [relationName, foreignKey] of Object.entries(
-      metadata.relations,
-    )) {
-      if (foreignKey.fromTable === table.name) {
-        constraints.push(
-          buildProjectionForeignKeyConstraintSql(relationName, foreignKey),
-        );
-      }
-    }
-
-    return `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(table.name)} (${[
-      ...columnDefinitions,
-      ...constraints,
-    ].join(", ")})`;
-  }
-
-  function projectionColumnSqlType(column: ProjectionColumnMetadata): string {
-    switch (column.kind) {
-      case "boolean":
-      case "event_ref":
-      case "integer":
-        return "INTEGER";
-      case "json":
-      case "text":
-        return "TEXT";
-    }
-  }
-
-  function buildProjectionForeignKeyConstraintSql(
-    name: string,
-    foreignKey: ProjectionForeignKeyMetadata,
-  ): string {
-    return [
-      `CONSTRAINT ${quoteIdentifier(name)}`,
-      `FOREIGN KEY (${foreignKey.fromColumns.map(quoteIdentifier).join(", ")})`,
-      `REFERENCES ${quoteIdentifier(
-        foreignKey.toTable,
-      )} (${foreignKey.toColumns.map(quoteIdentifier).join(", ")})`,
-      `ON DELETE ${projectionForeignKeyActionSql(foreignKey.onDelete)}`,
-    ].join(" ");
-  }
-
-  function projectionForeignKeyActionSql(
-    action: ProjectionForeignKeyAction,
-  ): string {
-    switch (action) {
-      case "cascade":
-        return "CASCADE";
-      case "no_action":
-        return "NO ACTION";
-      case "restrict":
-        return "RESTRICT";
-      case "set_null":
-        return "SET NULL";
-    }
-  }
-
-  function buildCreateProjectionIndexSql(
-    table: ProjectionTableMetadata,
-    index: ProjectionIndexMetadata,
-  ): string {
-    const uniqueSql = index.unique ? "UNIQUE " : "";
-
-    return `CREATE ${uniqueSql}INDEX IF NOT EXISTS ${quoteIdentifier(
-      index.name,
-    )} ON ${quoteIdentifier(table.name)} (${index.columns
-      .map(quoteIdentifier)
-      .join(", ")})`;
-  }
-
-  function quoteIdentifier(identifier: string): string {
-    return `"${identifier.replaceAll('"', '""')}"`;
   }
 
   async function runInTransaction<T>(

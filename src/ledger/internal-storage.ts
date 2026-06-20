@@ -1,9 +1,10 @@
 import type { Static, TSchema } from "typebox";
 
 import type { LedgerIndexerContext } from "./ledger.ts";
+import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 
-const registeredLedgerImplementationsBrand: unique symbol = Symbol(
-  "sledge.registeredLedgerImplementations",
+const registeredLedgerImplementationFactoryBrand: unique symbol = Symbol(
+  "sledge.registeredLedgerImplementationFactory",
 );
 
 export type LedgerStorageRow = Record<string, unknown>;
@@ -51,31 +52,39 @@ export type LedgerImplementations<
   };
 };
 
+export type LedgerImplementationFactory<
+  TIndexers extends Record<string, TSchema> = {},
+  TQueries extends Record<string, LedgerImplementationQuerySchema> = {},
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+> = (input: {
+  readonly statementCompiler: ProjectionStatementCompiler;
+}) => LedgerImplementations<TIndexers, TQueries, TEvents>;
+
 type RegisteredLedgerImplementationCarrier<
   TIndexers extends Record<string, TSchema>,
   TQueries extends Record<string, LedgerImplementationQuerySchema>,
   TEvents extends Record<string, TSchema>,
 > = {
-  readonly [registeredLedgerImplementationsBrand]?: LedgerImplementations<
+  readonly [registeredLedgerImplementationFactoryBrand]?: LedgerImplementationFactory<
     TIndexers,
     TQueries,
     TEvents
   >;
 };
 
-export function attachLedgerImplementations<
+export function attachLedgerImplementationFactory<
   TModel extends object,
   TIndexers extends Record<string, TSchema>,
   TQueries extends Record<string, LedgerImplementationQuerySchema>,
   TEvents extends Record<string, TSchema>,
 >(
   model: TModel,
-  implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
+  factory: LedgerImplementationFactory<TIndexers, TQueries, TEvents>,
 ): TModel {
-  Object.defineProperty(model, registeredLedgerImplementationsBrand, {
+  Object.defineProperty(model, registeredLedgerImplementationFactoryBrand, {
     configurable: false,
     enumerable: false,
-    value: implementations,
+    value: factory,
     writable: false,
   });
 
@@ -86,17 +95,24 @@ export function readLedgerImplementations<
   TIndexers extends Record<string, TSchema>,
   TQueries extends Record<string, LedgerImplementationQuerySchema>,
   TEvents extends Record<string, TSchema>,
->(model: object): LedgerImplementations<TIndexers, TQueries, TEvents> {
+>(
+  model: object,
+  input: {
+    readonly statementCompiler: ProjectionStatementCompiler;
+  },
+): LedgerImplementations<TIndexers, TQueries, TEvents> {
   const carrier = model as RegisteredLedgerImplementationCarrier<
     TIndexers,
     TQueries,
     TEvents
   >;
-  const implementations = carrier[registeredLedgerImplementationsBrand];
+  const factory = carrier[registeredLedgerImplementationFactoryBrand];
 
-  if (implementations === undefined) {
-    throw new Error("registered ledger model is missing implementations");
+  if (factory === undefined) {
+    throw new Error(
+      "registered ledger model is missing implementation factory",
+    );
   }
 
-  return implementations;
+  return factory(input);
 }

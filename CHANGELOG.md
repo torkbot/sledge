@@ -33,8 +33,9 @@
 - Route materialization facade execution through an internal statement compiler
   boundary so future Kysely lowering does not change the public indexer/query
   API.
-- Make that statement compiler an explicit internal dependency of projection
-  implementation wrappers, removing the global SQLite compiler assumption.
+- Make that statement compiler an explicit adapter-supplied internal dependency
+  for projection implementation factories and materialization table/index DDL,
+  removing the register-time SQLite compiler assumption.
 - Add typed `whereAny([...])` disjunction groups to projection read, update,
   and delete builders so common OR predicates do not require raw SQL.
 - Add typed `innerJoin(...).selectFrom(...)` projection reads for

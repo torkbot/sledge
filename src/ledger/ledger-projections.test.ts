@@ -261,8 +261,11 @@ function readTestLedgerImplementations<
     TIndexerDefinitions,
     TQueryDefinitions
   >,
+  statementCompiler: ProjectionStatementCompiler = createSqliteProjectionStatementCompiler(),
 ): LedgerImplementations<TIndexers, TQueries, TEvents> {
-  return readLedgerImplementations<TIndexers, TQueries, TEvents>(model);
+  return readLedgerImplementations<TIndexers, TQueries, TEvents>(model, {
+    statementCompiler,
+  });
 }
 
 async function settlesWithin<T>(
@@ -433,6 +436,49 @@ test("projection implementations compile through the supplied statement compiler
     method: "get",
     params: ["u_123", 1],
     sql: 'SELECT "userId" AS "userId", "email" AS "email", "source" AS "source" FROM "users" WHERE "userId" = ? LIMIT ? /* supplied compiler */',
+  });
+});
+
+test("registered projection implementations use the adapter-supplied statement compiler", async () => {
+  const sqliteCompiler = createSqliteProjectionStatementCompiler();
+  const statementCompiler: ProjectionStatementCompiler = {
+    ...sqliteCompiler,
+    compileSelect: (statement) => {
+      const compiled = sqliteCompiler.compileSelect(statement);
+
+      return {
+        params: compiled.params,
+        text: `${compiled.text} /* adapter compiler */`,
+      };
+    },
+  };
+  const generatedImplementations = readTestLedgerImplementations(
+    registeredModelWithoutHandlers,
+    statementCompiler,
+  );
+  const query = generatedImplementations.queries?.userById;
+
+  if (query === undefined) {
+    throw new Error("expected userById query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      userId: "u_123",
+      email: "alice@example.com",
+      source: 42,
+    },
+  });
+
+  await query(fake.scope, {
+    userId: "u_123",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: ["u_123", 1],
+    sql: 'SELECT "userId" AS "userId", "email" AS "email", "source" AS "source" FROM "users" WHERE "userId" = ? LIMIT ? /* adapter compiler */',
   });
 });
 
@@ -2163,6 +2209,80 @@ test("ledger projection definition applies relations over inferred tables", () =
       onDelete: "restrict",
     },
   });
+});
+
+test("sqlite projection compiler compiles materialization schema DDL", () => {
+  const relationSchema = defineMaterializationSchema({
+    namespace: "ddl",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"])
+          .index("sessionsByUser", ["userId"]),
+    },
+    relations: (r) => ({
+      sessionUser: r
+        .foreignKey("sessions", ["userId"])
+        .references("users", ["userId"])
+        .onDelete("cascade"),
+    }),
+  });
+  const usersTable = relationSchema.metadata.tables.users;
+  const sessionsTable = relationSchema.metadata.tables.sessions;
+
+  if (usersTable === undefined || sessionsTable === undefined) {
+    throw new Error("expected relation schema tables");
+  }
+
+  const sessionsByUserIndex = sessionsTable.indexes[0];
+
+  if (sessionsByUserIndex === undefined) {
+    throw new Error("expected sessionsByUser index");
+  }
+
+  const compiler = createSqliteProjectionStatementCompiler();
+
+  assert.deepEqual(
+    compiler.compileCreateTable({
+      metadata: relationSchema.metadata,
+      table: usersTable,
+    }),
+    {
+      params: [],
+      text: 'CREATE TABLE IF NOT EXISTS "users" ("userId" TEXT NOT NULL, PRIMARY KEY ("userId"))',
+    },
+  );
+  assert.deepEqual(
+    compiler.compileCreateTable({
+      metadata: relationSchema.metadata,
+      table: sessionsTable,
+    }),
+    {
+      params: [],
+      text: 'CREATE TABLE IF NOT EXISTS "sessions" ("sessionId" TEXT NOT NULL, "userId" TEXT NOT NULL, PRIMARY KEY ("sessionId"), CONSTRAINT "sessionUser" FOREIGN KEY ("userId") REFERENCES "users" ("userId") ON DELETE CASCADE)',
+    },
+  );
+  assert.deepEqual(
+    compiler.compileCreateIndex({
+      index: sessionsByUserIndex,
+      tableName: "sessions",
+    }),
+    {
+      params: [],
+      text: 'CREATE INDEX IF NOT EXISTS "sessionsByUser" ON "sessions" ("userId")',
+    },
+  );
 });
 
 test("materialization histories validate versions and record typed operations", () => {

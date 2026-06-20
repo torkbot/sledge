@@ -19,7 +19,7 @@ import {
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
-  attachLedgerImplementations,
+  attachLedgerImplementationFactory,
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
@@ -28,8 +28,11 @@ import {
   type QuerySchema,
   type RegisterFunction,
 } from "./ledger.ts";
+import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import { defineProjectionSchema } from "./projections.ts";
 import { createTursoStorageRuntime } from "./turso-ledger.ts";
+
+const projectionCompiler = createSqliteProjectionStatementCompiler();
 
 type EngineFixtureModel<
   TEvents extends Record<string, TSchema>,
@@ -133,7 +136,10 @@ function defineEngineFixtureModel<
         TSignalQueues
       >;
 
-      return attachLedgerImplementations(registeredModel, implementations);
+      return attachLedgerImplementationFactory(
+        registeredModel,
+        () => implementations,
+      );
     },
   };
 }
@@ -493,6 +499,7 @@ test("ledger queries do not block external write transactions", async () => {
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(serializedStorage),
     model: model.withImplementations({
       indexers: {},
@@ -574,6 +581,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(serializedStorage),
     model: model.withImplementations({
       indexers: {},
@@ -631,6 +639,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
     model: model.withImplementations({
       indexers: {},
@@ -689,6 +698,7 @@ test("event-handler query actions expire after handler completion", async () => 
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
     model: model.withImplementations({
       indexers: {},
@@ -787,6 +797,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(serializedStorage),
     model: model.withImplementations({
       indexers: {},
@@ -954,6 +965,7 @@ test("closing workers during a pending claim releases the claimed work", async (
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(blockingStorage),
     model: model.withImplementations({
       indexers: {},
@@ -1111,6 +1123,7 @@ test("ledger close waits for startup before closing storage", async () => {
 
   try {
     await using ledger = createDatabaseLedger({
+      projectionCompiler,
       storage,
       model: model.withImplementations({
         indexers: {},
@@ -1163,6 +1176,7 @@ test("ledger close closes storage after startup failure", async () => {
   });
 
   const ledger = createDatabaseLedger({
+    projectionCompiler,
     storage,
     model: model.withImplementations({
       indexers: {},
@@ -1247,6 +1261,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
   });
 
   const ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(failingStorage),
     model: model.withImplementations({
       indexers: {},
@@ -2234,6 +2249,7 @@ test("tailEvents does not expose rolled back events from a shared read/write sco
 
   try {
     await using ledger = createDatabaseLedger({
+      projectionCompiler,
       storage: singleConnectionStorageRuntime(
         wrapBetterSqliteDatabase(database),
       ),

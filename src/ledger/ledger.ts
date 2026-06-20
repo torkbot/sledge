@@ -3,7 +3,7 @@ import type { Static, TSchema } from "typebox";
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import { createEventRef, type EventRef } from "./event-ref.ts";
 import type { LedgerImplementations } from "./internal-storage.ts";
-import { attachLedgerImplementations } from "./internal-storage.ts";
+import { attachLedgerImplementationFactory } from "./internal-storage.ts";
 import {
   createProjectionAccess,
   createProjectionImplementations,
@@ -18,7 +18,6 @@ import {
   type ProjectionQuerySchemas,
   type ProjectionUpdateRow,
 } from "./projection-access.ts";
-import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import {
   defineProjectionSchemaForEvents,
   type ProjectionColumn,
@@ -2241,15 +2240,6 @@ function createDefinedLedgerModel<
     model,
     projections: input.access.projections,
     register: (register) => {
-      const implementations = createProjectionImplementations({
-        events: input.shape.events,
-        statementCompiler: createSqliteProjectionStatementCompiler(),
-        projections: input.access.projections,
-        indexers: input.access.indexerDefinitions,
-        queries: input.access.queryDefinitions,
-        register,
-      }) as LedgerImplementations<TIndexers, TQueries, TEvents>;
-
       const registeredModel: RegisteredLedgerModel<
         TEvents,
         TQueues,
@@ -2267,7 +2257,16 @@ function createDefinedLedgerModel<
         register,
       };
 
-      return attachLedgerImplementations(registeredModel, implementations);
+      return attachLedgerImplementationFactory(registeredModel, (factory) => {
+        return createProjectionImplementations({
+          events: input.shape.events,
+          statementCompiler: factory.statementCompiler,
+          projections: input.access.projections,
+          indexers: input.access.indexerDefinitions,
+          queries: input.access.queryDefinitions,
+          register,
+        }) as LedgerImplementations<TIndexers, TQueries, TEvents>;
+      });
     },
   };
 }

@@ -1,3 +1,12 @@
+import type {
+  ProjectionColumnMetadata,
+  ProjectionForeignKeyAction,
+  ProjectionForeignKeyMetadata,
+  ProjectionIndexMetadata,
+  ProjectionSchemaMetadata,
+  ProjectionTableMetadata,
+} from "./projections.ts";
+
 export type ProjectionCompiledSql = {
   readonly params: readonly unknown[];
   readonly text: string;
@@ -160,9 +169,25 @@ export type ProjectionCompilerDeleteStatement = {
   readonly where: readonly ProjectionCompilerWhereClause[];
 };
 
+export type ProjectionCompilerCreateTableStatement = {
+  readonly metadata: ProjectionSchemaMetadata;
+  readonly table: ProjectionTableMetadata;
+};
+
+export type ProjectionCompilerCreateIndexStatement = {
+  readonly index: ProjectionIndexMetadata;
+  readonly tableName: string;
+};
+
 export type ProjectionStatementCompiler = {
   compileAggregate(
     statement: ProjectionCompilerAggregateStatement,
+  ): ProjectionCompiledSql;
+  compileCreateIndex(
+    statement: ProjectionCompilerCreateIndexStatement,
+  ): ProjectionCompiledSql;
+  compileCreateTable(
+    statement: ProjectionCompilerCreateTableStatement,
   ): ProjectionCompiledSql;
   compileDelete(
     statement: ProjectionCompilerDeleteStatement,
@@ -184,12 +209,106 @@ export type ProjectionStatementCompiler = {
 export function createSqliteProjectionStatementCompiler(): ProjectionStatementCompiler {
   return {
     compileAggregate: compileAggregateStatement,
+    compileCreateIndex: compileCreateIndexStatement,
+    compileCreateTable: compileCreateTableStatement,
     compileDelete: compileDeleteStatement,
     compileEventRead: compileEventReadStatement,
     compileInsert: compileInsertStatement,
     compileSelect: compileSelectStatement,
     compileUpdate: compileUpdateStatement,
   };
+}
+
+function compileCreateTableStatement(
+  statement: ProjectionCompilerCreateTableStatement,
+): ProjectionCompiledSql {
+  const columnDefinitions = Object.entries(statement.table.columns).map(
+    ([columnName, column]) => {
+      return `${quoteIdentifier(columnName)} ${projectionColumnSqlType(
+        column,
+      )}${column.nullable ? "" : " NOT NULL"}`;
+    },
+  );
+  const constraints: string[] = [];
+
+  if (statement.table.primaryKey.length > 0) {
+    constraints.push(
+      `PRIMARY KEY (${statement.table.primaryKey
+        .map(quoteIdentifier)
+        .join(", ")})`,
+    );
+  }
+
+  for (const [relationName, foreignKey] of Object.entries(
+    statement.metadata.relations,
+  )) {
+    if (foreignKey.fromTable === statement.table.name) {
+      constraints.push(compileForeignKeyConstraint(relationName, foreignKey));
+    }
+  }
+
+  return {
+    params: [],
+    text: `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(
+      statement.table.name,
+    )} (${[...columnDefinitions, ...constraints].join(", ")})`,
+  };
+}
+
+function compileCreateIndexStatement(
+  statement: ProjectionCompilerCreateIndexStatement,
+): ProjectionCompiledSql {
+  const uniqueSql = statement.index.unique ? "UNIQUE " : "";
+
+  return {
+    params: [],
+    text: `CREATE ${uniqueSql}INDEX IF NOT EXISTS ${quoteIdentifier(
+      statement.index.name,
+    )} ON ${quoteIdentifier(statement.tableName)} (${statement.index.columns
+      .map(quoteIdentifier)
+      .join(", ")})`,
+  };
+}
+
+function projectionColumnSqlType(column: ProjectionColumnMetadata): string {
+  switch (column.kind) {
+    case "boolean":
+    case "event_ref":
+    case "integer":
+      return "INTEGER";
+    case "json":
+    case "text":
+      return "TEXT";
+  }
+}
+
+function compileForeignKeyConstraint(
+  name: string,
+  foreignKey: ProjectionForeignKeyMetadata,
+): string {
+  return [
+    `CONSTRAINT ${quoteIdentifier(name)}`,
+    `FOREIGN KEY (${foreignKey.fromColumns.map(quoteIdentifier).join(", ")})`,
+    `REFERENCES ${quoteIdentifier(
+      foreignKey.toTable,
+    )} (${foreignKey.toColumns.map(quoteIdentifier).join(", ")})`,
+    `ON DELETE ${projectionForeignKeyActionSql(foreignKey.onDelete)}`,
+  ].join(" ");
+}
+
+function projectionForeignKeyActionSql(
+  action: ProjectionForeignKeyAction,
+): string {
+  switch (action) {
+    case "cascade":
+      return "CASCADE";
+    case "no_action":
+      return "NO ACTION";
+    case "restrict":
+      return "RESTRICT";
+    case "set_null":
+      return "SET NULL";
+  }
 }
 
 function compileAggregateStatement(
