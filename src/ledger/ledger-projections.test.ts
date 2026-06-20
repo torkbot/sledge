@@ -22,6 +22,11 @@ import type {
   ProjectionIndexerDefinitions,
   ProjectionQueryDefinitions,
 } from "./projection-access.ts";
+import { createProjectionImplementations } from "./projection-access.ts";
+import {
+  createSqliteProjectionStatementCompiler,
+  type ProjectionStatementCompiler,
+} from "./projection-sql-compiler.ts";
 import {
   createEventRef,
   defineLedgerShape,
@@ -376,6 +381,59 @@ test("projection access compiles typed indexer and query definitions to storage 
       userId: "u_123",
     });
   }, /users\.source event reference id must be a positive safe integer/);
+});
+
+test("projection implementations compile through the supplied statement compiler", async () => {
+  const sqliteCompiler = createSqliteProjectionStatementCompiler();
+  const statementCompiler: ProjectionStatementCompiler = {
+    ...sqliteCompiler,
+    compileSelect: (statement) => {
+      const compiled = sqliteCompiler.compileSelect(statement);
+
+      return {
+        params: compiled.params,
+        text: `${compiled.text} /* supplied compiler */`,
+      };
+    },
+  };
+  const generatedImplementations = createProjectionImplementations({
+    events: shape.shape.events,
+    statementCompiler,
+    projections: schema,
+    indexers: {},
+    queries: materializations.queries,
+    register: {
+      queries: implementations.queries,
+    },
+  }) as LedgerImplementations<
+    {},
+    typeof materializations.queries,
+    typeof shape.shape.events
+  >;
+  const query = generatedImplementations.queries?.userById;
+
+  if (query === undefined) {
+    throw new Error("expected userById query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      userId: "u_123",
+      email: "alice@example.com",
+      source: 42,
+    },
+  });
+
+  await query(fake.scope, {
+    userId: "u_123",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: ["u_123", 1],
+    sql: 'SELECT "userId" AS "userId", "email" AS "email", "source" AS "source" FROM "users" WHERE "userId" = ? LIMIT ? /* supplied compiler */',
+  });
 });
 
 test("projection access waits for unawaited writes before completing indexers", async () => {

@@ -18,6 +18,7 @@ import {
   type ProjectionQuerySchemas,
   type ProjectionUpdateRow,
 } from "./projection-access.ts";
+import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import {
   defineProjectionSchemaForEvents,
   type ProjectionColumn,
@@ -2242,6 +2243,7 @@ function createDefinedLedgerModel<
     register: (register) => {
       const implementations = createProjectionImplementations({
         events: input.shape.events,
+        statementCompiler: createSqliteProjectionStatementCompiler(),
         projections: input.access.projections,
         indexers: input.access.indexerDefinitions,
         queries: input.access.queryDefinitions,

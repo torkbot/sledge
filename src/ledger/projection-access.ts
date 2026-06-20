@@ -12,16 +12,16 @@ import type {
   LedgerIndexerContext,
   QuerySchema,
 } from "./ledger.ts";
-import {
-  createSqliteProjectionStatementCompiler,
-  type ProjectionCompiledSql,
-  type ProjectionCompilerAggregate,
-  type ProjectionCompilerAssignment,
-  type ProjectionCompilerColumnReference,
-  type ProjectionCompilerExpression,
-  type ProjectionCompilerJoinClause,
-  type ProjectionCompilerOrderClause,
-  type ProjectionCompilerWhereClause,
+import type {
+  ProjectionCompiledSql,
+  ProjectionCompilerAggregate,
+  ProjectionCompilerAssignment,
+  ProjectionCompilerColumnReference,
+  ProjectionCompilerExpression,
+  ProjectionCompilerJoinClause,
+  ProjectionCompilerOrderClause,
+  ProjectionStatementCompiler,
+  ProjectionCompilerWhereClause,
 } from "./projection-sql-compiler.ts";
 import {
   type ProjectionColumn,
@@ -40,7 +40,6 @@ import {
 
 type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
 declare const projectionExpressionBrand: unique symbol;
-const projectionStatementCompiler = createSqliteProjectionStatementCompiler();
 
 const ProjectionEventRowSchema = Type.Object({
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
@@ -1016,6 +1015,7 @@ export function createProjectionImplementations<
   const TQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
   readonly events: TEvents;
+  readonly statementCompiler: ProjectionStatementCompiler;
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
@@ -1061,6 +1061,7 @@ export function createProjectionImplementations<
         indexerInput,
         context,
         input.events,
+        input.statementCompiler,
       );
     };
   }
@@ -1079,6 +1080,7 @@ export function createProjectionImplementations<
           input.projections.metadata,
           scope,
           input.events,
+          input.statementCompiler,
         ),
       });
     };
@@ -1105,6 +1107,7 @@ async function runProjectionIndexer(
   input: unknown,
   context: LedgerIndexerContext,
   events: Record<string, TSchema>,
+  statementCompiler: ProjectionStatementCompiler,
 ): Promise<void> {
   const event = createProjectionIndexerEvent(definition.sourceEvent, context);
   const pendingWrites = new Set<Promise<unknown>>();
@@ -1135,6 +1138,7 @@ async function runProjectionIndexer(
         scope,
         events,
         trackWrite,
+        statementCompiler,
       ),
     });
   } catch (error: unknown) {
@@ -1192,10 +1196,16 @@ function createProjectionDatabase<
   scope: LedgerStorageScope,
   events: Record<string, TSchema>,
   trackWrite: ProjectionWriteTracker,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionDatabase<TProjectionSchema, Record<string, TSchema>> {
   return {
-    ...createProjectionReadDatabase(metadata, scope, events),
-    ...createProjectionWriteDatabase(metadata, scope, trackWrite),
+    ...createProjectionReadDatabase(metadata, scope, events, statementCompiler),
+    ...createProjectionWriteDatabase(
+      metadata,
+      scope,
+      trackWrite,
+      statementCompiler,
+    ),
   };
 }
 
@@ -1205,11 +1215,18 @@ function createProjectionWriteDatabase<
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   trackWrite: ProjectionWriteTracker,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionWriteDatabase<TProjectionSchema> {
   return {
     deleteFrom: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
-      return createProjectionDeleteBuilder(scope, table, [], trackWrite);
+      return createProjectionDeleteBuilder(
+        scope,
+        table,
+        [],
+        trackWrite,
+        statementCompiler,
+      );
     },
     insertInto: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
@@ -1233,7 +1250,14 @@ function createProjectionWriteDatabase<
 
           return createInsertConflictBuilder<
             ProjectionSchemaTables<TProjectionSchema>[typeof tableName]
-          >(scope, table, insertColumns, insertValues, trackWrite);
+          >(
+            scope,
+            table,
+            insertColumns,
+            insertValues,
+            trackWrite,
+            statementCompiler,
+          );
         },
       };
     },
@@ -1254,6 +1278,7 @@ function createProjectionWriteDatabase<
             updateAssignments,
             [],
             trackWrite,
+            statementCompiler,
           );
         },
       };
@@ -1269,10 +1294,11 @@ function createInsertConflictBuilder<TTable>(
   insertColumns: readonly string[],
   insertValues: readonly unknown[],
   trackWrite: ProjectionWriteTracker,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionInsertConflictBuilder<TTable> {
   return {
     execute: () => {
-      const sql = buildInsertSql(table, insertColumns, null);
+      const sql = buildInsertSql(statementCompiler, table, insertColumns, null);
       return trackWrite(async () => {
         return await scope
           .prepare(sql.text)
@@ -1284,7 +1310,7 @@ function createInsertConflictBuilder<TTable>(
 
       return {
         doNothing: () => {
-          const sql = buildInsertSql(table, insertColumns, {
+          const sql = buildInsertSql(statementCompiler, table, insertColumns, {
             kind: "do_nothing",
             conflictColumns,
           });
@@ -1305,11 +1331,16 @@ function createInsertConflictBuilder<TTable>(
 
           return {
             execute: () => {
-              const sql = buildInsertSql(table, insertColumns, {
-                kind: "do_update",
-                conflictColumns,
-                updateAssignments,
-              });
+              const sql = buildInsertSql(
+                statementCompiler,
+                table,
+                insertColumns,
+                {
+                  kind: "do_update",
+                  conflictColumns,
+                  updateAssignments,
+                },
+              );
               return trackWrite(async () => {
                 return await scope
                   .prepare(sql.text)
@@ -1317,11 +1348,16 @@ function createInsertConflictBuilder<TTable>(
               });
             },
             executeExpectingOne: async () => {
-              const sql = buildInsertSql(table, insertColumns, {
-                kind: "do_update",
-                conflictColumns,
-                updateAssignments,
-              });
+              const sql = buildInsertSql(
+                statementCompiler,
+                table,
+                insertColumns,
+                {
+                  kind: "do_update",
+                  conflictColumns,
+                  updateAssignments,
+                },
+              );
               await createProjectionExecutableWrite(
                 scope,
                 sql.text,
@@ -1371,9 +1407,15 @@ function createProjectionUpdateWhereBuilder<TTable>(
   updateAssignments: readonly ProjectionUpdateAssignment[],
   whereClauses: readonly ProjectionWhereClause[],
   trackWrite: ProjectionWriteTracker,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionUpdateWhereBuilder<TTable> {
   const executable = () => {
-    const sql = buildUpdateSql(table, updateAssignments, whereClauses);
+    const sql = buildUpdateSql(
+      statementCompiler,
+      table,
+      updateAssignments,
+      whereClauses,
+    );
     return createProjectionExecutableWrite(
       scope,
       sql.text,
@@ -1392,6 +1434,7 @@ function createProjectionUpdateWhereBuilder<TTable>(
         updateAssignments,
         [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
         trackWrite,
+        statementCompiler,
       );
     },
     where: (columnName, operator, value) => {
@@ -1410,6 +1453,7 @@ function createProjectionUpdateWhereBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
     whereIn: (columnName, values) => {
@@ -1427,6 +1471,7 @@ function createProjectionUpdateWhereBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
     whereNotNull: (columnName) => {
@@ -1444,6 +1489,7 @@ function createProjectionUpdateWhereBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
     whereNull: (columnName) => {
@@ -1461,6 +1507,7 @@ function createProjectionUpdateWhereBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
   };
@@ -1471,9 +1518,10 @@ function createProjectionDeleteBuilder<TTable>(
   table: ProjectionTableMetadata,
   whereClauses: readonly ProjectionWhereClause[],
   trackWrite: ProjectionWriteTracker,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionDeleteBuilder<TTable> {
   const executable = () => {
-    const sql = buildDeleteSql(table, whereClauses);
+    const sql = buildDeleteSql(statementCompiler, table, whereClauses);
     return createProjectionExecutableWrite(
       scope,
       sql.text,
@@ -1491,6 +1539,7 @@ function createProjectionDeleteBuilder<TTable>(
         table,
         [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
         trackWrite,
+        statementCompiler,
       );
     },
     where: (columnName, operator, value) => {
@@ -1508,6 +1557,7 @@ function createProjectionDeleteBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
     whereIn: (columnName, values) => {
@@ -1524,6 +1574,7 @@ function createProjectionDeleteBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
     whereNotNull: (columnName) => {
@@ -1540,6 +1591,7 @@ function createProjectionDeleteBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
     whereNull: (columnName) => {
@@ -1556,6 +1608,7 @@ function createProjectionDeleteBuilder<TTable>(
           ),
         ],
         trackWrite,
+        statementCompiler,
       );
     },
   };
@@ -1568,13 +1621,14 @@ function createProjectionReadDatabase<
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   events: TEvents,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionReadDatabase<TProjectionSchema, TEvents> {
   return {
     readEvent: async (ref) => {
-      return await readProjectionEvent(scope, events, ref);
+      return await readProjectionEvent(scope, events, ref, statementCompiler);
     },
     readEvents: async (refs) => {
-      return await readProjectionEvents(scope, events, refs);
+      return await readProjectionEvents(scope, events, refs, statementCompiler);
     },
     selectFrom: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
@@ -1587,6 +1641,7 @@ function createProjectionReadDatabase<
             table,
             [],
             [],
+            statementCompiler,
           );
         },
         innerJoin: (joinedTableName, condition) => {
@@ -1601,9 +1656,13 @@ function createProjectionReadDatabase<
             String(condition.toColumn),
           );
 
-          return createProjectionJoinedSelectBuilder(metadata, scope, table, [
-            joinClause,
-          ]);
+          return createProjectionJoinedSelectBuilder(
+            metadata,
+            scope,
+            table,
+            [joinClause],
+            statementCompiler,
+          );
         },
         select: (columns) => {
           validateProjectionColumns("selected columns", table, columns);
@@ -1621,6 +1680,7 @@ function createProjectionReadDatabase<
             [],
             [],
             null,
+            statementCompiler,
           );
         },
       };
@@ -1653,6 +1713,7 @@ function createProjectionAggregateBuilder<
   table: ProjectionTableMetadata,
   aggregates: readonly ProjectionAggregate[],
   whereClauses: readonly ProjectionWhereClause[],
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName> {
   const createNext = <TNextResult>(
     nextAggregates: readonly ProjectionAggregate[],
@@ -1663,7 +1724,14 @@ function createProjectionAggregateBuilder<
       TFromTableName,
       TTable,
       TNextResult
-    >(metadata, scope, table, nextAggregates, nextWhereClauses);
+    >(
+      metadata,
+      scope,
+      table,
+      nextAggregates,
+      nextWhereClauses,
+      statementCompiler,
+    );
   };
 
   return {
@@ -1748,7 +1816,12 @@ function createProjectionAggregateBuilder<
       );
     },
     execute: async () => {
-      const sql = buildAggregateSql(table, aggregates, whereClauses);
+      const sql = buildAggregateSql(
+        statementCompiler,
+        table,
+        aggregates,
+        whereClauses,
+      );
       const row = await scope.prepare(sql.text).get(...sql.params);
 
       if (row === undefined) {
@@ -1821,6 +1894,7 @@ function createProjectionJoinedSelectBuilder<
   scope: LedgerStorageScope,
   fromTable: ProjectionTableMetadata,
   joinClauses: readonly ProjectionJoinClause[],
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionJoinedSelectBuilder<TTables, TFromTableName, TJoinedTableName> {
   return {
     selectFrom: (tableName, columns) => {
@@ -1848,6 +1922,7 @@ function createProjectionJoinedSelectBuilder<
         [],
         [],
         null,
+        statementCompiler,
       );
     },
   };
@@ -1869,6 +1944,7 @@ function createProjectionExecutableSelect<
   whereClauses: readonly ProjectionWhereClause[],
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName> {
   return {
     limit: (limit) => {
@@ -1884,6 +1960,7 @@ function createProjectionExecutableSelect<
         whereClauses,
         orderClauses,
         limit,
+        statementCompiler,
       );
     },
     orderBy: (columnName, direction = "asc") => {
@@ -1908,6 +1985,7 @@ function createProjectionExecutableSelect<
           },
         ],
         limitClause,
+        statementCompiler,
       );
     },
     orderByList: (columnName, values) => {
@@ -1930,6 +2008,7 @@ function createProjectionExecutableSelect<
           ),
         ],
         limitClause,
+        statementCompiler,
       );
     },
     whereAny: (conditions) => {
@@ -1944,6 +2023,7 @@ function createProjectionExecutableSelect<
         [...whereClauses, createProjectionAnyWhereClause(table, conditions)],
         orderClauses,
         limitClause,
+        statementCompiler,
       );
     },
     whereNotExists: (tableName, condition) => {
@@ -1968,6 +2048,7 @@ function createProjectionExecutableSelect<
         ],
         orderClauses,
         limitClause,
+        statementCompiler,
       );
     },
     where: (columnName, operator, value) => {
@@ -1991,6 +2072,7 @@ function createProjectionExecutableSelect<
         ],
         orderClauses,
         limitClause,
+        statementCompiler,
       );
     },
     whereIn: (columnName, values) => {
@@ -2013,6 +2095,7 @@ function createProjectionExecutableSelect<
         ],
         orderClauses,
         limitClause,
+        statementCompiler,
       );
     },
     whereNotNull: (columnName) => {
@@ -2035,6 +2118,7 @@ function createProjectionExecutableSelect<
         ],
         orderClauses,
         limitClause,
+        statementCompiler,
       );
     },
     whereNull: (columnName) => {
@@ -2057,10 +2141,12 @@ function createProjectionExecutableSelect<
         ],
         orderClauses,
         limitClause,
+        statementCompiler,
       );
     },
     execute: async () => {
       const sql = buildSelectSql(
+        statementCompiler,
         fromTable,
         selectedColumnReferences,
         joinClauses,
@@ -2081,6 +2167,7 @@ function createProjectionExecutableSelect<
     },
     executeTakeFirst: async () => {
       const sql = buildSelectSql(
+        statementCompiler,
         fromTable,
         selectedColumnReferences,
         joinClauses,
@@ -2102,6 +2189,7 @@ function createProjectionExecutableSelect<
     },
     stream: async function* () {
       const sql = buildSelectSql(
+        statementCompiler,
         fromTable,
         selectedColumnReferences,
         joinClauses,
@@ -2140,6 +2228,7 @@ function createProjectionExecutableJoinedSelect<
   whereClauses: readonly ProjectionWhereClause[],
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
+  statementCompiler: ProjectionStatementCompiler,
 ): ProjectionExecutableJoinedSelect<
   TTables,
   TTableNames,
@@ -2167,6 +2256,7 @@ function createProjectionExecutableJoinedSelect<
       nextWhereClauses,
       nextOrderClauses,
       nextLimitClause,
+      statementCompiler,
     );
   };
 
@@ -2332,6 +2422,7 @@ function createProjectionExecutableJoinedSelect<
     },
     execute: async () => {
       const sql = buildSelectSql(
+        statementCompiler,
         fromTable,
         selectedColumnReferences,
         joinClauses,
@@ -2351,6 +2442,7 @@ function createProjectionExecutableJoinedSelect<
     },
     executeTakeFirst: async () => {
       const sql = buildSelectSql(
+        statementCompiler,
         fromTable,
         selectedColumnReferences,
         joinClauses,
@@ -2372,6 +2464,7 @@ function createProjectionExecutableJoinedSelect<
     },
     stream: async function* () {
       const sql = buildSelectSql(
+        statementCompiler,
         fromTable,
         selectedColumnReferences,
         joinClauses,
@@ -2634,6 +2727,7 @@ function compileProjectionExpressionOperand(
 }
 
 function buildInsertSql(
+  statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
   insertColumns: readonly string[],
   conflict:
@@ -2648,7 +2742,7 @@ function buildInsertSql(
         readonly updateAssignments: readonly ProjectionUpdateAssignment[];
       },
 ): CompiledProjectionSql {
-  return projectionStatementCompiler.compileInsert({
+  return statementCompiler.compileInsert({
     columns: insertColumns,
     conflict:
       conflict === null
@@ -2668,6 +2762,7 @@ function buildInsertSql(
 }
 
 function buildSelectSql(
+  statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
   selectedColumns: readonly ProjectionColumnReference[],
   joinClauses: readonly ProjectionJoinClause[],
@@ -2675,7 +2770,7 @@ function buildSelectSql(
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
 ): CompiledProjectionSql {
-  return projectionStatementCompiler.compileSelect({
+  return statementCompiler.compileSelect({
     columns: selectedColumns,
     fromTableName: table.name,
     joins: joinClauses,
@@ -2686,11 +2781,12 @@ function buildSelectSql(
 }
 
 function buildAggregateSql(
+  statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
   aggregates: readonly ProjectionAggregate[],
   whereClauses: readonly ProjectionWhereClause[],
 ): CompiledProjectionSql {
-  return projectionStatementCompiler.compileAggregate({
+  return statementCompiler.compileAggregate({
     aggregates,
     fromTableName: table.name,
     where: whereClauses,
@@ -2698,21 +2794,23 @@ function buildAggregateSql(
 }
 
 function buildReadProjectionEventsSql(
+  statementCompiler: ProjectionStatementCompiler,
   eventName: string,
   eventIds: readonly number[],
 ): CompiledProjectionSql {
-  return projectionStatementCompiler.compileEventRead({
+  return statementCompiler.compileEventRead({
     eventIds,
     eventName,
   });
 }
 
 function buildUpdateSql(
+  statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
   assignments: readonly ProjectionUpdateAssignment[],
   whereClauses: readonly ProjectionWhereClause[],
 ): CompiledProjectionSql {
-  return projectionStatementCompiler.compileUpdate({
+  return statementCompiler.compileUpdate({
     assignments,
     tableName: table.name,
     where: whereClauses,
@@ -2720,10 +2818,11 @@ function buildUpdateSql(
 }
 
 function buildDeleteSql(
+  statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
   whereClauses: readonly ProjectionWhereClause[],
 ): CompiledProjectionSql {
-  return projectionStatementCompiler.compileDelete({
+  return statementCompiler.compileDelete({
     tableName: table.name,
     where: whereClauses,
   });
@@ -3215,8 +3314,14 @@ async function readProjectionEvent<
   scope: LedgerStorageScope,
   events: TEvents,
   ref: EventRef<TEventName>,
+  statementCompiler: ProjectionStatementCompiler,
 ): Promise<EventEnvelope<TEvents, TEventName> | null> {
-  const eventResults = await readProjectionEvents(scope, events, [ref]);
+  const eventResults = await readProjectionEvents(
+    scope,
+    events,
+    [ref],
+    statementCompiler,
+  );
 
   return eventResults[0] ?? null;
 }
@@ -3237,6 +3342,7 @@ async function readProjectionEvents<
   scope: LedgerStorageScope,
   events: TEvents,
   refs: readonly EventRef<TEventName>[],
+  statementCompiler: ProjectionStatementCompiler,
 ): Promise<readonly (EventEnvelope<TEvents, TEventName> | null)[]> {
   const normalizedRefs = refs.map((ref) => {
     return validateProjectionEventRef(events, ref);
@@ -3277,7 +3383,11 @@ async function readProjectionEvents<
       );
     }
 
-    const sql = buildReadProjectionEventsSql(group.eventName, group.eventIds);
+    const sql = buildReadProjectionEventsSql(
+      statementCompiler,
+      group.eventName,
+      group.eventIds,
+    );
     const rows = await scope.prepare(sql.text).all(...sql.params);
 
     for (const row of rows) {
