@@ -422,6 +422,20 @@ test("materialization histories validate versions and record typed operations", 
     ]),
     m.migration(2, "add user email", (s) => [
       s.addColumn("users", "email", (t) => t.text()),
+      s.data("backfill user email", async ({ db }) => {
+        for await (const row of db
+          .selectFrom("users")
+          .select(["userId"])
+          .stream()) {
+          await db
+            .updateTable("users")
+            .set({
+              email: `${row.userId}@example.invalid`,
+            })
+            .where("userId", "=", row.userId)
+            .execute();
+        }
+      }),
       s.createIndex("usersByEmail", "users", ["email"]),
       s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
     ]),
@@ -435,36 +449,46 @@ test("materialization histories validate versions and record typed operations", 
     }).history.current,
     schemaV2,
   );
-  assert.deepEqual(historyV2.migrations[1]?.operations, [
-    {
-      column: {
-        eventName: null,
-        kind: "text",
-        nullable: true,
-      },
-      columnName: "email",
-      kind: "add_column",
-      tableName: "users",
+  const secondMigration = historyV2.migrations[1];
+
+  assert.ok(secondMigration !== undefined);
+  assert.deepEqual(secondMigration.operations[0], {
+    column: {
+      eventName: null,
+      kind: "text",
+      nullable: true,
     },
-    {
-      index: {
-        columns: ["email"],
-        name: "usersByEmail",
-        unique: false,
-      },
-      kind: "create_index",
-      tableName: "users",
+    columnName: "email",
+    kind: "add_column",
+    tableName: "users",
+  });
+
+  const dataOperation = secondMigration.operations[1];
+
+  if (dataOperation.kind !== "data") {
+    throw new Error("expected data migration operation");
+  }
+
+  assert.equal(dataOperation.description, "backfill user email");
+  assert.equal(typeof dataOperation.run, "function");
+  assert.deepEqual(secondMigration.operations[2], {
+    index: {
+      columns: ["email"],
+      name: "usersByEmail",
+      unique: false,
     },
-    {
-      index: {
-        columns: ["email"],
-        name: "usersByEmailUnique",
-        unique: true,
-      },
-      kind: "create_index",
-      tableName: "users",
+    kind: "create_index",
+    tableName: "users",
+  });
+  assert.deepEqual(secondMigration.operations[3], {
+    index: {
+      columns: ["email"],
+      name: "usersByEmailUnique",
+      unique: true,
     },
-  ]);
+    kind: "create_index",
+    tableName: "users",
+  });
 
   assert.throws(() => {
     defineMaterializationHistory(schemaV2, (m) => [
@@ -626,6 +650,45 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           })
           .primaryKey(["userId"]),
       ),
+      s.data("typed user data", async ({ db }) => {
+        const row = await db
+          .selectFrom("users")
+          .select(["email"])
+          .executeTakeFirst();
+
+        if (row !== null) {
+          const email: string = row.email;
+          // @ts-expect-error only selected columns are available.
+          const userId: string = row.userId;
+
+          void email;
+          void userId;
+        }
+
+        await db
+          .insertInto("users")
+          .values({
+            userId: "u_123",
+            email: "alice@example.com",
+            source: createEventRef("user.created", 1),
+          })
+          .execute();
+        await db
+          .updateTable("users")
+          .set({
+            email: "alice@example.com",
+          })
+          .where("userId", "=", "u_123")
+          .execute();
+        await db.deleteFrom("users").where("userId", "=", "u_123").execute();
+
+        // @ts-expect-error migration data cannot select unknown tables.
+        db.selectFrom("sessions");
+        // @ts-expect-error migration data can only select known columns.
+        db.selectFrom("users").select(["missing"]);
+        // @ts-expect-error migration data can only update known columns.
+        db.updateTable("users").set({ missing: "" });
+      }),
     ]),
   ]);
 

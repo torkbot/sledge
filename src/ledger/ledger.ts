@@ -10,14 +10,17 @@ import {
   type ProjectionImplementationRegistration,
   type ProjectionIndexerDefinitions,
   type ProjectionIndexerSchemas,
+  type ProjectionInsertBuilder,
   type ProjectionQueryDefinitions,
   type ProjectionQuerySchemas,
+  type ProjectionUpdateRow,
 } from "./projection-access.ts";
 import {
   defineProjectionSchemaForEvents,
   type ProjectionColumn,
   type ProjectionColumnKind,
   type ProjectionColumnMetadata,
+  type ProjectionColumnValue,
   type ProjectionForeignKeyMetadata,
   type ProjectionIndexMetadata,
   type ProjectionRelationBuilder,
@@ -700,7 +703,111 @@ export type MaterializationMigrationColumnBuilder<TEventName extends string> =
     "boolean" | "eventRef" | "integer" | "json" | "text"
   >;
 
-export type MaterializationMigrationOperation =
+type MaterializationMigrationWhereValue<
+  TTable,
+  TColumnName extends ProjectionTableColumnName<TTable>,
+> = NonNullable<
+  ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+>;
+
+export type MaterializationMigrationSelectedRow<
+  TTable,
+  TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
+> = {
+  readonly [TColumnName in TColumnNames[number]]: ProjectionColumnValue<
+    ProjectionTableColumns<TTable>[TColumnName]
+  >;
+};
+
+export type MaterializationMigrationExecutableSelect<
+  TTable,
+  TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
+> = {
+  execute(): Promise<
+    readonly MaterializationMigrationSelectedRow<TTable, TColumnNames>[]
+  >;
+  executeTakeFirst(): Promise<MaterializationMigrationSelectedRow<
+    TTable,
+    TColumnNames
+  > | null>;
+  stream(): AsyncIterable<
+    MaterializationMigrationSelectedRow<TTable, TColumnNames>
+  >;
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: "=",
+    value: MaterializationMigrationWhereValue<TTable, TColumnName>,
+  ): MaterializationMigrationExecutableSelect<TTable, TColumnNames>;
+};
+
+export type MaterializationMigrationSelectBuilder<TTable> = {
+  select<
+    const TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
+  >(
+    columns: TColumnNames,
+  ): MaterializationMigrationExecutableSelect<TTable, TColumnNames>;
+};
+
+export type MaterializationMigrationUpdateBuilder<TTable> = {
+  set(
+    values: ProjectionUpdateRow<TTable>,
+  ): MaterializationMigrationUpdateWhereBuilder<TTable>;
+};
+
+export type MaterializationMigrationUpdateWhereBuilder<TTable> = {
+  execute(): Promise<void>;
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: "=",
+    value: MaterializationMigrationWhereValue<TTable, TColumnName>,
+  ): MaterializationMigrationUpdateWhereBuilder<TTable>;
+};
+
+export type MaterializationMigrationDeleteBuilder<TTable> = {
+  execute(): Promise<void>;
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: "=",
+    value: MaterializationMigrationWhereValue<TTable, TColumnName>,
+  ): MaterializationMigrationDeleteBuilder<TTable>;
+};
+
+export type MaterializationMigrationDatabase<
+  TSchema extends AnyProjectionSchema,
+> = {
+  deleteFrom<const TTableName extends MaterializationTableName<TSchema>>(
+    tableName: TTableName,
+  ): MaterializationMigrationDeleteBuilder<
+    MaterializationTableForName<TSchema, TTableName>
+  >;
+  insertInto<const TTableName extends MaterializationTableName<TSchema>>(
+    tableName: TTableName,
+  ): ProjectionInsertBuilder<MaterializationTableForName<TSchema, TTableName>>;
+  selectFrom<const TTableName extends MaterializationTableName<TSchema>>(
+    tableName: TTableName,
+  ): MaterializationMigrationSelectBuilder<
+    MaterializationTableForName<TSchema, TTableName>
+  >;
+  updateTable<const TTableName extends MaterializationTableName<TSchema>>(
+    tableName: TTableName,
+  ): MaterializationMigrationUpdateBuilder<
+    MaterializationTableForName<TSchema, TTableName>
+  >;
+};
+
+export type MaterializationMigrationDataInput<
+  TSchema extends AnyProjectionSchema,
+> = {
+  readonly db: MaterializationMigrationDatabase<TSchema>;
+};
+
+export type MaterializationMigrationDataFunction<
+  TSchema extends AnyProjectionSchema,
+> = (input: MaterializationMigrationDataInput<TSchema>) => void | Promise<void>;
+
+export type MaterializationMigrationOperation<
+  TSchema extends AnyProjectionSchema = AnyProjectionSchema,
+> =
   | {
       readonly kind: "create_table";
       readonly table: ProjectionTableMetadata;
@@ -721,11 +828,18 @@ export type MaterializationMigrationOperation =
       readonly foreignKey: ProjectionForeignKeyMetadata;
       readonly kind: "add_foreign_key";
       readonly name: string;
+    }
+  | {
+      readonly description: string;
+      readonly kind: "data";
+      readonly run: MaterializationMigrationDataFunction<TSchema>;
     };
 
-export type MaterializationMigrationOperations = readonly [
-  MaterializationMigrationOperation,
-  ...MaterializationMigrationOperation[],
+export type MaterializationMigrationOperations<
+  TSchema extends AnyProjectionSchema = AnyProjectionSchema,
+> = readonly [
+  MaterializationMigrationOperation<TSchema>,
+  ...MaterializationMigrationOperation<TSchema>[],
 ];
 
 export type MaterializationMigration<
@@ -808,6 +922,11 @@ export type MaterializationMigrationStepBuilder<
     tableName: TTableName,
     columns: TColumnNames,
   ): MaterializationMigrationOperation;
+
+  data<const TDescription extends string>(
+    description: TDescription,
+    run: MaterializationMigrationDataFunction<TCurrentSchema>,
+  ): MaterializationMigrationOperation<TCurrentSchema>;
 };
 
 export type MaterializationHistoryBuilder<
@@ -1270,6 +1389,18 @@ function createMaterializationMigrationStepBuilder<
         tableName: String(tableName),
       };
     },
+    data: (description, run) => {
+      validateMaterializationIdentifier(
+        "materialization data migration description",
+        description,
+      );
+
+      return {
+        description,
+        kind: "data",
+        run,
+      };
+    },
   };
 }
 
@@ -1463,6 +1594,10 @@ function validateMaterializationHistory(
       );
     }
 
+    for (const operation of migration.operations) {
+      validateMaterializationMigrationOperation(migration.version, operation);
+    }
+
     if (versions.has(migration.version)) {
       throw new Error(
         `duplicate materialization migration version ${migration.version}`,
@@ -1497,6 +1632,32 @@ function validateMaterializationHistory(
     if (version !== previousVersion + 1) {
       throw new Error("materialization history versions must not have gaps");
     }
+  }
+}
+
+function validateMaterializationMigrationOperation(
+  version: number,
+  operation: MaterializationMigrationOperation,
+): void {
+  switch (operation.kind) {
+    case "add_column":
+    case "add_foreign_key":
+    case "create_index":
+    case "create_table":
+      return;
+    case "data":
+      validateMaterializationIdentifier(
+        `materialization migration ${version} data operation description`,
+        operation.description,
+      );
+
+      if (typeof operation.run !== "function") {
+        throw new Error(
+          `materialization migration ${version} data operation must provide a function`,
+        );
+      }
+
+      return;
   }
 }
 

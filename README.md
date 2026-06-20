@@ -281,15 +281,29 @@ const history = defineMaterializationHistory(schemaV2, (m) => [
     ),
   ]),
   m.migration(2, "add user email", (s) => [
-    s.addColumn("users", "email", (t) => t.text().notNull()),
+    s.addColumn("users", "email", (t) => t.text()),
+    s.data("backfill user email", async ({ db }) => {
+      for await (const row of db
+        .selectFrom("users")
+        .select(["userId"])
+        .stream()) {
+        await db
+          .updateTable("users")
+          .set({ email: `${row.userId}@example.invalid` })
+          .where("userId", "=", row.userId)
+          .execute();
+      }
+    }),
     s.createIndex("usersByEmail", "users", ["email"]),
   ]),
 ]);
 ```
 
 Migration steps are typed against the current schema's known tables, columns,
-and semantic event references. This slice records operation metadata but does
-not yet execute it.
+and semantic event references. Data migration steps receive a Sledge-owned
+typed migration database facade, not a raw SQL handle, so future executors can
+inject tenancy and storage-specific behavior before operations reach the
+database. This slice records operation metadata but does not yet execute it.
 
 Sledge validates that the history starts at version 1, versions are unique
 positive integers, versions have no gaps, and the latest migration version

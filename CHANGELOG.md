@@ -14,8 +14,9 @@
   foreign-key metadata, schema namespace/version metadata, and materialization
   migration history metadata.
 - Add a typed materialization migration DSL for ordered schema-change history:
-  create table, add column, create index, create unique index, and add foreign
-  key operations are recorded as data instead of `from` / `to` callbacks.
+  create table, add column, create index, create unique index, add foreign key,
+  and data migration operations are recorded as data instead of `from` / `to`
+  callbacks.
 - Split materialization contracts from implementations. `defineMaterializations`
   declares plain-object indexer/query contracts, while `.register(...)` supplies
   typed indexer/query implementations.
