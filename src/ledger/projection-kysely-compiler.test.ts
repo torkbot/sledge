@@ -184,6 +184,70 @@ test("kysely projection compiler strips externally-bound insert value params", (
   assert.equal(rightCoalesce["func"], "coalesce");
 });
 
+test("kysely projection compiler lowers typed integer add expressions", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: [1, "c_1"],
+        sql: 'update "counters" set "attempts" = "attempts" + ? where "counterId" = ?',
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileUpdate({
+      assignments: [
+        {
+          columnName: "attempts",
+          value: {
+            columnName: "attempts",
+            kind: "add",
+            value: {
+              kind: "value",
+              value: 1,
+            },
+          },
+        },
+      ],
+      tableName: "counters",
+      where: [
+        {
+          column: {
+            columnName: "counterId",
+            tableName: null,
+          },
+          kind: "comparison",
+          operator: "=",
+          value: "c_1",
+        },
+      ],
+    }),
+    {
+      params: [1, "c_1"],
+      text: 'update "counters" set "attempts" = "attempts" + ? where "counterId" = ?',
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const updates = readArray(query["updates"], "query updates");
+  const update = readRecord(updates[0], "first update");
+  const value = readRecord(update["value"], "add update value");
+  const operator = readRecord(value["operator"], "add operator");
+  const rightOperand = readRecord(value["rightOperand"], "add right operand");
+
+  assert.equal(query["kind"], "UpdateQueryNode");
+  assert.equal(value["kind"], "BinaryOperationNode");
+  assert.equal(operator["operator"], "+");
+  assert.equal(rightOperand["value"], 1);
+});
+
 test("kysely sqlite projection compiler uses the supplied query compiler constructor", () => {
   const calls: KyselyProjectionOperationNode[] = [];
 

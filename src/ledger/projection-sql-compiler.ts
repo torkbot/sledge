@@ -19,6 +19,11 @@ export type ProjectionCompilerColumnReference = {
 
 export type ProjectionCompilerExpression =
   | {
+      readonly kind: "add";
+      readonly columnName: string;
+      readonly value: ProjectionCompilerExpression;
+    }
+  | {
       readonly kind: "coalesce";
       readonly columnName: string;
       readonly value: ProjectionCompilerExpression;
@@ -622,6 +627,13 @@ function compileExpression(
   expression: ProjectionCompilerExpression,
 ): ProjectionCompiledSql {
   switch (expression.kind) {
+    case "add": {
+      const value = compileExpression(expression.value);
+      return {
+        params: value.params,
+        text: `${quoteIdentifier(expression.columnName)} + ${value.text}`,
+      };
+    }
     case "coalesce": {
       const value = compileExpression(expression.value);
       return {

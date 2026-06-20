@@ -209,12 +209,12 @@ function compileEventReadStatement(
     ].map((columnName) => selectionNode(referenceNode(null, columnName))),
     where: whereNode(
       andOperationNodes([
-        comparisonNode(
+        binaryOperationNode(
           referenceNode(null, "event_name"),
           "=",
           valueNode(statement.eventName),
         ),
-        comparisonNode(referenceNode(null, "signal"), "=", valueNode(0)),
+        binaryOperationNode(referenceNode(null, "signal"), "=", valueNode(0)),
         inNode(referenceNode(null, "event_id"), statement.eventIds),
       ]),
     ),
@@ -424,6 +424,12 @@ function expressionNode(
   expression: ProjectionCompilerExpression,
 ): KyselyProjectionOperationNode {
   switch (expression.kind) {
+    case "add":
+      return binaryOperationNode(
+        referenceNode(null, expression.columnName),
+        "+",
+        expressionNode(dialect, expression.value),
+      );
     case "coalesce":
       return functionNode("coalesce", [
         referenceNode(null, expression.columnName),
@@ -488,7 +494,7 @@ function whereOperationNode(
         orOperationNodes(clause.clauses.map(whereOperationNode)),
       );
     case "comparison":
-      return comparisonNode(
+      return binaryOperationNode(
         referenceNode(clause.column.tableName, clause.column.columnName),
         clause.operator,
         valueNode(clause.value),
@@ -499,7 +505,7 @@ function whereOperationNode(
         clause.values,
       );
     case "null":
-      return comparisonNode(
+      return binaryOperationNode(
         referenceNode(clause.column.tableName, clause.column.columnName),
         clause.not ? "is not" : "is",
         valueNodeImmediate(null),
@@ -512,7 +518,7 @@ function whereOperationNode(
           kind: "SelectQueryNode",
           selections: [selectionNode(valueNodeImmediate(1))],
           where: whereNode(
-            comparisonNode(
+            binaryOperationNode(
               referenceNode(
                 clause.innerColumn.tableName,
                 clause.innerColumn.columnName,
@@ -538,7 +544,7 @@ function inNode(
     return rawNode("0 = 1");
   }
 
-  return comparisonNode(left, "in", primitiveValueListNode(values));
+  return binaryOperationNode(left, "in", primitiveValueListNode(values));
 }
 
 function andOperationNodes(
@@ -572,7 +578,7 @@ function binaryLogicOperationNodes(
   }, firstNode);
 }
 
-function comparisonNode(
+function binaryOperationNode(
   leftOperand: KyselyProjectionOperationNode,
   operator: string,
   rightOperand: KyselyProjectionOperationNode,
@@ -650,7 +656,7 @@ function joinNode(
         kind: "JoinNode",
         on: {
           kind: "OnNode",
-          on: comparisonNode(
+          on: binaryOperationNode(
             referenceNode(clause.left.tableName, clause.left.columnName),
             "=",
             referenceNode(clause.right.tableName, clause.right.columnName),

@@ -70,6 +70,11 @@ export type ProjectionWriteRow<TTable> = ProjectionRow<
 
 type ProjectionExpressionMetadata =
   | {
+      readonly kind: "add";
+      readonly columnName: string;
+      readonly value: ProjectionExpressionOperandMetadata;
+    }
+  | {
       readonly kind: "coalesce";
       readonly columnName: string;
       readonly value: ProjectionExpressionOperandMetadata;
@@ -112,6 +117,12 @@ export type ProjectionExpressionOperand<
     >;
 
 export type ProjectionExpressionBuilder<TTable> = {
+  add<const TColumnName extends ProjectionIntegerColumnName<TTable>>(
+    columnName: TColumnName,
+    value: ProjectionExpressionOperand<TTable, TColumnName>,
+  ): ProjectionExpression<
+    ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+  >;
   coalesce<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     value: ProjectionExpressionOperand<TTable, TColumnName>,
@@ -2523,6 +2534,18 @@ function createProjectionExpressionBuilder<TTable>(
   table: ProjectionTableMetadata,
 ): ProjectionExpressionBuilder<TTable> {
   return {
+    add: (columnName, value) => {
+      const stringColumnName = String(columnName);
+      validateProjectionIntegerColumn("add column", table, stringColumnName);
+      return createProjectionExpression({
+        kind: "add",
+        columnName: stringColumnName,
+        value: createProjectionExpressionOperandMetadata(
+          stringColumnName,
+          value,
+        ),
+      });
+    },
     coalesce: (columnName, value) => {
       const stringColumnName = String(columnName);
       validateProjectionColumns("coalesce column", table, [stringColumnName]);
@@ -2659,6 +2682,24 @@ function compileProjectionExpression(
   allowExcluded: boolean,
 ): ProjectionCompilerExpression {
   switch (expression.kind) {
+    case "add": {
+      validateProjectionIntegerColumn(
+        "add column",
+        table,
+        expression.columnName,
+      );
+      const value = compileProjectionExpressionOperand(
+        table,
+        expression.value,
+        allowExcluded,
+      );
+
+      return {
+        columnName: expression.columnName,
+        kind: "add",
+        value,
+      };
+    }
     case "coalesce": {
       validateProjectionColumns("coalesce column", table, [
         expression.columnName,
@@ -2735,6 +2776,20 @@ function compileProjectionExpressionOperand(
       `${table.name}.${operand.columnName}`,
     ),
   };
+}
+
+function validateProjectionIntegerColumn(
+  label: string,
+  table: ProjectionTableMetadata,
+  columnName: string,
+): void {
+  validateProjectionColumns(label, table, [columnName]);
+
+  if (table.columns[columnName]?.kind !== "integer") {
+    throw new Error(
+      `${label} ${table.name}.${columnName} must be an integer column`,
+    );
+  }
 }
 
 function buildInsertSql(

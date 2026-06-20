@@ -35,6 +35,8 @@
   public indexer/query API.
 - Use the Kysely-backed SQLite statement compiler from the SQLite storage
   adapters while keeping Kysely out of the public callback surfaces.
+- Add typed integer `add(...)` write expressions so counters and retry attempts
+  can be incremented without raw SQL.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

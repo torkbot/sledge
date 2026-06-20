@@ -386,6 +386,89 @@ test("projection access compiles typed indexer and query definitions to storage 
   }, /users\.source event reference id must be a positive safe integer/);
 });
 
+test("projection access supports typed integer increments without raw SQL", async () => {
+  const counterSchema = defineMaterializationSchema({
+    namespace: "counter",
+    version: 1,
+    tables: {
+      counters: (t) =>
+        t
+          .columns({
+            attempts: t.integer().notNull(),
+            counterId: t.text().notNull(),
+          })
+          .primaryKey(["counterId"]),
+    },
+  });
+  const counterHistory = defineMaterializationHistory(counterSchema, (m) => [
+    m.migration(1, "create counters", (s) => [
+      s.createTable("counters", (t) =>
+        t
+          .columns({
+            attempts: t.integer().notNull(),
+            counterId: t.text().notNull(),
+          })
+          .primaryKey(["counterId"]),
+      ),
+    ]),
+  ]);
+  const counterMaterializations = defineMaterializations({
+    history: counterHistory,
+    indexers: {
+      incrementCounter: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          counterId: Type.String(),
+        }),
+      },
+    },
+    queries: {},
+  });
+  const counterModel = withMaterializations(
+    shape,
+    counterMaterializations,
+  ).register({
+    indexers: {
+      incrementCounter: async ({ input, db }) => {
+        await db
+          .updateTable("counters")
+          .set((e) => ({
+            attempts: e.add("attempts", 1),
+          }))
+          .where("counterId", "=", input.counterId)
+          .executeExpectingOne();
+      },
+    },
+  });
+  const indexer =
+    readTestLedgerImplementations(counterModel).indexers?.incrementCounter;
+
+  if (indexer === undefined) {
+    throw new Error("expected incrementCounter indexer implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await indexer(
+    fake.scope,
+    {
+      counterId: "c_1",
+    },
+    createUserCreatedContext(42),
+  );
+
+  assert.deepEqual(fake.calls, [
+    {
+      method: "run",
+      params: [1, "c_1"],
+      sql: 'UPDATE "counters" SET "attempts" = "attempts" + ? WHERE "counterId" = ?',
+    },
+  ]);
+});
+
 test("projection implementations compile through the supplied statement compiler", async () => {
   const sqliteCompiler = createSqliteProjectionStatementCompiler();
   const statementCompiler: ProjectionStatementCompiler = {

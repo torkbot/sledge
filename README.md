@@ -346,8 +346,8 @@ Indexer and query implementations receive sledge-owned facades:
   `count(...)`, `countNotNull(...)`, `min(...)`, and `max(...)`,
   `orderBy(...)`, domain-specific `orderByList(...)` value ordering,
   `limit(...)`, `execute()`, `executeTakeFirst()`, and `stream()`
-- writes return affected-row metadata and support typed `MAX(...)`,
-  `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
+- writes return affected-row metadata and support typed integer `add(...)`,
+  `MAX(...)`, `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
 Semantic event refs can be hydrated one at a time with `readEvent(ref)` or in
 batches with `readEvents(refs)`. Batch reads preserve the input order and avoid
