@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Reject SQLite URI `databaseUrl` values before opening adapter connections.
+  This prevents shared-memory URI strings such as
+  `file:sledge?mode=memory&cache=shared` from being treated as literal
+  filesystem paths by the underlying drivers.
+
 ## 0.9.0 - 2026-05-20
 
 - Breaking: SQLite/Turso adapters now take a `databaseUrl` instead of a
