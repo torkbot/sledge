@@ -31,8 +31,8 @@
   materialization facade while keeping public indexer/query callbacks on
   Sledge-owned handles.
 - Route materialization facade execution through an internal statement compiler
-  boundary so future Kysely lowering does not change the public indexer/query
-  API.
+  boundary and add a non-public Kysely-backed lowerer without changing the
+  public indexer/query API.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

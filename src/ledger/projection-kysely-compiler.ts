@@ -1,0 +1,883 @@
+import type {
+  ProjectionColumnMetadata,
+  ProjectionForeignKeyAction,
+  ProjectionForeignKeyMetadata,
+} from "./projections.ts";
+import type {
+  ProjectionCompiledSql,
+  ProjectionCompilerAggregate,
+  ProjectionCompilerAggregateStatement,
+  ProjectionCompilerAssignment,
+  ProjectionCompilerColumnReference,
+  ProjectionCompilerCreateIndexStatement,
+  ProjectionCompilerCreateTableStatement,
+  ProjectionCompilerDeleteStatement,
+  ProjectionCompilerEventReadStatement,
+  ProjectionCompilerExpression,
+  ProjectionCompilerInsertStatement,
+  ProjectionCompilerJoinClause,
+  ProjectionCompilerOrderClause,
+  ProjectionCompilerSelectStatement,
+  ProjectionCompilerUpdateStatement,
+  ProjectionCompilerWhereClause,
+  ProjectionStatementCompiler,
+} from "./projection-sql-compiler.ts";
+
+export type KyselyProjectionDialect = "postgres" | "sqlite";
+
+export type KyselyProjectionCompiledQuery = {
+  readonly parameters: readonly unknown[];
+  readonly sql: string;
+};
+
+export type KyselyProjectionOperationNode = Readonly<
+  Record<string, unknown>
+> & {
+  readonly kind: string;
+};
+
+export type KyselyProjectionQueryCompiler = {
+  compileQuery(
+    node: KyselyProjectionOperationNode,
+    queryId: unknown,
+  ): KyselyProjectionCompiledQuery;
+};
+
+export type KyselyProjectionStatementCompilerInput = {
+  readonly dialect: KyselyProjectionDialect;
+  readonly queryCompiler: KyselyProjectionQueryCompiler;
+};
+
+const insertValuePlaceholder = Symbol("sledge.projection.insertValue");
+
+export function createKyselyProjectionStatementCompiler(
+  input: KyselyProjectionStatementCompilerInput,
+): ProjectionStatementCompiler {
+  return {
+    compileAggregate: (statement) =>
+      compileAggregateStatement(input, statement),
+    compileCreateIndex: (statement) =>
+      compileCreateIndexStatement(input, statement),
+    compileCreateTable: (statement) =>
+      compileCreateTableStatement(input, statement),
+    compileDelete: (statement) => compileDeleteStatement(input, statement),
+    compileEventRead: (statement) =>
+      compileEventReadStatement(input, statement),
+    compileInsert: (statement) => compileInsertStatement(input, statement),
+    compileSelect: (statement) => compileSelectStatement(input, statement),
+    compileUpdate: (statement) => compileUpdateStatement(input, statement),
+  };
+}
+
+function compileAggregateStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerAggregateStatement,
+): ProjectionCompiledSql {
+  if (statement.aggregates.length === 0) {
+    throw new Error("aggregate select must include at least one aggregate");
+  }
+
+  const query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode(statement.fromTableName)]),
+    kind: "SelectQueryNode",
+    selections: statement.aggregates.map(selectionNodeForAggregate),
+  };
+  const where = whereNodeForClauses(statement.where);
+
+  if (where !== null) {
+    return compileQuery(input.queryCompiler, {
+      ...query,
+      where,
+    });
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileCreateIndexStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerCreateIndexStatement,
+): ProjectionCompiledSql {
+  const query: KyselyProjectionOperationNode = {
+    columns: statement.index.columns.map(columnNode),
+    ifNotExists: true,
+    kind: "CreateIndexNode",
+    name: identifierNode(statement.index.name),
+    table: tableNode(statement.tableName),
+  };
+
+  if (statement.index.unique) {
+    return compileQuery(input.queryCompiler, {
+      ...query,
+      unique: true,
+    });
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileCreateTableStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerCreateTableStatement,
+): ProjectionCompiledSql {
+  const constraints: KyselyProjectionOperationNode[] = [];
+
+  if (statement.table.primaryKey.length > 0) {
+    constraints.push({
+      columns: statement.table.primaryKey.map(columnNode),
+      kind: "PrimaryKeyConstraintNode",
+    });
+  }
+
+  for (const [relationName, foreignKey] of Object.entries(
+    statement.metadata.relations,
+  )) {
+    if (foreignKey.fromTable === statement.table.name) {
+      constraints.push(foreignKeyConstraintNode(relationName, foreignKey));
+    }
+  }
+
+  const query: KyselyProjectionOperationNode = {
+    columns: Object.entries(statement.table.columns).map(
+      ([columnName, column]) => {
+        return columnDefinitionNode(columnName, column);
+      },
+    ),
+    constraints,
+    ifNotExists: true,
+    kind: "CreateTableNode",
+    table: tableNode(statement.table.name),
+  };
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileDeleteStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerDeleteStatement,
+): ProjectionCompiledSql {
+  const query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode(statement.tableName)]),
+    kind: "DeleteQueryNode",
+  };
+  const where = whereNodeForClauses(statement.where);
+
+  if (where !== null) {
+    return compileQuery(input.queryCompiler, {
+      ...query,
+      where,
+    });
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileEventReadStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerEventReadStatement,
+): ProjectionCompiledSql {
+  if (statement.eventIds.length === 0) {
+    throw new Error("event read must include at least one event id");
+  }
+
+  const query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode("events")]),
+    kind: "SelectQueryNode",
+    selections: [
+      "event_id",
+      "ts_ms",
+      "event_name",
+      "payload_json",
+      "causation_event_id",
+      "dedupe_key",
+    ].map((columnName) => selectionNode(referenceNode(null, columnName))),
+    where: whereNode(
+      andOperationNodes([
+        comparisonNode(
+          referenceNode(null, "event_name"),
+          "=",
+          valueNode(statement.eventName),
+        ),
+        comparisonNode(referenceNode(null, "signal"), "=", valueNode(0)),
+        inNode(referenceNode(null, "event_id"), statement.eventIds),
+      ]),
+    ),
+  };
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileInsertStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerInsertStatement,
+): ProjectionCompiledSql {
+  const query: KyselyProjectionOperationNode = {
+    columns: statement.columns.map(columnNode),
+    into: tableNode(statement.tableName),
+    kind: "InsertQueryNode",
+    values: valuesNode([
+      valueListNode(
+        statement.columns.map(() => valueNode(insertValuePlaceholder)),
+      ),
+    ]),
+  };
+
+  const queryWithConflict = attachInsertConflict(input, query, statement);
+  const compiled = compileQuery(input.queryCompiler, queryWithConflict);
+
+  return {
+    params: compiled.params.slice(statement.columns.length),
+    text: compiled.text,
+  };
+}
+
+function attachInsertConflict(
+  input: KyselyProjectionStatementCompilerInput,
+  query: KyselyProjectionOperationNode,
+  statement: ProjectionCompilerInsertStatement,
+): KyselyProjectionOperationNode {
+  if (statement.conflict === null) {
+    return query;
+  }
+
+  const onConflictBase: KyselyProjectionOperationNode = {
+    columns: statement.conflict.conflictColumns.map(columnNode),
+    kind: "OnConflictNode",
+  };
+
+  if (statement.conflict.kind === "do_nothing") {
+    return {
+      ...query,
+      onConflict: {
+        ...onConflictBase,
+        doNothing: true,
+      },
+    };
+  }
+
+  if (statement.conflict.assignments.length === 0) {
+    throw new Error("update values must include at least one column");
+  }
+
+  return {
+    ...query,
+    onConflict: {
+      ...onConflictBase,
+      updates: statement.conflict.assignments.map((assignment) =>
+        columnUpdateNode(input.dialect, assignment),
+      ),
+    },
+  };
+}
+
+function compileSelectStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerSelectStatement,
+): ProjectionCompiledSql {
+  let query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode(statement.fromTableName)]),
+    kind: "SelectQueryNode",
+    selections: statement.columns.map(selectionNodeForColumnReference),
+  };
+
+  if (statement.joins.length > 0) {
+    query = {
+      ...query,
+      joins: statement.joins.map(joinNode),
+    };
+  }
+
+  const where = whereNodeForClauses(statement.where);
+
+  if (where !== null) {
+    query = {
+      ...query,
+      where,
+    };
+  }
+
+  if (statement.orderBy.length > 0) {
+    query = {
+      ...query,
+      orderBy: orderByNode(statement.orderBy),
+    };
+  }
+
+  if (statement.limit !== null) {
+    query = {
+      ...query,
+      limit: limitNode(valueNode(statement.limit)),
+    };
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileUpdateStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerUpdateStatement,
+): ProjectionCompiledSql {
+  if (statement.assignments.length === 0) {
+    throw new Error("update values must include at least one column");
+  }
+
+  const query: KyselyProjectionOperationNode = {
+    kind: "UpdateQueryNode",
+    table: tableNode(statement.tableName),
+    updates: statement.assignments.map((assignment) =>
+      columnUpdateNode(input.dialect, assignment),
+    ),
+  };
+  const where = whereNodeForClauses(statement.where);
+
+  if (where !== null) {
+    return compileQuery(input.queryCompiler, {
+      ...query,
+      where,
+    });
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileQuery(
+  queryCompiler: KyselyProjectionQueryCompiler,
+  query: KyselyProjectionOperationNode,
+): ProjectionCompiledSql {
+  const compiled = queryCompiler.compileQuery(query, {});
+
+  return {
+    params: compiled.parameters,
+    text: compiled.sql,
+  };
+}
+
+function selectionNodeForColumnReference(
+  column: ProjectionCompilerColumnReference,
+): KyselyProjectionOperationNode {
+  return selectionNode(
+    aliasNode(
+      referenceNode(column.tableName, column.columnName),
+      column.columnName,
+    ),
+  );
+}
+
+function selectionNodeForAggregate(
+  aggregate: ProjectionCompilerAggregate,
+): KyselyProjectionOperationNode {
+  let aggregateNode: KyselyProjectionOperationNode;
+
+  switch (aggregate.kind) {
+    case "count":
+      aggregateNode = aggregateFunctionNode("count", [rawNode("*")]);
+      break;
+    case "count_not_null":
+      aggregateNode = aggregateFunctionNode("count", [
+        referenceNode(aggregate.column.tableName, aggregate.column.columnName),
+      ]);
+      break;
+    case "max":
+      aggregateNode = aggregateFunctionNode("max", [
+        referenceNode(aggregate.column.tableName, aggregate.column.columnName),
+      ]);
+      break;
+    case "min":
+      aggregateNode = aggregateFunctionNode("min", [
+        referenceNode(aggregate.column.tableName, aggregate.column.columnName),
+      ]);
+      break;
+  }
+
+  return selectionNode(aliasNode(aggregateNode, aggregate.alias));
+}
+
+function columnUpdateNode(
+  dialect: KyselyProjectionDialect,
+  assignment: ProjectionCompilerAssignment,
+): KyselyProjectionOperationNode {
+  return {
+    column: columnNode(assignment.columnName),
+    kind: "ColumnUpdateNode",
+    value: expressionNode(dialect, assignment.value),
+  };
+}
+
+function expressionNode(
+  dialect: KyselyProjectionDialect,
+  expression: ProjectionCompilerExpression,
+): KyselyProjectionOperationNode {
+  switch (expression.kind) {
+    case "coalesce":
+      return functionNode("coalesce", [
+        referenceNode(null, expression.columnName),
+        expressionNode(dialect, expression.value),
+      ]);
+    case "column":
+      return referenceNode(null, expression.columnName);
+    case "excluded":
+      return referenceNode("excluded", expression.columnName);
+    case "max":
+      return functionNode(scalarMaxFunctionName(dialect), [
+        referenceNode(null, expression.columnName),
+        expressionNode(dialect, expression.value),
+      ]);
+    case "value":
+      return valueNode(expression.value);
+  }
+}
+
+function scalarMaxFunctionName(dialect: KyselyProjectionDialect): string {
+  switch (dialect) {
+    case "postgres":
+      return "greatest";
+    case "sqlite":
+      return "max";
+  }
+}
+
+function whereNodeForClauses(
+  clauses: readonly ProjectionCompilerWhereClause[],
+): KyselyProjectionOperationNode | null {
+  if (clauses.length === 0) {
+    return null;
+  }
+
+  return whereNode(andOperationNodes(clauses.map(whereOperationNode)));
+}
+
+function whereOperationNode(
+  clause: ProjectionCompilerWhereClause,
+): KyselyProjectionOperationNode {
+  switch (clause.kind) {
+    case "any":
+      if (clause.clauses.length === 0) {
+        throw new Error("any predicate group must include at least one clause");
+      }
+
+      return parensNode(
+        orOperationNodes(clause.clauses.map(whereOperationNode)),
+      );
+    case "comparison":
+      return comparisonNode(
+        referenceNode(clause.column.tableName, clause.column.columnName),
+        clause.operator,
+        valueNode(clause.value),
+      );
+    case "in":
+      return inNode(
+        referenceNode(clause.column.tableName, clause.column.columnName),
+        clause.values,
+      );
+    case "null":
+      return comparisonNode(
+        referenceNode(clause.column.tableName, clause.column.columnName),
+        clause.not ? "is not" : "is",
+        valueNodeImmediate(null),
+      );
+    case "not_exists":
+      return {
+        kind: "UnaryOperationNode",
+        operand: {
+          from: fromNode([tableNode(clause.tableName)]),
+          kind: "SelectQueryNode",
+          selections: [selectionNode(valueNodeImmediate(1))],
+          where: whereNode(
+            comparisonNode(
+              referenceNode(
+                clause.innerColumn.tableName,
+                clause.innerColumn.columnName,
+              ),
+              "=",
+              referenceNode(
+                clause.outerColumn.tableName,
+                clause.outerColumn.columnName,
+              ),
+            ),
+          ),
+        },
+        operator: operatorNode("not exists"),
+      };
+  }
+}
+
+function inNode(
+  left: KyselyProjectionOperationNode,
+  values: readonly unknown[],
+): KyselyProjectionOperationNode {
+  if (values.length === 0) {
+    return rawNode("0 = 1");
+  }
+
+  return comparisonNode(left, "in", primitiveValueListNode(values));
+}
+
+function andOperationNodes(
+  nodes: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return binaryLogicOperationNodes("AndNode", nodes);
+}
+
+function orOperationNodes(
+  nodes: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return binaryLogicOperationNodes("OrNode", nodes);
+}
+
+function binaryLogicOperationNodes(
+  kind: "AndNode" | "OrNode",
+  nodes: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  const firstNode = nodes[0];
+
+  if (firstNode === undefined) {
+    throw new Error("logical predicate group must include at least one clause");
+  }
+
+  return nodes.slice(1).reduce<KyselyProjectionOperationNode>((left, right) => {
+    return {
+      kind,
+      left,
+      right,
+    };
+  }, firstNode);
+}
+
+function comparisonNode(
+  leftOperand: KyselyProjectionOperationNode,
+  operator: string,
+  rightOperand: KyselyProjectionOperationNode,
+): KyselyProjectionOperationNode {
+  return {
+    kind: "BinaryOperationNode",
+    leftOperand,
+    operator: operatorNode(operator),
+    rightOperand,
+  };
+}
+
+function orderByNode(
+  clauses: readonly ProjectionCompilerOrderClause[],
+): KyselyProjectionOperationNode {
+  return {
+    items: clauses.map(orderByItemNode),
+    kind: "OrderByNode",
+  };
+}
+
+function orderByItemNode(
+  clause: ProjectionCompilerOrderClause,
+): KyselyProjectionOperationNode {
+  switch (clause.kind) {
+    case "column":
+      return {
+        direction: rawNode(clause.direction),
+        kind: "OrderByItemNode",
+        orderBy: referenceNode(
+          clause.column.tableName,
+          clause.column.columnName,
+        ),
+      };
+    case "value_list":
+      if (clause.values.length === 0) {
+        throw new Error("value-list order clause must include values");
+      }
+
+      return {
+        direction: rawNode("asc"),
+        kind: "OrderByItemNode",
+        orderBy: valueListOrderCaseNode(clause),
+      };
+  }
+}
+
+function valueListOrderCaseNode(
+  clause: Extract<
+    ProjectionCompilerOrderClause,
+    { readonly kind: "value_list" }
+  >,
+): KyselyProjectionOperationNode {
+  return {
+    else: valueNode(clause.values.length),
+    kind: "CaseNode",
+    value: referenceNode(clause.column.tableName, clause.column.columnName),
+    when: clause.values.map((value, index) => {
+      return {
+        condition: valueNode(value),
+        kind: "WhenNode",
+        result: valueNode(index),
+      };
+    }),
+  };
+}
+
+function joinNode(
+  clause: ProjectionCompilerJoinClause,
+): KyselyProjectionOperationNode {
+  switch (clause.kind) {
+    case "inner":
+      return {
+        joinType: "InnerJoin",
+        kind: "JoinNode",
+        on: {
+          kind: "OnNode",
+          on: comparisonNode(
+            referenceNode(clause.left.tableName, clause.left.columnName),
+            "=",
+            referenceNode(clause.right.tableName, clause.right.columnName),
+          ),
+        },
+        table: tableNode(clause.tableName),
+      };
+  }
+}
+
+function foreignKeyConstraintNode(
+  name: string,
+  foreignKey: ProjectionForeignKeyMetadata,
+): KyselyProjectionOperationNode {
+  return {
+    columns: foreignKey.fromColumns.map(columnNode),
+    kind: "ForeignKeyConstraintNode",
+    name: identifierNode(name),
+    onDelete: foreignKeyActionSql(foreignKey.onDelete),
+    references: {
+      columns: foreignKey.toColumns.map(columnNode),
+      kind: "ReferencesNode",
+      table: tableNode(foreignKey.toTable),
+    },
+  };
+}
+
+function columnDefinitionNode(
+  columnName: string,
+  column: ProjectionColumnMetadata,
+): KyselyProjectionOperationNode {
+  const node: KyselyProjectionOperationNode = {
+    column: columnNode(columnName),
+    dataType: dataTypeNode(projectionColumnSqlType(column)),
+    kind: "ColumnDefinitionNode",
+  };
+
+  if (column.nullable) {
+    return node;
+  }
+
+  return {
+    ...node,
+    notNull: true,
+  };
+}
+
+function projectionColumnSqlType(column: ProjectionColumnMetadata): string {
+  switch (column.kind) {
+    case "boolean":
+    case "event_ref":
+    case "integer":
+      return "integer";
+    case "json":
+    case "text":
+      return "text";
+  }
+}
+
+function foreignKeyActionSql(action: ProjectionForeignKeyAction): string {
+  switch (action) {
+    case "cascade":
+      return "cascade";
+    case "no_action":
+      return "no action";
+    case "restrict":
+      return "restrict";
+    case "set_null":
+      return "set null";
+  }
+}
+
+function aggregateFunctionNode(
+  func: string,
+  aggregated: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return {
+    aggregated,
+    func,
+    kind: "AggregateFunctionNode",
+  };
+}
+
+function aliasNode(
+  node: KyselyProjectionOperationNode,
+  alias: string,
+): KyselyProjectionOperationNode {
+  return {
+    alias: identifierNode(alias),
+    kind: "AliasNode",
+    node,
+  };
+}
+
+function columnNode(columnName: string): KyselyProjectionOperationNode {
+  return {
+    column: identifierNode(columnName),
+    kind: "ColumnNode",
+  };
+}
+
+function dataTypeNode(dataType: string): KyselyProjectionOperationNode {
+  return {
+    dataType,
+    kind: "DataTypeNode",
+  };
+}
+
+function fromNode(
+  froms: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return {
+    froms,
+    kind: "FromNode",
+  };
+}
+
+function functionNode(
+  func: string,
+  args: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return {
+    arguments: args,
+    func,
+    kind: "FunctionNode",
+  };
+}
+
+function identifierNode(name: string): KyselyProjectionOperationNode {
+  return {
+    kind: "IdentifierNode",
+    name,
+  };
+}
+
+function limitNode(
+  limit: KyselyProjectionOperationNode,
+): KyselyProjectionOperationNode {
+  return {
+    kind: "LimitNode",
+    limit,
+  };
+}
+
+function operatorNode(operator: string): KyselyProjectionOperationNode {
+  return {
+    kind: "OperatorNode",
+    operator,
+  };
+}
+
+function parensNode(
+  node: KyselyProjectionOperationNode,
+): KyselyProjectionOperationNode {
+  return {
+    kind: "ParensNode",
+    node,
+  };
+}
+
+function primitiveValueListNode(
+  values: readonly unknown[],
+): KyselyProjectionOperationNode {
+  return {
+    kind: "PrimitiveValueListNode",
+    values,
+  };
+}
+
+function rawNode(sql: string): KyselyProjectionOperationNode {
+  return {
+    kind: "RawNode",
+    parameters: [],
+    sqlFragments: [sql],
+  };
+}
+
+function referenceNode(
+  tableName: string | null,
+  columnName: string,
+): KyselyProjectionOperationNode {
+  if (tableName === null) {
+    return {
+      column: columnNode(columnName),
+      kind: "ReferenceNode",
+    };
+  }
+
+  return {
+    column: columnNode(columnName),
+    kind: "ReferenceNode",
+    table: tableNode(tableName),
+  };
+}
+
+function schemableIdentifierNode(name: string): KyselyProjectionOperationNode {
+  return {
+    identifier: identifierNode(name),
+    kind: "SchemableIdentifierNode",
+  };
+}
+
+function selectionNode(
+  selection: KyselyProjectionOperationNode,
+): KyselyProjectionOperationNode {
+  return {
+    kind: "SelectionNode",
+    selection,
+  };
+}
+
+function tableNode(tableName: string): KyselyProjectionOperationNode {
+  return {
+    kind: "TableNode",
+    table: schemableIdentifierNode(tableName),
+  };
+}
+
+function valueListNode(
+  values: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return {
+    kind: "ValueListNode",
+    values,
+  };
+}
+
+function valueNode(value: unknown): KyselyProjectionOperationNode {
+  return {
+    kind: "ValueNode",
+    value,
+  };
+}
+
+function valueNodeImmediate(value: unknown): KyselyProjectionOperationNode {
+  return {
+    immediate: true,
+    kind: "ValueNode",
+    value,
+  };
+}
+
+function valuesNode(
+  values: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return {
+    kind: "ValuesNode",
+    values,
+  };
+}
+
+function whereNode(
+  where: KyselyProjectionOperationNode,
+): KyselyProjectionOperationNode {
+  return {
+    kind: "WhereNode",
+    where,
+  };
+}
