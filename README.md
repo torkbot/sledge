@@ -342,10 +342,23 @@ Indexer and query implementations receive sledge-owned facades:
   materialization tables
 - reads support typed predicates, null predicates, typed `whereAny([...])`
   disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
-  typed `whereNotExists(...)` anti-joins, `orderBy(...)`, `limit(...)`,
+  typed `whereNotExists(...)` anti-joins, typed aggregate reads with
+  `count(...)` and `countNotNull(...)`, `orderBy(...)`, `limit(...)`,
   `execute()`, `executeTakeFirst()`, and `stream()`
 - writes return affected-row metadata and support typed `MAX(...)`,
   `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
+
+Aggregate reads return a single typed object keyed by the declared aliases:
+
+```ts
+const summary = await db
+  .selectFrom("toolCalls")
+  .aggregate()
+  .count("totalToolCallCount")
+  .countNotNull("completedToolCallCount", "resultMessageJson")
+  .where("runId", "=", params.runId)
+  .execute();
+```
 
 They do not receive a raw storage handle. Event handlers can `index`, `enqueue`,
 and `query`.

@@ -15,6 +15,7 @@ import type {
 import {
   createSqliteProjectionStatementCompiler,
   type ProjectionCompiledSql,
+  type ProjectionCompilerAggregate,
   type ProjectionCompilerAssignment,
   type ProjectionCompilerColumnReference,
   type ProjectionCompilerExpression,
@@ -413,6 +414,12 @@ export type ProjectionSelectBuilder<
   TTables,
   TFromTableName extends ProjectionTableName<TTables>,
 > = {
+  aggregate(): ProjectionAggregateBuilder<
+    TTables[TFromTableName],
+    {},
+    TTables,
+    TFromTableName
+  >;
   innerJoin<const TJoinedTableName extends ProjectionTableName<TTables>>(
     tableName: TJoinedTableName,
     condition: ProjectionJoinCondition<
@@ -503,6 +510,63 @@ export type ProjectionExecutableSelect<
     TColumnNames
   > | null>;
   stream(): AsyncIterable<ProjectionSelectedRow<TTable, TColumnNames>>;
+};
+
+export type ProjectionAggregateBuilder<
+  TTable,
+  TResult,
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+> = {
+  count<const TAlias extends string>(
+    alias: TAlias,
+  ): ProjectionAggregateBuilder<
+    TTable,
+    TResult & { readonly [TKey in TAlias]: number },
+    TTables,
+    TFromTableName
+  >;
+  countNotNull<
+    const TAlias extends string,
+    const TColumnName extends ProjectionTableColumnName<TTable>,
+  >(
+    alias: TAlias,
+    columnName: TColumnName,
+  ): ProjectionAggregateBuilder<
+    TTable,
+    TResult & { readonly [TKey in TAlias]: number },
+    TTables,
+    TFromTableName
+  >;
+  whereAny(
+    conditions: readonly ProjectionWhereCondition<TTable>[],
+  ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName>;
+  whereNotExists<
+    const TExistenceTableName extends ProjectionTableName<TTables>,
+  >(
+    tableName: TExistenceTableName,
+    condition: ProjectionJoinCondition<
+      TTables,
+      TFromTableName,
+      TExistenceTableName
+    >,
+  ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName>;
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: ProjectionWhereOperator,
+    value: ProjectionWhereValue<TTable, TColumnName>,
+  ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName>;
+  whereIn<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTable, TColumnName>[],
+  ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName>;
+  whereNotNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName>;
+  whereNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName>;
+  execute(): Promise<TResult>;
 };
 
 export type ProjectionExecutableJoinedSelect<
@@ -1436,6 +1500,15 @@ function createProjectionReadDatabase<
       const table = readProjectionTable(metadata, String(tableName));
 
       return {
+        aggregate: () => {
+          return createProjectionAggregateBuilder(
+            metadata,
+            scope,
+            table,
+            [],
+            [],
+          );
+        },
         innerJoin: (joinedTableName, condition) => {
           const joinedTable = readProjectionTable(
             metadata,
@@ -1483,9 +1556,133 @@ type ProjectionColumnReference = ProjectionCompilerColumnReference;
 
 type ProjectionJoinClause = ProjectionCompilerJoinClause;
 
+type ProjectionAggregate = ProjectionCompilerAggregate;
+
 type CompiledProjectionSql = ProjectionCompiledSql;
 
 type ProjectionUpdateAssignment = ProjectionCompilerAssignment;
+
+function createProjectionAggregateBuilder<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+  TTable,
+  TResult,
+>(
+  metadata: ProjectionSchemaMetadata,
+  scope: LedgerStorageScope,
+  table: ProjectionTableMetadata,
+  aggregates: readonly ProjectionAggregate[],
+  whereClauses: readonly ProjectionWhereClause[],
+): ProjectionAggregateBuilder<TTable, TResult, TTables, TFromTableName> {
+  const createNext = <TNextResult>(
+    nextAggregates: readonly ProjectionAggregate[],
+    nextWhereClauses: readonly ProjectionWhereClause[],
+  ) => {
+    return createProjectionAggregateBuilder<
+      TTables,
+      TFromTableName,
+      TTable,
+      TNextResult
+    >(metadata, scope, table, nextAggregates, nextWhereClauses);
+  };
+
+  return {
+    count: (alias) => {
+      validateProjectionAggregateAlias(alias, aggregates);
+
+      return createNext<TResult & { readonly [TKey in typeof alias]: number }>(
+        [
+          ...aggregates,
+          {
+            alias,
+            kind: "count",
+          },
+        ],
+        whereClauses,
+      );
+    },
+    countNotNull: (alias, columnName) => {
+      validateProjectionAggregateAlias(alias, aggregates);
+      validateProjectionColumns("aggregate column", table, [
+        String(columnName),
+      ]);
+
+      return createNext<TResult & { readonly [TKey in typeof alias]: number }>(
+        [
+          ...aggregates,
+          {
+            alias,
+            column: createProjectionColumnReference(null, String(columnName)),
+            kind: "count_not_null",
+          },
+        ],
+        whereClauses,
+      );
+    },
+    execute: async () => {
+      const sql = buildAggregateSql(table, aggregates, whereClauses);
+      const row = await scope.prepare(sql.text).get(...sql.params);
+
+      if (row === undefined) {
+        throw new Error("aggregate query did not return a row");
+      }
+
+      return decodeProjectionAggregateRow(
+        aggregates,
+        row,
+      ) as unknown as TResult;
+    },
+    whereAny: (conditions) => {
+      return createNext<TResult>(aggregates, [
+        ...whereClauses,
+        createProjectionAnyWhereClause(table, conditions),
+      ]);
+    },
+    whereNotExists: (tableName, condition) => {
+      const existenceTable = readProjectionTable(metadata, String(tableName));
+
+      return createNext<TResult>(aggregates, [
+        ...whereClauses,
+        createProjectionNotExistsWhereClause(
+          table,
+          existenceTable,
+          String(condition.fromColumn),
+          String(condition.toColumn),
+        ),
+      ]);
+    },
+    where: (columnName, operator, value) => {
+      return createNext<TResult>(aggregates, [
+        ...whereClauses,
+        createProjectionComparisonWhereClause(
+          table,
+          String(columnName),
+          operator,
+          value,
+          null,
+        ),
+      ]);
+    },
+    whereIn: (columnName, values) => {
+      return createNext<TResult>(aggregates, [
+        ...whereClauses,
+        createProjectionInWhereClause(table, String(columnName), values, null),
+      ]);
+    },
+    whereNotNull: (columnName) => {
+      return createNext<TResult>(aggregates, [
+        ...whereClauses,
+        createProjectionNullWhereClause(table, String(columnName), true, null),
+      ]);
+    },
+    whereNull: (columnName) => {
+      return createNext<TResult>(aggregates, [
+        ...whereClauses,
+        createProjectionNullWhereClause(table, String(columnName), false, null),
+      ]);
+    },
+  };
+}
 
 function createProjectionJoinedSelectBuilder<
   TTables,
@@ -2314,6 +2511,18 @@ function buildSelectSql(
   });
 }
 
+function buildAggregateSql(
+  table: ProjectionTableMetadata,
+  aggregates: readonly ProjectionAggregate[],
+  whereClauses: readonly ProjectionWhereClause[],
+): CompiledProjectionSql {
+  return projectionStatementCompiler.compileAggregate({
+    aggregates,
+    fromTableName: table.name,
+    where: whereClauses,
+  });
+}
+
 function buildUpdateSql(
   table: ProjectionTableMetadata,
   assignments: readonly ProjectionUpdateAssignment[],
@@ -2694,6 +2903,26 @@ function validateProjectionKey(
   }
 }
 
+function validateProjectionAggregateAlias(
+  alias: string,
+  aggregates: readonly ProjectionAggregate[],
+): void {
+  if (alias.length === 0) {
+    throw new Error("projection aggregate alias must not be empty");
+  }
+
+  const normalizedAlias = alias.toLocaleLowerCase("en-US");
+  const existing = aggregates.find((aggregate) => {
+    return aggregate.alias.toLocaleLowerCase("en-US") === normalizedAlias;
+  });
+
+  if (existing !== undefined) {
+    throw new Error(
+      `projection aggregate alias ${alias} conflicts with ${existing.alias}`,
+    );
+  }
+}
+
 function validateProjectionLimit(limit: number): void {
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new Error("projection limit must be a non-negative safe integer");
@@ -2826,6 +3055,27 @@ function decodeProjectionSelectedRow(
       row[columnName],
       `${table.name}.${columnName}`,
     );
+  }
+
+  return decoded;
+}
+
+function decodeProjectionAggregateRow(
+  aggregates: readonly ProjectionAggregate[],
+  row: LedgerStorageRow,
+): Readonly<Record<string, number>> {
+  const decoded: Record<string, number> = {};
+
+  for (const aggregate of aggregates) {
+    const value = row[aggregate.alias];
+
+    if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+      throw new Error(
+        `projection aggregate ${aggregate.alias} must be a stored integer`,
+      );
+    }
+
+    decoded[aggregate.alias] = value;
   }
 
   return decoded;

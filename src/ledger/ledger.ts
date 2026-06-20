@@ -46,6 +46,7 @@ const registeredLedgerModelBrand: unique symbol = Symbol(
 );
 
 export type {
+  ProjectionAggregateBuilder,
   ProjectionExecutableSelect,
   ProjectionExecutableJoinedSelect,
   ProjectionExecutableWrite,

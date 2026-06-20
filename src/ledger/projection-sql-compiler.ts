@@ -85,6 +85,17 @@ export type ProjectionCompilerJoinClause = {
   readonly tableName: string;
 };
 
+export type ProjectionCompilerAggregate =
+  | {
+      readonly alias: string;
+      readonly kind: "count";
+    }
+  | {
+      readonly alias: string;
+      readonly column: ProjectionCompilerColumnReference;
+      readonly kind: "count_not_null";
+    };
+
 export type ProjectionCompilerInsertStatement = {
   readonly conflict:
     | null
@@ -110,6 +121,12 @@ export type ProjectionCompilerSelectStatement = {
   readonly where: readonly ProjectionCompilerWhereClause[];
 };
 
+export type ProjectionCompilerAggregateStatement = {
+  readonly aggregates: readonly ProjectionCompilerAggregate[];
+  readonly fromTableName: string;
+  readonly where: readonly ProjectionCompilerWhereClause[];
+};
+
 export type ProjectionCompilerUpdateStatement = {
   readonly assignments: readonly ProjectionCompilerAssignment[];
   readonly tableName: string;
@@ -122,6 +139,9 @@ export type ProjectionCompilerDeleteStatement = {
 };
 
 export type ProjectionStatementCompiler = {
+  compileAggregate(
+    statement: ProjectionCompilerAggregateStatement,
+  ): ProjectionCompiledSql;
   compileDelete(
     statement: ProjectionCompilerDeleteStatement,
   ): ProjectionCompiledSql;
@@ -138,10 +158,43 @@ export type ProjectionStatementCompiler = {
 
 export function createSqliteProjectionStatementCompiler(): ProjectionStatementCompiler {
   return {
+    compileAggregate: compileAggregateStatement,
     compileDelete: compileDeleteStatement,
     compileInsert: compileInsertStatement,
     compileSelect: compileSelectStatement,
     compileUpdate: compileUpdateStatement,
+  };
+}
+
+function compileAggregateStatement(
+  statement: ProjectionCompilerAggregateStatement,
+): ProjectionCompiledSql {
+  if (statement.aggregates.length === 0) {
+    throw new Error("aggregate select must include at least one aggregate");
+  }
+
+  const selectedSql = statement.aggregates
+    .map((aggregate) => {
+      const alias = quoteIdentifier(aggregate.alias);
+
+      switch (aggregate.kind) {
+        case "count":
+          return `COUNT(*) AS ${alias}`;
+        case "count_not_null":
+          return `COUNT(${compileColumnReference(aggregate.column)}) AS ${alias}`;
+      }
+    })
+    .join(", ");
+  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.fromTableName)}`;
+  const whereSql = compileWhere(statement.where);
+
+  if (whereSql.text.length > 0) {
+    text += ` WHERE ${whereSql.text}`;
+  }
+
+  return {
+    params: whereSql.params,
+    text,
   };
 }
 

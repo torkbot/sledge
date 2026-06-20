@@ -1378,6 +1378,122 @@ test("projection access supports typed anti-join predicates", async () => {
   ]);
 });
 
+test("projection access supports typed aggregate reads", async () => {
+  const toolSchema = defineMaterializationSchema({
+    namespace: "tool-aggregates",
+    version: 1,
+    tables: {
+      toolCalls: (t) =>
+        t
+          .columns({
+            toolCallId: t.text().notNull(),
+            runId: t.text().notNull(),
+            resultMessageJson: t.text(),
+          })
+          .primaryKey(["toolCallId"])
+          .index("tool_calls_by_run", ["runId"]),
+    },
+  });
+  const toolMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(toolSchema, (m) => [
+      m.migration(1, "create tool call tables", (s) => [
+        s.createTable("toolCalls", (t) =>
+          t
+            .columns({
+              toolCallId: t.text().notNull(),
+              runId: t.text().notNull(),
+              resultMessageJson: t.text(),
+            })
+            .primaryKey(["toolCallId"])
+            .index("tool_calls_by_run", ["runId"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      duplicateAlias: {
+        params: Type.Object({}),
+        result: Type.Object({
+          total: Type.Number(),
+        }),
+      },
+      toolSummary: {
+        params: Type.Object({
+          runId: Type.String(),
+        }),
+        result: Type.Object({
+          completedToolCallCount: Type.Number(),
+          totalToolCallCount: Type.Number(),
+        }),
+      },
+    },
+  });
+  const toolModel = withMaterializations(shape, toolMaterializations).register({
+    queries: {
+      duplicateAlias: async ({ db }) => {
+        return await db
+          .selectFrom("toolCalls")
+          .aggregate()
+          .count("total")
+          .count("Total")
+          .execute();
+      },
+      toolSummary: async ({ params, db }) => {
+        return await db
+          .selectFrom("toolCalls")
+          .aggregate()
+          .count("totalToolCallCount")
+          .countNotNull("completedToolCallCount", "resultMessageJson")
+          .where("runId", "=", params.runId)
+          .execute();
+      },
+    },
+  });
+  const toolQueries = readTestLedgerImplementations(toolModel).queries;
+  const toolSummary = toolQueries?.toolSummary;
+  const duplicateAlias = toolQueries?.duplicateAlias;
+
+  if (toolSummary === undefined) {
+    throw new Error("expected toolSummary query implementation");
+  }
+
+  if (duplicateAlias === undefined) {
+    throw new Error("expected duplicateAlias query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      completedToolCallCount: 2,
+      totalToolCallCount: 3,
+    },
+  });
+
+  const summary = await toolSummary(fake.scope, {
+    runId: "run_1",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: ["run_1"],
+    sql: 'SELECT COUNT(*) AS "totalToolCallCount", COUNT("resultMessageJson") AS "completedToolCallCount" FROM "toolCalls" WHERE "runId" = ?',
+  });
+  assert.deepEqual(summary, {
+    completedToolCallCount: 2,
+    totalToolCallCount: 3,
+  });
+
+  const invalidFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await duplicateAlias(invalidFake.scope, {});
+  }, /projection aggregate alias Total conflicts with total/);
+  assert.deepEqual(invalidFake.calls, []);
+});
+
 test("projection access hydrates semantic event references without exposing events table", async () => {
   const eventMaterializations = defineMaterializations({
     history,
@@ -2428,6 +2544,26 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           const userId: string = event.payload.userId;
           void userId;
         }
+
+        const aggregateRow = await db
+          .selectFrom("users")
+          .aggregate()
+          .count("total")
+          .countNotNull("withEmail", "email")
+          .execute();
+        const aggregateTotal: number = aggregateRow.total;
+        const aggregateWithEmail: number = aggregateRow.withEmail;
+        // @ts-expect-error aggregate results only expose declared aliases.
+        const aggregateMissing = aggregateRow.missing;
+
+        void aggregateTotal;
+        void aggregateWithEmail;
+        void aggregateMissing;
+
+        db.selectFrom("users")
+          .aggregate()
+          // @ts-expect-error aggregate countNotNull must reference known columns.
+          .countNotNull("missingCount", "missing");
 
         db.selectFrom("users")
           .select(["email"])
