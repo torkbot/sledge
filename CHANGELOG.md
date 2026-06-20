@@ -35,6 +35,11 @@
   operations ordered before their referenced tables or columns exist.
 - Reject non-positive event reference IDs when projection access serializes or
   decodes event-ref columns.
+- Ensure declared materialization tables and indexes during ledger startup from
+  the typed materialization schema instead of requiring callers to run raw SQL
+  setup.
+- Remove the low-level `@torkbot/sledge/database-ledger-engine` package export
+  and hide generated raw-scope implementations behind an internal symbol.
 
 ## 0.9.0 - 2026-05-20
 

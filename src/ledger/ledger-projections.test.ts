@@ -4,11 +4,14 @@ import test from "node:test";
 import { Type } from "typebox";
 
 import { createEventRef } from "./event-ref.ts";
+import {
+  registeredLedgerImplementationsBrand,
+  type LedgerStorageRow,
+  type LedgerStorageScope,
+} from "./internal-storage.ts";
 import type {
   EventEnvelope,
   LedgerIndexerContext,
-  LedgerStorageRow,
-  LedgerStorageScope,
   MaterializationImplementationRegistration,
 } from "./ledger.ts";
 import {
@@ -224,9 +227,11 @@ function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
 
 test("projection access compiles typed indexer and query definitions to storage operations", async () => {
   const indexer =
-    registeredModelWithoutHandlers.implementations.indexers?.upsertUser;
+    registeredModelWithoutHandlers[registeredLedgerImplementationsBrand]
+      .indexers?.upsertUser;
   const query =
-    registeredModelWithoutHandlers.implementations.queries?.userById;
+    registeredModelWithoutHandlers[registeredLedgerImplementationsBrand].queries
+      ?.userById;
 
   if (indexer === undefined) {
     throw new Error("expected upsertUser indexer implementation");
@@ -387,8 +392,12 @@ test("projection access rejects non-serializable JSON values before storage", as
       },
     },
   });
-  const insertJson = registeredJsonModel.implementations.indexers?.insertJson;
-  const updateJson = registeredJsonModel.implementations.indexers?.updateJson;
+  const insertJson =
+    registeredJsonModel[registeredLedgerImplementationsBrand].indexers
+      ?.insertJson;
+  const updateJson =
+    registeredJsonModel[registeredLedgerImplementationsBrand].indexers
+      ?.updateJson;
 
   if (insertJson === undefined) {
     throw new Error("expected insertJson indexer implementation");
@@ -490,7 +499,8 @@ test("ledger projection construction feeds generated contracts and implementatio
     definedModel.model.queries.userById,
   );
   assert.equal(
-    typeof registeredModel.implementations.indexers?.upsertUser,
+    typeof registeredModel[registeredLedgerImplementationsBrand].indexers
+      ?.upsertUser,
     "function",
   );
   assert.equal(registeredModel.projections, definedModel.projections);

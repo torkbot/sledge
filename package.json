@@ -17,10 +17,6 @@
       "types": "./dist/ledger/ledger.d.ts",
       "default": "./dist/ledger/ledger.js"
     },
-    "./database-ledger-engine": {
-      "types": "./dist/ledger/database-ledger-engine.d.ts",
-      "default": "./dist/ledger/database-ledger-engine.js"
-    },
     "./better-sqlite3-ledger": {
       "types": "./dist/ledger/better-sqlite3-ledger.d.ts",
       "default": "./dist/ledger/better-sqlite3-ledger.js"

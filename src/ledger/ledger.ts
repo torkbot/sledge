@@ -2,6 +2,8 @@ import type { Static, TSchema } from "typebox";
 
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import type { EventRef } from "./event-ref.ts";
+import type { LedgerImplementations } from "./internal-storage.ts";
+import { registeredLedgerImplementationsBrand } from "./internal-storage.ts";
 import {
   createProjectionAccess,
   createProjectionImplementations,
@@ -159,53 +161,6 @@ export interface WorkLease<
   readonly leaseExpiresAtMs: number;
   readonly signal: AbortSignal;
 }
-
-export type LedgerStorageRow = Record<string, unknown>;
-
-export interface LedgerStorageStatement {
-  run(...params: unknown[]): Promise<{
-    readonly changes: number;
-    readonly lastInsertRowid: number | bigint;
-  }>;
-
-  get(...params: unknown[]): Promise<LedgerStorageRow | undefined>;
-
-  all(...params: unknown[]): Promise<readonly LedgerStorageRow[]>;
-}
-
-export interface LedgerStorageScope {
-  exec(sql: string): Promise<void>;
-
-  prepare(sql: string): LedgerStorageStatement;
-}
-
-/**
- * Runtime implementations bound to index and query schema contracts.
- */
-export type LedgerImplementations<
-  TIndexers extends Record<string, TSchema> = {},
-  TQueries extends Record<string, AnyQuerySchema> = {},
-  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
-> = {
-  readonly indexers?: {
-    readonly [TIndexName in keyof TIndexers]: (
-      scope: LedgerStorageScope,
-      input: Static<TIndexers[TIndexName]>,
-      context: LedgerIndexerContext<TEvents>,
-    ) => void | Promise<void>;
-  };
-
-  /**
-   * Projection reads. Top-level ledger queries receive an ambient read scope;
-   * event projection queries receive the projection transaction scope.
-   */
-  readonly queries?: {
-    readonly [TQueryName in keyof TQueries]: (
-      scope: LedgerStorageScope,
-      params: Static<TQueries[TQueryName]["params"]>,
-    ) => unknown | Promise<unknown>;
-  };
-};
 
 /**
  * Runtime actions available while handling one queue work attempt.
@@ -621,7 +576,11 @@ export type RegisteredLedgerModel<
       TIndexerDefinitions,
       TQueryDefinitions
     >;
-  readonly implementations: LedgerImplementations<TIndexers, TQueries, TEvents>;
+  readonly [registeredLedgerImplementationsBrand]: LedgerImplementations<
+    TIndexers,
+    TQueries,
+    TEvents
+  >;
 };
 
 export type LedgerShape<
@@ -2189,10 +2148,10 @@ function createDefinedLedgerModel<
 
       return {
         [registeredLedgerModelBrand]: true,
+        [registeredLedgerImplementationsBrand]: implementations,
         model,
         projections: input.access.projections,
         register,
-        implementations,
       };
     },
   };

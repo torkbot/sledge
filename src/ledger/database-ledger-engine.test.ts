@@ -19,8 +19,11 @@ import {
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
-  type RegisteredLedgerModel,
+  registeredLedgerImplementationsBrand,
   type LedgerImplementations,
+} from "./internal-storage.ts";
+import {
+  type RegisteredLedgerModel,
   type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
@@ -118,10 +121,10 @@ function defineEngineFixtureModel<
       // Engine tests exercise custom storage hooks that the public v2
       // construction path deliberately no longer exposes.
       return {
+        [registeredLedgerImplementationsBrand]: implementations,
         model,
         projections,
         register: input.register,
-        implementations,
       } as unknown as RegisteredLedgerModel<
         TEvents,
         TQueues,

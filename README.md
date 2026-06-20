@@ -20,7 +20,6 @@ handles to indexer and query callbacks.
 ## Quick Start
 
 ```ts
-import Database from "better-sqlite3";
 import { Type } from "typebox";
 
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
@@ -37,18 +36,6 @@ import {
 } from "@torkbot/sledge/runtime/node-runtime";
 
 const databaseUrl = "./app.sqlite";
-
-// Materialization migrations are still explicit in this v2 slice.
-// Indexer/query callbacks below do not receive this database handle.
-const db = new Database(databaseUrl);
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    userId TEXT PRIMARY KEY,
-    email TEXT NOT NULL,
-    source INTEGER NOT NULL
-  );
-`);
-db.close();
 
 const ledgerShape = defineLedgerShape({
   events: {
@@ -360,12 +347,10 @@ separate bind step.
 
 ### 6. Run Database Hygiene
 
-This v2 slice records materialization schema metadata, typed relations, and
-typed migration operation metadata, but does not yet run materialization
-migrations.
-Applications must still create/update materialization tables before opening the
-runtime. The intended lifecycle is internal migrations first, then
-materialization migrations, then runtime.
+Opening a ledger creates Sledge's internal tables and ensures the declared
+materialization tables and indexes exist from the typed materialization schema.
+This v2 slice records typed migration operation metadata, but does not yet run
+versioned materialization migrations or data migration steps.
 
 ### 7. Open a Runtime
 
@@ -469,7 +454,6 @@ Cursor values are opaque. Persist and reuse them as-is.
 ## Package Exports
 
 - `@torkbot/sledge/ledger`
-- `@torkbot/sledge/database-ledger-engine`
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`
 - `@torkbot/sledge/runtime/contracts`

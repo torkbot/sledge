@@ -1,4 +1,3 @@
-import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,17 +21,6 @@ runLedgerContractSuite({
       tmpdir(),
       `sledge-contract-better-${randomUUID()}.sqlite`,
     );
-    const db = new Database(databaseUrl);
-
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS "contractProjection" (
-        "sourceEventId" INTEGER PRIMARY KEY,
-        "decisionAttempts" INTEGER NOT NULL,
-        "dispatchCount" INTEGER NOT NULL,
-        "plannedIntentEventId" INTEGER
-      );
-    `);
-
     let decisionMode: LedgerContractDecisionMode = "ack";
     let materializationFailureText: string | null = null;
 
@@ -77,7 +65,6 @@ runLedgerContractSuite({
       stop: async () => {
         await workers.close();
         await ledger.close();
-        db.close();
         await rm(databaseUrl, { force: true });
       },
       setDecisionMode: (mode) => {

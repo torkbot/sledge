@@ -4,11 +4,10 @@ import type { EventRef } from "./event-ref.ts";
 import { createEventRef } from "./event-ref.ts";
 import type {
   LedgerImplementations,
-  LedgerIndexerContext,
   LedgerStorageRow,
   LedgerStorageScope,
-  QuerySchema,
-} from "./ledger.ts";
+} from "./internal-storage.ts";
+import type { LedgerIndexerContext, QuerySchema } from "./ledger.ts";
 import {
   type ProjectionColumnMetadata,
   type ProjectionColumnValue,
