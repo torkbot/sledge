@@ -336,8 +336,14 @@ signal-queue handlers.
 
 Indexer and query implementations receive sledge-owned facades:
 
-- indexers can `insertInto(...).values(...).onConflict(...).doUpdateSet(...)`
-- queries can `selectFrom(...).select(...).where(...).executeTakeFirst()`
+- indexers can `selectFrom(...)`, `readEvent(ref)`, `insertInto(...)`,
+  `updateTable(...)`, and `deleteFrom(...)`
+- queries can `selectFrom(...)` and `readEvent(ref)`, but cannot mutate
+  materialization tables
+- reads support typed predicates, null predicates, `orderBy(...)`,
+  `limit(...)`, `execute()`, `executeTakeFirst()`, and `stream()`
+- writes return affected-row metadata and support typed `MAX(...)`,
+  `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
 They do not receive a raw storage handle. Event handlers can `index`, `enqueue`,
 and `query`.

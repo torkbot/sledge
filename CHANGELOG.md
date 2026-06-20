@@ -23,6 +23,13 @@
 - Add ledger-owned event refs on event envelopes so projection access callbacks
   can write semantic event references without exposing the internal events
   table.
+- Expand the typed materialization facade toward TorkBot coverage: indexers can
+  read projection state, update rows, delete rows, inspect affected-row counts,
+  use ordered/limited range queries, and hydrate semantic `EventRef` values
+  without receiving raw SQL or the internal `events` table.
+- Declare `kysely` as the internal SQL compiler substrate for the v2
+  materialization facade while keeping public indexer/query callbacks on
+  Sledge-owned handles.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and

@@ -1,4 +1,5 @@
-import type { Static, TSchema } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 
 import type { EventRef } from "./event-ref.ts";
 import { createEventRef } from "./event-ref.ts";
@@ -6,7 +7,11 @@ import type {
   LedgerStorageRow,
   LedgerStorageScope,
 } from "./internal-storage.ts";
-import type { LedgerIndexerContext, QuerySchema } from "./ledger.ts";
+import type {
+  EventEnvelope,
+  LedgerIndexerContext,
+  QuerySchema,
+} from "./ledger.ts";
 import {
   type ProjectionColumnMetadata,
   type ProjectionColumnValue,
@@ -21,6 +26,17 @@ import {
 } from "./projections.ts";
 
 type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
+declare const projectionExpressionBrand: unique symbol;
+
+const ProjectionEventRowSchema = Type.Object({
+  causation_event_id: Type.Union([Type.Null(), Type.Number()]),
+  dedupe_key: Type.Union([Type.Null(), Type.String()]),
+  event_id: Type.Number(),
+  event_name: Type.String(),
+  payload_json: Type.String(),
+  ts_ms: Type.Number(),
+});
+
 export type AnyProjectionSchema = {
   readonly metadata: ProjectionSchemaMetadata;
 };
@@ -35,11 +51,98 @@ export type ProjectionWriteRow<TTable> = ProjectionRow<
   ProjectionTableColumns<TTable>
 >;
 
+type ProjectionExpressionMetadata =
+  | {
+      readonly kind: "coalesce";
+      readonly columnName: string;
+      readonly value: ProjectionExpressionOperandMetadata;
+    }
+  | {
+      readonly kind: "column";
+      readonly columnName: string;
+    }
+  | {
+      readonly kind: "excluded";
+      readonly columnName: string;
+    }
+  | {
+      readonly kind: "max";
+      readonly columnName: string;
+      readonly value: ProjectionExpressionOperandMetadata;
+    };
+
+type ProjectionExpressionOperandMetadata =
+  | ProjectionExpressionMetadata
+  | {
+      readonly kind: "value";
+      readonly columnName: string;
+      readonly value: unknown;
+    };
+
+export type ProjectionExpression<TValue> = {
+  readonly [projectionExpressionBrand]?: TValue;
+  readonly metadata: ProjectionExpressionMetadata;
+};
+
+export type ProjectionExpressionOperand<
+  TTable,
+  TColumnName extends ProjectionTableColumnName<TTable>,
+> =
+  | ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+  | ProjectionExpression<
+      ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+    >;
+
+export type ProjectionExpressionBuilder<TTable> = {
+  coalesce<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    value: ProjectionExpressionOperand<TTable, TColumnName>,
+  ): ProjectionExpression<
+    ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+  >;
+  column<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionExpression<
+    ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+  >;
+  max<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    value: ProjectionExpressionOperand<TTable, TColumnName>,
+  ): ProjectionExpression<
+    ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+  >;
+};
+
+export type ProjectionUpsertExpressionBuilder<TTable> =
+  ProjectionExpressionBuilder<TTable> & {
+    excluded<const TColumnName extends ProjectionTableColumnName<TTable>>(
+      columnName: TColumnName,
+    ): ProjectionExpression<
+      ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+    >;
+  };
+
+type ProjectionUpdateValue<TColumn> =
+  | ProjectionColumnValue<TColumn>
+  | ProjectionExpression<ProjectionColumnValue<TColumn>>;
+
 export type ProjectionUpdateRow<TTable> = {
-  readonly [TColumnName in ProjectionTableColumnName<TTable>]?: ProjectionColumnValue<
+  readonly [TColumnName in ProjectionTableColumnName<TTable>]?: ProjectionUpdateValue<
     ProjectionTableColumns<TTable>[TColumnName]
   >;
 };
+
+export type ProjectionUpdateSet<TTable> =
+  | ProjectionUpdateRow<TTable>
+  | ((
+      expressions: ProjectionExpressionBuilder<TTable>,
+    ) => ProjectionUpdateRow<TTable>);
+
+export type ProjectionUpsertUpdateSet<TTable> =
+  | ProjectionUpdateRow<TTable>
+  | ((
+      expressions: ProjectionUpsertExpressionBuilder<TTable>,
+    ) => ProjectionUpdateRow<TTable>);
 
 type ProjectionWhereValue<
   TTable,
@@ -47,6 +150,10 @@ type ProjectionWhereValue<
 > = NonNullable<
   ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
 >;
+
+export type ProjectionWhereOperator = "=" | "!=" | "<" | "<=" | ">" | ">=";
+
+export type ProjectionOrderDirection = "asc" | "desc";
 
 export type ProjectionSelectedRow<
   TTable,
@@ -57,6 +164,11 @@ export type ProjectionSelectedRow<
   >;
 };
 
+export type ProjectionWriteResult = {
+  readonly changes: number;
+  readonly lastInsertRowid: number | bigint;
+};
+
 export type ProjectionInsertBuilder<TTable> = {
   values(
     row: ProjectionWriteRow<TTable>,
@@ -64,7 +176,7 @@ export type ProjectionInsertBuilder<TTable> = {
 };
 
 export type ProjectionInsertConflictBuilder<TTable> = {
-  execute(): Promise<void>;
+  execute(): Promise<ProjectionWriteResult>;
   onConflict<const TColumns extends ProjectionTableKey<TTable>>(
     columns: TColumns,
   ): ProjectionInsertOnConflictBuilder<TTable>;
@@ -72,16 +184,28 @@ export type ProjectionInsertConflictBuilder<TTable> = {
 
 export type ProjectionInsertOnConflictBuilder<TTable> = {
   doNothing(): ProjectionExecutableWrite;
-  doUpdateSet(values: ProjectionUpdateRow<TTable>): ProjectionExecutableWrite;
+  doUpdateSet(
+    values: ProjectionUpsertUpdateSet<TTable>,
+  ): ProjectionExecutableWrite;
 };
 
 export type ProjectionExecutableWrite = {
-  execute(): Promise<void>;
+  execute(): Promise<ProjectionWriteResult>;
+  executeExpectingOne(): Promise<void>;
 };
 
 export type ProjectionWriteDatabase<
   TProjectionSchema extends AnyProjectionSchema,
 > = {
+  deleteFrom<
+    const TTableName extends ProjectionTableName<
+      ProjectionSchemaTables<TProjectionSchema>
+    >,
+  >(
+    tableName: TTableName,
+  ): ProjectionDeleteBuilder<
+    ProjectionSchemaTables<TProjectionSchema>[TTableName]
+  >;
   insertInto<
     const TTableName extends ProjectionTableName<
       ProjectionSchemaTables<TProjectionSchema>
@@ -91,6 +215,57 @@ export type ProjectionWriteDatabase<
   ): ProjectionInsertBuilder<
     ProjectionSchemaTables<TProjectionSchema>[TTableName]
   >;
+  updateTable<
+    const TTableName extends ProjectionTableName<
+      ProjectionSchemaTables<TProjectionSchema>
+    >,
+  >(
+    tableName: TTableName,
+  ): ProjectionUpdateBuilder<
+    ProjectionSchemaTables<TProjectionSchema>[TTableName]
+  >;
+};
+
+export type ProjectionUpdateBuilder<TTable> = {
+  set(
+    values: ProjectionUpdateSet<TTable>,
+  ): ProjectionUpdateWhereBuilder<TTable>;
+};
+
+export type ProjectionUpdateWhereBuilder<TTable> = ProjectionExecutableWrite & {
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: ProjectionWhereOperator,
+    value: ProjectionWhereValue<TTable, TColumnName>,
+  ): ProjectionUpdateWhereBuilder<TTable>;
+  whereIn<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTable, TColumnName>[],
+  ): ProjectionUpdateWhereBuilder<TTable>;
+  whereNotNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionUpdateWhereBuilder<TTable>;
+  whereNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionUpdateWhereBuilder<TTable>;
+};
+
+export type ProjectionDeleteBuilder<TTable> = ProjectionExecutableWrite & {
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: ProjectionWhereOperator,
+    value: ProjectionWhereValue<TTable, TColumnName>,
+  ): ProjectionDeleteBuilder<TTable>;
+  whereIn<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTable, TColumnName>[],
+  ): ProjectionDeleteBuilder<TTable>;
+  whereNotNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionDeleteBuilder<TTable>;
+  whereNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionDeleteBuilder<TTable>;
 };
 
 export type ProjectionSelectBuilder<TTable> = {
@@ -105,21 +280,41 @@ export type ProjectionExecutableSelect<
   TTable,
   TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
 > = {
+  limit(limit: number): ProjectionExecutableSelect<TTable, TColumnNames>;
+  orderBy<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    direction?: ProjectionOrderDirection,
+  ): ProjectionExecutableSelect<TTable, TColumnNames>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
-    operator: "=",
+    operator: ProjectionWhereOperator,
     value: ProjectionWhereValue<TTable, TColumnName>,
+  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  whereIn<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    values: readonly ProjectionWhereValue<TTable, TColumnName>[],
+  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  whereNotNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  whereNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
   ): ProjectionExecutableSelect<TTable, TColumnNames>;
   execute(): Promise<readonly ProjectionSelectedRow<TTable, TColumnNames>[]>;
   executeTakeFirst(): Promise<ProjectionSelectedRow<
     TTable,
     TColumnNames
   > | null>;
+  stream(): AsyncIterable<ProjectionSelectedRow<TTable, TColumnNames>>;
 };
 
 export type ProjectionReadDatabase<
   TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = {
+  readEvent<const TEventName extends Extract<keyof TEvents, string>>(
+    ref: EventRef<TEventName>,
+  ): Promise<EventEnvelope<TEvents, TEventName> | null>;
   selectFrom<
     const TTableName extends ProjectionTableName<
       ProjectionSchemaTables<TProjectionSchema>
@@ -131,14 +326,21 @@ export type ProjectionReadDatabase<
   >;
 };
 
+export type ProjectionDatabase<
+  TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+> = ProjectionReadDatabase<TProjectionSchema, TEvents> &
+  ProjectionWriteDatabase<TProjectionSchema>;
+
 export type ProjectionIndexerRunInput<
   TProjectionSchema extends AnyProjectionSchema,
   TInputSchema extends TSchema,
   TSourceEventName extends string,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = {
   readonly input: Static<TInputSchema>;
   readonly event: ProjectionIndexerEvent<TSourceEventName>;
-  readonly db: ProjectionWriteDatabase<TProjectionSchema>;
+  readonly db: ProjectionDatabase<TProjectionSchema, TEvents>;
 };
 
 export type ProjectionIndexerContract<
@@ -166,9 +368,10 @@ export type ProjectionIndexerDefinitions<TSourceEventName extends string> =
 export type ProjectionQueryRunInput<
   TProjectionSchema extends AnyProjectionSchema,
   TParamsSchema extends TSchema,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = {
   readonly params: Static<TParamsSchema>;
-  readonly db: ProjectionReadDatabase<TProjectionSchema>;
+  readonly db: ProjectionReadDatabase<TProjectionSchema, TEvents>;
 };
 
 export type ProjectionQueryContract<
@@ -196,6 +399,7 @@ export type ProjectionQueryDefinitions = Readonly<
 export type ProjectionIndexerImplementations<
   TProjectionSchema extends AnyProjectionSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = {
   readonly [TName in keyof TIndexerDefinitions]: TIndexerDefinitions[TName] extends {
     readonly input: infer TInputSchema extends TSchema;
@@ -205,7 +409,8 @@ export type ProjectionIndexerImplementations<
         input: ProjectionIndexerRunInput<
           TProjectionSchema,
           TInputSchema,
-          TSourceEventName
+          TSourceEventName,
+          TEvents
         >,
       ) => void | Promise<void>
     : never;
@@ -214,13 +419,18 @@ export type ProjectionIndexerImplementations<
 export type ProjectionQueryImplementations<
   TProjectionSchema extends AnyProjectionSchema,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = {
   readonly [TName in keyof TQueryDefinitions]: TQueryDefinitions[TName] extends {
     readonly params: infer TParamsSchema extends TSchema;
     readonly result: infer TResultSchema extends TSchema;
   }
     ? (
-        input: ProjectionQueryRunInput<TProjectionSchema, TParamsSchema>,
+        input: ProjectionQueryRunInput<
+          TProjectionSchema,
+          TParamsSchema,
+          TEvents
+        >,
       ) => Static<TResultSchema> | Promise<Static<TResultSchema>>
     : never;
 };
@@ -339,6 +549,7 @@ export type ProjectionImplementationRegistration<
   TProjectionSchema extends AnyProjectionSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = (keyof TIndexerDefinitions extends never
   ? {
       readonly indexers?: never;
@@ -346,7 +557,8 @@ export type ProjectionImplementationRegistration<
   : {
       readonly indexers: ProjectionIndexerImplementations<
         TProjectionSchema,
-        TIndexerDefinitions
+        TIndexerDefinitions,
+        TEvents
       >;
     }) &
   (keyof TQueryDefinitions extends never
@@ -356,22 +568,26 @@ export type ProjectionImplementationRegistration<
     : {
         readonly queries: ProjectionQueryImplementations<
           TProjectionSchema,
-          TQueryDefinitions
+          TQueryDefinitions,
+          TEvents
         >;
       });
 
 export function createProjectionImplementations<
+  const TEvents extends Record<string, TSchema>,
   const TProjectionSchema extends AnyProjectionSchema,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   const TQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
+  readonly events: TEvents;
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
   readonly register: ProjectionImplementationRegistration<
     TProjectionSchema,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TEvents
   >;
 }): unknown {
   const indexerImplementations: Record<
@@ -408,6 +624,7 @@ export function createProjectionImplementations<
         scope,
         indexerInput,
         context,
+        input.events,
       );
     };
   }
@@ -422,7 +639,11 @@ export function createProjectionImplementations<
     queryImplementations[queryName] = async (scope, params) => {
       return await implementation({
         params,
-        db: createProjectionReadDatabase(input.projections.metadata, scope),
+        db: createProjectionReadDatabase(
+          input.projections.metadata,
+          scope,
+          input.events,
+        ),
       });
     };
   }
@@ -437,22 +658,29 @@ async function runProjectionIndexer(
   projections: AnyProjectionSchema,
   definition: ProjectionIndexerContractLike,
   implementation: (
-    input: ProjectionIndexerRunInput<AnyProjectionSchema, TSchema, string>,
+    input: ProjectionIndexerRunInput<
+      AnyProjectionSchema,
+      TSchema,
+      string,
+      Record<string, TSchema>
+    >,
   ) => void | Promise<void>,
   scope: LedgerStorageScope,
   input: unknown,
   context: LedgerIndexerContext,
+  events: Record<string, TSchema>,
 ): Promise<void> {
   const event = createProjectionIndexerEvent(definition.sourceEvent, context);
-  const pendingWrites = new Set<Promise<void>>();
+  const pendingWrites = new Set<Promise<unknown>>();
   const trackWrite: ProjectionWriteTracker = (run) => {
-    let tracked: Promise<void>;
-    tracked = run().finally(() => {
+    let tracked: Promise<unknown>;
+    const runPromise = run();
+    tracked = runPromise.finally(() => {
       pendingWrites.delete(tracked);
     });
     pendingWrites.add(tracked);
 
-    return tracked;
+    return runPromise;
   };
 
   let implementationError: unknown = null;
@@ -461,9 +689,10 @@ async function runProjectionIndexer(
     await implementation({
       input,
       event,
-      db: createProjectionWriteDatabase(
+      db: createProjectionDatabase(
         projections.metadata,
         scope,
+        events,
         trackWrite,
       ),
     });
@@ -483,7 +712,7 @@ async function runProjectionIndexer(
 }
 
 async function settleProjectionWrites(
-  pendingWrites: ReadonlySet<Promise<void>>,
+  pendingWrites: ReadonlySet<Promise<unknown>>,
 ): Promise<unknown | null> {
   if (pendingWrites.size === 0) {
     return null;
@@ -514,6 +743,20 @@ function createProjectionIndexerEvent(
   };
 }
 
+function createProjectionDatabase<
+  TProjectionSchema extends AnyProjectionSchema,
+>(
+  metadata: ProjectionSchemaMetadata,
+  scope: LedgerStorageScope,
+  events: Record<string, TSchema>,
+  trackWrite: ProjectionWriteTracker,
+): ProjectionDatabase<TProjectionSchema, Record<string, TSchema>> {
+  return {
+    ...createProjectionReadDatabase(metadata, scope, events),
+    ...createProjectionWriteDatabase(metadata, scope, trackWrite),
+  };
+}
+
 function createProjectionWriteDatabase<
   TProjectionSchema extends AnyProjectionSchema,
 >(
@@ -522,6 +765,10 @@ function createProjectionWriteDatabase<
   trackWrite: ProjectionWriteTracker,
 ): ProjectionWriteDatabase<TProjectionSchema> {
   return {
+    deleteFrom: (tableName) => {
+      const table = readProjectionTable(metadata, String(tableName));
+      return createProjectionDeleteBuilder(scope, table, [], trackWrite);
+    },
     insertInto: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
 
@@ -548,10 +795,31 @@ function createProjectionWriteDatabase<
         },
       };
     },
+    updateTable: (tableName) => {
+      const table = readProjectionTable(metadata, String(tableName));
+
+      return {
+        set: (values) => {
+          const updateAssignments = readProjectionUpdateAssignments(
+            table,
+            resolveProjectionUpdateSet(table, values),
+            false,
+          );
+
+          return createProjectionUpdateWhereBuilder(
+            scope,
+            table,
+            updateAssignments,
+            [],
+            trackWrite,
+          );
+        },
+      };
+    },
   };
 }
 
-type ProjectionWriteTracker = (run: () => Promise<void>) => Promise<void>;
+type ProjectionWriteTracker = <T>(run: () => Promise<T>) => Promise<T>;
 
 function createInsertConflictBuilder<TTable>(
   scope: LedgerStorageScope,
@@ -564,7 +832,9 @@ function createInsertConflictBuilder<TTable>(
     execute: () => {
       const sql = buildInsertSql(table, insertColumns, null);
       return trackWrite(async () => {
-        await scope.prepare(sql).run(...insertValues);
+        return await scope
+          .prepare(sql.text)
+          .run(...insertValues, ...sql.params);
       });
     },
     onConflict: (conflictColumns) => {
@@ -572,46 +842,50 @@ function createInsertConflictBuilder<TTable>(
 
       return {
         doNothing: () => {
-          return {
-            execute: () => {
-              const sql = buildInsertSql(table, insertColumns, {
-                kind: "do_nothing",
-                conflictColumns,
-              });
-              return trackWrite(async () => {
-                await scope.prepare(sql).run(...insertValues);
-              });
-            },
-          };
+          const sql = buildInsertSql(table, insertColumns, {
+            kind: "do_nothing",
+            conflictColumns,
+          });
+
+          return createProjectionExecutableWrite(
+            scope,
+            sql.text,
+            [...insertValues, ...sql.params],
+            trackWrite,
+          );
         },
         doUpdateSet: (values) => {
-          const updateValuesByColumn = values as Readonly<
-            Record<string, unknown>
-          >;
-          const updateColumns = validateProjectionWriteRow(
-            "update values",
+          const updateAssignments = readProjectionUpdateAssignments(
             table,
-            updateValuesByColumn,
-            false,
+            resolveProjectionUpsertUpdateSet(table, values),
+            true,
           );
-          const updateValues = updateColumns.map((columnName) => {
-            return serializeProjectionColumnValue(
-              table.columns[columnName],
-              updateValuesByColumn[columnName],
-              `${table.name}.${columnName}`,
-            );
-          });
 
           return {
             execute: () => {
               const sql = buildInsertSql(table, insertColumns, {
                 kind: "do_update",
                 conflictColumns,
-                updateColumns,
+                updateAssignments,
               });
               return trackWrite(async () => {
-                await scope.prepare(sql).run(...insertValues, ...updateValues);
+                return await scope
+                  .prepare(sql.text)
+                  .run(...insertValues, ...sql.params);
               });
+            },
+            executeExpectingOne: async () => {
+              const sql = buildInsertSql(table, insertColumns, {
+                kind: "do_update",
+                conflictColumns,
+                updateAssignments,
+              });
+              await createProjectionExecutableWrite(
+                scope,
+                sql.text,
+                [...insertValues, ...sql.params],
+                trackWrite,
+              ).executeExpectingOne();
             },
           };
         },
@@ -620,13 +894,194 @@ function createInsertConflictBuilder<TTable>(
   };
 }
 
+function createProjectionExecutableWrite(
+  scope: LedgerStorageScope,
+  sql: string,
+  params: readonly unknown[],
+  trackWrite: ProjectionWriteTracker,
+): ProjectionExecutableWrite {
+  return {
+    execute: () => {
+      return trackWrite(async () => {
+        return await scope.prepare(sql).run(...params);
+      });
+    },
+    executeExpectingOne: async () => {
+      const result = await trackWrite(async () => {
+        return await scope.prepare(sql).run(...params);
+      });
+      assertProjectionWriteChangedOne(result);
+    },
+  };
+}
+
+function assertProjectionWriteChangedOne(result: ProjectionWriteResult): void {
+  if (result.changes !== 1) {
+    throw new Error(
+      `expected projection write to change one row but changed ${result.changes}`,
+    );
+  }
+}
+
+function createProjectionUpdateWhereBuilder<TTable>(
+  scope: LedgerStorageScope,
+  table: ProjectionTableMetadata,
+  updateAssignments: readonly ProjectionUpdateAssignment[],
+  whereClauses: readonly ProjectionWhereClause[],
+  trackWrite: ProjectionWriteTracker,
+): ProjectionUpdateWhereBuilder<TTable> {
+  const executable = () => {
+    const sql = buildUpdateSql(table, updateAssignments, whereClauses);
+    return createProjectionExecutableWrite(
+      scope,
+      sql.text,
+      sql.params,
+      trackWrite,
+    );
+  };
+
+  return {
+    execute: () => executable().execute(),
+    executeExpectingOne: () => executable().executeExpectingOne(),
+    where: (columnName, operator, value) => {
+      return createProjectionUpdateWhereBuilder(
+        scope,
+        table,
+        updateAssignments,
+        [
+          ...whereClauses,
+          createProjectionComparisonWhereClause(
+            table,
+            String(columnName),
+            operator,
+            value,
+          ),
+        ],
+        trackWrite,
+      );
+    },
+    whereIn: (columnName, values) => {
+      return createProjectionUpdateWhereBuilder(
+        scope,
+        table,
+        updateAssignments,
+        [
+          ...whereClauses,
+          createProjectionInWhereClause(table, String(columnName), values),
+        ],
+        trackWrite,
+      );
+    },
+    whereNotNull: (columnName) => {
+      return createProjectionUpdateWhereBuilder(
+        scope,
+        table,
+        updateAssignments,
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(table, String(columnName), true),
+        ],
+        trackWrite,
+      );
+    },
+    whereNull: (columnName) => {
+      return createProjectionUpdateWhereBuilder(
+        scope,
+        table,
+        updateAssignments,
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(table, String(columnName), false),
+        ],
+        trackWrite,
+      );
+    },
+  };
+}
+
+function createProjectionDeleteBuilder<TTable>(
+  scope: LedgerStorageScope,
+  table: ProjectionTableMetadata,
+  whereClauses: readonly ProjectionWhereClause[],
+  trackWrite: ProjectionWriteTracker,
+): ProjectionDeleteBuilder<TTable> {
+  const executable = () => {
+    const sql = buildDeleteSql(table, whereClauses);
+    return createProjectionExecutableWrite(
+      scope,
+      sql.text,
+      sql.params,
+      trackWrite,
+    );
+  };
+
+  return {
+    execute: () => executable().execute(),
+    executeExpectingOne: () => executable().executeExpectingOne(),
+    where: (columnName, operator, value) => {
+      return createProjectionDeleteBuilder(
+        scope,
+        table,
+        [
+          ...whereClauses,
+          createProjectionComparisonWhereClause(
+            table,
+            String(columnName),
+            operator,
+            value,
+          ),
+        ],
+        trackWrite,
+      );
+    },
+    whereIn: (columnName, values) => {
+      return createProjectionDeleteBuilder(
+        scope,
+        table,
+        [
+          ...whereClauses,
+          createProjectionInWhereClause(table, String(columnName), values),
+        ],
+        trackWrite,
+      );
+    },
+    whereNotNull: (columnName) => {
+      return createProjectionDeleteBuilder(
+        scope,
+        table,
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(table, String(columnName), true),
+        ],
+        trackWrite,
+      );
+    },
+    whereNull: (columnName) => {
+      return createProjectionDeleteBuilder(
+        scope,
+        table,
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(table, String(columnName), false),
+        ],
+        trackWrite,
+      );
+    },
+  };
+}
+
 function createProjectionReadDatabase<
   TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema>,
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
-): ProjectionReadDatabase<TProjectionSchema> {
+  events: TEvents,
+): ProjectionReadDatabase<TProjectionSchema, TEvents> {
   return {
+    readEvent: async (ref) => {
+      return await readProjectionEvent(scope, events, ref);
+    },
     selectFrom: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
 
@@ -634,16 +1089,52 @@ function createProjectionReadDatabase<
         select: (columns) => {
           validateProjectionColumns("selected columns", table, columns);
 
-          return createProjectionExecutableSelect(scope, table, columns, []);
+          return createProjectionExecutableSelect(
+            scope,
+            table,
+            columns,
+            [],
+            [],
+            null,
+          );
         },
       };
     },
   };
 }
 
-type ProjectionWhereClause = {
+type ProjectionWhereClause =
+  | {
+      readonly columnName: string;
+      readonly kind: "comparison";
+      readonly operator: ProjectionWhereOperator;
+      readonly value: unknown;
+    }
+  | {
+      readonly columnName: string;
+      readonly kind: "in";
+      readonly values: readonly unknown[];
+    }
+  | {
+      readonly columnName: string;
+      readonly kind: "null";
+      readonly not: boolean;
+    };
+
+type ProjectionOrderClause = {
   readonly columnName: string;
-  readonly value: unknown;
+  readonly direction: ProjectionOrderDirection;
+};
+
+type CompiledProjectionSql = {
+  readonly params: readonly unknown[];
+  readonly text: string;
+};
+
+type ProjectionUpdateAssignment = {
+  readonly columnName: string;
+  readonly params: readonly unknown[];
+  readonly sql: string;
 };
 
 function createProjectionExecutableSelect<
@@ -654,34 +1145,106 @@ function createProjectionExecutableSelect<
   table: ProjectionTableMetadata,
   selectedColumns: TColumnNames,
   whereClauses: readonly ProjectionWhereClause[],
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
 ): ProjectionExecutableSelect<TTable, TColumnNames> {
   return {
-    where: (columnName, operator, value) => {
-      if (operator !== "=") {
-        throw new Error(`unsupported projection where operator ${operator}`);
-      }
-
-      validateProjectionColumns("where column", table, [String(columnName)]);
-      const column = table.columns[String(columnName)];
-      const serializedValue = serializeProjectionColumnValue(
-        column,
-        value,
-        `${table.name}.${String(columnName)}`,
+    limit: (limit) => {
+      validateProjectionLimit(limit);
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        whereClauses,
+        orderClauses,
+        limit,
       );
+    },
+    orderBy: (columnName, direction = "asc") => {
+      validateProjectionColumns("order column", table, [String(columnName)]);
+      validateProjectionOrderDirection(direction);
 
-      return createProjectionExecutableSelect(scope, table, selectedColumns, [
-        ...whereClauses,
-        {
-          columnName: String(columnName),
-          value: serializedValue,
-        },
-      ]);
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        whereClauses,
+        [
+          ...orderClauses,
+          {
+            columnName: String(columnName),
+            direction,
+          },
+        ],
+        limitClause,
+      );
+    },
+    where: (columnName, operator, value) => {
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        [
+          ...whereClauses,
+          createProjectionComparisonWhereClause(
+            table,
+            String(columnName),
+            operator,
+            value,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    whereIn: (columnName, values) => {
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        [
+          ...whereClauses,
+          createProjectionInWhereClause(table, String(columnName), values),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    whereNotNull: (columnName) => {
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(table, String(columnName), true),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    whereNull: (columnName) => {
+      return createProjectionExecutableSelect(
+        scope,
+        table,
+        selectedColumns,
+        [
+          ...whereClauses,
+          createProjectionNullWhereClause(table, String(columnName), false),
+        ],
+        orderClauses,
+        limitClause,
+      );
     },
     execute: async () => {
-      const sql = buildSelectSql(table, selectedColumns, whereClauses);
-      const rows = await scope
-        .prepare(sql)
-        .all(...whereClauses.map((clause) => clause.value));
+      const sql = buildSelectSql(
+        table,
+        selectedColumns,
+        whereClauses,
+        orderClauses,
+        limitClause,
+      );
+      const rows = await scope.prepare(sql.text).all(...sql.params);
 
       const decodedRows = rows.map((row) => {
         return decodeProjectionSelectedRow(table, selectedColumns, row);
@@ -693,10 +1256,14 @@ function createProjectionExecutableSelect<
       >[];
     },
     executeTakeFirst: async () => {
-      const sql = `${buildSelectSql(table, selectedColumns, whereClauses)} LIMIT 1`;
-      const row = await scope
-        .prepare(sql)
-        .get(...whereClauses.map((clause) => clause.value));
+      const sql = buildSelectSql(
+        table,
+        selectedColumns,
+        whereClauses,
+        orderClauses,
+        1,
+      );
+      const row = await scope.prepare(sql.text).get(...sql.params);
 
       if (row === undefined) {
         return null;
@@ -708,6 +1275,268 @@ function createProjectionExecutableSelect<
         row,
       ) as ProjectionSelectedRow<TTable, TColumnNames>;
     },
+    stream: async function* () {
+      const sql = buildSelectSql(
+        table,
+        selectedColumns,
+        whereClauses,
+        orderClauses,
+        limitClause,
+      );
+      const rows = await scope.prepare(sql.text).all(...sql.params);
+
+      for (const row of rows) {
+        yield decodeProjectionSelectedRow(
+          table,
+          selectedColumns,
+          row,
+        ) as ProjectionSelectedRow<TTable, TColumnNames>;
+      }
+    },
+  };
+}
+
+function resolveProjectionUpdateSet<TTable>(
+  table: ProjectionTableMetadata,
+  values: ProjectionUpdateSet<TTable>,
+): ProjectionUpdateRow<TTable> {
+  if (typeof values !== "function") {
+    return values;
+  }
+
+  return values(createProjectionExpressionBuilder(table));
+}
+
+function resolveProjectionUpsertUpdateSet<TTable>(
+  table: ProjectionTableMetadata,
+  values: ProjectionUpsertUpdateSet<TTable>,
+): ProjectionUpdateRow<TTable> {
+  if (typeof values !== "function") {
+    return values;
+  }
+
+  return values(createProjectionUpsertExpressionBuilder(table));
+}
+
+function createProjectionExpressionBuilder<TTable>(
+  table: ProjectionTableMetadata,
+): ProjectionExpressionBuilder<TTable> {
+  return {
+    coalesce: (columnName, value) => {
+      const stringColumnName = String(columnName);
+      validateProjectionColumns("coalesce column", table, [stringColumnName]);
+      return createProjectionExpression({
+        kind: "coalesce",
+        columnName: stringColumnName,
+        value: createProjectionExpressionOperandMetadata(
+          stringColumnName,
+          value,
+        ),
+      });
+    },
+    column: (columnName) => {
+      const stringColumnName = String(columnName);
+      validateProjectionColumns("expression column", table, [stringColumnName]);
+      return createProjectionExpression({
+        kind: "column",
+        columnName: stringColumnName,
+      });
+    },
+    max: (columnName, value) => {
+      const stringColumnName = String(columnName);
+      validateProjectionColumns("max column", table, [stringColumnName]);
+      return createProjectionExpression({
+        kind: "max",
+        columnName: stringColumnName,
+        value: createProjectionExpressionOperandMetadata(
+          stringColumnName,
+          value,
+        ),
+      });
+    },
+  };
+}
+
+function createProjectionUpsertExpressionBuilder<TTable>(
+  table: ProjectionTableMetadata,
+): ProjectionUpsertExpressionBuilder<TTable> {
+  return {
+    ...createProjectionExpressionBuilder(table),
+    excluded: (columnName) => {
+      const stringColumnName = String(columnName);
+      validateProjectionColumns("excluded column", table, [stringColumnName]);
+      return createProjectionExpression({
+        kind: "excluded",
+        columnName: stringColumnName,
+      });
+    },
+  };
+}
+
+function createProjectionExpression<TValue>(
+  metadata: ProjectionExpressionMetadata,
+): ProjectionExpression<TValue> {
+  return {
+    metadata,
+  };
+}
+
+function createProjectionExpressionOperandMetadata(
+  columnName: string,
+  value: unknown,
+): ProjectionExpressionOperandMetadata {
+  if (isProjectionExpression(value)) {
+    return value.metadata;
+  }
+
+  return {
+    kind: "value",
+    columnName,
+    value,
+  };
+}
+
+function isProjectionExpression(
+  value: unknown,
+): value is ProjectionExpression<unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const metadata = (value as { readonly metadata?: unknown }).metadata;
+
+  if (typeof metadata !== "object" || metadata === null) {
+    return false;
+  }
+
+  return "kind" in metadata;
+}
+
+function readProjectionUpdateAssignments(
+  table: ProjectionTableMetadata,
+  values: ProjectionUpdateRow<unknown>,
+  allowExcluded: boolean,
+): readonly ProjectionUpdateAssignment[] {
+  const updateValuesByColumn = values as Readonly<Record<string, unknown>>;
+  const updateColumns = validateProjectionWriteRow(
+    "update values",
+    table,
+    updateValuesByColumn,
+    false,
+  );
+
+  return updateColumns.map((columnName) => {
+    const value = updateValuesByColumn[columnName];
+
+    if (isProjectionExpression(value)) {
+      const compiled = compileProjectionExpression(
+        table,
+        value.metadata,
+        allowExcluded,
+      );
+
+      return {
+        columnName,
+        params: compiled.params,
+        sql: compiled.text,
+      };
+    }
+
+    return {
+      columnName,
+      params: [
+        serializeProjectionColumnValue(
+          table.columns[columnName],
+          value,
+          `${table.name}.${columnName}`,
+        ),
+      ],
+      sql: "?",
+    };
+  });
+}
+
+function compileProjectionExpression(
+  table: ProjectionTableMetadata,
+  expression: ProjectionExpressionMetadata,
+  allowExcluded: boolean,
+): CompiledProjectionSql {
+  switch (expression.kind) {
+    case "coalesce": {
+      validateProjectionColumns("coalesce column", table, [
+        expression.columnName,
+      ]);
+      const value = compileProjectionExpressionOperand(
+        table,
+        expression.value,
+        allowExcluded,
+      );
+
+      return {
+        params: value.params,
+        text: `COALESCE(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+      };
+    }
+    case "column":
+      validateProjectionColumns("expression column", table, [
+        expression.columnName,
+      ]);
+      return {
+        params: [],
+        text: quoteIdentifier(expression.columnName),
+      };
+    case "excluded":
+      if (!allowExcluded) {
+        throw new Error(
+          "excluded column expressions are only valid in upserts",
+        );
+      }
+
+      validateProjectionColumns("excluded column", table, [
+        expression.columnName,
+      ]);
+      return {
+        params: [],
+        text: `excluded.${quoteIdentifier(expression.columnName)}`,
+      };
+    case "max": {
+      validateProjectionColumns("max column", table, [expression.columnName]);
+      const value = compileProjectionExpressionOperand(
+        table,
+        expression.value,
+        allowExcluded,
+      );
+
+      return {
+        params: value.params,
+        text: `MAX(${quoteIdentifier(expression.columnName)}, ${value.text})`,
+      };
+    }
+  }
+}
+
+function compileProjectionExpressionOperand(
+  table: ProjectionTableMetadata,
+  operand: ProjectionExpressionOperandMetadata,
+  allowExcluded: boolean,
+): CompiledProjectionSql {
+  if (operand.kind !== "value") {
+    return compileProjectionExpression(table, operand, allowExcluded);
+  }
+
+  validateProjectionColumns("expression value column", table, [
+    operand.columnName,
+  ]);
+
+  return {
+    params: [
+      serializeProjectionColumnValue(
+        table.columns[operand.columnName],
+        operand.value,
+        `${table.name}.${operand.columnName}`,
+      ),
+    ],
+    text: "?",
   };
 }
 
@@ -723,41 +1552,57 @@ function buildInsertSql(
     | {
         readonly kind: "do_update";
         readonly conflictColumns: readonly string[];
-        readonly updateColumns: readonly string[];
+        readonly updateAssignments: readonly ProjectionUpdateAssignment[];
       },
-): string {
+): CompiledProjectionSql {
   const columnSql = insertColumns.map(quoteIdentifier).join(", ");
   const valuesSql = insertColumns.map(() => "?").join(", ");
   let sql = `INSERT INTO ${quoteIdentifier(table.name)} (${columnSql}) VALUES (${valuesSql})`;
 
   if (conflict === null) {
-    return sql;
+    return {
+      params: [],
+      text: sql,
+    };
   }
 
   const conflictSql = conflict.conflictColumns.map(quoteIdentifier).join(", ");
 
   if (conflict.kind === "do_nothing") {
     sql += ` ON CONFLICT (${conflictSql}) DO NOTHING`;
-    return sql;
+    return {
+      params: [],
+      text: sql,
+    };
   }
 
-  if (conflict.updateColumns.length === 0) {
+  if (conflict.updateAssignments.length === 0) {
     throw new Error("update values must include at least one column");
   }
 
-  const updateSql = conflict.updateColumns
-    .map((columnName) => `${quoteIdentifier(columnName)} = ?`)
+  const updateSql = conflict.updateAssignments
+    .map(
+      (assignment) =>
+        `${quoteIdentifier(assignment.columnName)} = ${assignment.sql}`,
+    )
     .join(", ");
   sql += ` ON CONFLICT (${conflictSql}) DO UPDATE SET ${updateSql}`;
 
-  return sql;
+  return {
+    params: conflict.updateAssignments.flatMap((assignment) => [
+      ...assignment.params,
+    ]),
+    text: sql,
+  };
 }
 
 function buildSelectSql(
   table: ProjectionTableMetadata,
   selectedColumns: readonly string[],
   whereClauses: readonly ProjectionWhereClause[],
-): string {
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
+): CompiledProjectionSql {
   const selectedSql = selectedColumns
     .map((columnName) => {
       const quotedColumnName = quoteIdentifier(columnName);
@@ -765,17 +1610,172 @@ function buildSelectSql(
     })
     .join(", ");
   let sql = `SELECT ${selectedSql} FROM ${quoteIdentifier(table.name)}`;
+  const params: unknown[] = [];
 
-  if (whereClauses.length === 0) {
-    return sql;
+  const whereSql = buildWhereSql(whereClauses);
+  if (whereSql.text.length > 0) {
+    sql += ` WHERE ${whereSql.text}`;
+    params.push(...whereSql.params);
   }
 
-  const whereSql = whereClauses
-    .map((clause) => `${quoteIdentifier(clause.columnName)} = ?`)
-    .join(" AND ");
-  sql += ` WHERE ${whereSql}`;
+  if (orderClauses.length > 0) {
+    const orderSql = orderClauses
+      .map((clause) => {
+        return `${quoteIdentifier(clause.columnName)} ${clause.direction.toUpperCase()}`;
+      })
+      .join(", ");
+    sql += ` ORDER BY ${orderSql}`;
+  }
 
-  return sql;
+  if (limitClause !== null) {
+    sql += " LIMIT ?";
+    params.push(limitClause);
+  }
+
+  return {
+    params,
+    text: sql,
+  };
+}
+
+function buildUpdateSql(
+  table: ProjectionTableMetadata,
+  assignments: readonly ProjectionUpdateAssignment[],
+  whereClauses: readonly ProjectionWhereClause[],
+): CompiledProjectionSql {
+  if (assignments.length === 0) {
+    throw new Error("update values must include at least one column");
+  }
+
+  const params: unknown[] = [];
+  const setSql = assignments
+    .map((assignment) => {
+      params.push(...assignment.params);
+      return `${quoteIdentifier(assignment.columnName)} = ${assignment.sql}`;
+    })
+    .join(", ");
+  let sql = `UPDATE ${quoteIdentifier(table.name)} SET ${setSql}`;
+  const whereSql = buildWhereSql(whereClauses);
+
+  if (whereSql.text.length > 0) {
+    sql += ` WHERE ${whereSql.text}`;
+    params.push(...whereSql.params);
+  }
+
+  return {
+    params,
+    text: sql,
+  };
+}
+
+function buildDeleteSql(
+  table: ProjectionTableMetadata,
+  whereClauses: readonly ProjectionWhereClause[],
+): CompiledProjectionSql {
+  let sql = `DELETE FROM ${quoteIdentifier(table.name)}`;
+  const whereSql = buildWhereSql(whereClauses);
+
+  if (whereSql.text.length > 0) {
+    sql += ` WHERE ${whereSql.text}`;
+  }
+
+  return {
+    params: whereSql.params,
+    text: sql,
+  };
+}
+
+function buildWhereSql(
+  whereClauses: readonly ProjectionWhereClause[],
+): CompiledProjectionSql {
+  if (whereClauses.length === 0) {
+    return {
+      params: [],
+      text: "",
+    };
+  }
+
+  const params: unknown[] = [];
+  const text = whereClauses
+    .map((clause) => {
+      switch (clause.kind) {
+        case "comparison":
+          params.push(clause.value);
+          return `${quoteIdentifier(clause.columnName)} ${clause.operator} ?`;
+        case "in":
+          if (clause.values.length === 0) {
+            return "0 = 1";
+          }
+
+          params.push(...clause.values);
+          return `${quoteIdentifier(clause.columnName)} IN (${clause.values
+            .map(() => "?")
+            .join(", ")})`;
+        case "null":
+          return `${quoteIdentifier(clause.columnName)} IS ${clause.not ? "NOT " : ""}NULL`;
+      }
+    })
+    .join(" AND ");
+
+  return {
+    params,
+    text,
+  };
+}
+
+function createProjectionComparisonWhereClause(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  operator: ProjectionWhereOperator,
+  value: unknown,
+): ProjectionWhereClause {
+  validateProjectionColumns("where column", table, [columnName]);
+  validateProjectionWhereOperator(operator);
+
+  return {
+    columnName,
+    kind: "comparison",
+    operator,
+    value: serializeProjectionColumnValue(
+      table.columns[columnName],
+      value,
+      `${table.name}.${columnName}`,
+    ),
+  };
+}
+
+function createProjectionInWhereClause(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  values: readonly unknown[],
+): ProjectionWhereClause {
+  validateProjectionColumns("where column", table, [columnName]);
+
+  return {
+    columnName,
+    kind: "in",
+    values: values.map((value) => {
+      return serializeProjectionColumnValue(
+        table.columns[columnName],
+        value,
+        `${table.name}.${columnName}`,
+      );
+    }),
+  };
+}
+
+function createProjectionNullWhereClause(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  not: boolean,
+): ProjectionWhereClause {
+  validateProjectionColumns("where column", table, [columnName]);
+
+  return {
+    columnName,
+    kind: "null",
+    not,
+  };
 }
 
 function readProjectionTable(
@@ -854,6 +1854,36 @@ function validateProjectionKey(
   }
 }
 
+function validateProjectionLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new Error("projection limit must be a non-negative safe integer");
+  }
+}
+
+function validateProjectionOrderDirection(
+  direction: ProjectionOrderDirection,
+): void {
+  if (direction !== "asc" && direction !== "desc") {
+    throw new Error(`unsupported projection order direction ${direction}`);
+  }
+}
+
+function validateProjectionWhereOperator(
+  operator: ProjectionWhereOperator,
+): void {
+  switch (operator) {
+    case "!=":
+    case "<":
+    case "<=":
+    case "=":
+    case ">":
+    case ">=":
+      return;
+  }
+
+  throw new Error(`unsupported projection where operator ${operator}`);
+}
+
 function serializeProjectionColumnValue(
   column: ProjectionColumnMetadata | undefined,
   value: unknown,
@@ -885,6 +1915,62 @@ function serializeProjectionColumnValue(
     case "text":
       return serializeString(value, context);
   }
+}
+
+async function readProjectionEvent<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  scope: LedgerStorageScope,
+  events: TEvents,
+  ref: EventRef<TEventName>,
+): Promise<EventEnvelope<TEvents, TEventName> | null> {
+  const eventName = ref.eventName;
+  const eventSchema = events[eventName];
+
+  if (eventSchema === undefined) {
+    throw new Error(
+      `projection event ref references unknown event ${eventName}`,
+    );
+  }
+
+  const row = await scope
+    .prepare(
+      `SELECT event_id, ts_ms, event_name, payload_json, causation_event_id, dedupe_key
+       FROM events
+       WHERE event_id = ?
+         AND event_name = ?
+         AND signal = 0`,
+    )
+    .get(ref.eventId, eventName);
+
+  if (row === undefined) {
+    return null;
+  }
+
+  const decodedRow = Value.Decode(ProjectionEventRowSchema, row);
+
+  if (decodedRow.event_name !== eventName) {
+    throw new Error(
+      `projection event ref expected ${eventName} but storage returned ${decodedRow.event_name}`,
+    );
+  }
+
+  const payload = Value.Decode(
+    eventSchema,
+    parseJson(decodedRow.payload_json, "events.payload_json"),
+  ) as Static<TEvents[TEventName]>;
+  const typedRef = ref as EventRef<Extract<TEventName, string>>;
+
+  return {
+    causationEventId: decodedRow.causation_event_id,
+    dedupeKey: decodedRow.dedupe_key,
+    eventId: decodedRow.event_id,
+    eventName,
+    payload,
+    ref: typedRef,
+    tsMs: decodedRow.ts_ms,
+  };
 }
 
 function decodeProjectionSelectedRow(

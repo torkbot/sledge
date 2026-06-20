@@ -322,8 +322,8 @@ test("projection access compiles typed indexer and query definitions to storage 
 
   assert.deepEqual(fake.calls[1], {
     method: "get",
-    params: ["u_123"],
-    sql: 'SELECT "userId" AS "userId", "email" AS "email", "source" AS "source" FROM "users" WHERE "userId" = ? LIMIT 1',
+    params: ["u_123", 1],
+    sql: 'SELECT "userId" AS "userId", "email" AS "email", "source" AS "source" FROM "users" WHERE "userId" = ? LIMIT ?',
   });
   assert.deepEqual(row, {
     userId: "u_123",
@@ -651,6 +651,280 @@ test("projection access rejects non-serializable JSON values before storage", as
     );
   }, /jsonRows\.metadata\.nested must be JSON-serializable/);
   assert.deepEqual(invalidUpdateFake.calls, []);
+});
+
+test("projection access supports stateful indexers and ordered range queries", async () => {
+  const stateSchema = defineMaterializationSchema({
+    namespace: "stateful",
+    version: 1,
+    tables: {
+      runState: (t) =>
+        t
+          .columns({
+            runId: t.text().notNull(),
+            latestInputEventId: t.integer().notNull(),
+            messageJson: t.text(),
+          })
+          .primaryKey(["runId"]),
+    },
+  });
+  const stateMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(stateSchema, (m) => [
+      m.migration(1, "create run state", (s) => [
+        s.createTable("runState", (t) =>
+          t
+            .columns({
+              runId: t.text().notNull(),
+              latestInputEventId: t.integer().notNull(),
+              messageJson: t.text(),
+            })
+            .primaryKey(["runId"]),
+        ),
+      ]),
+    ]),
+    indexers: {
+      checkpoint: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          runId: Type.String(),
+          inputEventId: Type.Number(),
+          messageJson: Type.String(),
+        }),
+      },
+      remove: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          runId: Type.String(),
+        }),
+      },
+    },
+    queries: {
+      due: {
+        params: Type.Object({
+          afterEventId: Type.Number(),
+          limit: Type.Number(),
+        }),
+        result: Type.Array(
+          Type.Object({
+            runId: Type.String(),
+            latestInputEventId: Type.Number(),
+            messageJson: Type.Union([Type.Null(), Type.String()]),
+          }),
+        ),
+      },
+    },
+  });
+  const stateModel = withMaterializations(
+    shape,
+    stateMaterializations,
+  ).register({
+    indexers: {
+      checkpoint: async ({ input, db }) => {
+        const current = await db
+          .selectFrom("runState")
+          .select(["latestInputEventId"])
+          .where("runId", "=", input.runId)
+          .executeTakeFirst();
+
+        if (
+          current !== null &&
+          current.latestInputEventId > input.inputEventId
+        ) {
+          return;
+        }
+
+        await db
+          .insertInto("runState")
+          .values({
+            runId: input.runId,
+            latestInputEventId: input.inputEventId,
+            messageJson: input.messageJson,
+          })
+          .onConflict(["runId"])
+          .doUpdateSet((e) => ({
+            latestInputEventId: e.max(
+              "latestInputEventId",
+              e.excluded("latestInputEventId"),
+            ),
+            messageJson: e.coalesce("messageJson", e.excluded("messageJson")),
+          }))
+          .execute();
+      },
+      remove: async ({ input, db }) => {
+        const result = await db
+          .deleteFrom("runState")
+          .where("runId", "=", input.runId)
+          .execute();
+
+        assert.equal(result.changes, 1);
+      },
+    },
+    queries: {
+      due: async ({ params, db }) => {
+        const rows = await db
+          .selectFrom("runState")
+          .select(["runId", "latestInputEventId", "messageJson"])
+          .where("latestInputEventId", ">", params.afterEventId)
+          .whereNull("messageJson")
+          .orderBy("latestInputEventId", "asc")
+          .orderBy("runId")
+          .limit(params.limit)
+          .execute();
+
+        return [...rows];
+      },
+    },
+  });
+  const implementations = readTestLedgerImplementations(stateModel);
+  const checkpoint = implementations.indexers?.checkpoint;
+  const remove = implementations.indexers?.remove;
+  const due = implementations.queries?.due;
+
+  if (checkpoint === undefined) {
+    throw new Error("expected checkpoint indexer implementation");
+  }
+
+  if (remove === undefined) {
+    throw new Error("expected remove indexer implementation");
+  }
+
+  if (due === undefined) {
+    throw new Error("expected due query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        runId: "run_1",
+        latestInputEventId: 10,
+        messageJson: null,
+      },
+    ],
+    getRow: {
+      latestInputEventId: 1,
+    },
+  });
+
+  await checkpoint(
+    fake.scope,
+    {
+      runId: "run_1",
+      inputEventId: 10,
+      messageJson: "hello",
+    },
+    createUserCreatedContext(42),
+  );
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: ["run_1", 1],
+    sql: 'SELECT "latestInputEventId" AS "latestInputEventId" FROM "runState" WHERE "runId" = ? LIMIT ?',
+  });
+  assert.deepEqual(fake.calls[1], {
+    method: "run",
+    params: ["run_1", 10, "hello"],
+    sql: 'INSERT INTO "runState" ("runId", "latestInputEventId", "messageJson") VALUES (?, ?, ?) ON CONFLICT ("runId") DO UPDATE SET "latestInputEventId" = MAX("latestInputEventId", excluded."latestInputEventId"), "messageJson" = COALESCE("messageJson", excluded."messageJson")',
+  });
+
+  const rows = await due(fake.scope, {
+    afterEventId: 0,
+    limit: 25,
+  });
+
+  assert.deepEqual(fake.calls[2], {
+    method: "all",
+    params: [0, 25],
+    sql: 'SELECT "runId" AS "runId", "latestInputEventId" AS "latestInputEventId", "messageJson" AS "messageJson" FROM "runState" WHERE "latestInputEventId" > ? AND "messageJson" IS NULL ORDER BY "latestInputEventId" ASC, "runId" ASC LIMIT ?',
+  });
+  assert.deepEqual(rows, [
+    {
+      runId: "run_1",
+      latestInputEventId: 10,
+      messageJson: null,
+    },
+  ]);
+
+  await remove(
+    fake.scope,
+    {
+      runId: "run_1",
+    },
+    createUserCreatedContext(43),
+  );
+
+  assert.deepEqual(fake.calls[3], {
+    method: "run",
+    params: ["run_1"],
+    sql: 'DELETE FROM "runState" WHERE "runId" = ?',
+  });
+});
+
+test("projection access hydrates semantic event references without exposing events table", async () => {
+  const eventMaterializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {
+      sourceEvent: {
+        params: Type.Object({
+          eventId: Type.Number(),
+        }),
+        result: Type.Union([Type.Null(), UserCreatedSchema]),
+      },
+    },
+  });
+  const eventModel = withMaterializations(
+    shape,
+    eventMaterializations,
+  ).register({
+    queries: {
+      sourceEvent: async ({ params, db }) => {
+        const event = await db.readEvent(
+          createEventRef("user.created", params.eventId),
+        );
+
+        return event === null ? null : event.payload;
+      },
+    },
+  });
+  const sourceEvent =
+    readTestLedgerImplementations(eventModel).queries?.sourceEvent;
+
+  if (sourceEvent === undefined) {
+    throw new Error("expected sourceEvent query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      causation_event_id: null,
+      dedupe_key: null,
+      event_id: 42,
+      event_name: "user.created",
+      payload_json: JSON.stringify({
+        userId: "u_123",
+        email: "alice@example.com",
+      }),
+      ts_ms: 1_000,
+    },
+  });
+
+  const payload = await sourceEvent(fake.scope, {
+    eventId: 42,
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: [42, "user.created"],
+    sql: `SELECT event_id, ts_ms, event_name, payload_json, causation_event_id, dedupe_key
+       FROM events
+       WHERE event_id = ?
+         AND event_name = ?
+         AND signal = 0`,
+  });
+  assert.deepEqual(payload, {
+    userId: "u_123",
+    email: "alice@example.com",
+  });
 });
 
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
@@ -1494,6 +1768,17 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .onConflict(["email"])
           .doNothing()
           .execute();
+        await db
+          .updateTable("users")
+          .set((e) => ({
+            email: e.coalesce("email", "alice@example.com"),
+          }))
+          .where("userId", "!=", "u_123")
+          .execute();
+        db.updateTable("users").set((e) => ({
+          // @ts-expect-error normal updates cannot reference upsert excluded values.
+          email: e.excluded("email"),
+        }));
       },
     },
     queries: {
@@ -1512,13 +1797,24 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           void userId;
         }
 
+        const event = await db.readEvent(createEventRef("user.created", 1));
+
+        if (event !== null) {
+          const userId: string = event.payload.userId;
+          void userId;
+        }
+
+        // @ts-expect-error queries cannot mutate materialization tables.
+        db.updateTable("users");
+
         return null;
       },
     },
   } satisfies MaterializationImplementationRegistration<
     typeof typedSchema,
     typeof typedMaterializations.indexers,
-    typeof typedMaterializations.queries
+    typeof typedMaterializations.queries,
+    typeof shape.shape.events
   >;
 
   void typedImplementations;

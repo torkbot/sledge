@@ -48,6 +48,10 @@ const registeredLedgerModelBrand: unique symbol = Symbol(
 export type {
   ProjectionExecutableSelect,
   ProjectionExecutableWrite,
+  ProjectionDatabase,
+  ProjectionDeleteBuilder,
+  ProjectionExpression,
+  ProjectionExpressionBuilder,
   ProjectionIndexerContract,
   ProjectionIndexerDefinitions,
   ProjectionIndexerEvent,
@@ -56,6 +60,7 @@ export type {
   ProjectionInsertBuilder,
   ProjectionInsertConflictBuilder,
   ProjectionInsertOnConflictBuilder,
+  ProjectionOrderDirection,
   ProjectionQueryContract,
   ProjectionQueryDefinitions,
   ProjectionQueryImplementations,
@@ -64,8 +69,15 @@ export type {
   ProjectionSelectBuilder,
   ProjectionSelectedRow,
   ProjectionUpdateRow,
+  ProjectionUpdateSet,
+  ProjectionUpdateBuilder,
+  ProjectionUpdateWhereBuilder,
+  ProjectionUpsertExpressionBuilder,
+  ProjectionUpsertUpdateSet,
+  ProjectionWhereOperator,
   ProjectionWriteDatabase,
   ProjectionWriteRow,
+  ProjectionWriteResult,
 } from "./projection-access.ts";
 export { createEventRef };
 export type { EventRef };
@@ -576,7 +588,8 @@ export type RegisteredLedgerModel<
     ProjectionImplementationRegistration<
       TProjectionSchema,
       TIndexerDefinitions,
-      TQueryDefinitions
+      TQueryDefinitions,
+      TEvents
     >;
 };
 
@@ -949,10 +962,12 @@ export type MaterializationImplementationRegistration<
   TMaterializationSchema extends AnyMaterializationSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = ProjectionImplementationRegistration<
   TMaterializationSchema,
   TIndexerDefinitions,
-  TQueryDefinitions
+  TQueryDefinitions,
+  TEvents
 >;
 
 export function defineMaterializationSchema<
@@ -1091,7 +1106,8 @@ export type DefinedLedgerModel<
       ProjectionImplementationRegistration<
         TProjectionSchema,
         TIndexerDefinitions,
-        TQueryDefinitions
+        TQueryDefinitions,
+        TEvents
       >,
   ): RegisteredLedgerModel<
     TEvents,
@@ -2219,6 +2235,7 @@ function createDefinedLedgerModel<
     projections: input.access.projections,
     register: (register) => {
       const implementations = createProjectionImplementations({
+        events: input.shape.events,
         projections: input.access.projections,
         indexers: input.access.indexerDefinitions,
         queries: input.access.queryDefinitions,
