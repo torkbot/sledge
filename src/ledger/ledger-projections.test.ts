@@ -279,6 +279,161 @@ test("projection access compiles typed indexer and query definitions to storage 
   });
 });
 
+test("projection access rejects non-serializable JSON values before storage", async () => {
+  const jsonSchema = defineMaterializationSchema({
+    namespace: "json",
+    version: 1,
+    tables: {
+      jsonRows: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            metadata: t.json<unknown>().notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+  const jsonMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(jsonSchema, (m) => [
+      m.migration(1, "create json rows", (s) => [
+        s.createTable("jsonRows", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              metadata: t.json<unknown>().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]),
+    indexers: {
+      insertJson: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          userId: Type.String(),
+          metadata: Type.Unknown(),
+        }),
+      },
+      updateJson: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          userId: Type.String(),
+          metadata: Type.Unknown(),
+        }),
+      },
+    },
+    queries: {},
+  });
+  const registeredJsonModel = withMaterializations(
+    shape,
+    jsonMaterializations,
+  ).register({
+    indexers: {
+      insertJson: async ({ input, db }) => {
+        await db
+          .insertInto("jsonRows")
+          .values({
+            userId: input.userId,
+            metadata: input.metadata,
+          })
+          .execute();
+      },
+      updateJson: async ({ input, db }) => {
+        await db
+          .insertInto("jsonRows")
+          .values({
+            userId: input.userId,
+            metadata: {
+              existing: true,
+            },
+          })
+          .onConflict(["userId"])
+          .doUpdateSet({
+            metadata: input.metadata,
+          })
+          .execute();
+      },
+    },
+  });
+  const insertJson = registeredJsonModel.implementations.indexers?.insertJson;
+  const updateJson = registeredJsonModel.implementations.indexers?.updateJson;
+
+  if (insertJson === undefined) {
+    throw new Error("expected insertJson indexer implementation");
+  }
+
+  if (updateJson === undefined) {
+    throw new Error("expected updateJson indexer implementation");
+  }
+
+  const validFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await insertJson(
+    validFake.scope,
+    {
+      userId: "u_json",
+      metadata: {
+        active: true,
+        count: 1,
+        tags: ["alpha"],
+      },
+    },
+    createUserCreatedContext(42),
+  );
+
+  assert.deepEqual(validFake.calls[0], {
+    method: "run",
+    params: [
+      "u_json",
+      JSON.stringify({
+        active: true,
+        count: 1,
+        tags: ["alpha"],
+      }),
+    ],
+    sql: 'INSERT INTO "jsonRows" ("userId", "metadata") VALUES (?, ?)',
+  });
+
+  const invalidInsertFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await insertJson(
+      invalidInsertFake.scope,
+      {
+        userId: "u_json",
+        metadata: undefined,
+      },
+      createUserCreatedContext(43),
+    );
+  }, /jsonRows\.metadata must be JSON-serializable/);
+  assert.deepEqual(invalidInsertFake.calls, []);
+
+  const invalidUpdateFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await updateJson(
+      invalidUpdateFake.scope,
+      {
+        userId: "u_json",
+        metadata: {
+          nested: () => undefined,
+        },
+      },
+      createUserCreatedContext(44),
+    );
+  }, /jsonRows\.metadata\.nested must be JSON-serializable/);
+  assert.deepEqual(invalidUpdateFake.calls, []);
+});
+
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
   const registeredModel = definedModel.register({
     indexers: implementations.indexers,

@@ -811,7 +811,7 @@ function serializeProjectionColumnValue(
     case "integer":
       return serializeNumber(value, context);
     case "json":
-      return JSON.stringify(value);
+      return serializeJson(value, context);
     case "text":
       return serializeString(value, context);
   }
@@ -924,6 +924,94 @@ function decodeString(value: unknown, context: string): string {
   }
 
   return value;
+}
+
+function serializeJson(value: unknown, context: string): string {
+  validateJsonValue(value, context, new Set<object>());
+  const serialized = JSON.stringify(value);
+
+  if (typeof serialized !== "string") {
+    throw new Error(`${context} must be JSON-serializable`);
+  }
+
+  return serialized;
+}
+
+function validateJsonValue(
+  value: unknown,
+  context: string,
+  seen: Set<object>,
+): void {
+  if (value === null) {
+    return;
+  }
+
+  switch (typeof value) {
+    case "boolean":
+    case "string":
+      return;
+    case "number":
+      if (!Number.isFinite(value)) {
+        throw new Error(`${context} must be a finite JSON number`);
+      }
+
+      return;
+    case "bigint":
+    case "function":
+    case "symbol":
+    case "undefined":
+      throw new Error(`${context} must be JSON-serializable`);
+    case "object":
+      validateJsonObject(value, context, seen);
+      return;
+  }
+}
+
+function validateJsonObject(
+  value: object,
+  context: string,
+  seen: Set<object>,
+): void {
+  if (seen.has(value)) {
+    throw new Error(`${context} must not contain circular JSON values`);
+  }
+
+  seen.add(value);
+
+  try {
+    if (Array.isArray(value)) {
+      validateJsonArray(value, context, seen);
+      return;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error(`${context} must be a plain JSON object`);
+    }
+
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      throw new Error(`${context} must not contain symbol keys`);
+    }
+
+    for (const [key, item] of Object.entries(
+      value as Readonly<Record<string, unknown>>,
+    )) {
+      validateJsonValue(item, `${context}.${key}`, seen);
+    }
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function validateJsonArray(
+  value: readonly unknown[],
+  context: string,
+  seen: Set<object>,
+): void {
+  for (let index = 0; index < value.length; index += 1) {
+    validateJsonValue(value[index], `${context}[${index}]`, seen);
+  }
 }
 
 function serializeEventRef(

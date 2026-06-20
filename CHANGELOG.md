@@ -23,6 +23,8 @@
 - Add ledger-owned event refs on event envelopes so projection access callbacks
   can write semantic event references without exposing the internal events
   table.
+- Reject non-serializable JSON projection values at the facade boundary before
+  storage adapters receive bind parameters.
 
 ## 0.9.0 - 2026-05-20
 
