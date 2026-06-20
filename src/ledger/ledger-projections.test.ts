@@ -277,6 +277,38 @@ test("projection access compiles typed indexer and query definitions to storage 
       eventId: 42,
     },
   });
+
+  const invalidRefFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await indexer(
+      invalidRefFake.scope,
+      {
+        userId: "u_123",
+        email: "alice@example.com",
+      },
+      createUserCreatedContext(0),
+    );
+  }, /users\.source event reference id must be a positive safe integer/);
+  assert.deepEqual(invalidRefFake.calls, []);
+
+  const invalidStoredRefFake = createFakeScope({
+    allRows: [],
+    getRow: {
+      userId: "u_123",
+      email: "alice@example.com",
+      source: 0,
+    },
+  });
+
+  await assert.rejects(async () => {
+    await query(invalidStoredRefFake.scope, {
+      userId: "u_123",
+    });
+  }, /users\.source event reference id must be a positive safe integer/);
 });
 
 test("projection access rejects non-serializable JSON values before storage", async () => {
@@ -561,7 +593,9 @@ test("materialization histories validate versions and record typed operations", 
             userId: t.text().notNull(),
             email: t.text(),
           })
-          .primaryKey(["userId"]),
+          .primaryKey(["userId"])
+          .index("usersByEmail", ["email"])
+          .unique("usersByEmailUnique", ["email"]),
     },
   });
 
@@ -717,6 +751,115 @@ test("materialization histories validate versions and record typed operations", 
       ]),
     ]);
   }, /materialization history table users must match current schema columns/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+        s.createIndex("usersByEmail", "users", ["email"]),
+      ]),
+      m.migration(2, "add user email", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+      ]),
+    ]);
+  }, /materialization history index usersByEmail references unknown column email/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(2, "forget user email index", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+      ]),
+    ]);
+  }, /materialization history table users must match current schema keys/);
+});
+
+test("materialization histories replay foreign keys against current state", () => {
+  const relationSchema = defineMaterializationSchema({
+    namespace: "relation-history",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    },
+    relations: (r) => ({
+      sessionUser: r
+        .foreignKey("sessions", ["userId"])
+        .references("users", ["userId"]),
+    }),
+  });
+
+  assert.throws(() => {
+    defineMaterializationHistory(relationSchema, (m) => [
+      m.migration(1, "create relation tables", (s) => [
+        s.createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        ),
+        s.addForeignKey("sessionUser", (r) =>
+          r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
+        ),
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]);
+  }, /materialization history relation sessionUser references unknown table users/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(relationSchema, (m) => [
+      m.migration(1, "create relation tables", (s) => [
+        s.createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        ),
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]);
+  }, /materialization history must match current schema relations/);
 });
 
 test("withMaterializations rejects materialization event refs outside the ledger shape", () => {

@@ -1560,6 +1560,43 @@ function validateMaterializationTableMetadataMatch(
   if (!equalStringLists(expected.primaryKey, actual.primaryKey)) {
     throw new Error(`${context} must match current schema primary key`);
   }
+
+  if (!equalProjectionKeys(expected.keys, actual.keys)) {
+    throw new Error(`${context} must match current schema keys`);
+  }
+
+  if (!equalProjectionIndexes(expected.indexes, actual.indexes)) {
+    throw new Error(`${context} must match current schema indexes`);
+  }
+}
+
+function validateMaterializationRelationsMetadataMatch(
+  expected: Readonly<Record<string, ProjectionForeignKeyMetadata>>,
+  actual: ReadonlyMap<string, ProjectionForeignKeyMetadata>,
+): void {
+  const expectedNames = Object.keys(expected).sort();
+  const actualNames = [...actual.keys()].sort();
+
+  if (!equalStringLists(expectedNames, actualNames)) {
+    throw new Error(
+      "materialization history must match current schema relations",
+    );
+  }
+
+  for (const relationName of expectedNames) {
+    const expectedRelation = expected[relationName];
+    const actualRelation = actual.get(relationName);
+
+    if (
+      expectedRelation === undefined ||
+      actualRelation === undefined ||
+      !equalProjectionForeignKeyMetadata(expectedRelation, actualRelation)
+    ) {
+      throw new Error(
+        `materialization history relation ${relationName} must match current schema`,
+      );
+    }
+  }
 }
 
 function equalMaterializationColumnMetadata(
@@ -1588,6 +1625,60 @@ function equalStringLists(
   }
 
   return true;
+}
+
+function equalProjectionKeys(
+  left: readonly ProjectionTableMetadata["keys"][number][],
+  right: readonly ProjectionTableMetadata["keys"][number][],
+): boolean {
+  return equalSortedMetadataLists(left, right, projectionKeyIdentity);
+}
+
+function equalProjectionIndexes(
+  left: readonly ProjectionIndexMetadata[],
+  right: readonly ProjectionIndexMetadata[],
+): boolean {
+  return equalSortedMetadataLists(left, right, projectionIndexIdentity);
+}
+
+function equalSortedMetadataLists<T>(
+  left: readonly T[],
+  right: readonly T[],
+  identity: (value: T) => string,
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const leftIdentities = left.map(identity).sort();
+  const rightIdentities = right.map(identity).sort();
+
+  return equalStringLists(leftIdentities, rightIdentities);
+}
+
+function projectionKeyIdentity(
+  key: ProjectionTableMetadata["keys"][number],
+): string {
+  return `${key.kind}:${key.name ?? ""}:${key.columns.join(",")}`;
+}
+
+function projectionIndexIdentity(index: ProjectionIndexMetadata): string {
+  return `${index.unique ? "unique" : "index"}:${index.name}:${index.columns.join(
+    ",",
+  )}`;
+}
+
+function equalProjectionForeignKeyMetadata(
+  left: ProjectionForeignKeyMetadata,
+  right: ProjectionForeignKeyMetadata,
+): boolean {
+  return (
+    left.fromTable === right.fromTable &&
+    left.toTable === right.toTable &&
+    left.onDelete === right.onDelete &&
+    equalStringLists(left.fromColumns, right.fromColumns) &&
+    equalStringLists(left.toColumns, right.toColumns)
+  );
 }
 
 function readMaterializationColumnMetadata(
@@ -1730,16 +1821,22 @@ function validateMaterializationHistoryResult(
   current: AnyMaterializationSchema,
   migrations: readonly MaterializationMigration[],
 ): void {
-  const tables = new Map<string, ProjectionTableMetadata>();
+  const state: MaterializationHistoryReplayState = {
+    relations: new Map(),
+    tables: new Map(),
+  };
 
   for (const migration of migrations) {
     for (const operation of migration.operations) {
-      applyMaterializationMigrationOperation(tables, operation);
+      applyMaterializationMigrationOperation(state, operation);
     }
   }
 
   if (
-    !equalStringLists([...tables.keys()], Object.keys(current.metadata.tables))
+    !equalStringLists(
+      [...state.tables.keys()].sort(),
+      Object.keys(current.metadata.tables).sort(),
+    )
   ) {
     throw new Error("materialization history must match current schema tables");
   }
@@ -1747,7 +1844,7 @@ function validateMaterializationHistoryResult(
   for (const [tableName, expectedTable] of Object.entries(
     current.metadata.tables,
   )) {
-    const actualTable = tables.get(tableName);
+    const actualTable = state.tables.get(tableName);
 
     if (actualTable === undefined) {
       throw new Error(
@@ -1761,24 +1858,34 @@ function validateMaterializationHistoryResult(
       actualTable,
     );
   }
+
+  validateMaterializationRelationsMetadataMatch(
+    current.metadata.relations,
+    state.relations,
+  );
 }
 
+type MaterializationHistoryReplayState = {
+  readonly relations: Map<string, ProjectionForeignKeyMetadata>;
+  readonly tables: Map<string, ProjectionTableMetadata>;
+};
+
 function applyMaterializationMigrationOperation(
-  tables: Map<string, ProjectionTableMetadata>,
+  state: MaterializationHistoryReplayState,
   operation: MaterializationMigrationOperation,
 ): void {
   switch (operation.kind) {
     case "create_table":
-      if (tables.has(operation.tableName)) {
+      if (state.tables.has(operation.tableName)) {
         throw new Error(
           `materialization history creates duplicate table ${operation.tableName}`,
         );
       }
 
-      tables.set(operation.tableName, operation.table);
+      state.tables.set(operation.tableName, operation.table);
       return;
     case "add_column": {
-      const table = tables.get(operation.tableName);
+      const table = state.tables.get(operation.tableName);
 
       if (table === undefined) {
         throw new Error(
@@ -1792,7 +1899,7 @@ function applyMaterializationMigrationOperation(
         );
       }
 
-      tables.set(operation.tableName, {
+      state.tables.set(operation.tableName, {
         ...table,
         columns: {
           ...table.columns,
@@ -1802,7 +1909,7 @@ function applyMaterializationMigrationOperation(
       return;
     }
     case "create_index": {
-      const table = tables.get(operation.tableName);
+      const table = state.tables.get(operation.tableName);
 
       if (table === undefined) {
         throw new Error(
@@ -1810,16 +1917,80 @@ function applyMaterializationMigrationOperation(
         );
       }
 
-      tables.set(operation.tableName, {
+      validateMaterializationColumnNames(
+        table,
+        operation.index.columns,
+        `materialization history index ${operation.index.name}`,
+      );
+
+      state.tables.set(operation.tableName, {
         ...table,
         indexes: [...table.indexes, operation.index],
+        keys: operation.index.unique
+          ? [
+              ...table.keys,
+              {
+                columns: operation.index.columns,
+                kind: "unique",
+                name: operation.index.name,
+              },
+            ]
+          : table.keys,
       });
       return;
     }
     case "add_foreign_key":
+      validateMaterializationForeignKeyReplay(
+        state.tables,
+        operation.name,
+        operation.foreignKey,
+      );
+
+      if (state.relations.has(operation.name)) {
+        throw new Error(
+          `materialization history adds duplicate relation ${operation.name}`,
+        );
+      }
+
+      state.relations.set(operation.name, operation.foreignKey);
+      return;
     case "data":
       return;
   }
+}
+
+function validateMaterializationForeignKeyReplay(
+  tables: ReadonlyMap<string, ProjectionTableMetadata>,
+  name: string,
+  foreignKey: ProjectionForeignKeyMetadata,
+): void {
+  const fromTable = tables.get(foreignKey.fromTable);
+
+  if (fromTable === undefined) {
+    throw new Error(
+      `materialization history relation ${name} references unknown table ${foreignKey.fromTable}`,
+    );
+  }
+
+  validateMaterializationColumnNames(
+    fromTable,
+    foreignKey.fromColumns,
+    `materialization history relation ${name}`,
+  );
+
+  const toTable = tables.get(foreignKey.toTable);
+
+  if (toTable === undefined) {
+    throw new Error(
+      `materialization history relation ${name} references unknown table ${foreignKey.toTable}`,
+    );
+  }
+
+  validateMaterializationColumnNames(
+    toTable,
+    foreignKey.toColumns,
+    `materialization history relation ${name}`,
+  );
 }
 
 function validateMaterializationMigrationOperation(

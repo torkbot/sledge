@@ -30,6 +30,11 @@
   event.
 - Reject out-of-order materialization histories and histories whose replayed
   table shape does not match the current materialization schema.
+- Reject materialization histories whose replayed indexes, unique keys, or
+  foreign keys do not match the current materialization schema, including
+  operations ordered before their referenced tables or columns exist.
+- Reject non-positive event reference IDs when projection access serializes or
+  decodes event-ref columns.
 
 ## 0.9.0 - 2026-05-20
 

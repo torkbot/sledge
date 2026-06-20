@@ -1059,8 +1059,14 @@ function serializeEventRef(
     throw new Error(`${context} must reference event ${column.eventName}`);
   }
 
-  if (typeof ref.eventId !== "number" || !Number.isSafeInteger(ref.eventId)) {
-    throw new Error(`${context} event reference id must be a safe integer`);
+  if (
+    typeof ref.eventId !== "number" ||
+    !Number.isSafeInteger(ref.eventId) ||
+    ref.eventId <= 0
+  ) {
+    throw new Error(
+      `${context} event reference id must be a positive safe integer`,
+    );
   }
 
   return ref.eventId;
@@ -1076,6 +1082,12 @@ function decodeEventRef(
   }
 
   const eventId = decodeNumber(value, context);
+
+  if (!Number.isSafeInteger(eventId) || eventId <= 0) {
+    throw new Error(
+      `${context} event reference id must be a positive safe integer`,
+    );
+  }
 
   return createEventRef(column.eventName, eventId);
 }
