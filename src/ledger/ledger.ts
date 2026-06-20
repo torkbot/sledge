@@ -1,9 +1,9 @@
 import type { Static, TSchema } from "typebox";
 
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
-import type { EventRef } from "./event-ref.ts";
+import { createEventRef, type EventRef } from "./event-ref.ts";
 import type { LedgerImplementations } from "./internal-storage.ts";
-import { registeredLedgerImplementationsBrand } from "./internal-storage.ts";
+import { attachLedgerImplementations } from "./internal-storage.ts";
 import {
   createProjectionAccess,
   createProjectionImplementations,
@@ -67,6 +67,8 @@ export type {
   ProjectionWriteDatabase,
   ProjectionWriteRow,
 } from "./projection-access.ts";
+export { createEventRef };
+export type { EventRef };
 
 /**
  * Optional knobs for producer-side event emission.
@@ -576,11 +578,6 @@ export type RegisteredLedgerModel<
       TIndexerDefinitions,
       TQueryDefinitions
     >;
-  readonly [registeredLedgerImplementationsBrand]: LedgerImplementations<
-    TIndexers,
-    TQueries,
-    TEvents
-  >;
 };
 
 export type LedgerShape<
@@ -1781,13 +1778,14 @@ function validateMaterializationHistoryResult(
   migrations: readonly MaterializationMigration[],
 ): void {
   const state: MaterializationHistoryReplayState = {
+    indexNames: new Map(),
     relations: new Map(),
     tables: new Map(),
   };
 
   for (const migration of migrations) {
     for (const operation of migration.operations) {
-      applyMaterializationMigrationOperation(state, operation);
+      applyMaterializationMigrationOperation(current, state, operation);
     }
   }
 
@@ -1825,11 +1823,13 @@ function validateMaterializationHistoryResult(
 }
 
 type MaterializationHistoryReplayState = {
+  readonly indexNames: Map<string, string>;
   readonly relations: Map<string, ProjectionForeignKeyMetadata>;
   readonly tables: Map<string, ProjectionTableMetadata>;
 };
 
 function applyMaterializationMigrationOperation(
+  current: AnyMaterializationSchema,
   state: MaterializationHistoryReplayState,
   operation: MaterializationMigrationOperation,
 ): void {
@@ -1839,6 +1839,10 @@ function applyMaterializationMigrationOperation(
         throw new Error(
           `materialization history creates duplicate table ${operation.tableName}`,
         );
+      }
+
+      for (const index of operation.table.indexes) {
+        validateMaterializationReplayIndexName(state, index.name);
       }
 
       state.tables.set(operation.tableName, operation.table);
@@ -1881,6 +1885,7 @@ function applyMaterializationMigrationOperation(
         operation.index.columns,
         `materialization history index ${operation.index.name}`,
       );
+      validateMaterializationReplayIndexName(state, operation.index.name);
 
       state.tables.set(operation.tableName, {
         ...table,
@@ -1914,7 +1919,67 @@ function applyMaterializationMigrationOperation(
       state.relations.set(operation.name, operation.foreignKey);
       return;
     case "data":
+      validateMaterializationDataReplay(current, state);
       return;
+  }
+}
+
+function validateMaterializationReplayIndexName(
+  state: MaterializationHistoryReplayState,
+  indexName: string,
+): void {
+  const normalized = normalizeMaterializationSqliteIdentifier(indexName);
+  const existing = state.indexNames.get(normalized);
+
+  if (existing !== undefined) {
+    throw new Error(
+      `materialization history index ${indexName} conflicts with ${existing}`,
+    );
+  }
+
+  state.indexNames.set(normalized, indexName);
+}
+
+function validateMaterializationDataReplay(
+  current: AnyMaterializationSchema,
+  state: MaterializationHistoryReplayState,
+): void {
+  for (const [tableName, expectedTable] of Object.entries(
+    current.metadata.tables,
+  )) {
+    const actualTable = state.tables.get(tableName);
+
+    if (actualTable === undefined) {
+      throw new Error(
+        `materialization data operation requires current schema table ${tableName}`,
+      );
+    }
+
+    if (
+      !equalStringLists(
+        Object.keys(expectedTable.columns).sort(),
+        Object.keys(actualTable.columns).sort(),
+      )
+    ) {
+      throw new Error(
+        `materialization data operation requires current schema table ${tableName} columns`,
+      );
+    }
+
+    for (const [columnName, expectedColumn] of Object.entries(
+      expectedTable.columns,
+    )) {
+      const actualColumn = actualTable.columns[columnName];
+
+      if (
+        actualColumn === undefined ||
+        !equalMaterializationColumnMetadata(expectedColumn, actualColumn)
+      ) {
+        throw new Error(
+          `materialization data operation requires current schema column ${tableName}.${columnName}`,
+        );
+      }
+    }
   }
 }
 
@@ -1950,6 +2015,20 @@ function validateMaterializationForeignKeyReplay(
     foreignKey.toColumns,
     `materialization history relation ${name}`,
   );
+
+  const referencesKey = toTable.keys.some((key) => {
+    return equalStringLists(key.columns, foreignKey.toColumns);
+  });
+
+  if (!referencesKey) {
+    throw new Error(
+      `materialization history relation ${name} must target a primary or unique key on ${foreignKey.toTable}`,
+    );
+  }
+}
+
+function normalizeMaterializationSqliteIdentifier(identifier: string): string {
+  return identifier.toLocaleLowerCase("en-US");
 }
 
 function validateMaterializationMigrationOperation(
@@ -2146,13 +2225,24 @@ function createDefinedLedgerModel<
         register,
       }) as LedgerImplementations<TIndexers, TQueries, TEvents>;
 
-      return {
+      const registeredModel: RegisteredLedgerModel<
+        TEvents,
+        TQueues,
+        TIndexers,
+        TQueries,
+        TSignals,
+        TSignalQueues,
+        TProjectionSchema,
+        TIndexerDefinitions,
+        TQueryDefinitions
+      > = {
         [registeredLedgerModelBrand]: true,
-        [registeredLedgerImplementationsBrand]: implementations,
         model,
         projections: input.access.projections,
         register,
       };
+
+      return attachLedgerImplementations(registeredModel, implementations);
     },
   };
 }

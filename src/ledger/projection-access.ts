@@ -3,7 +3,6 @@ import type { Static, TSchema } from "typebox";
 import type { EventRef } from "./event-ref.ts";
 import { createEventRef } from "./event-ref.ts";
 import type {
-  LedgerImplementations,
   LedgerStorageRow,
   LedgerStorageScope,
 } from "./internal-storage.ts";
@@ -374,10 +373,7 @@ export function createProjectionImplementations<
     TIndexerDefinitions,
     TQueryDefinitions
   >;
-}): LedgerImplementations<
-  ProjectionIndexerSchemas<TIndexerDefinitions>,
-  ProjectionQuerySchemas<TQueryDefinitions>
-> {
+}): unknown {
   const indexerImplementations: Record<
     string,
     (
@@ -434,10 +430,7 @@ export function createProjectionImplementations<
   return {
     indexers: indexerImplementations,
     queries: queryImplementations,
-  } as LedgerImplementations<
-    ProjectionIndexerSchemas<TIndexerDefinitions>,
-    ProjectionQuerySchemas<TQueryDefinitions>
-  >;
+  };
 }
 
 async function runProjectionIndexer(
@@ -451,12 +444,55 @@ async function runProjectionIndexer(
   context: LedgerIndexerContext,
 ): Promise<void> {
   const event = createProjectionIndexerEvent(definition.sourceEvent, context);
+  const pendingWrites = new Set<Promise<void>>();
+  const trackWrite: ProjectionWriteTracker = (run) => {
+    let tracked: Promise<void>;
+    tracked = run().finally(() => {
+      pendingWrites.delete(tracked);
+    });
+    pendingWrites.add(tracked);
 
-  await implementation({
-    input,
-    event,
-    db: createProjectionWriteDatabase(projections.metadata, scope),
-  });
+    return tracked;
+  };
+
+  let implementationError: unknown = null;
+
+  try {
+    await implementation({
+      input,
+      event,
+      db: createProjectionWriteDatabase(
+        projections.metadata,
+        scope,
+        trackWrite,
+      ),
+    });
+  } catch (error: unknown) {
+    implementationError = error;
+  }
+
+  const writeError = await settleProjectionWrites(pendingWrites);
+
+  if (implementationError !== null) {
+    throw implementationError;
+  }
+
+  if (writeError !== null) {
+    throw writeError;
+  }
+}
+
+async function settleProjectionWrites(
+  pendingWrites: ReadonlySet<Promise<void>>,
+): Promise<unknown | null> {
+  if (pendingWrites.size === 0) {
+    return null;
+  }
+
+  const settled = await Promise.allSettled([...pendingWrites]);
+  const failed = settled.find((result) => result.status === "rejected");
+
+  return failed === undefined ? null : failed.reason;
 }
 
 function createProjectionIndexerEvent(
@@ -483,6 +519,7 @@ function createProjectionWriteDatabase<
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
+  trackWrite: ProjectionWriteTracker,
 ): ProjectionWriteDatabase<TProjectionSchema> {
   return {
     insertInto: (tableName) => {
@@ -507,23 +544,28 @@ function createProjectionWriteDatabase<
 
           return createInsertConflictBuilder<
             ProjectionSchemaTables<TProjectionSchema>[typeof tableName]
-          >(scope, table, insertColumns, insertValues);
+          >(scope, table, insertColumns, insertValues, trackWrite);
         },
       };
     },
   };
 }
 
+type ProjectionWriteTracker = (run: () => Promise<void>) => Promise<void>;
+
 function createInsertConflictBuilder<TTable>(
   scope: LedgerStorageScope,
   table: ProjectionTableMetadata,
   insertColumns: readonly string[],
   insertValues: readonly unknown[],
+  trackWrite: ProjectionWriteTracker,
 ): ProjectionInsertConflictBuilder<TTable> {
   return {
-    execute: async () => {
+    execute: () => {
       const sql = buildInsertSql(table, insertColumns, null);
-      await scope.prepare(sql).run(...insertValues);
+      return trackWrite(async () => {
+        await scope.prepare(sql).run(...insertValues);
+      });
     },
     onConflict: (conflictColumns) => {
       validateProjectionKey("conflict target", table, conflictColumns);
@@ -531,12 +573,14 @@ function createInsertConflictBuilder<TTable>(
       return {
         doNothing: () => {
           return {
-            execute: async () => {
+            execute: () => {
               const sql = buildInsertSql(table, insertColumns, {
                 kind: "do_nothing",
                 conflictColumns,
               });
-              await scope.prepare(sql).run(...insertValues);
+              return trackWrite(async () => {
+                await scope.prepare(sql).run(...insertValues);
+              });
             },
           };
         },
@@ -559,13 +603,15 @@ function createInsertConflictBuilder<TTable>(
           });
 
           return {
-            execute: async () => {
+            execute: () => {
               const sql = buildInsertSql(table, insertColumns, {
                 kind: "do_update",
                 conflictColumns,
                 updateColumns,
               });
-              await scope.prepare(sql).run(...insertValues, ...updateValues);
+              return trackWrite(async () => {
+                await scope.prepare(sql).run(...insertValues, ...updateValues);
+              });
             },
           };
         },

@@ -1,20 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Type } from "typebox";
+import { Type, type TSchema } from "typebox";
 
-import { createEventRef } from "./event-ref.ts";
 import {
-  registeredLedgerImplementationsBrand,
+  readLedgerImplementations,
+  type LedgerImplementations,
   type LedgerStorageRow,
   type LedgerStorageScope,
 } from "./internal-storage.ts";
 import type {
   EventEnvelope,
+  EventRef,
   LedgerIndexerContext,
   MaterializationImplementationRegistration,
+  QuerySchema,
+  RegisteredLedgerModel,
 } from "./ledger.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 import {
+  createEventRef,
   defineLedgerShape,
   defineMaterializationHistory,
   defineMaterializationSchema,
@@ -225,13 +234,55 @@ function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
   };
 }
 
+function readTestLedgerImplementations<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, QuerySchema<TSchema, TSchema>>,
+  TSignals extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
+  TProjectionSchema extends AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TQueryDefinitions extends ProjectionQueryDefinitions,
+>(
+  model: RegisteredLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
+  >,
+): LedgerImplementations<TIndexers, TQueries, TEvents> {
+  return readLedgerImplementations<TIndexers, TQueries, TEvents>(model);
+}
+
+async function settlesWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<boolean> {
+  return await Promise.race([
+    promise.then(
+      () => true,
+      () => true,
+    ),
+    new Promise<boolean>((resolve) => {
+      setTimeout(() => {
+        resolve(false);
+      }, timeoutMs);
+    }),
+  ]);
+}
+
 test("projection access compiles typed indexer and query definitions to storage operations", async () => {
-  const indexer =
-    registeredModelWithoutHandlers[registeredLedgerImplementationsBrand]
-      .indexers?.upsertUser;
-  const query =
-    registeredModelWithoutHandlers[registeredLedgerImplementationsBrand].queries
-      ?.userById;
+  const implementations = readTestLedgerImplementations(
+    registeredModelWithoutHandlers,
+  );
+  const indexer = implementations.indexers?.upsertUser;
+  const query = implementations.queries?.userById;
 
   if (indexer === undefined) {
     throw new Error("expected upsertUser indexer implementation");
@@ -289,15 +340,26 @@ test("projection access compiles typed indexer and query definitions to storage 
   });
 
   await assert.rejects(async () => {
+    const validContext = createUserCreatedContext(1);
+
     await indexer(
       invalidRefFake.scope,
       {
         userId: "u_123",
         email: "alice@example.com",
       },
-      createUserCreatedContext(0),
+      {
+        event: {
+          ...validContext.event,
+          eventId: 0,
+          ref: {
+            eventName: "user.created",
+            eventId: 0,
+          } as EventRef<"user.created">,
+        },
+      },
     );
-  }, /users\.source event reference id must be a positive safe integer/);
+  }, /event reference id must be a positive safe integer/);
   assert.deepEqual(invalidRefFake.calls, []);
 
   const invalidStoredRefFake = createFakeScope({
@@ -314,6 +376,104 @@ test("projection access compiles typed indexer and query definitions to storage 
       userId: "u_123",
     });
   }, /users\.source event reference id must be a positive safe integer/);
+});
+
+test("projection access waits for unawaited writes before completing indexers", async () => {
+  const unawaitedModel = withMaterializations(shape, materializations).register(
+    {
+      indexers: {
+        upsertUser: ({ input, event, db }) => {
+          void db
+            .insertInto("users")
+            .values({
+              userId: input.userId,
+              email: input.email,
+              source: event.ref,
+            })
+            .execute();
+        },
+      },
+      queries: implementations.queries,
+    },
+  );
+  const indexer =
+    readTestLedgerImplementations(unawaitedModel).indexers?.upsertUser;
+
+  if (indexer === undefined) {
+    throw new Error("expected upsertUser indexer implementation");
+  }
+
+  const runStarted = Promise.withResolvers<void>();
+  const releaseRun = Promise.withResolvers<void>();
+  const calls: FakeStatementCall[] = [];
+  const scope: LedgerStorageScope = {
+    exec: async (sql) => {
+      calls.push({
+        method: "exec",
+        params: [],
+        sql,
+      });
+    },
+    prepare: (sql) => {
+      return {
+        all: async (...params) => {
+          calls.push({
+            method: "all",
+            params,
+            sql,
+          });
+
+          return [];
+        },
+        get: async (...params) => {
+          calls.push({
+            method: "get",
+            params,
+            sql,
+          });
+
+          return undefined;
+        },
+        run: async (...params) => {
+          calls.push({
+            method: "run",
+            params,
+            sql,
+          });
+          runStarted.resolve();
+          await releaseRun.promise;
+
+          return {
+            changes: 1,
+            lastInsertRowid: 0,
+          };
+        },
+      };
+    },
+  };
+
+  const indexerPromise = Promise.resolve(
+    indexer(
+      scope,
+      {
+        userId: "u_123",
+        email: "alice@example.com",
+      },
+      createUserCreatedContext(42),
+    ),
+  );
+
+  await runStarted.promise;
+  assert.equal(await settlesWithin(indexerPromise, 5), false);
+  releaseRun.resolve();
+  await indexerPromise;
+  assert.deepEqual(calls, [
+    {
+      method: "run",
+      params: ["u_123", "alice@example.com", 42],
+      sql: 'INSERT INTO "users" ("userId", "email", "source") VALUES (?, ?, ?)',
+    },
+  ]);
 });
 
 test("projection access rejects non-serializable JSON values before storage", async () => {
@@ -392,12 +552,10 @@ test("projection access rejects non-serializable JSON values before storage", as
       },
     },
   });
-  const insertJson =
-    registeredJsonModel[registeredLedgerImplementationsBrand].indexers
-      ?.insertJson;
-  const updateJson =
-    registeredJsonModel[registeredLedgerImplementationsBrand].indexers
-      ?.updateJson;
+  const jsonImplementations =
+    readTestLedgerImplementations(registeredJsonModel);
+  const insertJson = jsonImplementations.indexers?.insertJson;
+  const updateJson = jsonImplementations.indexers?.updateJson;
 
   if (insertJson === undefined) {
     throw new Error("expected insertJson indexer implementation");
@@ -499,8 +657,7 @@ test("ledger projection construction feeds generated contracts and implementatio
     definedModel.model.queries.userById,
   );
   assert.equal(
-    typeof registeredModel[registeredLedgerImplementationsBrand].indexers
-      ?.upsertUser,
+    typeof readTestLedgerImplementations(registeredModel).indexers?.upsertUser,
     "function",
   );
   assert.equal(registeredModel.projections, definedModel.projections);
@@ -790,12 +947,49 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
+        s.data("premature backfill", () => undefined),
+      ]),
+      m.migration(2, "add user email", (s) => [
+        s.addColumn("users", "email", (t) => t.text()),
+      ]),
+    ]);
+  }, /materialization data operation requires current schema table users columns/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
       ]),
       m.migration(2, "forget user email index", (s) => [
         s.addColumn("users", "email", (t) => t.text()),
       ]),
     ]);
   }, /materialization history table users must match current schema keys/);
+
+  assert.throws(() => {
+    defineMaterializationHistory(schemaV2, (m) => [
+      m.migration(1, "create users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+      m.migration(2, "duplicate user email index", (s) => [
+        s.createIndex("usersByEmail", "users", ["email"]),
+        s.createIndex("usersByEmail", "users", ["userId"]),
+      ]),
+    ]);
+  }, /materialization history index usersByEmail conflicts with usersByEmail/);
 });
 
 test("materialization histories replay foreign keys against current state", () => {
@@ -870,6 +1064,62 @@ test("materialization histories replay foreign keys against current state", () =
       ]),
     ]);
   }, /materialization history must match current schema relations/);
+
+  const relationByEmailSchema = defineMaterializationSchema({
+    namespace: "relation-key-history",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+          })
+          .primaryKey(["userId"])
+          .unique("usersByEmail", ["email"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            email: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    },
+    relations: (r) => ({
+      sessionUserEmail: r
+        .foreignKey("sessions", ["email"])
+        .references("users", ["email"]),
+    }),
+  });
+
+  assert.throws(() => {
+    defineMaterializationHistory(relationByEmailSchema, (m) => [
+      m.migration(1, "create relation tables", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+        s.createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              email: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        ),
+        s.addForeignKey("sessionUserEmail", (r) =>
+          r.foreignKey("sessions", ["email"]).references("users", ["email"]),
+        ),
+      ]),
+      m.migration(2, "add email key", (s) => [
+        s.createUniqueIndex("usersByEmail", "users", ["email"]),
+      ]),
+    ]);
+  }, /materialization history relation sessionUserEmail must target a primary or unique key on users/);
 });
 
 test("materialization histories compare replayed columns by name", () => {

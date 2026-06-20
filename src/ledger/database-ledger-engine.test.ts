@@ -19,7 +19,7 @@ import {
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
-  registeredLedgerImplementationsBrand,
+  attachLedgerImplementations,
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
@@ -120,8 +120,7 @@ function defineEngineFixtureModel<
     withImplementations(implementations) {
       // Engine tests exercise custom storage hooks that the public v2
       // construction path deliberately no longer exposes.
-      return {
-        [registeredLedgerImplementationsBrand]: implementations,
+      const registeredModel = {
         model,
         projections,
         register: input.register,
@@ -133,6 +132,8 @@ function defineEngineFixtureModel<
         TSignals,
         TSignalQueues
       >;
+
+      return attachLedgerImplementations(registeredModel, implementations);
     },
   };
 }

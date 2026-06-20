@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 
 import { createEventRef } from "./event-ref.ts";
 import {
-  registeredLedgerImplementationsBrand,
+  readLedgerImplementations,
   type LedgerStorageRow,
   type LedgerStorageScope,
   type LedgerStorageStatement,
@@ -406,7 +406,11 @@ function openDatabaseLedgerEngine<
   const clock = input.timing.clock;
   const storage = input.storage;
   const model = input.model.model;
-  const implementations = input.model[registeredLedgerImplementationsBrand];
+  const implementations = readLedgerImplementations<
+    TIndexers,
+    TQueries,
+    TEvents
+  >(input.model);
   const registration = input.model.register;
 
   let closed = false;

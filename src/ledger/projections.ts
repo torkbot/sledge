@@ -401,6 +401,8 @@ function defineProjectionSchemaInternal<
     tableMetadata[tableName] = renameTableMetadata(metadata, tableName);
   }
 
+  validateProjectionSchemaIndexNames(tableMetadata);
+
   return createProjectionSchema<
     ProjectionTablesForFactories<TFactories>,
     {},
@@ -494,6 +496,11 @@ function createColumn<
 function createTableDraft<TColumns extends ProjectionColumns>(
   columns: TColumns,
 ): ProjectionTableDraft<TColumns> {
+  validateUniqueSqliteIdentifiers(
+    "projection column name",
+    Object.keys(columns),
+  );
+
   return {
     primaryKey: (primaryKey) => {
       validateColumns("primary key", columns, primaryKey);
@@ -843,4 +850,47 @@ function validateIndexName(name: string): void {
   if (name.length === 0) {
     throw new Error("index name must be non-empty");
   }
+}
+
+function validateProjectionSchemaIndexNames(
+  tables: Readonly<Record<string, ProjectionTableMetadata>>,
+): void {
+  const indexNames = new Map<string, string>();
+
+  for (const table of Object.values(tables)) {
+    for (const index of table.indexes) {
+      const normalized = normalizeSqliteIdentifier(index.name);
+      const existing = indexNames.get(normalized);
+
+      if (existing !== undefined) {
+        throw new Error(
+          `projection index name ${index.name} conflicts with ${existing}`,
+        );
+      }
+
+      indexNames.set(normalized, index.name);
+    }
+  }
+}
+
+function validateUniqueSqliteIdentifiers(
+  context: string,
+  identifiers: readonly string[],
+): void {
+  const names = new Map<string, string>();
+
+  for (const identifier of identifiers) {
+    const normalized = normalizeSqliteIdentifier(identifier);
+    const existing = names.get(normalized);
+
+    if (existing !== undefined) {
+      throw new Error(`${context} ${identifier} conflicts with ${existing}`);
+    }
+
+    names.set(normalized, identifier);
+  }
+}
+
+function normalizeSqliteIdentifier(identifier: string): string {
+  return identifier.toLocaleLowerCase("en-US");
 }

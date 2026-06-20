@@ -342,6 +342,9 @@ Indexer and query implementations receive sledge-owned facades:
 They do not receive a raw storage handle. Event handlers can `index`, `enqueue`,
 and `query`.
 
+The low-level database engine and storage scope are internal implementation
+details, not package exports.
+
 Registration returns the model passed to a storage adapter. There is no
 separate bind step.
 

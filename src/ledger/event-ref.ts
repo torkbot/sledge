@@ -12,6 +12,10 @@ export function createEventRef<TEventName extends string>(
   eventName: TEventName,
   eventId: number,
 ): EventRef<TEventName> {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0) {
+    throw new Error("event reference id must be a positive safe integer");
+  }
+
   return {
     eventName,
     eventId,

@@ -2,7 +2,7 @@ import type { Static, TSchema } from "typebox";
 
 import type { LedgerIndexerContext } from "./ledger.ts";
 
-export const registeredLedgerImplementationsBrand: unique symbol = Symbol(
+const registeredLedgerImplementationsBrand: unique symbol = Symbol(
   "sledge.registeredLedgerImplementations",
 );
 
@@ -50,3 +50,53 @@ export type LedgerImplementations<
     ) => unknown | Promise<unknown>;
   };
 };
+
+type RegisteredLedgerImplementationCarrier<
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, LedgerImplementationQuerySchema>,
+  TEvents extends Record<string, TSchema>,
+> = {
+  readonly [registeredLedgerImplementationsBrand]?: LedgerImplementations<
+    TIndexers,
+    TQueries,
+    TEvents
+  >;
+};
+
+export function attachLedgerImplementations<
+  TModel extends object,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, LedgerImplementationQuerySchema>,
+  TEvents extends Record<string, TSchema>,
+>(
+  model: TModel,
+  implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
+): TModel {
+  Object.defineProperty(model, registeredLedgerImplementationsBrand, {
+    configurable: false,
+    enumerable: false,
+    value: implementations,
+    writable: false,
+  });
+
+  return model;
+}
+
+export function readLedgerImplementations<
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, LedgerImplementationQuerySchema>,
+  TEvents extends Record<string, TSchema>,
+>(model: object): LedgerImplementations<TIndexers, TQueries, TEvents> {
+  const carrier = model as RegisteredLedgerImplementationCarrier<
+    TIndexers,
+    TQueries,
+    TEvents
+  >;
+  const implementations = carrier[registeredLedgerImplementationsBrand];
+
+  if (implementations === undefined) {
+    throw new Error("registered ledger model is missing implementations");
+  }
+
+  return implementations;
+}

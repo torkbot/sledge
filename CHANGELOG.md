@@ -39,7 +39,13 @@
   the typed materialization schema instead of requiring callers to run raw SQL
   setup.
 - Remove the low-level `@torkbot/sledge/database-ledger-engine` package export
-  and hide generated raw-scope implementations behind an internal symbol.
+  and hide generated raw-scope implementations behind an internal attachment
+  that is not part of the public registered-model type.
+- Export `createEventRef(...)` from `@torkbot/sledge/ledger` and reject invalid
+  event-ref IDs at construction time.
+- Harden materialization/projection validation for migration-order data steps,
+  foreign-key target keys, duplicate index names, case-only duplicate columns,
+  and unawaited projection writes.
 
 ## 0.9.0 - 2026-05-20
 
