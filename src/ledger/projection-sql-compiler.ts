@@ -65,6 +65,12 @@ export type ProjectionCompilerWhereClause =
       readonly column: ProjectionCompilerColumnReference;
       readonly kind: "null";
       readonly not: boolean;
+    }
+  | {
+      readonly innerColumn: ProjectionCompilerColumnReference;
+      readonly kind: "not_exists";
+      readonly outerColumn: ProjectionCompilerColumnReference;
+      readonly tableName: string;
     };
 
 export type ProjectionCompilerOrderClause = {
@@ -354,6 +360,11 @@ function compileWhereClause(
       return {
         params: [],
         text: `${compileColumnReference(clause.column)} IS ${clause.not ? "NOT " : ""}NULL`,
+      };
+    case "not_exists":
+      return {
+        params: [],
+        text: `NOT EXISTS (SELECT 1 FROM ${quoteIdentifier(clause.tableName)} WHERE ${compileColumnReference(clause.innerColumn)} = ${compileColumnReference(clause.outerColumn)})`,
       };
   }
 }

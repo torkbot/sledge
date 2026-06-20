@@ -37,6 +37,8 @@
   and delete builders so common OR predicates do not require raw SQL.
 - Add typed `innerJoin(...).selectFrom(...)` projection reads for
   association-table lookups without exposing raw SQL or storage handles.
+- Add typed `whereNotExists(...)` projection anti-join predicates for
+  unassociated-row lookups without exposing raw subqueries.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and

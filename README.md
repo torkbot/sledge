@@ -342,8 +342,8 @@ Indexer and query implementations receive sledge-owned facades:
   materialization tables
 - reads support typed predicates, null predicates, typed `whereAny([...])`
   disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
-  `orderBy(...)`, `limit(...)`, `execute()`, `executeTakeFirst()`, and
-  `stream()`
+  typed `whereNotExists(...)` anti-joins, `orderBy(...)`, `limit(...)`,
+  `execute()`, `executeTakeFirst()`, and `stream()`
 - writes return affected-row metadata and support typed `MAX(...)`,
   `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 

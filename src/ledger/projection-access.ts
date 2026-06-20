@@ -427,7 +427,12 @@ export type ProjectionSelectBuilder<
     >[],
   >(
     columns: TColumnNames,
-  ): ProjectionExecutableSelect<TTables[TFromTableName], TColumnNames>;
+  ): ProjectionExecutableSelect<
+    TTables[TFromTableName],
+    TColumnNames,
+    TTables,
+    TFromTableName
+  >;
 };
 
 export type ProjectionJoinedSelectBuilder<
@@ -454,30 +459,44 @@ export type ProjectionJoinedSelectBuilder<
 export type ProjectionExecutableSelect<
   TTable,
   TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
 > = {
-  limit(limit: number): ProjectionExecutableSelect<TTable, TColumnNames>;
+  limit(
+    limit: number,
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   orderBy<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     direction?: ProjectionOrderDirection,
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   whereAny(
     conditions: readonly ProjectionWhereCondition<TTable>[],
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
+  whereNotExists<
+    const TExistenceTableName extends ProjectionTableName<TTables>,
+  >(
+    tableName: TExistenceTableName,
+    condition: ProjectionJoinCondition<
+      TTables,
+      TFromTableName,
+      TExistenceTableName
+    >,
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     operator: ProjectionWhereOperator,
     value: ProjectionWhereValue<TTable, TColumnName>,
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   whereIn<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     values: readonly ProjectionWhereValue<TTable, TColumnName>[],
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   whereNotNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   whereNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
-  ): ProjectionExecutableSelect<TTable, TColumnNames>;
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   execute(): Promise<readonly ProjectionSelectedRow<TTable, TColumnNames>[]>;
   executeTakeFirst(): Promise<ProjectionSelectedRow<
     TTable,
@@ -1437,6 +1456,7 @@ function createProjectionReadDatabase<
           validateProjectionColumns("selected columns", table, columns);
 
           return createProjectionExecutableSelect(
+            metadata,
             scope,
             table,
             table,
@@ -1509,9 +1529,12 @@ function createProjectionJoinedSelectBuilder<
 }
 
 function createProjectionExecutableSelect<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
   TTable,
   const TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
 >(
+  metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   fromTable: ProjectionTableMetadata,
   table: ProjectionTableMetadata,
@@ -1521,11 +1544,12 @@ function createProjectionExecutableSelect<
   whereClauses: readonly ProjectionWhereClause[],
   orderClauses: readonly ProjectionOrderClause[],
   limitClause: number | null,
-): ProjectionExecutableSelect<TTable, TColumnNames> {
+): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName> {
   return {
     limit: (limit) => {
       validateProjectionLimit(limit);
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -1542,6 +1566,7 @@ function createProjectionExecutableSelect<
       validateProjectionOrderDirection(direction);
 
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -1561,6 +1586,7 @@ function createProjectionExecutableSelect<
     },
     whereAny: (conditions) => {
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -1572,8 +1598,33 @@ function createProjectionExecutableSelect<
         limitClause,
       );
     },
+    whereNotExists: (tableName, condition) => {
+      const existenceTable = readProjectionTable(metadata, String(tableName));
+
+      return createProjectionExecutableSelect(
+        metadata,
+        scope,
+        fromTable,
+        table,
+        selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
+        [
+          ...whereClauses,
+          createProjectionNotExistsWhereClause(
+            fromTable,
+            existenceTable,
+            String(condition.fromColumn),
+            String(condition.toColumn),
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
     where: (columnName, operator, value) => {
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -1596,6 +1647,7 @@ function createProjectionExecutableSelect<
     },
     whereIn: (columnName, values) => {
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -1617,6 +1669,7 @@ function createProjectionExecutableSelect<
     },
     whereNotNull: (columnName) => {
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -1638,6 +1691,7 @@ function createProjectionExecutableSelect<
     },
     whereNull: (columnName) => {
       return createProjectionExecutableSelect(
+        metadata,
         scope,
         fromTable,
         table,
@@ -2469,6 +2523,33 @@ function createProjectionNullWhereClause(
     column: createProjectionColumnReference(tableName, columnName),
     kind: "null",
     not,
+  };
+}
+
+function createProjectionNotExistsWhereClause(
+  fromTable: ProjectionTableMetadata,
+  existenceTable: ProjectionTableMetadata,
+  fromColumn: string,
+  toColumn: string,
+): ProjectionWhereClause {
+  validateProjectionColumns("not-exists source column", fromTable, [
+    fromColumn,
+  ]);
+  validateProjectionColumns("not-exists target column", existenceTable, [
+    toColumn,
+  ]);
+  validateProjectionJoinColumns(
+    fromTable,
+    fromColumn,
+    existenceTable,
+    toColumn,
+  );
+
+  return {
+    innerColumn: createProjectionColumnReference(existenceTable.name, toColumn),
+    kind: "not_exists",
+    outerColumn: createProjectionColumnReference(fromTable.name, fromColumn),
+    tableName: existenceTable.name,
   };
 }
 

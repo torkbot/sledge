@@ -1255,6 +1255,129 @@ test("projection access supports typed inner joins between materialization table
   ]);
 });
 
+test("projection access supports typed anti-join predicates", async () => {
+  const networkSchema = defineMaterializationSchema({
+    namespace: "network-anti-join",
+    version: 1,
+    tables: {
+      policyPromptRequests: (t) =>
+        t
+          .columns({
+            policyPromptId: t.text().notNull(),
+            requestId: t.text().notNull(),
+          })
+          .primaryKey(["policyPromptId", "requestId"])
+          .index("policy_prompt_requests_by_request", ["requestId"]),
+      requests: (t) =>
+        t
+          .columns({
+            requestId: t.text().notNull(),
+            requestedAtMs: t.integer().notNull(),
+            resolvedAtMs: t.integer(),
+            summary: t.text().notNull(),
+          })
+          .primaryKey(["requestId"])
+          .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
+    },
+  });
+  const networkMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(networkSchema, (m) => [
+      m.migration(1, "create network request tables", (s) => [
+        s.createTable("policyPromptRequests", (t) =>
+          t
+            .columns({
+              policyPromptId: t.text().notNull(),
+              requestId: t.text().notNull(),
+            })
+            .primaryKey(["policyPromptId", "requestId"])
+            .index("policy_prompt_requests_by_request", ["requestId"]),
+        ),
+        s.createTable("requests", (t) =>
+          t
+            .columns({
+              requestId: t.text().notNull(),
+              requestedAtMs: t.integer().notNull(),
+              resolvedAtMs: t.integer(),
+              summary: t.text().notNull(),
+            })
+            .primaryKey(["requestId"])
+            .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      unpromptedPending: {
+        params: Type.Object({}),
+        result: Type.Array(
+          Type.Object({
+            requestId: Type.String(),
+            requestedAtMs: Type.Number(),
+            resolvedAtMs: Type.Union([Type.Null(), Type.Number()]),
+            summary: Type.String(),
+          }),
+        ),
+      },
+    },
+  });
+  const networkModel = withMaterializations(
+    shape,
+    networkMaterializations,
+  ).register({
+    queries: {
+      unpromptedPending: async ({ db }) => {
+        const rows = await db
+          .selectFrom("requests")
+          .select(["requestId", "requestedAtMs", "resolvedAtMs", "summary"])
+          .whereNotExists("policyPromptRequests", {
+            fromColumn: "requestId",
+            toColumn: "requestId",
+          })
+          .whereNull("resolvedAtMs")
+          .orderBy("requestedAtMs", "asc")
+          .orderBy("requestId", "asc")
+          .execute();
+
+        return [...rows];
+      },
+    },
+  });
+  const unpromptedPending =
+    readTestLedgerImplementations(networkModel).queries?.unpromptedPending;
+
+  if (unpromptedPending === undefined) {
+    throw new Error("expected unpromptedPending query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        requestId: "req_1",
+        requestedAtMs: 1_000,
+        resolvedAtMs: null,
+        summary: "network access",
+      },
+    ],
+    getRow: undefined,
+  });
+
+  const rows = await unpromptedPending(fake.scope, {});
+
+  assert.deepEqual(fake.calls[0], {
+    method: "all",
+    params: [],
+    sql: 'SELECT "requestId" AS "requestId", "requestedAtMs" AS "requestedAtMs", "resolvedAtMs" AS "resolvedAtMs", "summary" AS "summary" FROM "requests" WHERE NOT EXISTS (SELECT 1 FROM "policyPromptRequests" WHERE "policyPromptRequests"."requestId" = "requests"."requestId") AND "resolvedAtMs" IS NULL ORDER BY "requestedAtMs" ASC, "requestId" ASC',
+  });
+  assert.deepEqual(rows, [
+    {
+      requestId: "req_1",
+      requestedAtMs: 1_000,
+      resolvedAtMs: null,
+      summary: "network access",
+    },
+  ]);
+});
+
 test("projection access hydrates semantic event references without exposing events table", async () => {
   const eventMaterializations = defineMaterializations({
     history,
@@ -2189,6 +2312,22 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .selectFrom("parents", ["rank"])
           // @ts-expect-error joined where clauses only reference joined tables.
           .where("users", "userId", "=", "u_123");
+        db.selectFrom("parents").select(["rank"]).whereNotExists("children", {
+          fromColumn: "parentId",
+          toColumn: "parentId",
+        });
+        db.selectFrom("parents").select(["rank"]).whereNotExists("children", {
+          fromColumn: "rank",
+          // @ts-expect-error anti-join columns must have compatible value types.
+          toColumn: "parentId",
+        });
+        db.selectFrom("parents")
+          .select(["rank"])
+          // @ts-expect-error anti-join target table must be declared.
+          .whereNotExists("missing", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          });
 
         return null;
       },
