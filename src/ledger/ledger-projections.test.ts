@@ -729,6 +729,40 @@ test("projection access rejects non-serializable JSON values before storage", as
     sql: 'INSERT INTO "jsonRows" ("userId", "metadata") VALUES (?, ?)',
   });
 
+  const expressionShapedJsonFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await updateJson(
+    expressionShapedJsonFake.scope,
+    {
+      userId: "u_expression",
+      metadata: {
+        metadata: {
+          kind: "column",
+        },
+      },
+    },
+    createUserCreatedContext(44),
+  );
+
+  assert.deepEqual(expressionShapedJsonFake.calls[0], {
+    method: "run",
+    params: [
+      "u_expression",
+      JSON.stringify({
+        existing: true,
+      }),
+      JSON.stringify({
+        metadata: {
+          kind: "column",
+        },
+      }),
+    ],
+    sql: 'INSERT INTO "jsonRows" ("userId", "metadata") VALUES (?, ?) ON CONFLICT ("userId") DO UPDATE SET "metadata" = ?',
+  });
+
   const invalidInsertFake = createFakeScope({
     allRows: [],
     getRow: undefined,
@@ -741,7 +775,7 @@ test("projection access rejects non-serializable JSON values before storage", as
         userId: "u_json",
         metadata: undefined,
       },
-      createUserCreatedContext(44),
+      createUserCreatedContext(45),
     );
   }, /jsonRows\.metadata must be JSON-serializable/);
   assert.deepEqual(invalidInsertFake.calls, []);
@@ -760,7 +794,7 @@ test("projection access rejects non-serializable JSON values before storage", as
           nested: () => undefined,
         },
       },
-      createUserCreatedContext(45),
+      createUserCreatedContext(46),
     );
   }, /jsonRows\.metadata\.nested must be JSON-serializable/);
   assert.deepEqual(invalidUpdateFake.calls, []);
@@ -1583,6 +1617,134 @@ test("projection access supports typed anti-join predicates", async () => {
   ]);
 });
 
+test("projection access rejects unsafe predicate and self-join shapes", async () => {
+  const nodeSchema = defineMaterializationSchema({
+    namespace: "node-shapes",
+    version: 1,
+    tables: {
+      nodes: (t) =>
+        t
+          .columns({
+            nodeId: t.text().notNull(),
+            parentId: t.text(),
+          })
+          .primaryKey(["nodeId"]),
+    },
+  });
+  const nodeMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(nodeSchema, (m) => [
+      m.migration(1, "create nodes", (s) => [
+        s.createTable("nodes", (t) =>
+          t
+            .columns({
+              nodeId: t.text().notNull(),
+              parentId: t.text(),
+            })
+            .primaryKey(["nodeId"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      nullComparison: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+      nullIn: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+      selfAntiJoin: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+      selfJoin: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+    },
+  });
+  const nodeModel = withMaterializations(shape, nodeMaterializations).register({
+    queries: {
+      nullComparison: async ({ db }) => {
+        await db
+          .selectFrom("nodes")
+          .select(["nodeId"])
+          .where("parentId", "=", null as never)
+          .execute();
+
+        return null;
+      },
+      nullIn: async ({ db }) => {
+        await db
+          .selectFrom("nodes")
+          .select(["nodeId"])
+          .whereIn("parentId", [null as never])
+          .execute();
+
+        return null;
+      },
+      selfAntiJoin: async ({ db }) => {
+        await db
+          .selectFrom("nodes")
+          .select(["nodeId"])
+          .whereNotExists("nodes", {
+            fromColumn: "parentId",
+            toColumn: "nodeId",
+          })
+          .execute();
+
+        return null;
+      },
+      selfJoin: async ({ db }) => {
+        await db
+          .selectFrom("nodes")
+          .innerJoin("nodes", {
+            fromColumn: "parentId",
+            toColumn: "nodeId",
+          })
+          .selectFrom("nodes", ["nodeId"])
+          .execute();
+
+        return null;
+      },
+    },
+  });
+  const nodeQueries = readTestLedgerImplementations(nodeModel).queries;
+  const nullComparison = nodeQueries?.nullComparison;
+  const nullIn = nodeQueries?.nullIn;
+  const selfAntiJoin = nodeQueries?.selfAntiJoin;
+  const selfJoin = nodeQueries?.selfJoin;
+
+  if (
+    nullComparison === undefined ||
+    nullIn === undefined ||
+    selfAntiJoin === undefined ||
+    selfJoin === undefined
+  ) {
+    throw new Error("expected node query implementations");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await nullComparison(fake.scope, {});
+  }, /nodes\.parentId predicate value cannot be null/);
+  await assert.rejects(async () => {
+    await nullIn(fake.scope, {});
+  }, /nodes\.parentId predicate value cannot be null/);
+  await assert.rejects(async () => {
+    await selfAntiJoin(fake.scope, {});
+  }, /projection anti-join cannot target the same table nodes/);
+  await assert.rejects(async () => {
+    await selfJoin(fake.scope, {});
+  }, /projection inner join cannot target the same table nodes/);
+  assert.deepEqual(fake.calls, []);
+});
+
 test("projection access supports typed aggregate reads", async () => {
   const toolSchema = defineMaterializationSchema({
     namespace: "tool-aggregates",
@@ -1848,6 +2010,32 @@ test("projection access hydrates semantic event references without exposing even
       email: "alice@example.com",
     },
   ]);
+
+  const chunkedBatchFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+  const chunkedPayloads = (await sourceEvents(chunkedBatchFake.scope, {
+    eventIds: Array.from({ length: 901 }, (_value, index) => {
+      return index + 1;
+    }),
+  })) as readonly unknown[];
+
+  assert.equal(chunkedPayloads.length, 901);
+  assert.equal(
+    chunkedPayloads.every((event) => event === null),
+    true,
+  );
+  assert.equal(chunkedBatchFake.calls.length, 2);
+  assert.equal(chunkedBatchFake.calls[0]?.method, "all");
+  assert.equal(chunkedBatchFake.calls[0]?.params.length, 902);
+  assert.deepEqual(chunkedBatchFake.calls[0]?.params.slice(0, 3), [
+    "user.created",
+    0,
+    1,
+  ]);
+  assert.equal(chunkedBatchFake.calls[1]?.method, "all");
+  assert.deepEqual(chunkedBatchFake.calls[1]?.params, ["user.created", 0, 901]);
 
   const emptyBatchFake = createFakeScope({
     allRows: [],

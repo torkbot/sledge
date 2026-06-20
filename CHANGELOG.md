@@ -70,11 +70,15 @@
   event-ref IDs at construction time.
 - Harden materialization/projection validation for migration-order data steps,
   foreign-key target keys, duplicate index names, case-only duplicate columns,
-  and late projection writes after indexer completion.
+  null predicate values, unsupported same-table joins, and late projection
+  writes after indexer completion.
 - Reject projection table/index names that would collide under SQLite's
   identifier rules or share SQLite's table/index namespace, enable SQLite
   foreign-key enforcement on adapter connections, and preserve JSON `null`
   values in JSON projection columns.
+- Preserve JSON objects that look like projection-expression metadata during
+  update/upsert serialization, and chunk batched semantic event reads below
+  SQLite bind-variable limits.
 
 ## 0.9.0 - 2026-05-20
 

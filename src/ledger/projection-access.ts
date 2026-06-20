@@ -39,7 +39,10 @@ import {
 } from "./projections.ts";
 
 type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
-declare const projectionExpressionBrand: unique symbol;
+const projectionExpressionBrand: unique symbol = Symbol(
+  "sledge.projectionExpression",
+);
+declare const projectionExpressionValueBrand: unique symbol;
 
 const ProjectionEventRowSchema = Type.Object({
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
@@ -49,6 +52,7 @@ const ProjectionEventRowSchema = Type.Object({
   payload_json: Type.String(),
   ts_ms: Type.Number(),
 });
+const maxProjectionEventReadIdsPerStatement = 900;
 
 export type AnyProjectionSchema = {
   readonly metadata: ProjectionSchemaMetadata;
@@ -93,7 +97,8 @@ type ProjectionExpressionOperandMetadata =
     };
 
 export type ProjectionExpression<TValue> = {
-  readonly [projectionExpressionBrand]?: TValue;
+  readonly [projectionExpressionBrand]: true;
+  readonly [projectionExpressionValueBrand]?: TValue;
   readonly metadata: ProjectionExpressionMetadata;
 };
 
@@ -2566,6 +2571,7 @@ function createProjectionExpression<TValue>(
   metadata: ProjectionExpressionMetadata,
 ): ProjectionExpression<TValue> {
   return {
+    [projectionExpressionBrand]: true,
     metadata,
   };
 }
@@ -2592,13 +2598,11 @@ function isProjectionExpression(
     return false;
   }
 
-  const metadata = (value as { readonly metadata?: unknown }).metadata;
-
-  if (typeof metadata !== "object" || metadata === null) {
-    return false;
-  }
-
-  return "kind" in metadata;
+  return (
+    (value as { readonly [projectionExpressionBrand]?: unknown })[
+      projectionExpressionBrand
+    ] === true
+  );
 }
 
 function readProjectionUpdateAssignments(
@@ -2974,11 +2978,7 @@ function createProjectionComparisonWhereClause(
     column: createProjectionColumnReference(tableName, columnName),
     kind: "comparison",
     operator,
-    value: serializeProjectionColumnValue(
-      table.columns[columnName],
-      value,
-      `${table.name}.${columnName}`,
-    ),
+    value: serializeProjectionPredicateValue(table, columnName, value),
   };
 }
 
@@ -2994,13 +2994,27 @@ function createProjectionInWhereClause(
     column: createProjectionColumnReference(tableName, columnName),
     kind: "in",
     values: values.map((value) => {
-      return serializeProjectionColumnValue(
-        table.columns[columnName],
-        value,
-        `${table.name}.${columnName}`,
-      );
+      return serializeProjectionPredicateValue(table, columnName, value);
     }),
   };
+}
+
+function serializeProjectionPredicateValue(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  value: unknown,
+): unknown {
+  if (value === null) {
+    throw new Error(
+      `${table.name}.${columnName} predicate value cannot be null; use whereNull or whereNotNull`,
+    );
+  }
+
+  return serializeProjectionColumnValue(
+    table.columns[columnName],
+    value,
+    `${table.name}.${columnName}`,
+  );
 }
 
 function createProjectionNullWhereClause(
@@ -3049,6 +3063,12 @@ function createProjectionNotExistsWhereClause(
   fromColumn: string,
   toColumn: string,
 ): ProjectionWhereClause {
+  if (fromTable.name === existenceTable.name) {
+    throw new Error(
+      `projection anti-join cannot target the same table ${fromTable.name}`,
+    );
+  }
+
   validateProjectionColumns("not-exists source column", fromTable, [
     fromColumn,
   ]);
@@ -3086,6 +3106,12 @@ function createProjectionInnerJoinClause(
   fromColumn: string,
   toColumn: string,
 ): ProjectionJoinClause {
+  if (fromTable.name === joinedTable.name) {
+    throw new Error(
+      `projection inner join cannot target the same table ${fromTable.name}`,
+    );
+  }
+
   validateProjectionColumns("join source column", fromTable, [fromColumn]);
   validateProjectionColumns("join target column", joinedTable, [toColumn]);
   validateProjectionJoinColumns(fromTable, fromColumn, joinedTable, toColumn);
@@ -3383,23 +3409,33 @@ async function readProjectionEvents<
       );
     }
 
-    const sql = buildReadProjectionEventsSql(
-      statementCompiler,
-      group.eventName,
-      group.eventIds,
-    );
-    const rows = await scope.prepare(sql.text).all(...sql.params);
-
-    for (const row of rows) {
-      const event = decodeProjectionEventRow(
-        eventSchema,
-        group.eventName,
-        row,
-      ) as AnyProjectionEventEnvelope<TEvents>;
-      eventsByRef.set(
-        createProjectionEventReadKey(event.eventName, event.eventId),
-        event,
+    for (
+      let offset = 0;
+      offset < group.eventIds.length;
+      offset += maxProjectionEventReadIdsPerStatement
+    ) {
+      const eventIds = group.eventIds.slice(
+        offset,
+        offset + maxProjectionEventReadIdsPerStatement,
       );
+      const sql = buildReadProjectionEventsSql(
+        statementCompiler,
+        group.eventName,
+        eventIds,
+      );
+      const rows = await scope.prepare(sql.text).all(...sql.params);
+
+      for (const row of rows) {
+        const event = decodeProjectionEventRow(
+          eventSchema,
+          group.eventName,
+          row,
+        ) as AnyProjectionEventEnvelope<TEvents>;
+        eventsByRef.set(
+          createProjectionEventReadKey(event.eventName, event.eventId),
+          event,
+        );
+      }
     }
   }
 
