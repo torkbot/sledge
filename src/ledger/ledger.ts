@@ -64,6 +64,7 @@ export type {
   ProjectionInsertOnConflictBuilder,
   ProjectionJoinCondition,
   ProjectionJoinedSelectBuilder,
+  ProjectionNullOrder,
   ProjectionOrderDirection,
   ProjectionQualifiedWhereCondition,
   ProjectionQueryContract,

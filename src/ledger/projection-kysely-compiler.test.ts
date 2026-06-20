@@ -184,6 +184,74 @@ test("kysely projection compiler strips externally-bound insert value params", (
   assert.equal(rightCoalesce["func"], "coalesce");
 });
 
+test("kysely projection compiler lowers explicit null ordering", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: [],
+        sql: 'select "requests"."requestId" as "requestId" from "requests" order by case when "requests"."remainingUses" is null then 1 else 0 end asc',
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileSelect({
+      columns: [
+        {
+          columnName: "requestId",
+          tableName: "requests",
+        },
+      ],
+      fromTableName: "requests",
+      joins: [],
+      limit: null,
+      orderBy: [
+        {
+          column: {
+            columnName: "remainingUses",
+            tableName: "requests",
+          },
+          kind: "nulls",
+          order: "last",
+        },
+      ],
+      where: [],
+    }),
+    {
+      params: [],
+      text: 'select "requests"."requestId" as "requestId" from "requests" order by case when "requests"."remainingUses" is null then 1 else 0 end asc',
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const orderBy = readRecord(query["orderBy"], "order by");
+  const orderItems = readArray(orderBy["items"], "order by items");
+  const orderItem = readRecord(orderItems[0], "first order item");
+  const orderCase = readRecord(orderItem["orderBy"], "order case");
+  const orderWhen = readRecord(
+    readArray(orderCase["when"], "order case whens")[0],
+    "first order case when",
+  );
+  const condition = readRecord(orderWhen["condition"], "null order condition");
+  const operator = readRecord(condition["operator"], "null order operator");
+  const result = readRecord(orderWhen["result"], "null order result");
+  const fallback = readRecord(orderCase["else"], "null order else");
+
+  assert.equal(orderCase["kind"], "CaseNode");
+  assert.equal(operator["operator"], "is");
+  assert.equal(result["value"], 1);
+  assert.equal(result["immediate"], true);
+  assert.equal(fallback["value"], 0);
+  assert.equal(fallback["immediate"], true);
+});
+
 test("kysely projection compiler lowers typed integer add expressions", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {

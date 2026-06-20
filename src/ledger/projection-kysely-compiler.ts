@@ -613,6 +613,12 @@ function orderByItemNode(
           clause.column.columnName,
         ),
       };
+    case "nulls":
+      return {
+        direction: rawNode("asc"),
+        kind: "OrderByItemNode",
+        orderBy: nullOrderCaseNode(clause),
+      };
     case "value_list":
       if (clause.values.length === 0) {
         throw new Error("value-list order clause must include values");
@@ -624,6 +630,29 @@ function orderByItemNode(
         orderBy: valueListOrderCaseNode(clause),
       };
   }
+}
+
+function nullOrderCaseNode(
+  clause: Extract<ProjectionCompilerOrderClause, { readonly kind: "nulls" }>,
+): KyselyProjectionOperationNode {
+  const nullRank = clause.order === "first" ? 0 : 1;
+  const presentRank = clause.order === "first" ? 1 : 0;
+
+  return {
+    else: valueNodeImmediate(presentRank),
+    kind: "CaseNode",
+    when: [
+      {
+        condition: binaryOperationNode(
+          referenceNode(clause.column.tableName, clause.column.columnName),
+          "is",
+          valueNodeImmediate(null),
+        ),
+        kind: "WhenNode",
+        result: valueNodeImmediate(nullRank),
+      },
+    ],
+  };
 }
 
 function valueListOrderCaseNode(

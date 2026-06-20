@@ -1231,6 +1231,7 @@ test("projection access supports typed application-defined ordering", async () =
             docId: t.text().notNull(),
             version: t.integer().notNull(),
             content: t.text().notNull(),
+            archivedAtMs: t.integer(),
           })
           .primaryKey(["docId"]),
     },
@@ -1244,6 +1245,7 @@ test("projection access supports typed application-defined ordering", async () =
               docId: t.text().notNull(),
               version: t.integer().notNull(),
               content: t.text().notNull(),
+              archivedAtMs: t.integer(),
             })
             .primaryKey(["docId"]),
         ),
@@ -1272,6 +1274,7 @@ test("projection access supports typed application-defined ordering", async () =
         const rows = await db
           .selectFrom("profileDocs")
           .select(["docId", "version", "content"])
+          .orderByNulls("archivedAtMs", "last")
           .orderByList("docId", ["SOUL", "IDENTITY", "USER"])
           .execute();
 
@@ -1301,7 +1304,7 @@ test("projection access supports typed application-defined ordering", async () =
   assert.deepEqual(fake.calls[0], {
     method: "all",
     params: ["SOUL", 0, "IDENTITY", 1, "USER", 2, 3],
-    sql: 'SELECT "docId" AS "docId", "version" AS "version", "content" AS "content" FROM "profileDocs" ORDER BY CASE "docId" WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? ELSE ? END ASC',
+    sql: 'SELECT "docId" AS "docId", "version" AS "version", "content" AS "content" FROM "profileDocs" ORDER BY CASE WHEN "archivedAtMs" IS NULL THEN 1 ELSE 0 END ASC, CASE "docId" WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? ELSE ? END ASC',
   });
   assert.deepEqual(rows, [
     {
@@ -3185,6 +3188,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
       parents: (t) =>
         t
           .columns({
+            deletedAtMs: t.integer(),
             parentId: t.text().notNull(),
             rank: t.integer().notNull(),
           })
@@ -3204,6 +3208,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
       s.createTable("parents", (t) =>
         t
           .columns({
+            deletedAtMs: t.integer(),
             parentId: t.text().notNull(),
             rank: t.integer().notNull(),
           })
@@ -3232,6 +3237,21 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           })
           .selectFrom("parents", ["rank"])
           .orderByList("parents", "rank", [1, 2]);
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
+          .orderByNulls("parents", "deletedAtMs", "last");
+        db.selectFrom("children")
+          .innerJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank"])
+          // @ts-expect-error joined orderByNulls only accepts nullable columns.
+          .orderByNulls("parents", "rank", "last");
         db.selectFrom("children")
           .innerJoin("parents", {
             fromColumn: "parentId",
@@ -3408,6 +3428,10 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .select(["email"])
           // @ts-expect-error orderByList must reference known columns.
           .orderByList("missing", ["alice@example.com"]);
+        db.selectFrom("users")
+          .select(["email"])
+          // @ts-expect-error orderByNulls only accepts nullable columns.
+          .orderByNulls("email", "last");
 
         const event = await db.readEvent(createEventRef("user.created", 1));
 

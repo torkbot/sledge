@@ -53,6 +53,8 @@
   can avoid event-table N+1 reads without receiving the internal events table.
 - Add typed `orderByList(...)` projection reads for application-defined
   priority ordering without exposing raw `CASE` SQL.
+- Add typed `orderByNulls(...)` projection reads for explicit nullable-column
+  ordering without exposing raw `CASE` SQL.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and

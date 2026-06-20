@@ -344,8 +344,9 @@ Indexer and query implementations receive sledge-owned facades:
   disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
   typed `whereNotExists(...)` anti-joins, typed aggregate reads with
   `count(...)`, `countNotNull(...)`, `min(...)`, and `max(...)`,
-  `orderBy(...)`, domain-specific `orderByList(...)` value ordering,
-  `limit(...)`, `execute()`, `executeTakeFirst()`, and `stream()`
+  `orderBy(...)`, explicit nullable-column `orderByNulls(...)`,
+  domain-specific `orderByList(...)` value ordering, `limit(...)`,
+  `execute()`, `executeTakeFirst()`, and `stream()`
 - writes return affected-row metadata and support typed integer `add(...)`,
   `MAX(...)`, `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 

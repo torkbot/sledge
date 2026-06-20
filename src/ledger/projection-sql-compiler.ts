@@ -95,6 +95,11 @@ export type ProjectionCompilerOrderClause =
     }
   | {
       readonly column: ProjectionCompilerColumnReference;
+      readonly kind: "nulls";
+      readonly order: "first" | "last";
+    }
+  | {
+      readonly column: ProjectionCompilerColumnReference;
       readonly kind: "value_list";
       readonly values: readonly unknown[];
     };
@@ -471,6 +476,11 @@ function compileOrderBy(
       switch (clause.kind) {
         case "column":
           return `${compileColumnReference(clause.column)} ${clause.direction.toUpperCase()}`;
+        case "nulls": {
+          const nullRank = clause.order === "first" ? 0 : 1;
+          const presentRank = clause.order === "first" ? 1 : 0;
+          return `CASE WHEN ${compileColumnReference(clause.column)} IS NULL THEN ${nullRank} ELSE ${presentRank} END ASC`;
+        }
         case "value_list": {
           if (clause.values.length === 0) {
             throw new Error("value-list order clause must include values");

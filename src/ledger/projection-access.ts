@@ -312,6 +312,7 @@ export type ProjectionJoinCondition<
 }[ProjectionTableColumnName<TTables[TFromTableName]>];
 
 export type ProjectionOrderDirection = "asc" | "desc";
+export type ProjectionNullOrder = "first" | "last";
 
 export type ProjectionSelectedRow<
   TTable,
@@ -327,6 +328,16 @@ type ProjectionIntegerColumnName<TTable> = {
     "integer",
     unknown,
     boolean
+  >
+    ? TColumnName
+    : never;
+}[ProjectionTableColumnName<TTable>];
+
+type ProjectionNullableColumnName<TTable> = {
+  readonly [TColumnName in ProjectionTableColumnName<TTable>]: ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
+    ProjectionColumnKind,
+    unknown,
+    true
   >
     ? TColumnName
     : never;
@@ -519,6 +530,10 @@ export type ProjectionExecutableSelect<
     columnName: TColumnName,
     values: readonly ProjectionWhereValue<TTable, TColumnName>[],
   ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
+  orderByNulls<const TColumnName extends ProjectionNullableColumnName<TTable>>(
+    columnName: TColumnName,
+    order: ProjectionNullOrder,
+  ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
   whereAny(
     conditions: readonly ProjectionWhereCondition<TTable>[],
   ): ProjectionExecutableSelect<TTable, TColumnNames, TTables, TFromTableName>;
@@ -682,6 +697,19 @@ export type ProjectionExecutableJoinedSelect<
     tableName: TTableName,
     columnName: TColumnName,
     values: readonly ProjectionWhereValue<TTables[TTableName], TColumnName>[],
+  ): ProjectionExecutableJoinedSelect<
+    TTables,
+    TTableNames,
+    TSelectedTableName,
+    TColumnNames
+  >;
+  orderByNulls<
+    const TTableName extends TTableNames,
+    const TColumnName extends ProjectionNullableColumnName<TTables[TTableName]>,
+  >(
+    tableName: TTableName,
+    columnName: TColumnName,
+    order: ProjectionNullOrder,
   ): ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
@@ -2034,6 +2062,29 @@ function createProjectionExecutableSelect<
         statementCompiler,
       );
     },
+    orderByNulls: (columnName, order) => {
+      return createProjectionExecutableSelect(
+        metadata,
+        scope,
+        fromTable,
+        table,
+        selectedColumns,
+        selectedColumnReferences,
+        joinClauses,
+        whereClauses,
+        [
+          ...orderClauses,
+          createProjectionNullOrderClause(
+            table,
+            String(columnName),
+            order,
+            null,
+          ),
+        ],
+        limitClause,
+        statementCompiler,
+      );
+    },
     whereAny: (conditions) => {
       return createProjectionExecutableSelect(
         metadata,
@@ -2333,6 +2384,28 @@ function createProjectionExecutableJoinedSelect<
             orderTable,
             String(columnName),
             values,
+            orderTable.name,
+          ),
+        ],
+        limitClause,
+      );
+    },
+    orderByNulls: (tableName, columnName, order) => {
+      const orderTable = readProjectionJoinedTable(
+        metadata,
+        fromTable,
+        joinClauses,
+        String(tableName),
+      );
+
+      return createNext(
+        whereClauses,
+        [
+          ...orderClauses,
+          createProjectionNullOrderClause(
+            orderTable,
+            String(columnName),
+            order,
             orderTable.name,
           ),
         ],
@@ -3121,6 +3194,28 @@ function createProjectionValueListOrderClause(
   };
 }
 
+function createProjectionNullOrderClause(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  order: ProjectionNullOrder,
+  tableName: string | null,
+): ProjectionOrderClause {
+  validateProjectionColumns("null order column", table, [columnName]);
+  validateProjectionNullOrder(order);
+
+  if (table.columns[columnName]?.nullable !== true) {
+    throw new Error(
+      `null order column ${table.name}.${columnName} must be nullable`,
+    );
+  }
+
+  return {
+    column: createProjectionColumnReference(tableName, columnName),
+    kind: "nulls",
+    order,
+  };
+}
+
 function createProjectionNotExistsWhereClause(
   fromTable: ProjectionTableMetadata,
   existenceTable: ProjectionTableMetadata,
@@ -3345,6 +3440,12 @@ function validateProjectionOrderDirection(
 ): void {
   if (direction !== "asc" && direction !== "desc") {
     throw new Error(`unsupported projection order direction ${direction}`);
+  }
+}
+
+function validateProjectionNullOrder(order: ProjectionNullOrder): void {
+  if (order !== "first" && order !== "last") {
+    throw new Error(`unsupported projection null order ${order}`);
   }
 }
 
