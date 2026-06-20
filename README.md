@@ -343,8 +343,9 @@ Indexer and query implementations receive sledge-owned facades:
 - reads support typed predicates, null predicates, typed `whereAny([...])`
   disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
   typed `whereNotExists(...)` anti-joins, typed aggregate reads with
-  `count(...)` and `countNotNull(...)`, `orderBy(...)`, `limit(...)`,
-  `execute()`, `executeTakeFirst()`, and `stream()`
+  `count(...)`, `countNotNull(...)`, `min(...)`, and `max(...)`,
+  `orderBy(...)`, `limit(...)`, `execute()`, `executeTakeFirst()`, and
+  `stream()`
 - writes return affected-row metadata and support typed `MAX(...)`,
   `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
@@ -364,6 +365,8 @@ const summary = await db
   .aggregate()
   .count("totalToolCallCount")
   .countNotNull("completedToolCallCount", "resultMessageJson")
+  .min("firstToolCallAtMs", "createdAtMs")
+  .max("latestToolCallAtMs", "createdAtMs")
   .where("runId", "=", params.runId)
   .execute();
 ```

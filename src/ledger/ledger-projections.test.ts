@@ -1387,6 +1387,7 @@ test("projection access supports typed aggregate reads", async () => {
         t
           .columns({
             toolCallId: t.text().notNull(),
+            createdAtMs: t.integer().notNull(),
             runId: t.text().notNull(),
             resultMessageJson: t.text(),
           })
@@ -1401,6 +1402,7 @@ test("projection access supports typed aggregate reads", async () => {
           t
             .columns({
               toolCallId: t.text().notNull(),
+              createdAtMs: t.integer().notNull(),
               runId: t.text().notNull(),
               resultMessageJson: t.text(),
             })
@@ -1423,6 +1425,8 @@ test("projection access supports typed aggregate reads", async () => {
         }),
         result: Type.Object({
           completedToolCallCount: Type.Number(),
+          firstToolCallAtMs: Type.Union([Type.Null(), Type.Number()]),
+          latestToolCallAtMs: Type.Union([Type.Null(), Type.Number()]),
           totalToolCallCount: Type.Number(),
         }),
       },
@@ -1444,6 +1448,8 @@ test("projection access supports typed aggregate reads", async () => {
           .aggregate()
           .count("totalToolCallCount")
           .countNotNull("completedToolCallCount", "resultMessageJson")
+          .min("firstToolCallAtMs", "createdAtMs")
+          .max("latestToolCallAtMs", "createdAtMs")
           .where("runId", "=", params.runId)
           .execute();
       },
@@ -1465,6 +1471,8 @@ test("projection access supports typed aggregate reads", async () => {
     allRows: [],
     getRow: {
       completedToolCallCount: 2,
+      firstToolCallAtMs: 1_000,
+      latestToolCallAtMs: 1_500,
       totalToolCallCount: 3,
     },
   });
@@ -1476,10 +1484,12 @@ test("projection access supports typed aggregate reads", async () => {
   assert.deepEqual(fake.calls[0], {
     method: "get",
     params: ["run_1"],
-    sql: 'SELECT COUNT(*) AS "totalToolCallCount", COUNT("resultMessageJson") AS "completedToolCallCount" FROM "toolCalls" WHERE "runId" = ?',
+    sql: 'SELECT COUNT(*) AS "totalToolCallCount", COUNT("resultMessageJson") AS "completedToolCallCount", MIN("createdAtMs") AS "firstToolCallAtMs", MAX("createdAtMs") AS "latestToolCallAtMs" FROM "toolCalls" WHERE "runId" = ?',
   });
   assert.deepEqual(summary, {
     completedToolCallCount: 2,
+    firstToolCallAtMs: 1_000,
+    latestToolCallAtMs: 1_500,
     totalToolCallCount: 3,
   });
 
@@ -2481,7 +2491,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
 
   withMaterializations(shape, joinMaterializations).register({
     queries: {
-      joined: ({ db }) => {
+      joined: async ({ db }) => {
         db.selectFrom("children")
           .innerJoin("parents", {
             fromColumn: "parentId",
@@ -2528,6 +2538,23 @@ async function assertLedgerProjectionTypes(): Promise<void> {
             fromColumn: "parentId",
             toColumn: "parentId",
           });
+
+        const aggregateRow = await db
+          .selectFrom("parents")
+          .aggregate()
+          .min("lowestRank", "rank")
+          .max("highestRank", "rank")
+          .execute();
+        const lowestRank: number | null = aggregateRow.lowestRank;
+        const highestRank: number | null = aggregateRow.highestRank;
+
+        void lowestRank;
+        void highestRank;
+
+        db.selectFrom("parents")
+          .aggregate()
+          // @ts-expect-error min/max aggregates only accept integer columns.
+          .min("badRank", "parentId");
 
         return null;
       },

@@ -94,6 +94,16 @@ export type ProjectionCompilerAggregate =
       readonly alias: string;
       readonly column: ProjectionCompilerColumnReference;
       readonly kind: "count_not_null";
+    }
+  | {
+      readonly alias: string;
+      readonly column: ProjectionCompilerColumnReference;
+      readonly kind: "max";
+    }
+  | {
+      readonly alias: string;
+      readonly column: ProjectionCompilerColumnReference;
+      readonly kind: "min";
     };
 
 export type ProjectionCompilerInsertStatement = {
@@ -191,6 +201,10 @@ function compileAggregateStatement(
           return `COUNT(*) AS ${alias}`;
         case "count_not_null":
           return `COUNT(${compileColumnReference(aggregate.column)}) AS ${alias}`;
+        case "max":
+          return `MAX(${compileColumnReference(aggregate.column)}) AS ${alias}`;
+        case "min":
+          return `MIN(${compileColumnReference(aggregate.column)}) AS ${alias}`;
       }
     })
     .join(", ");

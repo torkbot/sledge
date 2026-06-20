@@ -300,6 +300,23 @@ export type ProjectionSelectedRow<
   >;
 };
 
+type ProjectionIntegerColumnName<TTable> = {
+  readonly [TColumnName in ProjectionTableColumnName<TTable>]: ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
+    "integer",
+    unknown,
+    boolean
+  >
+    ? TColumnName
+    : never;
+}[ProjectionTableColumnName<TTable>];
+
+type ProjectionIntegerAggregateValue<
+  TTable,
+  TColumnName extends ProjectionIntegerColumnName<TTable>,
+> = NonNullable<
+  ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+> | null;
+
 export type ProjectionWriteResult = {
   readonly changes: number;
   readonly lastInsertRowid: number | bigint;
@@ -535,6 +552,40 @@ export type ProjectionAggregateBuilder<
   ): ProjectionAggregateBuilder<
     TTable,
     TResult & { readonly [TKey in TAlias]: number },
+    TTables,
+    TFromTableName
+  >;
+  max<
+    const TAlias extends string,
+    const TColumnName extends ProjectionIntegerColumnName<TTable>,
+  >(
+    alias: TAlias,
+    columnName: TColumnName,
+  ): ProjectionAggregateBuilder<
+    TTable,
+    TResult & {
+      readonly [TKey in TAlias]: ProjectionIntegerAggregateValue<
+        TTable,
+        TColumnName
+      >;
+    },
+    TTables,
+    TFromTableName
+  >;
+  min<
+    const TAlias extends string,
+    const TColumnName extends ProjectionIntegerColumnName<TTable>,
+  >(
+    alias: TAlias,
+    columnName: TColumnName,
+  ): ProjectionAggregateBuilder<
+    TTable,
+    TResult & {
+      readonly [TKey in TAlias]: ProjectionIntegerAggregateValue<
+        TTable,
+        TColumnName
+      >;
+    },
     TTables,
     TFromTableName
   >;
@@ -1620,6 +1671,54 @@ function createProjectionAggregateBuilder<
             alias,
             column: createProjectionColumnReference(null, String(columnName)),
             kind: "count_not_null",
+          },
+        ],
+        whereClauses,
+      );
+    },
+    max: (alias, columnName) => {
+      const aggregateColumnName = String(columnName);
+      validateProjectionAggregateAlias(alias, aggregates);
+      validateProjectionAggregateIntegerColumn(table, aggregateColumnName);
+
+      return createNext<
+        TResult & {
+          readonly [TKey in typeof alias]: ProjectionIntegerAggregateValue<
+            TTable,
+            typeof columnName
+          >;
+        }
+      >(
+        [
+          ...aggregates,
+          {
+            alias,
+            column: createProjectionColumnReference(null, aggregateColumnName),
+            kind: "max",
+          },
+        ],
+        whereClauses,
+      );
+    },
+    min: (alias, columnName) => {
+      const aggregateColumnName = String(columnName);
+      validateProjectionAggregateAlias(alias, aggregates);
+      validateProjectionAggregateIntegerColumn(table, aggregateColumnName);
+
+      return createNext<
+        TResult & {
+          readonly [TKey in typeof alias]: ProjectionIntegerAggregateValue<
+            TTable,
+            typeof columnName
+          >;
+        }
+      >(
+        [
+          ...aggregates,
+          {
+            alias,
+            column: createProjectionColumnReference(null, aggregateColumnName),
+            kind: "min",
           },
         ],
         whereClauses,
@@ -2939,6 +3038,19 @@ function validateProjectionAggregateAlias(
   }
 }
 
+function validateProjectionAggregateIntegerColumn(
+  table: ProjectionTableMetadata,
+  columnName: string,
+): void {
+  validateProjectionColumns("aggregate column", table, [columnName]);
+
+  if (table.columns[columnName]?.kind !== "integer") {
+    throw new Error(
+      `aggregate column ${columnName} must reference an integer column`,
+    );
+  }
+}
+
 function validateProjectionLimit(limit: number): void {
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new Error("projection limit must be a non-negative safe integer");
@@ -3174,22 +3286,42 @@ function decodeProjectionSelectedRow(
 function decodeProjectionAggregateRow(
   aggregates: readonly ProjectionAggregate[],
   row: LedgerStorageRow,
-): Readonly<Record<string, number>> {
-  const decoded: Record<string, number> = {};
+): Readonly<Record<string, unknown>> {
+  const decoded: Record<string, unknown> = {};
 
   for (const aggregate of aggregates) {
     const value = row[aggregate.alias];
 
-    if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-      throw new Error(
-        `projection aggregate ${aggregate.alias} must be a stored integer`,
-      );
+    switch (aggregate.kind) {
+      case "count":
+      case "count_not_null":
+        decoded[aggregate.alias] = decodeProjectionStoredIntegerAggregate(
+          aggregate.alias,
+          value,
+        );
+        break;
+      case "max":
+      case "min":
+        decoded[aggregate.alias] =
+          value === null
+            ? null
+            : decodeProjectionStoredIntegerAggregate(aggregate.alias, value);
+        break;
     }
-
-    decoded[aggregate.alias] = value;
   }
 
   return decoded;
+}
+
+function decodeProjectionStoredIntegerAggregate(
+  alias: string,
+  value: unknown,
+): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error(`projection aggregate ${alias} must be a stored integer`);
+  }
+
+  return value;
 }
 
 function decodeProjectionColumnValue(
