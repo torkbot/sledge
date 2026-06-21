@@ -41,6 +41,10 @@ export type ProjectionCompilerExpression =
       readonly value: ProjectionCompilerExpression;
     }
   | {
+      readonly kind: "decrement_if_positive";
+      readonly columnName: string;
+    }
+  | {
       readonly kind: "column";
       readonly columnName: string;
     }
@@ -825,6 +829,11 @@ function compileExpression(
         text: `COALESCE(${quoteIdentifier(expression.columnName)}, ${value.text})`,
       };
     }
+    case "decrement_if_positive":
+      return {
+        params: [],
+        text: `CASE WHEN ${quoteIdentifier(expression.columnName)} IS NULL THEN NULL WHEN ${quoteIdentifier(expression.columnName)} > 0 THEN ${quoteIdentifier(expression.columnName)} - 1 ELSE ${quoteIdentifier(expression.columnName)} END`,
+      };
     case "column":
       return {
         params: [],

@@ -608,6 +608,8 @@ function expressionNode(
         referenceNode(null, expression.columnName),
         expressionNode(dialect, expression.value),
       ]);
+    case "decrement_if_positive":
+      return decrementIfPositiveNode(expression.columnName);
     case "column":
       return referenceNode(null, expression.columnName);
     case "excluded":
@@ -617,6 +619,39 @@ function expressionNode(
     case "value":
       return valueNode(expression.value);
   }
+}
+
+function decrementIfPositiveNode(
+  columnName: string,
+): KyselyProjectionOperationNode {
+  return {
+    else: referenceNode(null, columnName),
+    kind: "CaseNode",
+    when: [
+      {
+        condition: binaryOperationNode(
+          referenceNode(null, columnName),
+          "is",
+          valueNodeImmediate(null),
+        ),
+        kind: "WhenNode",
+        result: valueNodeImmediate(null),
+      },
+      {
+        condition: binaryOperationNode(
+          referenceNode(null, columnName),
+          ">",
+          valueNodeImmediate(0),
+        ),
+        kind: "WhenNode",
+        result: binaryOperationNode(
+          referenceNode(null, columnName),
+          "-",
+          valueNodeImmediate(1),
+        ),
+      },
+    ],
+  };
 }
 
 function nullSafeScalarMaxNode(

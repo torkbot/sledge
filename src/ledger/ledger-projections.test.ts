@@ -538,6 +538,89 @@ test("projection access supports typed integer increments without raw SQL", asyn
   ]);
 });
 
+test("projection access supports bounded integer decrements without raw SQL", async () => {
+  const grantSchema = defineMaterializationSchema({
+    namespace: "grant_consumes",
+    version: 1,
+    tables: {
+      grants: (t) =>
+        t
+          .columns({
+            grantId: t.text().notNull(),
+            remainingUses: t.integer(),
+          })
+          .primaryKey(["grantId"]),
+    },
+  });
+  const grantHistory = defineMaterializationHistory(shape, grantSchema, (m) => [
+    m.migration(1, "create grants", (s) => [
+      s.createTable("grants", (t) =>
+        t
+          .columns({
+            grantId: t.text().notNull(),
+            remainingUses: t.integer(),
+          })
+          .primaryKey(["grantId"]),
+      ),
+    ]),
+  ]);
+  const grantMaterializations = defineMaterializations({
+    history: grantHistory,
+    indexers: {
+      consumeGrant: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          grantId: Type.String(),
+        }),
+      },
+    },
+    queries: {},
+  });
+  const grantModel = withMaterializations(
+    shape,
+    grantMaterializations,
+  ).register({
+    indexers: {
+      consumeGrant: async ({ input, db }) => {
+        await db
+          .updateTable("grants")
+          .set((e) => ({
+            remainingUses: e.decrementIfPositive("remainingUses"),
+          }))
+          .where("grantId", "=", input.grantId)
+          .executeExpectingOne();
+      },
+    },
+  });
+  const indexer =
+    readTestLedgerImplementations(grantModel).indexers?.consumeGrant;
+
+  if (indexer === undefined) {
+    throw new Error("expected consumeGrant indexer implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await indexer(
+    fake.scope,
+    {
+      grantId: "g_1",
+    },
+    createUserCreatedContext(42),
+  );
+
+  assert.deepEqual(fake.calls, [
+    {
+      method: "run",
+      params: ["g_1"],
+      sql: 'UPDATE "grants" SET "remainingUses" = CASE WHEN "remainingUses" IS NULL THEN NULL WHEN "remainingUses" > 0 THEN "remainingUses" - 1 ELSE "remainingUses" END WHERE "grantId" = ?',
+    },
+  ]);
+});
+
 test("projection implementations compile through the supplied statement compiler", async () => {
   const sqliteCompiler = createSqliteProjectionStatementCompiler();
   const statementCompiler: ProjectionStatementCompiler = {

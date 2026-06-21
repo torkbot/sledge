@@ -600,6 +600,77 @@ test("kysely projection compiler lowers typed integer add expressions", () => {
   assert.equal(rightOperand["value"], 1);
 });
 
+test("kysely projection compiler lowers bounded integer decrement expressions", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: ["g_1"],
+        sql: 'update "grants" set "remainingUses" = case when "remainingUses" is null then null when "remainingUses" > 0 then "remainingUses" - 1 else "remainingUses" end where "grantId" = ?',
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileUpdate({
+      assignments: [
+        {
+          columnName: "remainingUses",
+          value: {
+            columnName: "remainingUses",
+            kind: "decrement_if_positive",
+          },
+        },
+      ],
+      tableName: "grants",
+      where: [
+        {
+          column: {
+            columnName: "grantId",
+            tableName: null,
+          },
+          kind: "comparison",
+          operator: "=",
+          value: "g_1",
+        },
+      ],
+    }),
+    {
+      params: ["g_1"],
+      text: 'update "grants" set "remainingUses" = case when "remainingUses" is null then null when "remainingUses" > 0 then "remainingUses" - 1 else "remainingUses" end where "grantId" = ?',
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const updates = readArray(query["updates"], "query updates");
+  const update = readRecord(updates[0], "first update");
+  const value = readRecord(update["value"], "decrement update value");
+  const when = readArray(value["when"], "case branches");
+  const positiveBranch = readRecord(when[1], "positive branch");
+  const positiveResult = readRecord(
+    positiveBranch["result"],
+    "positive result",
+  );
+  const operator = readRecord(positiveResult["operator"], "subtract operator");
+  const rightOperand = readRecord(
+    positiveResult["rightOperand"],
+    "subtract right operand",
+  );
+
+  assert.equal(query["kind"], "UpdateQueryNode");
+  assert.equal(value["kind"], "CaseNode");
+  assert.equal(when.length, 2);
+  assert.equal(positiveResult["kind"], "BinaryOperationNode");
+  assert.equal(operator["operator"], "-");
+  assert.equal(rightOperand["value"], 1);
+});
+
 test("kysely sqlite projection compiler uses the supplied query compiler constructor", () => {
   const calls: KyselyProjectionOperationNode[] = [];
 

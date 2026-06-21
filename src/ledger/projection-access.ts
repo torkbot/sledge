@@ -87,6 +87,10 @@ type ProjectionExpressionMetadata =
       readonly value: ProjectionExpressionOperandMetadata;
     }
   | {
+      readonly kind: "decrement_if_positive";
+      readonly columnName: string;
+    }
+  | {
       readonly kind: "column";
       readonly columnName: string;
     }
@@ -133,6 +137,13 @@ export type ProjectionExpressionBuilder<TTable> = {
   coalesce<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     value: ProjectionExpressionOperand<TTable, TColumnName>,
+  ): ProjectionExpression<
+    ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
+  >;
+  decrementIfPositive<
+    const TColumnName extends ProjectionIntegerColumnName<TTable>,
+  >(
+    columnName: TColumnName,
   ): ProjectionExpression<
     ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
   >;
@@ -3284,6 +3295,18 @@ function createProjectionExpressionBuilder<TTable>(
         ),
       });
     },
+    decrementIfPositive: (columnName) => {
+      const stringColumnName = String(columnName);
+      validateProjectionIntegerColumn(
+        "decrement-if-positive column",
+        table,
+        stringColumnName,
+      );
+      return createProjectionExpression({
+        kind: "decrement_if_positive",
+        columnName: stringColumnName,
+      });
+    },
     column: (columnName) => {
       const stringColumnName = String(columnName);
       validateProjectionColumns("expression column", table, [stringColumnName]);
@@ -3442,6 +3465,16 @@ function compileProjectionExpression(
         value,
       };
     }
+    case "decrement_if_positive":
+      validateProjectionIntegerColumn(
+        "decrement-if-positive column",
+        table,
+        expression.columnName,
+      );
+      return {
+        columnName: expression.columnName,
+        kind: "decrement_if_positive",
+      };
     case "column":
       validateProjectionColumns("expression column", table, [
         expression.columnName,

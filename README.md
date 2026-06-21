@@ -360,7 +360,8 @@ Indexer and query implementations receive sledge-owned facades:
 - reads can stream historical events with `scanEvents(eventName)` without
   exposing the internal `events` table
 - writes return affected-row metadata and support typed integer `add(...)`,
-  `MAX(...)`, `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
+  bounded `decrementIfPositive(...)`, `MAX(...)`, `COALESCE(...)`, and upsert
+  `excluded` expressions without raw SQL
 
 Semantic event refs can be hydrated one at a time with `readEvent(ref)` or in
 batches with `readEvents(refs)`. Batch reads preserve the input order and avoid
