@@ -1261,6 +1261,7 @@ function openDatabaseLedgerEngine<
     };
 
     const signalHandler = registration.signals?.[signalName];
+    const hasObservers = hasSignalObservers(String(signalName));
     const queued: {
       queueName: string;
       workKey: string | null;
@@ -1324,7 +1325,7 @@ function openDatabaseLedgerEngine<
         );
     }
 
-    if (queued.length === 0) {
+    if (queued.length === 0 && signalHandler === undefined && !hasObservers) {
       await database
         .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
         .run(eventId);
@@ -1420,6 +1421,12 @@ function openDatabaseLedgerEngine<
     for (const waiter of waiters) {
       waiter();
     }
+  }
+
+  function hasSignalObservers(signalName: string): boolean {
+    const observers = signalObserversByName.get(signalName);
+
+    return observers !== undefined && observers.size > 0;
   }
 
   function notifySignalObservers(

@@ -1918,6 +1918,7 @@ test("queue handlers publish signals immediately before handler completion", asy
 
   const gate = Promise.withResolvers<void>();
   let observerCount = 0;
+  let observedSignalEventId: number | null = null;
 
   const model = defineEngineFixtureModel({
     events: {
@@ -1974,17 +1975,37 @@ test("queue handlers publish signals immediately before handler completion", asy
     scheduler: runtime.scheduler,
   });
 
-  const subscription = ledger.onSignal("response.delta", () => {
+  const subscription = ledger.onSignal("response.delta", (signal) => {
     observerCount += 1;
+    observedSignalEventId = signal.eventId;
   });
 
   await ledger.emit("response.generate", { id: 1 });
   await waitFor(runtime, () => observerCount === 1);
 
+  if (observedSignalEventId === null) {
+    assert.fail("expected observed signal event id");
+  }
+
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
+    ),
+    1,
+  );
+
   gate.resolve();
   await waitFor(
     runtime,
     () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+  );
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
+    ),
+    1,
   );
 
   subscription[Symbol.dispose]();
