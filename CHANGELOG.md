@@ -44,6 +44,8 @@
   and delete builders so common OR predicates do not require raw SQL.
 - Add typed `innerJoin(...).selectFrom(...)` projection reads for
   association-table lookups without exposing raw SQL or storage handles.
+- Add typed `leftJoin(...).selectFrom(...)` projection reads for optional
+  related rows, with selected joined-table columns exposed as nullable.
 - Add typed `whereNotExists(...)` projection anti-join predicates for
   unassociated-row lookups without exposing raw subqueries.
 - Add typed projection aggregate reads with `count(...)`, `countNotNull(...)`,

@@ -117,7 +117,7 @@ export type ProjectionCompilerOrderClause =
     };
 
 export type ProjectionCompilerJoinClause = {
-  readonly kind: "inner";
+  readonly kind: "inner" | "left";
   readonly left: ProjectionCompilerColumnReference;
   readonly right: ProjectionCompilerColumnReference;
   readonly tableName: string;
@@ -464,6 +464,8 @@ function compileSelectStatement(
         switch (join.kind) {
           case "inner":
             return `INNER JOIN ${quoteIdentifier(join.tableName)} ON ${compileColumnReference(join.left)} = ${compileColumnReference(join.right)}`;
+          case "left":
+            return `LEFT JOIN ${quoteIdentifier(join.tableName)} ON ${compileColumnReference(join.left)} = ${compileColumnReference(join.right)}`;
         }
       })
       .join(" ");

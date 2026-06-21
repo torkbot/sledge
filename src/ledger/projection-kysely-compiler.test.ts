@@ -124,6 +124,64 @@ test("kysely projection compiler lowers Sledge select IR to operation nodes", ()
   assert.equal(whereValue["value"], "a@example.com");
 });
 
+test("kysely projection compiler lowers left joins", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: [],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileSelect({
+      columns: [
+        {
+          columnName: "completedAtMs",
+          tableName: "completions",
+        },
+      ],
+      fromTableName: "operations",
+      joins: [
+        {
+          kind: "left",
+          left: {
+            columnName: "operationKey",
+            tableName: "operations",
+          },
+          right: {
+            columnName: "operationKey",
+            tableName: "completions",
+          },
+          tableName: "completions",
+        },
+      ],
+      limit: null,
+      orderBy: [],
+      where: [],
+    }),
+    {
+      params: [],
+      text: "compiled:SelectQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const joins = readArray(query["joins"], "query joins");
+  const join = readRecord(joins[0], "first join");
+
+  assert.equal(join["kind"], "JoinNode");
+  assert.equal(join["joinType"], "LeftJoin");
+});
+
 test("kysely projection compiler strips externally-bound insert value params", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {

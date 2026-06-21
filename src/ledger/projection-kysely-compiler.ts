@@ -789,6 +789,20 @@ function joinNode(
         },
         table: tableNode(clause.tableName),
       };
+    case "left":
+      return {
+        joinType: "LeftJoin",
+        kind: "JoinNode",
+        on: {
+          kind: "OnNode",
+          on: binaryOperationNode(
+            referenceNode(clause.left.tableName, clause.left.columnName),
+            "=",
+            referenceNode(clause.right.tableName, clause.right.columnName),
+          ),
+        },
+        table: tableNode(clause.tableName),
+      };
   }
 }
 

@@ -342,10 +342,11 @@ Indexer and query implementations receive sledge-owned facades:
   materialization tables
 - reads support typed predicates, null predicates, typed `whereAny([...])`
   disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
-  typed `whereNotExists(...)` anti-joins, typed aggregate reads with
-  `count(...)`, `countNotNull(...)`, `min(...)`, and `max(...)`,
-  `orderBy(...)`, explicit nullable-column `orderByNulls(...)`,
-  domain-specific `orderByList(...)` value ordering, `limit(...)`,
+  typed `leftJoin(...).selectFrom(...)` optional-row joins, typed
+  `whereNotExists(...)` anti-joins, typed aggregate reads with `count(...)`,
+  `countNotNull(...)`, `min(...)`, and `max(...)`, `orderBy(...)`, explicit
+  nullable-column `orderByNulls(...)`, domain-specific `orderByList(...)`
+  value ordering, `limit(...)`,
   `execute()`, `executeTakeFirst()`, and `stream()`
 - reads can compose typed candidate streams with `unionFrom(...)`,
   `unionValue(...)`, and `unionAll(...)` without exposing raw SQL

@@ -2174,6 +2174,109 @@ test("projection access supports typed anti-join predicates", async () => {
   ]);
 });
 
+test("projection access supports left-joined optional rows", async () => {
+  const operationSchema = defineMaterializationSchema({
+    namespace: "operation-status",
+    version: 1,
+    tables: {
+      completions: (t) =>
+        t
+          .columns({
+            completedAtMs: t.integer().notNull(),
+            operationKey: t.text().notNull(),
+          })
+          .primaryKey(["operationKey"]),
+      operations: (t) =>
+        t
+          .columns({
+            operationKey: t.text().notNull(),
+            requestedAtMs: t.integer().notNull(),
+          })
+          .primaryKey(["operationKey"]),
+    },
+  });
+  const operationMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(operationSchema, (m) => [
+      m.migration(1, "create operation status tables", (s) => [
+        s.createTable("operations", (t) =>
+          t
+            .columns({
+              operationKey: t.text().notNull(),
+              requestedAtMs: t.integer().notNull(),
+            })
+            .primaryKey(["operationKey"]),
+        ),
+        s.createTable("completions", (t) =>
+          t
+            .columns({
+              completedAtMs: t.integer().notNull(),
+              operationKey: t.text().notNull(),
+            })
+            .primaryKey(["operationKey"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      completionByOperation: {
+        params: Type.Object({
+          operationKey: Type.String(),
+        }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            completedAtMs: Type.Union([Type.Null(), Type.Number()]),
+          }),
+        ]),
+      },
+    },
+  });
+  const operationModel = withMaterializations(
+    shape,
+    operationMaterializations,
+  ).register({
+    queries: {
+      completionByOperation: async ({ params, db }) => {
+        return await db
+          .selectFrom("operations")
+          .leftJoin("completions", {
+            fromColumn: "operationKey",
+            toColumn: "operationKey",
+          })
+          .selectFrom("completions", ["completedAtMs"])
+          .where("operations", "operationKey", "=", params.operationKey)
+          .executeTakeFirst();
+      },
+    },
+  });
+  const completionByOperation =
+    readTestLedgerImplementations(operationModel).queries
+      ?.completionByOperation;
+
+  if (completionByOperation === undefined) {
+    throw new Error("expected completionByOperation query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      completedAtMs: null,
+    },
+  });
+  const row = await completionByOperation(fake.scope, {
+    operationKey: "op_123",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: ["op_123", 1],
+    sql: 'SELECT "completions"."completedAtMs" AS "completedAtMs" FROM "operations" LEFT JOIN "completions" ON "operations"."operationKey" = "completions"."operationKey" WHERE "operations"."operationKey" = ? LIMIT ?',
+  });
+  assert.deepEqual(row, {
+    completedAtMs: null,
+  });
+});
+
 test("projection access rejects unsafe predicate and self-join shapes", async () => {
   const nodeSchema = defineMaterializationSchema({
     namespace: "node-shapes",
@@ -3577,6 +3680,41 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           })
           .selectFrom("parents", ["rank"])
           .orderByList("parents", "rank", [1, 2]);
+        const optionalParent = await db
+          .selectFrom("children")
+          .leftJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("parents", ["rank", "deletedAtMs"])
+          .executeTakeFirst();
+
+        if (optionalParent !== null) {
+          const rank: number | null = optionalParent.rank;
+          const deletedAtMs: number | null = optionalParent.deletedAtMs;
+          // @ts-expect-error left-joined rows can be absent.
+          const strictRank: number = optionalParent.rank;
+
+          void rank;
+          void deletedAtMs;
+          void strictRank;
+        }
+
+        const requiredChild = await db
+          .selectFrom("children")
+          .leftJoin("parents", {
+            fromColumn: "parentId",
+            toColumn: "parentId",
+          })
+          .selectFrom("children", ["childId"])
+          .executeTakeFirst();
+
+        if (requiredChild !== null) {
+          const childId: string = requiredChild.childId;
+
+          void childId;
+        }
+
         db.selectFrom("children")
           .innerJoin("parents", {
             fromColumn: "parentId",

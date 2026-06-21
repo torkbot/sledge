@@ -461,6 +461,26 @@ export type ProjectionSelectedRow<
   >;
 };
 
+export type ProjectionSelectedOptionalRow<
+  TTable,
+  TColumnNames extends readonly ProjectionTableColumnName<TTable>[],
+> = {
+  readonly [TColumnName in TColumnNames[number]]: ProjectionColumnValue<
+    ProjectionTableColumns<TTable>[TColumnName]
+  > | null;
+};
+
+type ProjectionJoinedSelectedRow<
+  TTables,
+  TSelectedTableName extends ProjectionTableName<TTables>,
+  TColumnNames extends readonly ProjectionTableColumnName<
+    TTables[TSelectedTableName]
+  >[],
+  TOptionalTableNames extends ProjectionTableName<TTables>,
+> = TSelectedTableName extends TOptionalTableNames
+  ? ProjectionSelectedOptionalRow<TTables[TSelectedTableName], TColumnNames>
+  : ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
+
 type ProjectionIntegerColumnName<TTable> = {
   readonly [TColumnName in ProjectionTableColumnName<TTable>]: ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
     "integer",
@@ -615,7 +635,25 @@ export type ProjectionSelectBuilder<
       TFromTableName,
       TJoinedTableName
     >,
-  ): ProjectionJoinedSelectBuilder<TTables, TFromTableName, TJoinedTableName>;
+  ): ProjectionJoinedSelectBuilder<
+    TTables,
+    TFromTableName,
+    TJoinedTableName,
+    never
+  >;
+  leftJoin<const TJoinedTableName extends ProjectionTableName<TTables>>(
+    tableName: TJoinedTableName,
+    condition: ProjectionJoinCondition<
+      TTables,
+      TFromTableName,
+      TJoinedTableName
+    >,
+  ): ProjectionJoinedSelectBuilder<
+    TTables,
+    TFromTableName,
+    TJoinedTableName,
+    TJoinedTableName
+  >;
   select<
     const TColumnNames extends readonly ProjectionTableColumnName<
       TTables[TFromTableName]
@@ -634,6 +672,7 @@ export type ProjectionJoinedSelectBuilder<
   TTables,
   TFromTableName extends ProjectionTableName<TTables>,
   TJoinedTableName extends ProjectionTableName<TTables>,
+  TOptionalTableNames extends ProjectionTableName<TTables>,
 > = {
   selectFrom<
     const TSelectedTableName extends TFromTableName | TJoinedTableName,
@@ -647,7 +686,8 @@ export type ProjectionJoinedSelectBuilder<
     TTables,
     TFromTableName | TJoinedTableName,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
 };
 
@@ -806,6 +846,7 @@ export type ProjectionExecutableJoinedSelect<
   TColumnNames extends readonly ProjectionTableColumnName<
     TTables[TSelectedTableName]
   >[],
+  TOptionalTableNames extends ProjectionTableName<TTables>,
 > = {
   limit(
     limit: number,
@@ -813,7 +854,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   orderBy<
     const TTableName extends TTableNames,
@@ -826,7 +868,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   orderByList<
     const TTableName extends TTableNames,
@@ -839,7 +882,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   orderByNulls<
     const TTableName extends TTableNames,
@@ -852,7 +896,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   whereAny(
     conditions: readonly ProjectionQualifiedWhereCondition<
@@ -863,7 +908,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   where<
     const TTableName extends TTableNames,
@@ -877,7 +923,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   whereIn<
     const TTableName extends TTableNames,
@@ -890,7 +937,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   whereNotNull<
     const TTableName extends TTableNames,
@@ -902,7 +950,8 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   whereNull<
     const TTableName extends TTableNames,
@@ -914,17 +963,30 @@ export type ProjectionExecutableJoinedSelect<
     TTables,
     TTableNames,
     TSelectedTableName,
-    TColumnNames
+    TColumnNames,
+    TOptionalTableNames
   >;
   execute(): Promise<
-    readonly ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>[]
+    readonly ProjectionJoinedSelectedRow<
+      TTables,
+      TSelectedTableName,
+      TColumnNames,
+      TOptionalTableNames
+    >[]
   >;
-  executeTakeFirst(): Promise<ProjectionSelectedRow<
-    TTables[TSelectedTableName],
-    TColumnNames
+  executeTakeFirst(): Promise<ProjectionJoinedSelectedRow<
+    TTables,
+    TSelectedTableName,
+    TColumnNames,
+    TOptionalTableNames
   > | null>;
   stream(): AsyncIterable<
-    ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>
+    ProjectionJoinedSelectedRow<
+      TTables,
+      TSelectedTableName,
+      TColumnNames,
+      TOptionalTableNames
+    >
   >;
 };
 
@@ -1938,6 +2000,28 @@ function createProjectionReadDatabase<
             scope,
             table,
             [joinClause],
+            [],
+            statementCompiler,
+          );
+        },
+        leftJoin: (joinedTableName, condition) => {
+          const joinedTable = readProjectionTable(
+            metadata,
+            String(joinedTableName),
+          );
+          const joinClause = createProjectionLeftJoinClause(
+            table,
+            joinedTable,
+            String(condition.fromColumn),
+            String(condition.toColumn),
+          );
+
+          return createProjectionJoinedSelectBuilder(
+            metadata,
+            scope,
+            table,
+            [joinClause],
+            [joinedTable.name],
             statementCompiler,
           );
         },
@@ -2375,13 +2459,20 @@ function createProjectionJoinedSelectBuilder<
   TTables,
   TFromTableName extends ProjectionTableName<TTables>,
   TJoinedTableName extends ProjectionTableName<TTables>,
+  TOptionalTableNames extends ProjectionTableName<TTables>,
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   fromTable: ProjectionTableMetadata,
   joinClauses: readonly ProjectionJoinClause[],
+  optionalTableNames: readonly string[],
   statementCompiler: ProjectionStatementCompiler,
-): ProjectionJoinedSelectBuilder<TTables, TFromTableName, TJoinedTableName> {
+): ProjectionJoinedSelectBuilder<
+  TTables,
+  TFromTableName,
+  TJoinedTableName,
+  TOptionalTableNames
+> {
   return {
     selectFrom: (tableName, columns) => {
       const selectedTable = readProjectionJoinedTable(
@@ -2391,12 +2482,16 @@ function createProjectionJoinedSelectBuilder<
         String(tableName),
       );
       validateProjectionColumns("selected columns", selectedTable, columns);
+      const selectedTableOptional = optionalTableNames.includes(
+        selectedTable.name,
+      );
 
       return createProjectionExecutableJoinedSelect(
         metadata,
         scope,
         fromTable,
         selectedTable,
+        selectedTableOptional,
         columns,
         columns.map((columnName) =>
           createProjectionColumnReference(
@@ -2730,11 +2825,13 @@ function createProjectionExecutableJoinedSelect<
   const TColumnNames extends readonly ProjectionTableColumnName<
     TTables[TSelectedTableName]
   >[],
+  TOptionalTableNames extends ProjectionTableName<TTables>,
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   fromTable: ProjectionTableMetadata,
   table: ProjectionTableMetadata,
+  selectedTableOptional: boolean,
   selectedColumns: TColumnNames,
   selectedColumnReferences: readonly ProjectionColumnReference[],
   joinClauses: readonly ProjectionJoinClause[],
@@ -2746,7 +2843,8 @@ function createProjectionExecutableJoinedSelect<
   TTables,
   TTableNames,
   TSelectedTableName,
-  TColumnNames
+  TColumnNames,
+  TOptionalTableNames
 > {
   const createNext = (
     nextWhereClauses: readonly ProjectionWhereClause[],
@@ -2757,12 +2855,14 @@ function createProjectionExecutableJoinedSelect<
       TTables,
       TTableNames,
       TSelectedTableName,
-      TColumnNames
+      TColumnNames,
+      TOptionalTableNames
     >(
       metadata,
       scope,
       fromTable,
       table,
+      selectedTableOptional,
       selectedColumns,
       selectedColumnReferences,
       joinClauses,
@@ -2972,7 +3072,13 @@ function createProjectionExecutableJoinedSelect<
           table,
           selectedColumns,
           row,
-        ) as ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
+          selectedTableOptional,
+        ) as ProjectionJoinedSelectedRow<
+          TTables,
+          TSelectedTableName,
+          TColumnNames,
+          TOptionalTableNames
+        >;
       });
     },
     executeTakeFirst: async () => {
@@ -2999,7 +3105,13 @@ function createProjectionExecutableJoinedSelect<
         table,
         selectedColumns,
         row,
-      ) as ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
+        selectedTableOptional,
+      ) as ProjectionJoinedSelectedRow<
+        TTables,
+        TSelectedTableName,
+        TColumnNames,
+        TOptionalTableNames
+      >;
     },
     stream: async function* () {
       const sql = buildSelectSql(
@@ -3018,7 +3130,13 @@ function createProjectionExecutableJoinedSelect<
           table,
           selectedColumns,
           row,
-        ) as ProjectionSelectedRow<TTables[TSelectedTableName], TColumnNames>;
+          selectedTableOptional,
+        ) as ProjectionJoinedSelectedRow<
+          TTables,
+          TSelectedTableName,
+          TColumnNames,
+          TOptionalTableNames
+        >;
       }
     },
   };
@@ -3880,9 +3998,40 @@ function createProjectionInnerJoinClause(
   fromColumn: string,
   toColumn: string,
 ): ProjectionJoinClause {
+  return createProjectionJoinClause(
+    "inner",
+    fromTable,
+    joinedTable,
+    fromColumn,
+    toColumn,
+  );
+}
+
+function createProjectionLeftJoinClause(
+  fromTable: ProjectionTableMetadata,
+  joinedTable: ProjectionTableMetadata,
+  fromColumn: string,
+  toColumn: string,
+): ProjectionJoinClause {
+  return createProjectionJoinClause(
+    "left",
+    fromTable,
+    joinedTable,
+    fromColumn,
+    toColumn,
+  );
+}
+
+function createProjectionJoinClause(
+  kind: ProjectionJoinClause["kind"],
+  fromTable: ProjectionTableMetadata,
+  joinedTable: ProjectionTableMetadata,
+  fromColumn: string,
+  toColumn: string,
+): ProjectionJoinClause {
   if (fromTable.name === joinedTable.name) {
     throw new Error(
-      `projection inner join cannot target the same table ${fromTable.name}`,
+      `projection ${kind} join cannot target the same table ${fromTable.name}`,
     );
   }
 
@@ -3891,7 +4040,7 @@ function createProjectionInnerJoinClause(
   validateProjectionJoinColumns(fromTable, fromColumn, joinedTable, toColumn);
 
   return {
-    kind: "inner",
+    kind,
     left: createProjectionColumnReference(fromTable.name, fromColumn),
     right: createProjectionColumnReference(joinedTable.name, toColumn),
     tableName: joinedTable.name,
@@ -4351,10 +4500,16 @@ function decodeProjectionSelectedRow(
   table: ProjectionTableMetadata,
   selectedColumns: readonly string[],
   row: LedgerStorageRow,
+  selectedTableOptional = false,
 ): Readonly<Record<string, unknown>> {
   const decoded: Record<string, unknown> = {};
 
   for (const columnName of selectedColumns) {
+    if (selectedTableOptional && row[columnName] === null) {
+      decoded[columnName] = null;
+      continue;
+    }
+
     decoded[columnName] = decodeProjectionColumnValue(
       table.columns[columnName],
       row[columnName],
