@@ -203,6 +203,13 @@ export type ProjectionCompilerEventReadStatement = {
   readonly eventName: string;
 };
 
+export type ProjectionCompilerEventIdBoundsStatement = {
+  readonly afterEventId: number | null;
+  readonly eventName: string;
+  readonly payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[];
+  readonly streamKind: ProjectionCompilerEventStreamKind;
+};
+
 export type ProjectionCompilerEventScanStatement = {
   readonly afterEventId: number | null;
   readonly eventName: string;
@@ -258,6 +265,9 @@ export type ProjectionStatementCompiler = {
   compileEventRead(
     statement: ProjectionCompilerEventReadStatement,
   ): ProjectionCompiledSql;
+  compileEventIdBounds(
+    statement: ProjectionCompilerEventIdBoundsStatement,
+  ): ProjectionCompiledSql;
   compileEventScan(
     statement: ProjectionCompilerEventScanStatement,
   ): ProjectionCompiledSql;
@@ -284,6 +294,7 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileCreateIndex: compileCreateIndexStatement,
     compileCreateTable: compileCreateTableStatement,
     compileDelete: compileDeleteStatement,
+    compileEventIdBounds: compileEventIdBoundsStatement,
     compileEventRead: compileEventReadStatement,
     compileEventScan: compileEventScanStatement,
     compileInsert: compileInsertStatement,
@@ -454,12 +465,45 @@ function compileEventReadStatement(
 function compileEventScanStatement(
   statement: ProjectionCompilerEventScanStatement,
 ): ProjectionCompiledSql {
+  const where = compileEventStreamWhere(statement);
+  const params = [...where.params];
+  let text = `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE ${where.text}`;
+
+  text += ` ORDER BY "event_id" ${statement.orderDirection.toUpperCase()}`;
+
+  if (statement.limit !== null) {
+    text += " LIMIT ?";
+    params.push(statement.limit);
+  }
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileEventIdBoundsStatement(
+  statement: ProjectionCompilerEventIdBoundsStatement,
+): ProjectionCompiledSql {
+  const where = compileEventStreamWhere(statement);
+
+  return {
+    params: where.params,
+    text: `SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM "events" WHERE ${where.text}`,
+  };
+}
+
+function compileEventStreamWhere(statement: {
+  readonly afterEventId: number | null;
+  readonly eventName: string;
+  readonly payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[];
+  readonly streamKind: ProjectionCompilerEventStreamKind;
+}): ProjectionCompiledSql {
   const params: unknown[] = [
     statement.eventName,
     eventStreamSignalValue(statement.streamKind),
   ];
-  let text =
-    'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ?';
+  let text = '"event_name" = ? AND "signal" = ?';
 
   for (const predicate of statement.payloadWhere) {
     text += ' AND json_extract("payload_json", ?) = ?';
@@ -472,13 +516,6 @@ function compileEventScanStatement(
   if (statement.afterEventId !== null) {
     text += ' AND "event_id" > ?';
     params.push(statement.afterEventId);
-  }
-
-  text += ` ORDER BY "event_id" ${statement.orderDirection.toUpperCase()}`;
-
-  if (statement.limit !== null) {
-    text += " LIMIT ?";
-    params.push(statement.limit);
   }
 
   return {

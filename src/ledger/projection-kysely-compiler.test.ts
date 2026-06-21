@@ -427,6 +427,59 @@ test("kysely projection compiler lowers semantic signal scans", () => {
   assert.equal(signalValue["value"], 1);
 });
 
+test("kysely projection compiler lowers stream event id bounds", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: ["run.stream.frame", 1, "$.runId", "run_1"],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileEventIdBounds({
+      afterEventId: null,
+      eventName: "run.stream.frame",
+      payloadWhere: [
+        {
+          fieldName: "runId",
+          value: "run_1",
+        },
+      ],
+      streamKind: "signal",
+    }),
+    {
+      params: ["run.stream.frame", 1, "$.runId", "run_1"],
+      text: "compiled:SelectQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const selections = readArray(query["selections"], "query selections");
+  const minSelection = readRecord(selections[0], "min selection");
+  const minAlias = readRecord(minSelection["selection"], "min alias");
+  const minAggregate = readRecord(minAlias["node"], "min aggregate");
+  const maxSelection = readRecord(selections[1], "max selection");
+  const maxAlias = readRecord(maxSelection["selection"], "max alias");
+  const maxAggregate = readRecord(maxAlias["node"], "max aggregate");
+  const where = readRecord(query["where"], "where");
+
+  assert.equal(query["kind"], "SelectQueryNode");
+  assert.equal(minAggregate["kind"], "AggregateFunctionNode");
+  assert.equal(minAggregate["func"], "min");
+  assert.equal(maxAggregate["kind"], "AggregateFunctionNode");
+  assert.equal(maxAggregate["func"], "max");
+  assert.equal(where["kind"], "WhereNode");
+});
+
 test("kysely projection compiler strips externally-bound insert value params", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {

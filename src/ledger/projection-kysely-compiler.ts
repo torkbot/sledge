@@ -13,6 +13,7 @@ import type {
   ProjectionCompilerCreateIndexStatement,
   ProjectionCompilerCreateTableStatement,
   ProjectionCompilerDeleteStatement,
+  ProjectionCompilerEventIdBoundsStatement,
   ProjectionCompilerEventReadStatement,
   ProjectionCompilerEventScanStatement,
   ProjectionCompilerEventStreamKind,
@@ -85,6 +86,8 @@ export function createKyselyProjectionStatementCompiler(
     compileCreateTable: (statement) =>
       compileCreateTableStatement(input, statement),
     compileDelete: (statement) => compileDeleteStatement(input, statement),
+    compileEventIdBounds: (statement) =>
+      compileEventIdBoundsStatement(input, statement),
     compileEventRead: (statement) =>
       compileEventReadStatement(input, statement),
     compileEventScan: (statement) =>
@@ -259,6 +262,64 @@ function compileEventScanStatement(
   input: KyselyProjectionStatementCompilerInput,
   statement: ProjectionCompilerEventScanStatement,
 ): ProjectionCompiledSql {
+  let query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode("events")]),
+    kind: "SelectQueryNode",
+    orderBy: orderByNode([
+      {
+        column: {
+          columnName: "event_id",
+          tableName: null,
+        },
+        direction: statement.orderDirection,
+        kind: "column",
+      },
+    ]),
+    selections: projectionEventRowColumnNames.map((columnName) =>
+      selectionNode(referenceNode(null, columnName)),
+    ),
+    where: eventStreamWhereNode(input, statement),
+  };
+
+  if (statement.limit !== null) {
+    query = {
+      ...query,
+      limit: limitNode(valueNode(statement.limit)),
+    };
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileEventIdBoundsStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerEventIdBoundsStatement,
+): ProjectionCompiledSql {
+  return compileQuery(input.queryCompiler, {
+    from: fromNode([tableNode("events")]),
+    kind: "SelectQueryNode",
+    selections: [
+      selectionNode(
+        aliasNode(
+          aggregateFunctionNode("min", [referenceNode(null, "event_id")]),
+          "min_event_id",
+        ),
+      ),
+      selectionNode(
+        aliasNode(
+          aggregateFunctionNode("max", [referenceNode(null, "event_id")]),
+          "max_event_id",
+        ),
+      ),
+    ],
+    where: eventStreamWhereNode(input, statement),
+  });
+}
+
+function eventStreamWhereNode(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerEventIdBoundsStatement,
+): KyselyProjectionOperationNode {
   const whereClauses: KyselyProjectionOperationNode[] = [
     binaryOperationNode(
       referenceNode(null, "event_name"),
@@ -292,33 +353,7 @@ function compileEventScanStatement(
     );
   }
 
-  let query: KyselyProjectionOperationNode = {
-    from: fromNode([tableNode("events")]),
-    kind: "SelectQueryNode",
-    orderBy: orderByNode([
-      {
-        column: {
-          columnName: "event_id",
-          tableName: null,
-        },
-        direction: statement.orderDirection,
-        kind: "column",
-      },
-    ]),
-    selections: projectionEventRowColumnNames.map((columnName) =>
-      selectionNode(referenceNode(null, columnName)),
-    ),
-    where: whereNode(andOperationNodes(whereClauses)),
-  };
-
-  if (statement.limit !== null) {
-    query = {
-      ...query,
-      limit: limitNode(valueNode(statement.limit)),
-    };
-  }
-
-  return compileQuery(input.queryCompiler, query);
+  return whereNode(andOperationNodes(whereClauses));
 }
 
 function eventPayloadFieldNode(

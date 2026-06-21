@@ -62,6 +62,10 @@ const ProjectionEventRowSchema = Type.Object({
   payload_json: Type.String(),
   ts_ms: Type.Number(),
 });
+const ProjectionEventIdBoundsRowSchema = Type.Object({
+  max_event_id: Type.Union([Type.Null(), Type.Number()]),
+  min_event_id: Type.Union([Type.Null(), Type.Number()]),
+});
 const maxProjectionEventReadIdsPerStatement = 900;
 
 export type AnyProjectionSchema = {
@@ -1092,8 +1096,14 @@ export type ProjectionEventScanBuilder<
     fieldName: TFieldName,
     value: ProjectionEventPayloadFieldValue<TEvents[TEventName], TFieldName>,
   ): ProjectionEventScanBuilder<TEvents, TEventName>;
+  eventIdBounds(): Promise<ProjectionEventIdBounds>;
   execute(): Promise<readonly EventEnvelope<TEvents, TEventName>[]>;
   stream(): AsyncIterable<EventEnvelope<TEvents, TEventName>>;
+};
+
+export type ProjectionEventIdBounds = {
+  readonly maxEventId: number | null;
+  readonly minEventId: number | null;
 };
 
 export type ProjectionUnionArm<TRow> = {
@@ -3751,6 +3761,21 @@ function buildScanProjectionEventsSql(
   });
 }
 
+function buildProjectionEventIdBoundsSql(
+  statementCompiler: ProjectionStatementCompiler,
+  streamKind: ProjectionCompilerEventStreamKind,
+  eventName: string,
+  afterEventId: number | null,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
+): CompiledProjectionSql {
+  return statementCompiler.compileEventIdBounds({
+    afterEventId,
+    eventName,
+    payloadWhere,
+    streamKind,
+  });
+}
+
 function buildUpdateSql(
   statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
@@ -4620,6 +4645,16 @@ function createProjectionEventScanBuilder<
         statementCompiler,
       );
     },
+    eventIdBounds: async () => {
+      return await readProjectionEventIdBounds(
+        scope,
+        streamKind,
+        eventName,
+        afterEventId,
+        payloadWhere,
+        statementCompiler,
+      );
+    },
     limit: (nextLimit) => {
       validateProjectionLimit(nextLimit);
 
@@ -4826,6 +4861,35 @@ async function scanProjectionEvents<
   return rows.map((row) => {
     return decodeProjectionEventRow(eventSchema, streamKind, eventName, row);
   });
+}
+
+async function readProjectionEventIdBounds(
+  scope: LedgerStorageScope,
+  streamKind: ProjectionCompilerEventStreamKind,
+  eventName: string,
+  afterEventId: number | null,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
+  statementCompiler: ProjectionStatementCompiler,
+): Promise<ProjectionEventIdBounds> {
+  const sql = buildProjectionEventIdBoundsSql(
+    statementCompiler,
+    streamKind,
+    eventName,
+    afterEventId,
+    payloadWhere,
+  );
+  const row = await scope.prepare(sql.text).get(...sql.params);
+
+  if (row === undefined) {
+    throw new Error(`projection ${streamKind} id bounds query returned no row`);
+  }
+
+  const decodedRow = Value.Decode(ProjectionEventIdBoundsRowSchema, row);
+
+  return {
+    maxEventId: decodedRow.max_event_id,
+    minEventId: decodedRow.min_event_id,
+  };
 }
 
 function validateProjectionEventStreamName<

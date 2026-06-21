@@ -51,6 +51,8 @@
   can query semantic event history without reaching for `json_extract(...)`.
 - Add typed `scanSignals(...)` reads for retained signal history using the same
   payload filtering facade and internal Kysely-backed compiler path.
+- Add typed `eventIdBounds()` on event and signal scans for low/high watermark
+  queries without raw `MIN(event_id)` / `MAX(event_id)` SQL.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

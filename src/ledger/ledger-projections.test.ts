@@ -2997,6 +2997,16 @@ test("projection access scans semantic signals without exposing events table", a
     history,
     indexers: {},
     queries: {
+      frameBoundsByRun: {
+        params: Type.Object({
+          afterSignalEventId: Type.Number(),
+          runId: Type.String(),
+        }),
+        result: Type.Object({
+          maxEventId: Type.Union([Type.Null(), Type.Number()]),
+          minEventId: Type.Union([Type.Null(), Type.Number()]),
+        }),
+      },
       framesByRun: {
         params: Type.Object({
           afterSignalEventId: Type.Number(),
@@ -3012,6 +3022,13 @@ test("projection access scans semantic signals without exposing events table", a
     signalMaterializations,
   ).register({
     queries: {
+      frameBoundsByRun: async ({ params, db }) => {
+        return await db
+          .scanSignals("run.stream.frame")
+          .wherePayload("runId", params.runId)
+          .afterEventId(params.afterSignalEventId)
+          .eventIdBounds();
+      },
       framesByRun: async ({ params, db }) => {
         const frames = await db
           .scanSignals("run.stream.frame")
@@ -3026,8 +3043,14 @@ test("projection access scans semantic signals without exposing events table", a
       },
     },
   });
+  const frameBoundsByRun =
+    readTestLedgerImplementations(signalModel).queries?.frameBoundsByRun;
   const framesByRun =
     readTestLedgerImplementations(signalModel).queries?.framesByRun;
+
+  if (frameBoundsByRun === undefined) {
+    throw new Error("expected frameBoundsByRun query implementation");
+  }
 
   if (framesByRun === undefined) {
     throw new Error("expected framesByRun query implementation");
@@ -3068,6 +3091,28 @@ test("projection access scans semantic signals without exposing events table", a
       sequence: 1,
     },
   ]);
+
+  const boundsFake = createFakeScope({
+    allRows: [],
+    getRow: {
+      max_event_id: 120,
+      min_event_id: 101,
+    },
+  });
+  const bounds = await frameBoundsByRun(boundsFake.scope, {
+    afterSignalEventId: 100,
+    runId: "run_1",
+  });
+
+  assert.deepEqual(boundsFake.calls[0], {
+    method: "get",
+    params: ["run.stream.frame", 1, "$.runId", "run_1", 100],
+    sql: 'SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ?',
+  });
+  assert.deepEqual(bounds, {
+    maxEventId: 120,
+    minEventId: 101,
+  });
 });
 
 test("projection facade supports TorkBot-style surface operation materialization", async () => {
@@ -4133,6 +4178,10 @@ test("materialization data migrations can scan typed ledger events", async () =>
     limit: () => scanBuilder,
     orderByEventId: () => scanBuilder,
     wherePayload: () => scanBuilder,
+    eventIdBounds: async () => ({
+      maxEventId: event.eventId,
+      minEventId: event.eventId,
+    }),
     execute: async () => [event],
     stream: async function* () {
       yield event;
@@ -5137,6 +5186,16 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           void frame;
           void sequence;
         }
+
+        const bounds = await db.scanSignals("run.stream.frame").eventIdBounds();
+        const minEventId: number | null = bounds.minEventId;
+        const maxEventId: number | null = bounds.maxEventId;
+        // @ts-expect-error event id bounds expose minEventId and maxEventId only.
+        const missingEventId = bounds.eventId;
+
+        void minEventId;
+        void maxEventId;
+        void missingEventId;
 
         db.scanSignals("run.stream.frame")
           // @ts-expect-error signal payload filters must reference known signal payload fields.
