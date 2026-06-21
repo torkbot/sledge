@@ -322,7 +322,7 @@ export type ProjectionQualifiedWhereCondition<
       }[ProjectionTableColumnName<TTables[TTableName]>];
     }[TTableNames];
 
-export type ProjectionJoinCondition<
+export type ProjectionJoinColumnCondition<
   TTables,
   TFromTableName extends ProjectionTableName<TTables>,
   TJoinedTableName extends ProjectionTableName<TTables>,
@@ -339,6 +339,27 @@ export type ProjectionJoinCondition<
     >;
   };
 }[ProjectionTableColumnName<TTables[TFromTableName]>];
+
+export type ProjectionTableJoinCondition<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+  TJoinedTableName extends ProjectionTableName<TTables>,
+> =
+  | ProjectionJoinColumnCondition<TTables, TFromTableName, TJoinedTableName>
+  | readonly [
+      ProjectionJoinColumnCondition<TTables, TFromTableName, TJoinedTableName>,
+      ...ProjectionJoinColumnCondition<
+        TTables,
+        TFromTableName,
+        TJoinedTableName
+      >[],
+    ];
+
+export type ProjectionJoinCondition<
+  TTables,
+  TFromTableName extends ProjectionTableName<TTables>,
+  TJoinedTableName extends ProjectionTableName<TTables>,
+> = ProjectionTableJoinCondition<TTables, TFromTableName, TJoinedTableName>;
 
 export type ProjectionOrderDirection = "asc" | "desc";
 export type ProjectionNullOrder = "first" | "last";
@@ -679,7 +700,7 @@ export type ProjectionSelectBuilder<
   >;
   innerJoin<const TJoinedTableName extends ProjectionTableName<TTables>>(
     tableName: TJoinedTableName,
-    condition: ProjectionJoinCondition<
+    condition: ProjectionTableJoinCondition<
       TTables,
       TFromTableName,
       TJoinedTableName
@@ -692,7 +713,7 @@ export type ProjectionSelectBuilder<
   >;
   leftJoin<const TJoinedTableName extends ProjectionTableName<TTables>>(
     tableName: TJoinedTableName,
-    condition: ProjectionJoinCondition<
+    condition: ProjectionTableJoinCondition<
       TTables,
       TFromTableName,
       TJoinedTableName
@@ -768,7 +789,7 @@ export type ProjectionExecutableSelect<
     const TExistenceTableName extends ProjectionTableName<TTables>,
   >(
     tableName: TExistenceTableName,
-    condition: ProjectionJoinCondition<
+    condition: ProjectionJoinColumnCondition<
       TTables,
       TFromTableName,
       TExistenceTableName
@@ -864,7 +885,7 @@ export type ProjectionAggregateBuilder<
     const TExistenceTableName extends ProjectionTableName<TTables>,
   >(
     tableName: TExistenceTableName,
-    condition: ProjectionJoinCondition<
+    condition: ProjectionJoinColumnCondition<
       TTables,
       TFromTableName,
       TExistenceTableName
@@ -2287,8 +2308,7 @@ function createProjectionReadDatabase<
           const joinClause = createProjectionInnerJoinClause(
             table,
             joinedTable,
-            String(condition.fromColumn),
-            String(condition.toColumn),
+            condition,
           );
 
           return createProjectionJoinedSelectBuilder(
@@ -2308,8 +2328,7 @@ function createProjectionReadDatabase<
           const joinClause = createProjectionLeftJoinClause(
             table,
             joinedTable,
-            String(condition.fromColumn),
-            String(condition.toColumn),
+            condition,
           );
 
           return createProjectionJoinedSelectBuilder(
@@ -2538,6 +2557,11 @@ type ProjectionOrderClause = ProjectionCompilerOrderClause;
 type ProjectionColumnReference = ProjectionCompilerColumnReference;
 
 type ProjectionJoinClause = ProjectionCompilerJoinClause;
+
+type ProjectionJoinConditionInput = {
+  readonly fromColumn: PropertyKey;
+  readonly toColumn: PropertyKey;
+};
 
 type ProjectionAggregate = ProjectionCompilerAggregate;
 
@@ -4366,39 +4390,30 @@ function createProjectionColumnReference(
 function createProjectionInnerJoinClause(
   fromTable: ProjectionTableMetadata,
   joinedTable: ProjectionTableMetadata,
-  fromColumn: string,
-  toColumn: string,
+  condition:
+    | ProjectionJoinConditionInput
+    | readonly ProjectionJoinConditionInput[],
 ): ProjectionJoinClause {
-  return createProjectionJoinClause(
-    "inner",
-    fromTable,
-    joinedTable,
-    fromColumn,
-    toColumn,
-  );
+  return createProjectionJoinClause("inner", fromTable, joinedTable, condition);
 }
 
 function createProjectionLeftJoinClause(
   fromTable: ProjectionTableMetadata,
   joinedTable: ProjectionTableMetadata,
-  fromColumn: string,
-  toColumn: string,
+  condition:
+    | ProjectionJoinConditionInput
+    | readonly ProjectionJoinConditionInput[],
 ): ProjectionJoinClause {
-  return createProjectionJoinClause(
-    "left",
-    fromTable,
-    joinedTable,
-    fromColumn,
-    toColumn,
-  );
+  return createProjectionJoinClause("left", fromTable, joinedTable, condition);
 }
 
 function createProjectionJoinClause(
   kind: ProjectionJoinClause["kind"],
   fromTable: ProjectionTableMetadata,
   joinedTable: ProjectionTableMetadata,
-  fromColumn: string,
-  toColumn: string,
+  condition:
+    | ProjectionJoinConditionInput
+    | readonly ProjectionJoinConditionInput[],
 ): ProjectionJoinClause {
   if (fromTable.name === joinedTable.name) {
     throw new Error(
@@ -4406,16 +4421,54 @@ function createProjectionJoinClause(
     );
   }
 
-  validateProjectionColumns("join source column", fromTable, [fromColumn]);
-  validateProjectionColumns("join target column", joinedTable, [toColumn]);
-  validateProjectionJoinColumns(fromTable, fromColumn, joinedTable, toColumn);
+  const conditions = readProjectionJoinConditions(condition);
 
   return {
+    conditions: conditions.map((joinCondition) => {
+      const fromColumn = String(joinCondition.fromColumn);
+      const toColumn = String(joinCondition.toColumn);
+
+      validateProjectionColumns("join source column", fromTable, [fromColumn]);
+      validateProjectionColumns("join target column", joinedTable, [toColumn]);
+      validateProjectionJoinColumns(
+        fromTable,
+        fromColumn,
+        joinedTable,
+        toColumn,
+      );
+
+      return {
+        left: createProjectionColumnReference(fromTable.name, fromColumn),
+        right: createProjectionColumnReference(joinedTable.name, toColumn),
+      };
+    }),
     kind,
-    left: createProjectionColumnReference(fromTable.name, fromColumn),
-    right: createProjectionColumnReference(joinedTable.name, toColumn),
     tableName: joinedTable.name,
   };
+}
+
+function readProjectionJoinConditions(
+  condition:
+    | ProjectionJoinConditionInput
+    | readonly ProjectionJoinConditionInput[],
+): readonly ProjectionJoinConditionInput[] {
+  if (isProjectionJoinConditionArray(condition)) {
+    if (condition.length === 0) {
+      throw new Error("projection join must include at least one condition");
+    }
+
+    return condition;
+  }
+
+  return [condition];
+}
+
+function isProjectionJoinConditionArray(
+  condition:
+    | ProjectionJoinConditionInput
+    | readonly ProjectionJoinConditionInput[],
+): condition is readonly ProjectionJoinConditionInput[] {
+  return Array.isArray(condition);
 }
 
 function readProjectionJoinedTable(

@@ -121,9 +121,11 @@ export type ProjectionCompilerOrderClause =
     };
 
 export type ProjectionCompilerJoinClause = {
+  readonly conditions: readonly {
+    readonly left: ProjectionCompilerColumnReference;
+    readonly right: ProjectionCompilerColumnReference;
+  }[];
   readonly kind: "inner" | "left";
-  readonly left: ProjectionCompilerColumnReference;
-  readonly right: ProjectionCompilerColumnReference;
   readonly tableName: string;
 };
 
@@ -651,11 +653,13 @@ function compileSelectStatement(
   if (statement.joins.length > 0) {
     const joinsSql = statement.joins
       .map((join) => {
+        const conditionsSql = compileJoinConditions(join);
+
         switch (join.kind) {
           case "inner":
-            return `INNER JOIN ${quoteIdentifier(join.tableName)} ON ${compileColumnReference(join.left)} = ${compileColumnReference(join.right)}`;
+            return `INNER JOIN ${quoteIdentifier(join.tableName)} ON ${conditionsSql}`;
           case "left":
-            return `LEFT JOIN ${quoteIdentifier(join.tableName)} ON ${compileColumnReference(join.left)} = ${compileColumnReference(join.right)}`;
+            return `LEFT JOIN ${quoteIdentifier(join.tableName)} ON ${conditionsSql}`;
         }
       })
       .join(" ");
@@ -685,6 +689,18 @@ function compileSelectStatement(
     params,
     text,
   };
+}
+
+function compileJoinConditions(join: ProjectionCompilerJoinClause): string {
+  if (join.conditions.length === 0) {
+    throw new Error("projection join must include at least one condition");
+  }
+
+  return join.conditions
+    .map((condition) => {
+      return `${compileColumnReference(condition.left)} = ${compileColumnReference(condition.right)}`;
+    })
+    .join(" AND ");
 }
 
 function compileUnionSelectStatement(

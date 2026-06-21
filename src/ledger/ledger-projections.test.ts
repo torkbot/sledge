@@ -2152,8 +2152,9 @@ test("projection access supports typed inner joins between materialization table
           .columns({
             policyPromptId: t.text().notNull(),
             requestId: t.text().notNull(),
+            tenantId: t.text().notNull(),
           })
-          .primaryKey(["policyPromptId", "requestId"])
+          .primaryKey(["tenantId", "policyPromptId", "requestId"])
           .index("policy_prompt_requests_by_request", ["requestId"]),
       requests: (t) =>
         t
@@ -2164,6 +2165,7 @@ test("projection access supports typed inner joins between materialization table
             requestedAtMs: t.integer().notNull(),
             resolvedAtMs: t.integer(),
             summary: t.text().notNull(),
+            tenantId: t.text().notNull(),
           })
           .primaryKey(["requestId"])
           .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
@@ -2177,8 +2179,9 @@ test("projection access supports typed inner joins between materialization table
             .columns({
               policyPromptId: t.text().notNull(),
               requestId: t.text().notNull(),
+              tenantId: t.text().notNull(),
             })
-            .primaryKey(["policyPromptId", "requestId"])
+            .primaryKey(["tenantId", "policyPromptId", "requestId"])
             .index("policy_prompt_requests_by_request", ["requestId"]),
         ),
         s.createTable("requests", (t) =>
@@ -2190,6 +2193,7 @@ test("projection access supports typed inner joins between materialization table
               requestedAtMs: t.integer().notNull(),
               resolvedAtMs: t.integer(),
               summary: t.text().notNull(),
+              tenantId: t.text().notNull(),
             })
             .primaryKey(["requestId"])
             .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
@@ -2223,10 +2227,16 @@ test("projection access supports typed inner joins between materialization table
       promptRequests: async ({ params, db }) => {
         const rows = await db
           .selectFrom("policyPromptRequests")
-          .innerJoin("requests", {
-            fromColumn: "requestId",
-            toColumn: "requestId",
-          })
+          .innerJoin("requests", [
+            {
+              fromColumn: "tenantId",
+              toColumn: "tenantId",
+            },
+            {
+              fromColumn: "requestId",
+              toColumn: "requestId",
+            },
+          ])
           .selectFrom("requests", [
             "requestId",
             "instanceId",
@@ -2278,7 +2288,7 @@ test("projection access supports typed inner joins between materialization table
   assert.deepEqual(fake.calls[0], {
     method: "all",
     params: ["prompt_1"],
-    sql: 'SELECT "requests"."requestId" AS "requestId", "requests"."instanceId" AS "instanceId", "requests"."runId" AS "runId", "requests"."requestedAtMs" AS "requestedAtMs", "requests"."resolvedAtMs" AS "resolvedAtMs", "requests"."summary" AS "summary" FROM "policyPromptRequests" INNER JOIN "requests" ON "policyPromptRequests"."requestId" = "requests"."requestId" WHERE "policyPromptRequests"."policyPromptId" = ? AND "requests"."resolvedAtMs" IS NULL ORDER BY "requests"."requestedAtMs" ASC, "requests"."requestId" ASC',
+    sql: 'SELECT "requests"."requestId" AS "requestId", "requests"."instanceId" AS "instanceId", "requests"."runId" AS "runId", "requests"."requestedAtMs" AS "requestedAtMs", "requests"."resolvedAtMs" AS "resolvedAtMs", "requests"."summary" AS "summary" FROM "policyPromptRequests" INNER JOIN "requests" ON "policyPromptRequests"."tenantId" = "requests"."tenantId" AND "policyPromptRequests"."requestId" = "requests"."requestId" WHERE "policyPromptRequests"."policyPromptId" = ? AND "requests"."resolvedAtMs" IS NULL ORDER BY "requests"."requestedAtMs" ASC, "requests"."requestId" ASC',
   });
   assert.deepEqual(rows, [
     {
@@ -4895,11 +4905,24 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .selectFrom("parents", ["rank"])
           .where("parents", "rank", ">", 0);
         db.selectFrom("children")
+          // @ts-expect-error joined columns must have compatible value types.
           .innerJoin("parents", {
             fromColumn: "parentId",
-            // @ts-expect-error joined columns must have compatible value types.
             toColumn: "rank",
           })
+          .selectFrom("parents", ["rank"]);
+        db.selectFrom("children")
+          .innerJoin("parents", [
+            {
+              fromColumn: "parentId",
+              toColumn: "parentId",
+            },
+            {
+              fromColumn: "childId",
+              // @ts-expect-error composite join columns must have compatible value types.
+              toColumn: "rank",
+            },
+          ])
           .selectFrom("parents", ["rank"]);
         db.selectFrom("children")
           .innerJoin("parents", {

@@ -1060,33 +1060,32 @@ function valueListOrderCaseNode(
 function joinNode(
   clause: ProjectionCompilerJoinClause,
 ): KyselyProjectionOperationNode {
+  const on = {
+    kind: "OnNode",
+    on: andOperationNodes(
+      clause.conditions.map((condition) =>
+        binaryOperationNode(
+          referenceNode(condition.left.tableName, condition.left.columnName),
+          "=",
+          referenceNode(condition.right.tableName, condition.right.columnName),
+        ),
+      ),
+    ),
+  };
+
   switch (clause.kind) {
     case "inner":
       return {
         joinType: "InnerJoin",
         kind: "JoinNode",
-        on: {
-          kind: "OnNode",
-          on: binaryOperationNode(
-            referenceNode(clause.left.tableName, clause.left.columnName),
-            "=",
-            referenceNode(clause.right.tableName, clause.right.columnName),
-          ),
-        },
+        on,
         table: tableNode(clause.tableName),
       };
     case "left":
       return {
         joinType: "LeftJoin",
         kind: "JoinNode",
-        on: {
-          kind: "OnNode",
-          on: binaryOperationNode(
-            referenceNode(clause.left.tableName, clause.left.columnName),
-            "=",
-            referenceNode(clause.right.tableName, clause.right.columnName),
-          ),
-        },
+        on,
         table: tableNode(clause.tableName),
       };
   }

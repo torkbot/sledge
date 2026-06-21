@@ -38,15 +38,19 @@ test("kysely projection compiler lowers Sledge select IR to operation nodes", ()
       fromTableName: "users",
       joins: [
         {
+          conditions: [
+            {
+              left: {
+                columnName: "userId",
+                tableName: "users",
+              },
+              right: {
+                columnName: "userId",
+                tableName: "sessions",
+              },
+            },
+          ],
           kind: "inner",
-          left: {
-            columnName: "userId",
-            tableName: "users",
-          },
-          right: {
-            columnName: "userId",
-            tableName: "sessions",
-          },
           tableName: "sessions",
         },
       ],
@@ -219,15 +223,29 @@ test("kysely projection compiler lowers left joins", () => {
       fromTableName: "operations",
       joins: [
         {
+          conditions: [
+            {
+              left: {
+                columnName: "operationKey",
+                tableName: "operations",
+              },
+              right: {
+                columnName: "operationKey",
+                tableName: "completions",
+              },
+            },
+            {
+              left: {
+                columnName: "tenantId",
+                tableName: "operations",
+              },
+              right: {
+                columnName: "tenantId",
+                tableName: "completions",
+              },
+            },
+          ],
           kind: "left",
-          left: {
-            columnName: "operationKey",
-            tableName: "operations",
-          },
-          right: {
-            columnName: "operationKey",
-            tableName: "completions",
-          },
           tableName: "completions",
         },
       ],
@@ -247,6 +265,9 @@ test("kysely projection compiler lowers left joins", () => {
 
   assert.equal(join["kind"], "JoinNode");
   assert.equal(join["joinType"], "LeftJoin");
+  const on = readRecord(join["on"], "join on");
+  const predicate = readRecord(on["on"], "join predicate");
+  assert.equal(predicate["kind"], "AndNode");
 });
 
 test("kysely projection compiler lowers semantic event scans", () => {

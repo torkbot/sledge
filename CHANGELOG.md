@@ -57,6 +57,8 @@
   grouped latest-ref queries without raw JSON extraction or `GROUP BY` SQL.
 - Add typed batch insert values so data migrations and indexers can write many
   projection rows in one statement without raw `INSERT ... VALUES` SQL.
+- Add typed composite projection joins so multi-column relationships can be
+  queried without raw `ON a = b AND c = d` SQL.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

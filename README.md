@@ -348,8 +348,9 @@ Indexer and query implementations receive sledge-owned facades:
 - queries can `selectFrom(...)` and `readEvent(ref)`, but cannot mutate
   materialization tables
 - reads support typed predicates, null predicates, typed `whereAny([...])`
-  disjunction groups, typed `innerJoin(...).selectFrom(...)` table joins,
-  typed `leftJoin(...).selectFrom(...)` optional-row joins, typed
+  disjunction groups, typed single-column and composite
+  `innerJoin(...).selectFrom(...)` table joins, typed single-column and
+  composite `leftJoin(...).selectFrom(...)` optional-row joins, typed
   `whereNotExists(...)` anti-joins, typed aggregate reads with `count(...)`,
   `countNotNull(...)`, `min(...)`, and `max(...)`, `orderBy(...)`, explicit
   nullable-column `orderByNulls(...)`, domain-specific `orderByList(...)`
