@@ -282,6 +282,19 @@ test("projection builders validate runtime metadata", () => {
   assert.throws(
     () =>
       defineProjectionSchema({
+        idx_work_due: (t) =>
+          t
+            .columns({
+              eventId: t.integer().notNull(),
+            })
+            .primaryKey(["eventId"]),
+      }),
+    /projection table name idx_work_due is reserved for ledger storage/,
+  );
+
+  assert.throws(
+    () =>
+      defineProjectionSchema({
         sqlite_sequence: (t) =>
           t
             .columns({

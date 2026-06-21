@@ -2135,6 +2135,10 @@ function createProjectionExecutableUnionSelect<TRow>(
       });
     },
     executeTakeFirst: async () => {
+      if (limitClause === 0) {
+        return null;
+      }
+
       const sql = buildUnionSelectSql(statementCompiler, arms, orderClauses, 1);
       const row = await scope.prepare(sql.text).get(...sql.params);
 
@@ -2671,6 +2675,10 @@ function createProjectionExecutableSelect<
       >[];
     },
     executeTakeFirst: async () => {
+      if (limitClause === 0) {
+        return null;
+      }
+
       const sql = buildSelectSql(
         statementCompiler,
         fromTable,
@@ -2968,6 +2976,10 @@ function createProjectionExecutableJoinedSelect<
       });
     },
     executeTakeFirst: async () => {
+      if (limitClause === 0) {
+        return null;
+      }
+
       const sql = buildSelectSql(
         statementCompiler,
         fromTable,

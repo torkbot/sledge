@@ -1561,6 +1561,119 @@ test("projection access supports typed disjunction predicate groups", async () =
   });
 });
 
+test("projection access executeTakeFirst honors explicit zero limits", async () => {
+  const limitSchema = defineMaterializationSchema({
+    namespace: "limit-zero",
+    version: 1,
+    tables: {
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+  const limitMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(limitSchema, (m) => [
+      m.migration(1, "create limit-zero tables", (s) => [
+        s.createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        ),
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      checkLimitZero: {
+        params: Type.Object({}),
+        result: Type.Null(),
+      },
+    },
+  });
+  const limitModel = withMaterializations(
+    shape,
+    limitMaterializations,
+  ).register({
+    queries: {
+      checkLimitZero: async ({ db }) => {
+        const selected = await db
+          .selectFrom("users")
+          .select(["userId"])
+          .limit(0)
+          .executeTakeFirst();
+        const joined = await db
+          .selectFrom("users")
+          .innerJoin("sessions", {
+            fromColumn: "userId",
+            toColumn: "userId",
+          })
+          .selectFrom("sessions", ["sessionId"])
+          .limit(0)
+          .executeTakeFirst();
+        const unioned = await db
+          .unionAll([
+            db.unionFrom("users").select({
+              id: "userId",
+              priority: db.unionValue(0),
+            }),
+            db.unionFrom("sessions").select({
+              id: "sessionId",
+              priority: db.unionValue(1),
+            }),
+          ])
+          .limit(0)
+          .executeTakeFirst();
+
+        assert.equal(selected, null);
+        assert.equal(joined, null);
+        assert.equal(unioned, null);
+
+        return null;
+      },
+    },
+  });
+  const checkLimitZero =
+    readTestLedgerImplementations(limitModel).queries?.checkLimitZero;
+
+  if (checkLimitZero === undefined) {
+    throw new Error("expected checkLimitZero query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      id: "should_not_read",
+      priority: 0,
+      sessionId: "should_not_read",
+      userId: "should_not_read",
+    },
+  });
+
+  const result = await checkLimitZero(fake.scope, {});
+
+  assert.equal(result, null);
+  assert.deepEqual(fake.calls, []);
+});
+
 test("projection access supports typed union candidate reads", async () => {
   const decisionSchema = defineMaterializationSchema({
     namespace: "network-decision",

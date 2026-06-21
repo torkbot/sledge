@@ -10,7 +10,12 @@ declare const projectionTableColumnsBrand: unique symbol;
 declare const projectionTablePrimaryKeyBrand: unique symbol;
 declare const projectionTableUniqueKeysBrand: unique symbol;
 
-const reservedProjectionTableNames = new Set(["events", "work"]);
+const reservedProjectionTableNames = new Set([
+  "events",
+  "idx_work_due",
+  "idx_work_ref",
+  "work",
+]);
 const reservedProjectionIndexNames = new Set(["idx_work_due", "idx_work_ref"]);
 const sqliteInternalNamePrefix = "sqlite_";
 
