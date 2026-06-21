@@ -47,6 +47,8 @@
   can be incremented without raw SQL.
 - Add typed `decrementIfPositive(...)` integer write expressions for bounded
   grant/use counters without raw `CASE` SQL.
+- Add typed event scan payload predicates and event-id ordering so callbacks
+  can query semantic event history without reaching for `json_extract(...)`.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

@@ -61,6 +61,7 @@ export type KyselySqliteProjectionStatementCompilerInput = {
 };
 
 const insertValuePlaceholder = Symbol("sledge.projection.insertValue");
+const projectionEventPayloadFieldNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const projectionEventRowColumnNames = [
   "event_id",
   "ts_ms",
@@ -276,6 +277,16 @@ function compileEventScanStatement(
     );
   }
 
+  for (const predicate of statement.payloadWhere) {
+    whereClauses.push(
+      binaryOperationNode(
+        eventPayloadFieldNode(input.dialect, predicate.fieldName),
+        "=",
+        valueNode(eventPayloadPredicateValue(input.dialect, predicate.value)),
+      ),
+    );
+  }
+
   let query: KyselyProjectionOperationNode = {
     from: fromNode([tableNode("events")]),
     kind: "SelectQueryNode",
@@ -285,7 +296,7 @@ function compileEventScanStatement(
           columnName: "event_id",
           tableName: null,
         },
-        direction: "asc",
+        direction: statement.orderDirection,
         kind: "column",
       },
     ]),
@@ -303,6 +314,56 @@ function compileEventScanStatement(
   }
 
   return compileQuery(input.queryCompiler, query);
+}
+
+function eventPayloadFieldNode(
+  dialect: KyselyProjectionDialect,
+  fieldName: string,
+): KyselyProjectionOperationNode {
+  validateProjectionEventPayloadFieldName(fieldName);
+
+  switch (dialect) {
+    case "sqlite":
+      return functionNode("json_extract", [
+        referenceNode(null, "payload_json"),
+        valueNode(createEventPayloadJsonPath(fieldName)),
+      ]);
+    case "postgres":
+      return functionNode("jsonb_extract_path_text", [
+        referenceNode(null, "payload_json"),
+        valueNode(fieldName),
+      ]);
+  }
+}
+
+function createEventPayloadJsonPath(fieldName: string): string {
+  validateProjectionEventPayloadFieldName(fieldName);
+
+  return `$.${fieldName}`;
+}
+
+function validateProjectionEventPayloadFieldName(fieldName: string): void {
+  if (!projectionEventPayloadFieldNamePattern.test(fieldName)) {
+    throw new Error(
+      `event payload field ${fieldName} must be a simple top-level identifier`,
+    );
+  }
+}
+
+function eventPayloadPredicateValue(
+  dialect: KyselyProjectionDialect,
+  value: boolean | number | string,
+): unknown {
+  switch (dialect) {
+    case "sqlite":
+      if (typeof value === "boolean") {
+        return value ? 1 : 0;
+      }
+
+      return value;
+    case "postgres":
+      return String(value);
+  }
 }
 
 function compileInsertStatement(

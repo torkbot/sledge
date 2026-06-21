@@ -271,6 +271,8 @@ test("kysely projection compiler lowers semantic event scans", () => {
       afterEventId: 42,
       eventName: "user.created",
       limit: 25,
+      orderDirection: "asc",
+      payloadWhere: [],
     }),
     {
       params: ["user.created", 0, 42, 25],
@@ -298,6 +300,82 @@ test("kysely projection compiler lowers semantic event scans", () => {
   assert.equal(orderItems.length, 1);
   assert.equal(limitValue["value"], 25);
   assert.equal(where["kind"], "WhereNode");
+});
+
+test("kysely projection compiler lowers event payload predicates", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: ["user.created", 0, "$.userId", "u_123", 1],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileEventScan({
+      afterEventId: null,
+      eventName: "user.created",
+      limit: 1,
+      orderDirection: "desc",
+      payloadWhere: [
+        {
+          fieldName: "userId",
+          value: "u_123",
+        },
+      ],
+    }),
+    {
+      params: ["user.created", 0, "$.userId", "u_123", 1],
+      text: "compiled:SelectQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const orderBy = readRecord(query["orderBy"], "order by");
+  const orderItems = readArray(orderBy["items"], "order by items");
+  const payloadOrder = readRecord(orderItems[0], "payload order item");
+  const payloadOrderDirection = readRecord(
+    payloadOrder["direction"],
+    "payload order direction",
+  );
+  const payloadOrderDirectionFragments = readArray(
+    payloadOrderDirection["sqlFragments"],
+    "payload order direction fragments",
+  );
+  const where = readRecord(query["where"], "where");
+  const whereExpression = readRecord(where["where"], "where expression");
+  const payloadPredicate = readRecord(
+    whereExpression["right"],
+    "payload predicate",
+  );
+  const payloadField = readRecord(
+    payloadPredicate["leftOperand"],
+    "payload predicate left operand",
+  );
+  const payloadArguments = readArray(
+    payloadField["arguments"],
+    "payload function arguments",
+  );
+  const payloadPath = readRecord(payloadArguments[1], "payload path");
+  const payloadValue = readRecord(
+    payloadPredicate["rightOperand"],
+    "payload predicate right operand",
+  );
+
+  assert.deepEqual(payloadOrderDirectionFragments, ["desc"]);
+  assert.equal(payloadPredicate["kind"], "BinaryOperationNode");
+  assert.equal(payloadField["kind"], "FunctionNode");
+  assert.equal(payloadField["func"], "json_extract");
+  assert.equal(payloadPath["value"], "$.userId");
+  assert.equal(payloadValue["value"], "u_123");
 });
 
 test("kysely projection compiler strips externally-bound insert value params", () => {

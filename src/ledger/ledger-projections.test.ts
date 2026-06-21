@@ -2707,6 +2707,12 @@ test("projection access hydrates semantic event references without exposing even
         }),
         result: Type.Array(UserCreatedSchema),
       },
+      sourceEventScanByUser: {
+        params: Type.Object({
+          userId: Type.String(),
+        }),
+        result: Type.Array(UserCreatedSchema),
+      },
     },
   });
   const eventModel = withMaterializations(
@@ -2743,12 +2749,25 @@ test("projection access hydrates semantic event references without exposing even
           return event.payload;
         });
       },
+      sourceEventScanByUser: async ({ params, db }) => {
+        const events = await db
+          .scanEvents("user.created")
+          .wherePayload("userId", params.userId)
+          .orderByEventId("desc")
+          .limit(1)
+          .execute();
+
+        return events.map((event) => {
+          return event.payload;
+        });
+      },
     },
   });
   const eventQueries = readTestLedgerImplementations(eventModel).queries;
   const sourceEvent = eventQueries?.sourceEvent;
   const sourceEvents = eventQueries?.sourceEvents;
   const sourceEventScan = eventQueries?.sourceEventScan;
+  const sourceEventScanByUser = eventQueries?.sourceEventScanByUser;
 
   if (sourceEvent === undefined) {
     throw new Error("expected sourceEvent query implementation");
@@ -2760,6 +2779,10 @@ test("projection access hydrates semantic event references without exposing even
 
   if (sourceEventScan === undefined) {
     throw new Error("expected sourceEventScan query implementation");
+  }
+
+  if (sourceEventScanByUser === undefined) {
+    throw new Error("expected sourceEventScanByUser query implementation");
   }
 
   const fake = createFakeScope({
@@ -2913,6 +2936,41 @@ test("projection access hydrates semantic event references without exposing even
     {
       userId: "u_456",
       email: "bob@example.com",
+    },
+  ]);
+
+  const payloadScanFake = createFakeScope({
+    allRows: [
+      {
+        causation_event_id: null,
+        dedupe_key: null,
+        event_id: 44,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_456",
+          email: "bob-latest@example.com",
+        }),
+        ts_ms: 1_200,
+      },
+    ],
+    getRow: undefined,
+  });
+  const payloadScannedPayloads = await sourceEventScanByUser(
+    payloadScanFake.scope,
+    {
+      userId: "u_456",
+    },
+  );
+
+  assert.deepEqual(payloadScanFake.calls[0], {
+    method: "all",
+    params: ["user.created", 0, "$.userId", "u_456", 1],
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? ORDER BY "event_id" DESC LIMIT ?',
+  });
+  assert.deepEqual(payloadScannedPayloads, [
+    {
+      userId: "u_456",
+      email: "bob-latest@example.com",
     },
   ]);
 });
@@ -3978,6 +4036,8 @@ test("materialization data migrations can scan typed ledger events", async () =>
   > = {
     afterEventId: () => scanBuilder,
     limit: () => scanBuilder,
+    orderByEventId: () => scanBuilder,
+    wherePayload: () => scanBuilder,
     execute: async () => [event],
     stream: async function* () {
       yield event;
@@ -4859,13 +4919,23 @@ async function assertLedgerProjectionTypes(): Promise<void> {
 
         for await (const scannedEvent of db
           .scanEvents("user.created")
+          .wherePayload("userId", "u_1")
           .afterEventId(0)
+          .orderByEventId("desc")
           .limit(10)
           .stream()) {
           const userId: string = scannedEvent.payload.userId;
 
           void userId;
         }
+
+        db.scanEvents("user.created")
+          // @ts-expect-error event payload filters must reference known payload fields.
+          .wherePayload("sessionId", "s_1");
+
+        db.scanEvents("user.created")
+          // @ts-expect-error event payload filters must use values compatible with the payload field type.
+          .wherePayload("userId", 1);
 
         // @ts-expect-error event scans must reference known ledger events.
         db.scanEvents("session.created");

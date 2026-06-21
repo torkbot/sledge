@@ -17,6 +17,7 @@ import type {
   ProjectionCompilerAggregate,
   ProjectionCompilerAssignment,
   ProjectionCompilerColumnReference,
+  ProjectionCompilerEventPayloadWhereClause,
   ProjectionCompilerExpression,
   ProjectionCompilerJoinClause,
   ProjectionCompilerOrderClause,
@@ -47,6 +48,7 @@ const projectionExpressionBrand: unique symbol = Symbol(
 const projectionUnionValueBrand: unique symbol = Symbol(
   "sledge.projectionUnionValue",
 );
+const projectionEventPayloadFieldNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 declare const projectionExpressionValueBrand: unique symbol;
 declare const projectionUnionArmRowBrand: unique symbol;
 declare const projectionUnionValueValueBrand: unique symbol;
@@ -332,6 +334,25 @@ export type ProjectionJoinCondition<
 export type ProjectionOrderDirection = "asc" | "desc";
 export type ProjectionNullOrder = "first" | "last";
 export type ProjectionUnionLiteralValue = boolean | number | string | null;
+type ProjectionEventPayloadPredicateValue = boolean | number | string;
+type ProjectionEventPayloadScalarField<TEventSchema extends TSchema> = Extract<
+  {
+    readonly [TFieldName in keyof Static<TEventSchema>]: Extract<
+      Static<TEventSchema>[TFieldName],
+      ProjectionEventPayloadPredicateValue
+    > extends never
+      ? never
+      : TFieldName;
+  }[keyof Static<TEventSchema>],
+  string
+>;
+type ProjectionEventPayloadFieldValue<
+  TEventSchema extends TSchema,
+  TFieldName extends ProjectionEventPayloadScalarField<TEventSchema>,
+> = Extract<
+  Static<TEventSchema>[TFieldName],
+  ProjectionEventPayloadPredicateValue
+>;
 type ProjectionWidenUnionLiteral<TValue extends ProjectionUnionLiteralValue> =
   TValue extends boolean
     ? boolean
@@ -1055,6 +1076,17 @@ export type ProjectionEventScanBuilder<
     eventId: number,
   ): ProjectionEventScanBuilder<TEvents, TEventName>;
   limit(limit: number): ProjectionEventScanBuilder<TEvents, TEventName>;
+  orderByEventId(
+    direction: ProjectionOrderDirection,
+  ): ProjectionEventScanBuilder<TEvents, TEventName>;
+  wherePayload<
+    const TFieldName extends ProjectionEventPayloadScalarField<
+      TEvents[TEventName]
+    >,
+  >(
+    fieldName: TFieldName,
+    value: ProjectionEventPayloadFieldValue<TEvents[TEventName], TFieldName>,
+  ): ProjectionEventScanBuilder<TEvents, TEventName>;
   execute(): Promise<readonly EventEnvelope<TEvents, TEventName>[]>;
   stream(): AsyncIterable<EventEnvelope<TEvents, TEventName>>;
 };
@@ -2052,6 +2084,8 @@ function createProjectionReadDatabase<
         eventName,
         null,
         null,
+        "asc",
+        [],
         statementCompiler,
       );
     },
@@ -3653,11 +3687,15 @@ function buildScanProjectionEventsSql(
   eventName: string,
   afterEventId: number | null,
   limit: number | null,
+  orderDirection: ProjectionOrderDirection,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
 ): CompiledProjectionSql {
   return statementCompiler.compileEventScan({
     afterEventId,
     eventName,
     limit,
+    orderDirection,
+    payloadWhere,
   });
 }
 
@@ -4490,9 +4528,11 @@ function createProjectionEventScanBuilder<
   eventName: TEventName,
   afterEventId: number | null,
   limit: number | null,
+  orderDirection: ProjectionOrderDirection,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
   statementCompiler: ProjectionStatementCompiler,
 ): ProjectionEventScanBuilder<TEvents, TEventName> {
-  validateProjectionEventName(events, eventName);
+  const eventSchema = validateProjectionEventName(events, eventName);
 
   return {
     afterEventId: (eventId) => {
@@ -4504,6 +4544,8 @@ function createProjectionEventScanBuilder<
         eventName,
         eventId,
         limit,
+        orderDirection,
+        payloadWhere,
         statementCompiler,
       );
     },
@@ -4514,6 +4556,8 @@ function createProjectionEventScanBuilder<
         eventName,
         afterEventId,
         limit,
+        orderDirection,
+        payloadWhere,
         statementCompiler,
       );
     },
@@ -4526,6 +4570,22 @@ function createProjectionEventScanBuilder<
         eventName,
         afterEventId,
         nextLimit,
+        orderDirection,
+        payloadWhere,
+        statementCompiler,
+      );
+    },
+    orderByEventId: (direction) => {
+      validateProjectionOrderDirection(direction);
+
+      return createProjectionEventScanBuilder(
+        scope,
+        events,
+        eventName,
+        afterEventId,
+        limit,
+        direction,
+        payloadWhere,
         statementCompiler,
       );
     },
@@ -4536,12 +4596,39 @@ function createProjectionEventScanBuilder<
         eventName,
         afterEventId,
         limit,
+        orderDirection,
+        payloadWhere,
         statementCompiler,
       );
 
       for (const event of scannedEvents) {
         yield event;
       }
+    },
+    wherePayload: (fieldName, value) => {
+      const stringFieldName = String(fieldName);
+      validateProjectionEventPayloadField(eventSchema, stringFieldName);
+      validateProjectionEventPayloadPredicateValue(
+        value,
+        `event payload field ${String(eventName)}.${stringFieldName}`,
+      );
+
+      return createProjectionEventScanBuilder(
+        scope,
+        events,
+        eventName,
+        afterEventId,
+        limit,
+        orderDirection,
+        [
+          ...payloadWhere,
+          {
+            fieldName: stringFieldName,
+            value,
+          },
+        ],
+        statementCompiler,
+      );
     },
   };
 }
@@ -4651,6 +4738,8 @@ async function scanProjectionEvents<
   eventName: TEventName,
   afterEventId: number | null,
   limit: number | null,
+  orderDirection: ProjectionOrderDirection,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
   statementCompiler: ProjectionStatementCompiler,
 ): Promise<readonly EventEnvelope<TEvents, TEventName>[]> {
   const eventSchema = validateProjectionEventName(events, eventName);
@@ -4659,6 +4748,8 @@ async function scanProjectionEvents<
     eventName,
     afterEventId,
     limit,
+    orderDirection,
+    payloadWhere,
   );
   const rows = await scope.prepare(sql.text).all(...sql.params);
 
@@ -4701,6 +4792,52 @@ function validateProjectionEventScanAfterEventId(eventId: number): void {
   if (!Number.isSafeInteger(eventId) || eventId < 0) {
     throw new Error("projection event scan cursor must be a safe integer");
   }
+}
+
+function validateProjectionEventPayloadField(
+  eventSchema: TSchema,
+  fieldName: string,
+): void {
+  if (fieldName.length === 0) {
+    throw new Error("event payload field name must not be empty");
+  }
+
+  if (!projectionEventPayloadFieldNamePattern.test(fieldName)) {
+    throw new Error(
+      `event payload field ${fieldName} must be a simple top-level identifier`,
+    );
+  }
+
+  const schemaRecord = readRecord(eventSchema);
+  const properties = readRecord(schemaRecord["properties"]);
+
+  if (properties[fieldName] === undefined) {
+    throw new Error(`event payload field ${fieldName} is not in schema`);
+  }
+}
+
+function validateProjectionEventPayloadPredicateValue(
+  value: unknown,
+  context: string,
+): asserts value is ProjectionEventPayloadPredicateValue {
+  switch (typeof value) {
+    case "boolean":
+    case "number":
+    case "string":
+      return;
+  }
+
+  throw new Error(
+    `${context} predicate value must be boolean, number, or string`,
+  );
+}
+
+function readRecord(value: unknown): Readonly<Record<string, unknown>> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("expected event schema metadata to be an object");
+  }
+
+  return value as Readonly<Record<string, unknown>>;
 }
 
 function decodeProjectionEventRow<

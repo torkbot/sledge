@@ -148,6 +148,11 @@ export type ProjectionCompilerAggregate =
       readonly kind: "min";
     };
 
+export type ProjectionCompilerEventPayloadWhereClause = {
+  readonly fieldName: string;
+  readonly value: boolean | number | string;
+};
+
 export type ProjectionCompilerInsertStatement = {
   readonly conflict:
     | null
@@ -200,6 +205,8 @@ export type ProjectionCompilerEventScanStatement = {
   readonly afterEventId: number | null;
   readonly eventName: string;
   readonly limit: number | null;
+  readonly orderDirection: "asc" | "desc";
+  readonly payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[];
 };
 
 export type ProjectionCompilerUpdateStatement = {
@@ -264,6 +271,8 @@ export type ProjectionStatementCompiler = {
     statement: ProjectionCompilerUpdateStatement,
   ): ProjectionCompiledSql;
 };
+
+const projectionEventPayloadFieldNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function createSqliteProjectionStatementCompiler(): ProjectionStatementCompiler {
   return {
@@ -446,12 +455,20 @@ function compileEventScanStatement(
   let text =
     'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ?';
 
+  for (const predicate of statement.payloadWhere) {
+    text += ' AND json_extract("payload_json", ?) = ?';
+    params.push(
+      createProjectionEventPayloadJsonPath(predicate.fieldName),
+      serializeProjectionEventPayloadPredicateValue(predicate.value),
+    );
+  }
+
   if (statement.afterEventId !== null) {
     text += ' AND "event_id" > ?';
     params.push(statement.afterEventId);
   }
 
-  text += ' ORDER BY "event_id" ASC';
+  text += ` ORDER BY "event_id" ${statement.orderDirection.toUpperCase()}`;
 
   if (statement.limit !== null) {
     text += " LIMIT ?";
@@ -462,6 +479,30 @@ function compileEventScanStatement(
     params,
     text,
   };
+}
+
+function createProjectionEventPayloadJsonPath(fieldName: string): string {
+  validateProjectionEventPayloadFieldName(fieldName);
+
+  return `$.${fieldName}`;
+}
+
+function validateProjectionEventPayloadFieldName(fieldName: string): void {
+  if (!projectionEventPayloadFieldNamePattern.test(fieldName)) {
+    throw new Error(
+      `event payload field ${fieldName} must be a simple top-level identifier`,
+    );
+  }
+}
+
+function serializeProjectionEventPayloadPredicateValue(
+  value: boolean | number | string,
+): unknown {
+  if (typeof value === "boolean") {
+    return value ? 1 : 0;
+  }
+
+  return value;
 }
 
 function compileInsertStatement(
