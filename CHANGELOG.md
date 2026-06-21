@@ -25,6 +25,13 @@
   namespace versions, create fresh namespaces from the current schema, replay
   data migration steps, and apply supported incremental DDL without exposing raw
   SQL.
+- Re-read materialization namespace versions after acquiring the migration lock
+  so concurrent runtimes do not replay data migrations from stale version
+  observations.
+- Create indexes declared on tables introduced by incremental materialization
+  migrations so upgraded namespaces match fresh namespaces.
+- Prune live-only signals that do not materialize durable signal work instead
+  of retaining observer-only rows forever.
 - Split materialization contracts from implementations. `defineMaterializations`
   declares plain-object indexer/query contracts, while `.register(...)` supplies
   typed indexer/query implementations.

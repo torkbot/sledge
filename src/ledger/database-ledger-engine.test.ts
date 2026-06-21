@@ -1993,7 +1993,7 @@ test("queue handlers publish signals immediately before handler completion", asy
       database,
       `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
     ),
-    1,
+    0,
   );
 
   gate.resolve();
@@ -2006,7 +2006,7 @@ test("queue handlers publish signals immediately before handler completion", asy
       database,
       `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
     ),
-    1,
+    0,
   );
 
   subscription[Symbol.dispose]();

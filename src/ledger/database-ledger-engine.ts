@@ -840,24 +840,40 @@ function openDatabaseLedgerEngine<
       )
     `);
 
-    const currentVersion = await readMaterializationVersion(
+    const observedVersion = await readMaterializationVersion(
       database,
       history.namespace,
     );
 
-    if (currentVersion > history.currentVersion) {
+    if (observedVersion > history.currentVersion) {
       throw new Error(
-        `materialization ${history.namespace} is at version ${currentVersion}, newer than model version ${history.currentVersion}`,
+        `materialization ${history.namespace} is at version ${observedVersion}, newer than model version ${history.currentVersion}`,
       );
     }
 
-    if (currentVersion === history.currentVersion) {
+    if (observedVersion === history.currentVersion) {
       return;
     }
 
     await database.exec("BEGIN IMMEDIATE");
 
     try {
+      const currentVersion = await readMaterializationVersion(
+        database,
+        history.namespace,
+      );
+
+      if (currentVersion > history.currentVersion) {
+        throw new Error(
+          `materialization ${history.namespace} is at version ${currentVersion}, newer than model version ${history.currentVersion}`,
+        );
+      }
+
+      if (currentVersion === history.currentVersion) {
+        await database.exec("COMMIT");
+        return;
+      }
+
       if (currentVersion === 0) {
         await createProjectionSchema(database, history.current.metadata);
       }
@@ -964,6 +980,7 @@ function openDatabaseLedgerEngine<
         }
 
         await createMaterializationTable(database, operation);
+        await createMaterializationTableIndexes(database, operation);
         return;
       case "create_index":
         if (freshNamespace) {
@@ -1022,6 +1039,22 @@ function openDatabaseLedgerEngine<
     });
 
     await database.exec(sql.text);
+  }
+
+  async function createMaterializationTableIndexes(
+    database: StorageDatabase,
+    operation: Extract<
+      MaterializationMigrationOperation,
+      { kind: "create_table" }
+    >,
+  ): Promise<void> {
+    for (const index of operation.table.indexes) {
+      const sql = input.projectionCompiler.compileCreateIndex({
+        index,
+        tableName: operation.tableName,
+      });
+      await database.exec(sql.text);
+    }
   }
 
   async function createMaterializationIndex(
@@ -1523,7 +1556,6 @@ function openDatabaseLedgerEngine<
     };
 
     const signalHandler = registration.signals?.[signalName];
-    const hasObservers = hasSignalObservers(String(signalName));
     const queued: {
       queueName: string;
       workKey: string | null;
@@ -1587,7 +1619,7 @@ function openDatabaseLedgerEngine<
         );
     }
 
-    if (queued.length === 0 && signalHandler === undefined && !hasObservers) {
+    if (queued.length === 0) {
       await database
         .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
         .run(eventId);
@@ -1683,12 +1715,6 @@ function openDatabaseLedgerEngine<
     for (const waiter of waiters) {
       waiter();
     }
-  }
-
-  function hasSignalObservers(signalName: string): boolean {
-    const observers = signalObserversByName.get(signalName);
-
-    return observers !== undefined && observers.size > 0;
   }
 
   function notifySignalObservers(

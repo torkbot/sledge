@@ -270,6 +270,7 @@ const history = defineMaterializationHistory(ledgerShape, schemaV2, (m) => [
   ]),
   m.migration(2, "add user email", (s) => [
     s.addColumn("users", "email", (t) => t.text()),
+    s.createIndex("usersByEmail", "users", ["email"]),
     s.data("backfill user email", async ({ db }) => {
       const events = await db.scanEvents("user.created").execute();
 
@@ -285,7 +286,6 @@ const history = defineMaterializationHistory(ledgerShape, schemaV2, (m) => [
           .execute();
       }
     }),
-    s.createIndex("usersByEmail", "users", ["email"]),
   ]),
 ]);
 ```
@@ -296,8 +296,9 @@ migration steps can also read or scan typed ledger events with `readEvent(...)`,
 `readEvents(...)`, and `scanEvents(...)` without seeing the internal `events`
 table. Data migration steps receive a Sledge-owned typed migration database
 facade, not a raw SQL handle, so future executors can inject tenancy and
-storage-specific behavior before operations reach the database. This slice
-records operation metadata but does not yet execute it.
+storage-specific behavior before operations reach the database. Sledge runs
+pending materialization migrations during ledger startup hygiene before runtime
+indexers and queries use the materialized tables.
 
 Sledge validates that the history starts at version 1, versions are unique
 positive integers, versions have no gaps, and the latest migration version

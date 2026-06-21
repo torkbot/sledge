@@ -117,11 +117,209 @@ test("database ledger startup applies materialization history hygiene", async ()
   );
 });
 
-function createMaterializationHygieneStorage(): {
+test("database ledger startup re-reads materialization version under the migration lock", async () => {
+  const shape = defineLedgerShape({
+    events: {
+      "user.created": Type.Object({
+        email: Type.String(),
+        userId: Type.String(),
+      }),
+    },
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const schema = defineMaterializationSchema({
+    namespace: "users",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            email: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+  const history = defineMaterializationHistory(shape, schema, (m) => [
+    m.migration(1, "create users", (s) => [
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            email: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+      s.data("seed user", async ({ db }) => {
+        await db
+          .insertInto("users")
+          .values({
+            email: "ada@example.com",
+            userId: "ada",
+          })
+          .execute();
+      }),
+    ]),
+  ]);
+  const materializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {},
+  });
+  const model = withMaterializations(shape, materializations).register({});
+  const storage = createMaterializationHygieneStorage({
+    materializationVersions: [undefined, 1],
+  });
+  const ledger = createDatabaseLedger({
+    model,
+    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    storage: storage.runtime,
+    timing: {
+      clock: {
+        nowMs: () => 12_345,
+      },
+    },
+  });
+
+  await ledger.close();
+
+  const versionReads = storage.calls.filter((call) => {
+    return call.sql.includes(
+      "SELECT version FROM sledge_materialization_versions",
+    );
+  });
+  assert.equal(versionReads.length, 2);
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql.includes('CREATE TABLE IF NOT EXISTS "users"');
+    }),
+    false,
+  );
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql.includes('INSERT INTO "users"');
+    }),
+    false,
+  );
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql === "COMMIT";
+    }),
+    true,
+  );
+});
+
+test("database ledger startup creates indexes for incremental create-table migrations", async () => {
+  const shape = defineLedgerShape({
+    events: {},
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const schema = defineMaterializationSchema({
+    namespace: "sessions",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"])
+          .index("sessionsByUser", ["userId"]),
+    },
+  });
+  const history = defineMaterializationHistory(shape, schema, (m) => [
+    m.migration(1, "create users", (s) => [
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    ]),
+    m.migration(2, "create sessions", (s) => [
+      s.createTable("sessions", (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"])
+          .index("sessionsByUser", ["userId"]),
+      ),
+    ]),
+  ]);
+  const materializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {},
+  });
+  const model = withMaterializations(shape, materializations).register({});
+  const storage = createMaterializationHygieneStorage({
+    materializationVersions: [1, 1],
+  });
+  const ledger = createDatabaseLedger({
+    model,
+    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    storage: storage.runtime,
+    timing: {
+      clock: {
+        nowMs: () => 12_345,
+      },
+    },
+  });
+
+  await ledger.close();
+
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql.includes('CREATE TABLE IF NOT EXISTS "users"');
+    }),
+    false,
+  );
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql.includes('CREATE TABLE IF NOT EXISTS "sessions"');
+    }),
+    true,
+  );
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql.includes('CREATE INDEX IF NOT EXISTS "sessionsByUser"');
+    }),
+    true,
+  );
+  assert.equal(
+    storage.calls.some((call) => {
+      return (
+        call.sql.includes("sledge_materialization_versions") &&
+        call.method === "run" &&
+        call.params[1] === 2
+      );
+    }),
+    true,
+  );
+});
+
+function createMaterializationHygieneStorage(input?: {
+  readonly materializationVersions?: readonly (number | undefined)[];
+}): {
   readonly calls: readonly StorageCall[];
   readonly runtime: StorageRuntime;
 } {
   const calls: StorageCall[] = [];
+  const materializationVersions = [...(input?.materializationVersions ?? [])];
   const scope: LedgerStorageScope = {
     exec: async (sql) => {
       calls.push({
@@ -131,7 +329,7 @@ function createMaterializationHygieneStorage(): {
       });
     },
     prepare: (sql) => {
-      return createStorageStatement(calls, sql);
+      return createStorageStatement(calls, sql, materializationVersions);
     },
   };
 
@@ -148,6 +346,7 @@ function createMaterializationHygieneStorage(): {
 function createStorageStatement(
   calls: StorageCall[],
   sql: string,
+  materializationVersions: (number | undefined)[],
 ): LedgerStorageStatement {
   return {
     all: async (...params) => {
@@ -199,6 +398,21 @@ function createStorageStatement(
         params,
         sql,
       });
+
+      if (
+        sql.includes("SELECT version FROM sledge_materialization_versions") &&
+        materializationVersions.length > 0
+      ) {
+        const version = materializationVersions.shift();
+
+        if (version === undefined) {
+          return undefined;
+        }
+
+        return {
+          version,
+        };
+      }
 
       return undefined;
     },
