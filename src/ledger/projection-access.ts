@@ -66,6 +66,10 @@ const ProjectionEventIdBoundsRowSchema = Type.Object({
   max_event_id: Type.Union([Type.Null(), Type.Number()]),
   min_event_id: Type.Union([Type.Null(), Type.Number()]),
 });
+const ProjectionLatestEventRefByPayloadRowSchema = Type.Object({
+  event_id: Type.Number(),
+  payload_value: Type.String(),
+});
 const maxProjectionEventReadIdsPerStatement = 900;
 
 export type AnyProjectionSchema = {
@@ -348,6 +352,14 @@ type ProjectionEventPayloadScalarField<TEventSchema extends TSchema> = Extract<
     > extends never
       ? never
       : TFieldName;
+  }[keyof Static<TEventSchema>],
+  string
+>;
+type ProjectionEventPayloadStringField<TEventSchema extends TSchema> = Extract<
+  {
+    readonly [TFieldName in keyof Static<TEventSchema>]: Static<TEventSchema>[TFieldName] extends string
+      ? TFieldName
+      : never;
   }[keyof Static<TEventSchema>],
   string
 >;
@@ -1097,6 +1109,13 @@ export type ProjectionEventScanBuilder<
     value: ProjectionEventPayloadFieldValue<TEvents[TEventName], TFieldName>,
   ): ProjectionEventScanBuilder<TEvents, TEventName>;
   eventIdBounds(): Promise<ProjectionEventIdBounds>;
+  latestEventRefsByPayload<
+    const TFieldName extends ProjectionEventPayloadStringField<
+      TEvents[TEventName]
+    >,
+  >(
+    fieldName: TFieldName,
+  ): Promise<readonly ProjectionLatestEventRefByPayload<TEventName>[]>;
   execute(): Promise<readonly EventEnvelope<TEvents, TEventName>[]>;
   stream(): AsyncIterable<EventEnvelope<TEvents, TEventName>>;
 };
@@ -1104,6 +1123,11 @@ export type ProjectionEventScanBuilder<
 export type ProjectionEventIdBounds = {
   readonly maxEventId: number | null;
   readonly minEventId: number | null;
+};
+
+export type ProjectionLatestEventRefByPayload<TEventName extends string> = {
+  readonly payloadValue: string;
+  readonly ref: EventRef<TEventName>;
 };
 
 export type ProjectionUnionArm<TRow> = {
@@ -3776,6 +3800,23 @@ function buildProjectionEventIdBoundsSql(
   });
 }
 
+function buildLatestEventRefsByPayloadSql(
+  statementCompiler: ProjectionStatementCompiler,
+  streamKind: ProjectionCompilerEventStreamKind,
+  eventName: string,
+  fieldName: string,
+  afterEventId: number | null,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
+): CompiledProjectionSql {
+  return statementCompiler.compileLatestEventRefsByPayload({
+    afterEventId,
+    eventName,
+    fieldName,
+    payloadWhere,
+    streamKind,
+  });
+}
+
 function buildUpdateSql(
   statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
@@ -4655,6 +4696,20 @@ function createProjectionEventScanBuilder<
         statementCompiler,
       );
     },
+    latestEventRefsByPayload: async (fieldName) => {
+      const stringFieldName = String(fieldName);
+      validateProjectionEventPayloadStringField(eventSchema, stringFieldName);
+
+      return await readProjectionLatestEventRefsByPayload(
+        scope,
+        streamKind,
+        eventName,
+        stringFieldName,
+        afterEventId,
+        payloadWhere,
+        statementCompiler,
+      );
+    },
     limit: (nextLimit) => {
       validateProjectionLimit(nextLimit);
 
@@ -4892,6 +4947,40 @@ async function readProjectionEventIdBounds(
   };
 }
 
+async function readProjectionLatestEventRefsByPayload<
+  TEventName extends string,
+>(
+  scope: LedgerStorageScope,
+  streamKind: ProjectionCompilerEventStreamKind,
+  eventName: TEventName,
+  fieldName: string,
+  afterEventId: number | null,
+  payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
+  statementCompiler: ProjectionStatementCompiler,
+): Promise<readonly ProjectionLatestEventRefByPayload<TEventName>[]> {
+  const sql = buildLatestEventRefsByPayloadSql(
+    statementCompiler,
+    streamKind,
+    eventName,
+    fieldName,
+    afterEventId,
+    payloadWhere,
+  );
+  const rows = await scope.prepare(sql.text).all(...sql.params);
+
+  return rows.map((row) => {
+    const decodedRow = Value.Decode(
+      ProjectionLatestEventRefByPayloadRowSchema,
+      row,
+    );
+
+    return {
+      payloadValue: decodedRow.payload_value,
+      ref: createEventRef(eventName, decodedRow.event_id),
+    };
+  });
+}
+
 function validateProjectionEventStreamName<
   TEvents extends Record<string, TSchema>,
   TEventName extends Extract<keyof TEvents, string>,
@@ -4951,6 +5040,21 @@ function validateProjectionEventPayloadField(
 
   if (properties[fieldName] === undefined) {
     throw new Error(`event payload field ${fieldName} is not in schema`);
+  }
+}
+
+function validateProjectionEventPayloadStringField(
+  eventSchema: TSchema,
+  fieldName: string,
+): void {
+  validateProjectionEventPayloadField(eventSchema, fieldName);
+
+  const schemaRecord = readRecord(eventSchema);
+  const properties = readRecord(schemaRecord["properties"]);
+  const propertySchema = readRecord(properties[fieldName]);
+
+  if (propertySchema["type"] !== "string") {
+    throw new Error(`event payload field ${fieldName} must be a string field`);
   }
 }
 

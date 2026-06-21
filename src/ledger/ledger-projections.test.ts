@@ -3349,23 +3349,23 @@ test("projection facade supports TorkBot-style surface operation materialization
           .scanEvents("surface.operation.requested")
           .afterEventId(params.afterEventId)
           .execute();
-        const completedEvents = await db
+        const completedRefs = await db
           .scanEvents("surface.operation.completed")
           .afterEventId(params.afterEventId)
-          .execute();
-        const failedEvents = await db
+          .latestEventRefsByPayload("operationKey");
+        const failedRefs = await db
           .scanEvents("surface.operation.failed")
           .afterEventId(params.afterEventId)
-          .execute();
+          .latestEventRefsByPayload("operationKey");
         const latestCompleted = new Map<string, number>();
         const latestFailed = new Map<string, number>();
 
-        for (const event of completedEvents) {
-          latestCompleted.set(event.payload.operationKey, event.eventId);
+        for (const eventRef of completedRefs) {
+          latestCompleted.set(eventRef.payloadValue, eventRef.ref.eventId);
         }
 
-        for (const event of failedEvents) {
-          latestFailed.set(event.payload.operationKey, event.eventId);
+        for (const eventRef of failedRefs) {
+          latestFailed.set(eventRef.payloadValue, eventRef.ref.eventId);
         }
 
         return requestedEvents.map((event) => {
@@ -3572,12 +3572,8 @@ test("projection facade supports TorkBot-style surface operation materialization
       ],
       [
         {
-          causation_event_id: 101,
-          dedupe_key: null,
           event_id: 102,
-          event_name: "surface.operation.completed",
-          payload_json: JSON.stringify(completedInput),
-          ts_ms: 1_100,
+          payload_value: "op_1",
         },
       ],
       [],
@@ -3592,9 +3588,13 @@ test("projection facade supports TorkBot-style surface operation materialization
     rebuildFake.calls.map((call) => call.params),
     [
       ["surface.operation.requested", 0, 0],
-      ["surface.operation.completed", 0, 0],
-      ["surface.operation.failed", 0, 0],
+      ["$.operationKey", "surface.operation.completed", 0, 0, "$.operationKey"],
+      ["$.operationKey", "surface.operation.failed", 0, 0, "$.operationKey"],
     ],
+  );
+  assert.equal(
+    rebuildFake.calls[1]?.sql,
+    'SELECT json_extract("payload_json", ?) AS "payload_value", MAX("event_id") AS "event_id" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? AND json_extract("payload_json", ?) IS NOT NULL GROUP BY "payload_value"',
   );
   assert.deepEqual(rebuilt, [
     {
@@ -4182,6 +4182,12 @@ test("materialization data migrations can scan typed ledger events", async () =>
       maxEventId: event.eventId,
       minEventId: event.eventId,
     }),
+    latestEventRefsByPayload: async () => [
+      {
+        payloadValue: event.payload.userId,
+        ref: event.ref,
+      },
+    ],
     execute: async () => [event],
     stream: async function* () {
       yield event;
@@ -5073,6 +5079,23 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           void userId;
         }
 
+        const latestUserRefs = await db
+          .scanEvents("user.created")
+          .latestEventRefsByPayload("userId");
+        const latestUserRef = latestUserRefs[0] ?? null;
+
+        if (latestUserRef !== null) {
+          const payloadValue: string = latestUserRef.payloadValue;
+          const ref: EventRef<"user.created"> = latestUserRef.ref;
+
+          void payloadValue;
+          void ref;
+        }
+
+        db.scanEvents("user.created")
+          // @ts-expect-error latest event refs must group by known string payload fields.
+          .latestEventRefsByPayload("sessionId");
+
         db.scanEvents("user.created")
           // @ts-expect-error event payload filters must reference known payload fields.
           .wherePayload("sessionId", "s_1");
@@ -5196,6 +5219,23 @@ async function assertLedgerProjectionTypes(): Promise<void> {
         void minEventId;
         void maxEventId;
         void missingEventId;
+
+        const latestSignalRefs = await db
+          .scanSignals("run.stream.frame")
+          .latestEventRefsByPayload("runId");
+        const latestSignalRef = latestSignalRefs[0] ?? null;
+
+        if (latestSignalRef !== null) {
+          const payloadValue: string = latestSignalRef.payloadValue;
+          const ref: EventRef<"run.stream.frame"> = latestSignalRef.ref;
+
+          void payloadValue;
+          void ref;
+        }
+
+        db.scanSignals("run.stream.frame")
+          // @ts-expect-error latest event refs can only group by string payload fields.
+          .latestEventRefsByPayload("sequence");
 
         db.scanSignals("run.stream.frame")
           // @ts-expect-error signal payload filters must reference known signal payload fields.

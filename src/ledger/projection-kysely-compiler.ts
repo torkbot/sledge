@@ -14,11 +14,13 @@ import type {
   ProjectionCompilerCreateTableStatement,
   ProjectionCompilerDeleteStatement,
   ProjectionCompilerEventIdBoundsStatement,
+  ProjectionCompilerEventPayloadWhereClause,
   ProjectionCompilerEventReadStatement,
   ProjectionCompilerEventScanStatement,
   ProjectionCompilerEventStreamKind,
   ProjectionCompilerExpression,
   ProjectionCompilerInsertStatement,
+  ProjectionCompilerLatestEventRefsByPayloadStatement,
   ProjectionCompilerJoinClause,
   ProjectionCompilerOrderClause,
   ProjectionCompilerSelectStatement,
@@ -92,6 +94,8 @@ export function createKyselyProjectionStatementCompiler(
       compileEventReadStatement(input, statement),
     compileEventScan: (statement) =>
       compileEventScanStatement(input, statement),
+    compileLatestEventRefsByPayload: (statement) =>
+      compileLatestEventRefsByPayloadStatement(input, statement),
     compileInsert: (statement) => compileInsertStatement(input, statement),
     compileSelect: (statement) => compileSelectStatement(input, statement),
     compileUnionSelect: (statement) =>
@@ -316,10 +320,61 @@ function compileEventIdBoundsStatement(
   });
 }
 
+function compileLatestEventRefsByPayloadStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerLatestEventRefsByPayloadStatement,
+): ProjectionCompiledSql {
+  const payloadField = eventPayloadFieldNode(
+    input.dialect,
+    statement.fieldName,
+  );
+  const whereClauses = eventStreamWhereClauses(input, statement);
+
+  whereClauses.push(
+    binaryOperationNode(
+      eventPayloadFieldNode(input.dialect, statement.fieldName),
+      "is not",
+      valueNodeImmediate(null),
+    ),
+  );
+
+  return compileQuery(input.queryCompiler, {
+    from: fromNode([tableNode("events")]),
+    groupBy: groupByNode([referenceNode(null, "payload_value")]),
+    kind: "SelectQueryNode",
+    selections: [
+      selectionNode(aliasNode(payloadField, "payload_value")),
+      selectionNode(
+        aliasNode(
+          aggregateFunctionNode("max", [referenceNode(null, "event_id")]),
+          "event_id",
+        ),
+      ),
+    ],
+    where: whereNode(andOperationNodes(whereClauses)),
+  });
+}
+
+type ProjectionCompilerEventStreamStatement = {
+  readonly afterEventId: number | null;
+  readonly eventName: string;
+  readonly payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[];
+  readonly streamKind: ProjectionCompilerEventStreamKind;
+};
+
 function eventStreamWhereNode(
   input: KyselyProjectionStatementCompilerInput,
-  statement: ProjectionCompilerEventIdBoundsStatement,
+  statement: ProjectionCompilerEventStreamStatement,
 ): KyselyProjectionOperationNode {
+  return whereNode(
+    andOperationNodes(eventStreamWhereClauses(input, statement)),
+  );
+}
+
+function eventStreamWhereClauses(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerEventStreamStatement,
+): KyselyProjectionOperationNode[] {
   const whereClauses: KyselyProjectionOperationNode[] = [
     binaryOperationNode(
       referenceNode(null, "event_name"),
@@ -353,7 +408,7 @@ function eventStreamWhereNode(
     );
   }
 
-  return whereNode(andOperationNodes(whereClauses));
+  return whereClauses;
 }
 
 function eventPayloadFieldNode(
@@ -1153,6 +1208,24 @@ function functionNode(
     arguments: args,
     func,
     kind: "FunctionNode",
+  };
+}
+
+function groupByNode(
+  items: readonly KyselyProjectionOperationNode[],
+): KyselyProjectionOperationNode {
+  return {
+    items: items.map(groupByItemNode),
+    kind: "GroupByNode",
+  };
+}
+
+function groupByItemNode(
+  groupBy: KyselyProjectionOperationNode,
+): KyselyProjectionOperationNode {
+  return {
+    groupBy,
+    kind: "GroupByItemNode",
   };
 }
 

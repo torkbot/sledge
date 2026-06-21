@@ -210,6 +210,14 @@ export type ProjectionCompilerEventIdBoundsStatement = {
   readonly streamKind: ProjectionCompilerEventStreamKind;
 };
 
+export type ProjectionCompilerLatestEventRefsByPayloadStatement = {
+  readonly afterEventId: number | null;
+  readonly eventName: string;
+  readonly fieldName: string;
+  readonly payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[];
+  readonly streamKind: ProjectionCompilerEventStreamKind;
+};
+
 export type ProjectionCompilerEventScanStatement = {
   readonly afterEventId: number | null;
   readonly eventName: string;
@@ -271,6 +279,9 @@ export type ProjectionStatementCompiler = {
   compileEventScan(
     statement: ProjectionCompilerEventScanStatement,
   ): ProjectionCompiledSql;
+  compileLatestEventRefsByPayload(
+    statement: ProjectionCompilerLatestEventRefsByPayloadStatement,
+  ): ProjectionCompiledSql;
   compileInsert(
     statement: ProjectionCompilerInsertStatement,
   ): ProjectionCompiledSql;
@@ -297,6 +308,7 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileEventIdBounds: compileEventIdBoundsStatement,
     compileEventRead: compileEventReadStatement,
     compileEventScan: compileEventScanStatement,
+    compileLatestEventRefsByPayload: compileLatestEventRefsByPayloadStatement,
     compileInsert: compileInsertStatement,
     compileSelect: compileSelectStatement,
     compileUnionSelect: compileUnionSelectStatement,
@@ -490,6 +502,18 @@ function compileEventIdBoundsStatement(
   return {
     params: where.params,
     text: `SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM "events" WHERE ${where.text}`,
+  };
+}
+
+function compileLatestEventRefsByPayloadStatement(
+  statement: ProjectionCompilerLatestEventRefsByPayloadStatement,
+): ProjectionCompiledSql {
+  const where = compileEventStreamWhere(statement);
+  const payloadPath = createProjectionEventPayloadJsonPath(statement.fieldName);
+
+  return {
+    params: [payloadPath, ...where.params, payloadPath],
+    text: `SELECT json_extract("payload_json", ?) AS "payload_value", MAX("event_id") AS "event_id" FROM "events" WHERE ${where.text} AND json_extract("payload_json", ?) IS NOT NULL GROUP BY "payload_value"`,
   };
 }
 

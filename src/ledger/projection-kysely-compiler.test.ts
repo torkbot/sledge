@@ -480,6 +480,87 @@ test("kysely projection compiler lowers stream event id bounds", () => {
   assert.equal(where["kind"], "WhereNode");
 });
 
+test("kysely projection compiler lowers latest event refs grouped by payload", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: [
+          "$.operationKey",
+          "surface.operation.completed",
+          0,
+          "$.operationKey",
+        ],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileLatestEventRefsByPayload({
+      afterEventId: null,
+      eventName: "surface.operation.completed",
+      fieldName: "operationKey",
+      payloadWhere: [],
+      streamKind: "event",
+    }),
+    {
+      params: [
+        "$.operationKey",
+        "surface.operation.completed",
+        0,
+        "$.operationKey",
+      ],
+      text: "compiled:SelectQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const selections = readArray(query["selections"], "query selections");
+  const payloadSelection = readRecord(selections[0], "payload selection");
+  const payloadAlias = readRecord(
+    payloadSelection["selection"],
+    "payload alias",
+  );
+  const payloadExpression = readRecord(payloadAlias["node"], "payload field");
+  const eventIdSelection = readRecord(selections[1], "event id selection");
+  const eventIdAlias = readRecord(
+    eventIdSelection["selection"],
+    "event id alias",
+  );
+  const eventIdAggregate = readRecord(
+    eventIdAlias["node"],
+    "event id aggregate",
+  );
+  const where = readRecord(query["where"], "where");
+  const whereExpression = readRecord(where["where"], "where expression");
+  const notNullPredicate = readRecord(
+    whereExpression["right"],
+    "not-null predicate",
+  );
+  const groupBy = readRecord(query["groupBy"], "group by");
+  const groupByItems = readArray(groupBy["items"], "group by items");
+  const groupByItem = readRecord(groupByItems[0], "group by item");
+
+  assert.equal(payloadAlias["kind"], "AliasNode");
+  assert.equal(payloadExpression["func"], "json_extract");
+  assert.equal(eventIdAggregate["kind"], "AggregateFunctionNode");
+  assert.equal(eventIdAggregate["func"], "max");
+  assert.equal(notNullPredicate["kind"], "BinaryOperationNode");
+  assert.deepEqual(notNullPredicate["operator"], {
+    kind: "OperatorNode",
+    operator: "is not",
+  });
+  assert.equal(groupBy["kind"], "GroupByNode");
+  assert.equal(groupByItem["kind"], "GroupByItemNode");
+});
+
 test("kysely projection compiler strips externally-bound insert value params", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {
@@ -962,6 +1043,24 @@ test(
       {
         params: ["a@example.com", 1],
         text: 'select "users"."userId" as "userId" from "users" where "users"."email" = ? limit ?',
+      },
+    );
+    assert.deepEqual(
+      compiler.compileLatestEventRefsByPayload({
+        afterEventId: null,
+        eventName: "surface.operation.completed",
+        fieldName: "operationKey",
+        payloadWhere: [],
+        streamKind: "event",
+      }),
+      {
+        params: [
+          "$.operationKey",
+          "surface.operation.completed",
+          0,
+          "$.operationKey",
+        ],
+        text: 'select json_extract("payload_json", ?) as "payload_value", max("event_id") as "event_id" from "events" where "event_name" = ? and "signal" = ? and json_extract("payload_json", ?) is not null group by "payload_value"',
       },
     );
   },

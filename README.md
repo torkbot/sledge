@@ -359,8 +359,9 @@ Indexer and query implementations receive sledge-owned facades:
   `unionValue(...)`, and `unionAll(...)` without exposing raw SQL
 - reads can stream historical events with `scanEvents(eventName)` and retained
   signals with `scanSignals(signalName)`, filter by typed top-level scalar
-  payload fields, choose event-id ordering, and read event-id bounds without
-  exposing the internal `events` table
+  payload fields, choose event-id ordering, read event-id bounds, and group
+  latest semantic event refs by string payload keys without exposing the
+  internal `events` table
 - writes return affected-row metadata and support typed integer `add(...)`,
   bounded `decrementIfPositive(...)`, `MAX(...)`, `COALESCE(...)`, and upsert
   `excluded` expressions without raw SQL

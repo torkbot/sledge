@@ -55,6 +55,7 @@ export type {
   ProjectionExecutableWrite,
   ProjectionEventScanBuilder,
   ProjectionEventIdBounds,
+  ProjectionLatestEventRefByPayload,
   ProjectionDatabase,
   ProjectionDeleteBuilder,
   ProjectionExpression,
