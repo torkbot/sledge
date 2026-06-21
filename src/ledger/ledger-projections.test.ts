@@ -14,6 +14,8 @@ import type {
   EventRef,
   LedgerIndexerContext,
   MaterializationImplementationRegistration,
+  MaterializationMigrationDatabase,
+  ProjectionEventScanBuilder,
   QuerySchema,
   RegisteredLedgerModel,
 } from "./ledger.ts";
@@ -3806,6 +3808,117 @@ test("materialization histories validate versions and record typed operations", 
       ]),
     ]);
   }, /materialization history index usersByEmail conflicts with usersByEmail/);
+});
+
+test("materialization data migrations can scan typed ledger events", async () => {
+  const migrationSchema = defineMaterializationSchema({
+    namespace: "event-backfill",
+    version: 1,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+    },
+  });
+  const backfilled: string[] = [];
+  const migrationHistory = defineMaterializationHistory(
+    shape,
+    migrationSchema,
+    (m) => [
+      m.migration(1, "create and backfill users", (s) => [
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+        s.data("backfill users from events", async ({ db }) => {
+          const events = await db
+            .scanEvents("user.created")
+            .afterEventId(0)
+            .limit(10)
+            .execute();
+
+          for (const event of events) {
+            backfilled.push(`${event.payload.userId}:${event.payload.email}`);
+          }
+        }),
+      ]),
+    ],
+  );
+  const migration = migrationHistory.migrations[0];
+  const dataOperation = migration.operations[1];
+
+  if (dataOperation.kind !== "data") {
+    throw new Error("expected data migration operation");
+  }
+
+  const event: EventEnvelope<typeof shape.shape.events, "user.created"> = {
+    eventId: 1,
+    ref: createEventRef("user.created", 1),
+    tsMs: 1_000,
+    eventName: "user.created",
+    payload: {
+      userId: "u_123",
+      email: "alice@example.com",
+    },
+    causationEventId: null,
+    dedupeKey: null,
+  };
+  const scanBuilder: ProjectionEventScanBuilder<
+    typeof shape.shape.events,
+    "user.created"
+  > = {
+    afterEventId: () => scanBuilder,
+    limit: () => scanBuilder,
+    execute: async () => [event],
+    stream: async function* () {
+      yield event;
+    },
+  };
+  const migrationDb: MaterializationMigrationDatabase<
+    typeof migrationSchema,
+    typeof shape.shape.events
+  > = {
+    deleteFrom: () => {
+      throw new Error("unexpected migration delete");
+    },
+    insertInto: () => {
+      throw new Error("unexpected migration insert");
+    },
+    readEvent: () => {
+      throw new Error("unexpected migration event read");
+    },
+    readEvents: () => {
+      throw new Error("unexpected migration event batch read");
+    },
+    scanEvents: (eventName) => {
+      assert.equal(eventName, "user.created");
+
+      return scanBuilder as ProjectionEventScanBuilder<
+        typeof shape.shape.events,
+        typeof eventName
+      >;
+    },
+    selectFrom: () => {
+      throw new Error("unexpected migration select");
+    },
+    updateTable: () => {
+      throw new Error("unexpected migration update");
+    },
+  };
+
+  await dataOperation.run({
+    db: migrationDb,
+  });
+
+  assert.deepEqual(backfilled, ["u_123:alice@example.com"]);
 });
 
 test("materialization histories replay foreign keys against current state", () => {
