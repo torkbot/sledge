@@ -20,6 +20,8 @@ import type {
   ProjectionCompilerExpression,
   ProjectionCompilerJoinClause,
   ProjectionCompilerOrderClause,
+  ProjectionCompilerSelection,
+  ProjectionCompilerUnionSelectArm,
   ProjectionStatementCompiler,
   ProjectionCompilerWhereClause,
 } from "./projection-sql-compiler.ts";
@@ -42,7 +44,12 @@ type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
 const projectionExpressionBrand: unique symbol = Symbol(
   "sledge.projectionExpression",
 );
+const projectionUnionValueBrand: unique symbol = Symbol(
+  "sledge.projectionUnionValue",
+);
 declare const projectionExpressionValueBrand: unique symbol;
+declare const projectionUnionArmRowBrand: unique symbol;
+declare const projectionUnionValueValueBrand: unique symbol;
 
 const ProjectionEventRowSchema = Type.Object({
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
@@ -313,6 +320,137 @@ export type ProjectionJoinCondition<
 
 export type ProjectionOrderDirection = "asc" | "desc";
 export type ProjectionNullOrder = "first" | "last";
+export type ProjectionUnionLiteralValue = boolean | number | string | null;
+type ProjectionWidenUnionLiteral<TValue extends ProjectionUnionLiteralValue> =
+  TValue extends boolean
+    ? boolean
+    : TValue extends number
+      ? number
+      : TValue extends string
+        ? string
+        : null;
+
+export type ProjectionUnionValue<TValue extends ProjectionUnionLiteralValue> = {
+  readonly [projectionUnionValueBrand]: true;
+  readonly [projectionUnionValueValueBrand]?: TValue;
+  readonly value: TValue;
+};
+
+type ProjectionUnionSelectionValue<TTable> =
+  | ProjectionTableColumnName<TTable>
+  | ProjectionUnionValue<ProjectionUnionLiteralValue>;
+
+export type ProjectionUnionSelection<TTable> = Readonly<
+  Record<string, ProjectionUnionSelectionValue<TTable>>
+>;
+
+export type ProjectionUnionSelectedRow<
+  TTable,
+  TSelection extends ProjectionUnionSelection<TTable>,
+> = {
+  readonly [TAlias in Extract<
+    keyof TSelection,
+    string
+  >]: TSelection[TAlias] extends ProjectionUnionValue<infer TValue>
+    ? TValue
+    : TSelection[TAlias] extends ProjectionTableColumnName<TTable>
+      ? ProjectionColumnValue<
+          ProjectionTableColumns<TTable>[TSelection[TAlias]]
+        >
+      : never;
+};
+
+type ProjectionUnionArmRow<TArm> =
+  TArm extends ProjectionUnionArm<infer TRow> ? TRow : never;
+
+type ProjectionAnyUnionRow = Readonly<Record<string, unknown>>;
+
+type ProjectionAnyUnionArm = ProjectionUnionArm<ProjectionAnyUnionRow>;
+
+type ProjectionUnionNonNull<TValue> = Exclude<TValue, null>;
+
+type ProjectionUnionCompatibleValue<TLeft, TRight> = [
+  ProjectionUnionNonNull<TLeft>,
+] extends [never]
+  ? true
+  : [ProjectionUnionNonNull<TRight>] extends [never]
+    ? true
+    : [ProjectionUnionNonNull<TLeft>] extends [ProjectionUnionNonNull<TRight>]
+      ? [ProjectionUnionNonNull<TRight>] extends [ProjectionUnionNonNull<TLeft>]
+        ? true
+        : false
+      : false;
+
+type ProjectionUnionCompatibleRow<TFirstRow, TRow> =
+  Exclude<
+    Extract<keyof TFirstRow, string>,
+    Extract<keyof TRow, string>
+  > extends never
+    ? Exclude<
+        Extract<keyof TRow, string>,
+        Extract<keyof TFirstRow, string>
+      > extends never
+      ? false extends {
+          readonly [TKey in Extract<
+            keyof TFirstRow,
+            string
+          >]: TKey extends keyof TRow
+            ? ProjectionUnionCompatibleValue<TFirstRow[TKey], TRow[TKey]>
+            : false;
+        }[Extract<keyof TFirstRow, string>]
+        ? false
+        : true
+      : false
+    : false;
+
+type ProjectionCompatibleUnionArm<
+  TFirstRow,
+  TArm extends ProjectionAnyUnionArm,
+> =
+  ProjectionUnionCompatibleRow<
+    TFirstRow,
+    ProjectionUnionArmRow<TArm>
+  > extends true
+    ? TArm
+    : never;
+
+type ProjectionCompatibleUnionArms<
+  TArms extends readonly [
+    ProjectionAnyUnionArm,
+    ProjectionAnyUnionArm,
+    ...ProjectionAnyUnionArm[],
+  ],
+> = {
+  readonly [TIndex in keyof TArms]: ProjectionCompatibleUnionArm<
+    ProjectionUnionArmRow<TArms[0]>,
+    TArms[TIndex]
+  >;
+};
+
+type ProjectionMergedUnionRow<
+  TArms extends readonly [
+    ProjectionAnyUnionArm,
+    ProjectionAnyUnionArm,
+    ...ProjectionAnyUnionArm[],
+  ],
+> = {
+  readonly [TKey in Extract<
+    keyof ProjectionUnionArmRow<TArms[0]>,
+    string
+  >]: ProjectionUnionArmRow<TArms[number]> extends infer TRow
+    ? TRow extends ProjectionAnyUnionRow
+      ? TKey extends keyof TRow
+        ? TRow[TKey]
+        : never
+      : never
+    : never;
+};
+
+type ProjectionNullableRowKey<TRow> = {
+  readonly [TKey in Extract<keyof TRow, string>]: null extends TRow[TKey]
+    ? TKey
+    : never;
+}[Extract<keyof TRow, string>];
 
 export type ProjectionSelectedRow<
   TTable,
@@ -810,6 +948,77 @@ export type ProjectionReadDatabase<
     ProjectionSchemaTables<TProjectionSchema>,
     TTableName
   >;
+  unionAll<
+    const TArms extends readonly [
+      ProjectionAnyUnionArm,
+      ProjectionAnyUnionArm,
+      ...ProjectionAnyUnionArm[],
+    ],
+  >(
+    arms: TArms & ProjectionCompatibleUnionArms<TArms>,
+  ): ProjectionExecutableUnionSelect<ProjectionMergedUnionRow<TArms>>;
+  unionFrom<
+    const TTableName extends ProjectionTableName<
+      ProjectionSchemaTables<TProjectionSchema>
+    >,
+  >(
+    tableName: TTableName,
+  ): ProjectionUnionArmSelectBuilder<
+    ProjectionSchemaTables<TProjectionSchema>[TTableName]
+  >;
+  unionValue<const TValue extends ProjectionUnionLiteralValue>(
+    value: TValue,
+  ): ProjectionUnionValue<ProjectionWidenUnionLiteral<TValue>>;
+};
+
+export type ProjectionUnionArm<TRow> = {
+  readonly [projectionUnionArmRowBrand]?: TRow;
+  readonly metadata: ProjectionUnionArmMetadata;
+};
+
+export type ProjectionUnionArmSelectBuilder<TTable> = {
+  select<const TSelection extends ProjectionUnionSelection<TTable>>(
+    selection: TSelection,
+  ): ProjectionUnionSelectedArm<
+    TTable,
+    ProjectionUnionSelectedRow<TTable, TSelection>
+  >;
+};
+
+export type ProjectionUnionSelectedArm<TTable, TRow> =
+  ProjectionUnionArm<TRow> & {
+    whereAny(
+      conditions: readonly ProjectionWhereCondition<TTable>[],
+    ): ProjectionUnionSelectedArm<TTable, TRow>;
+    where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+      columnName: TColumnName,
+      operator: ProjectionWhereOperator,
+      value: ProjectionWhereValue<TTable, TColumnName>,
+    ): ProjectionUnionSelectedArm<TTable, TRow>;
+    whereIn<const TColumnName extends ProjectionTableColumnName<TTable>>(
+      columnName: TColumnName,
+      values: readonly ProjectionWhereValue<TTable, TColumnName>[],
+    ): ProjectionUnionSelectedArm<TTable, TRow>;
+    whereNotNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+      columnName: TColumnName,
+    ): ProjectionUnionSelectedArm<TTable, TRow>;
+    whereNull<const TColumnName extends ProjectionTableColumnName<TTable>>(
+      columnName: TColumnName,
+    ): ProjectionUnionSelectedArm<TTable, TRow>;
+  };
+
+export type ProjectionExecutableUnionSelect<TRow> = {
+  limit(limit: number): ProjectionExecutableUnionSelect<TRow>;
+  orderBy<const TColumnName extends Extract<keyof TRow, string>>(
+    columnName: TColumnName,
+    direction?: ProjectionOrderDirection,
+  ): ProjectionExecutableUnionSelect<TRow>;
+  orderByNulls<const TColumnName extends ProjectionNullableRowKey<TRow>>(
+    columnName: TColumnName,
+    order: ProjectionNullOrder,
+  ): ProjectionExecutableUnionSelect<TRow>;
+  execute(): Promise<readonly TRow[]>;
+  executeTakeFirst(): Promise<TRow | null>;
 };
 
 export type ProjectionDatabase<
@@ -1681,6 +1890,23 @@ function createProjectionReadDatabase<
     readEvents: async (refs) => {
       return await readProjectionEvents(scope, events, refs, statementCompiler);
     },
+    unionAll: (arms) => {
+      return createProjectionExecutableUnionSelect(
+        scope,
+        arms.map((arm) => arm.metadata),
+        [],
+        null,
+        statementCompiler,
+      );
+    },
+    unionFrom: (tableName) => {
+      const table = readProjectionTable(metadata, String(tableName));
+
+      return createProjectionUnionArmSelectBuilder(table);
+    },
+    unionValue: (value) => {
+      return createProjectionUnionValue(value);
+    },
     selectFrom: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
 
@@ -1739,6 +1965,188 @@ function createProjectionReadDatabase<
   };
 }
 
+function createProjectionUnionValue<TValue extends ProjectionUnionLiteralValue>(
+  value: TValue,
+): ProjectionUnionValue<ProjectionWidenUnionLiteral<TValue>> {
+  validateProjectionUnionLiteralValue(value);
+
+  return {
+    [projectionUnionValueBrand]: true,
+    value: value as unknown as ProjectionWidenUnionLiteral<TValue>,
+  };
+}
+
+function createProjectionUnionArmSelectBuilder<TTable>(
+  table: ProjectionTableMetadata,
+): ProjectionUnionArmSelectBuilder<TTable> {
+  return {
+    select: (selection) => {
+      return createProjectionUnionSelectedArm<TTable, never>(
+        table,
+        readProjectionUnionSelections(table, selection),
+        [],
+      ) as ProjectionUnionSelectedArm<
+        TTable,
+        ProjectionUnionSelectedRow<TTable, typeof selection>
+      >;
+    },
+  };
+}
+
+function createProjectionUnionSelectedArm<TTable, TRow>(
+  table: ProjectionTableMetadata,
+  selections: readonly ProjectionUnionSelectionMetadata[],
+  whereClauses: readonly ProjectionWhereClause[],
+): ProjectionUnionSelectedArm<TTable, TRow> {
+  const createNext = (nextWhereClauses: readonly ProjectionWhereClause[]) => {
+    return createProjectionUnionSelectedArm<TTable, TRow>(
+      table,
+      selections,
+      nextWhereClauses,
+    );
+  };
+  const arm: ProjectionUnionSelectedArm<TTable, TRow> = {
+    metadata: {
+      fromTableName: table.name,
+      selections,
+      where: whereClauses,
+    },
+    whereAny: (conditions) => {
+      return createNext([
+        ...whereClauses,
+        createProjectionAnyWhereClause(table, conditions),
+      ]);
+    },
+    where: (columnName, operator, value) => {
+      return createNext([
+        ...whereClauses,
+        createProjectionComparisonWhereClause(
+          table,
+          String(columnName),
+          operator,
+          value,
+          null,
+        ),
+      ]);
+    },
+    whereIn: (columnName, values) => {
+      return createNext([
+        ...whereClauses,
+        createProjectionInWhereClause(table, String(columnName), values, null),
+      ]);
+    },
+    whereNotNull: (columnName) => {
+      return createNext([
+        ...whereClauses,
+        createProjectionNullWhereClause(table, String(columnName), true, null),
+      ]);
+    },
+    whereNull: (columnName) => {
+      return createNext([
+        ...whereClauses,
+        createProjectionNullWhereClause(table, String(columnName), false, null),
+      ]);
+    },
+  };
+
+  return arm;
+}
+
+function createProjectionExecutableUnionSelect<TRow>(
+  scope: LedgerStorageScope,
+  arms: readonly ProjectionUnionArmMetadata[],
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
+  statementCompiler: ProjectionStatementCompiler,
+): ProjectionExecutableUnionSelect<TRow> {
+  const shape = readProjectionUnionShape(arms);
+  const createNext = (
+    nextOrderClauses: readonly ProjectionOrderClause[],
+    nextLimitClause: number | null,
+  ) => {
+    return createProjectionExecutableUnionSelect<TRow>(
+      scope,
+      arms,
+      nextOrderClauses,
+      nextLimitClause,
+      statementCompiler,
+    );
+  };
+
+  return {
+    limit: (limit) => {
+      validateProjectionLimit(limit);
+
+      return createNext(orderClauses, limit);
+    },
+    orderBy: (columnName, direction = "asc") => {
+      const alias = String(columnName);
+      validateProjectionUnionAliasExists(shape, alias, "union order column");
+      validateProjectionOrderDirection(direction);
+
+      return createNext(
+        [
+          ...orderClauses,
+          {
+            column: createProjectionColumnReference(null, alias),
+            direction,
+            kind: "column",
+          },
+        ],
+        limitClause,
+      );
+    },
+    orderByNulls: (columnName, order) => {
+      const alias = String(columnName);
+      const column = validateProjectionUnionAliasExists(
+        shape,
+        alias,
+        "union null order column",
+      );
+      validateProjectionNullOrder(order);
+
+      if (!column.nullable) {
+        throw new Error(`union null order column ${alias} must be nullable`);
+      }
+
+      return createNext(
+        [
+          ...orderClauses,
+          {
+            column: createProjectionColumnReference(null, alias),
+            kind: "nulls",
+            order,
+          },
+        ],
+        limitClause,
+      );
+    },
+    execute: async () => {
+      const sql = buildUnionSelectSql(
+        statementCompiler,
+        arms,
+        orderClauses,
+        limitClause,
+      );
+      const rows = await scope.prepare(sql.text).all(...sql.params);
+
+      return rows.map((row) => {
+        return decodeProjectionUnionRow(shape, row) as TRow;
+      });
+    },
+    executeTakeFirst: async () => {
+      const sql = buildUnionSelectSql(statementCompiler, arms, orderClauses, 1);
+      const row = await scope.prepare(sql.text).get(...sql.params);
+
+      if (row === undefined) {
+        return null;
+      }
+
+      return decodeProjectionUnionRow(shape, row) as TRow;
+    },
+  };
+}
+
 type ProjectionWhereClause = ProjectionCompilerWhereClause;
 
 type ProjectionOrderClause = ProjectionCompilerOrderClause;
@@ -1752,6 +2160,29 @@ type ProjectionAggregate = ProjectionCompilerAggregate;
 type CompiledProjectionSql = ProjectionCompiledSql;
 
 type ProjectionUpdateAssignment = ProjectionCompilerAssignment;
+
+type ProjectionUnionSelectionMetadata = {
+  readonly alias: string;
+  readonly column: ProjectionColumnMetadata | null;
+  readonly nullable: boolean;
+  readonly selection: ProjectionCompilerSelection;
+};
+
+type ProjectionUnionArmMetadata = {
+  readonly fromTableName: string;
+  readonly selections: readonly ProjectionUnionSelectionMetadata[];
+  readonly where: readonly ProjectionWhereClause[];
+};
+
+type ProjectionUnionColumnMetadata = {
+  readonly column: ProjectionColumnMetadata | null;
+  readonly nullable: boolean;
+};
+
+type ProjectionUnionShapeMetadata = {
+  readonly aliases: readonly string[];
+  readonly columns: Readonly<Record<string, ProjectionUnionColumnMetadata>>;
+};
 
 function createProjectionAggregateBuilder<
   TTables,
@@ -2919,6 +3350,25 @@ function buildSelectSql(
   });
 }
 
+function buildUnionSelectSql(
+  statementCompiler: ProjectionStatementCompiler,
+  arms: readonly ProjectionUnionArmMetadata[],
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
+): CompiledProjectionSql {
+  return statementCompiler.compileUnionSelect({
+    arms: arms.map((arm): ProjectionCompilerUnionSelectArm => {
+      return {
+        fromTableName: arm.fromTableName,
+        selections: arm.selections.map((selection) => selection.selection),
+        where: arm.where,
+      };
+    }),
+    limit: limitClause,
+    orderBy: orderClauses,
+  });
+}
+
 function buildAggregateSql(
   statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
@@ -3194,6 +3644,159 @@ function createProjectionValueListOrderClause(
   };
 }
 
+function readProjectionUnionSelections(
+  table: ProjectionTableMetadata,
+  selection: Readonly<Record<string, unknown>>,
+): readonly ProjectionUnionSelectionMetadata[] {
+  const aliases = Object.keys(selection);
+
+  if (aliases.length === 0) {
+    throw new Error("union select must include at least one selection");
+  }
+
+  const seenAliases = new Set<string>();
+
+  return aliases.map((alias) => {
+    validateProjectionUnionAlias(alias, seenAliases);
+    const value = selection[alias];
+
+    if (isProjectionUnionValue(value)) {
+      return {
+        alias,
+        column: null,
+        nullable: value.value === null,
+        selection: {
+          alias,
+          kind: "value",
+          value: value.value,
+        },
+      };
+    }
+
+    if (typeof value !== "string") {
+      throw new Error(
+        `union selection ${alias} must reference a column or unionValue(...)`,
+      );
+    }
+
+    validateProjectionColumns("union selection column", table, [value]);
+    const column = table.columns[value];
+
+    if (column === undefined) {
+      throw new Error(`union selection ${alias} references unknown column`);
+    }
+
+    return {
+      alias,
+      column,
+      nullable: column.nullable,
+      selection: {
+        alias,
+        column: createProjectionColumnReference(null, value),
+        kind: "column",
+      },
+    };
+  });
+}
+
+function readProjectionUnionShape(
+  arms: readonly ProjectionUnionArmMetadata[],
+): ProjectionUnionShapeMetadata {
+  const firstArm = arms[0];
+
+  if (firstArm === undefined || arms.length < 2) {
+    throw new Error("union select must include at least two arms");
+  }
+
+  const aliases = firstArm.selections.map((selection) => selection.alias);
+  const columns: Record<string, ProjectionUnionColumnMetadata> = {};
+
+  for (const alias of aliases) {
+    columns[alias] = {
+      column: null,
+      nullable: false,
+    };
+  }
+
+  for (const arm of arms) {
+    validateProjectionUnionArmShape(aliases, arm);
+
+    for (const selection of arm.selections) {
+      const existing = columns[selection.alias];
+
+      if (existing === undefined) {
+        throw new Error(`union selection ${selection.alias} was not declared`);
+      }
+
+      columns[selection.alias] = mergeProjectionUnionColumnMetadata(
+        selection.alias,
+        existing,
+        {
+          column: selection.column,
+          nullable: selection.nullable,
+        },
+      );
+    }
+  }
+
+  return {
+    aliases,
+    columns,
+  };
+}
+
+function validateProjectionUnionArmShape(
+  aliases: readonly string[],
+  arm: ProjectionUnionArmMetadata,
+): void {
+  if (arm.selections.length !== aliases.length) {
+    throw new Error("union arms must select the same aliases");
+  }
+
+  for (const [index, alias] of aliases.entries()) {
+    const selection = arm.selections[index];
+
+    if (selection?.alias !== alias) {
+      throw new Error("union arms must select aliases in the same order");
+    }
+  }
+}
+
+function mergeProjectionUnionColumnMetadata(
+  alias: string,
+  existing: ProjectionUnionColumnMetadata,
+  next: ProjectionUnionColumnMetadata,
+): ProjectionUnionColumnMetadata {
+  if (existing.column !== null && next.column !== null) {
+    validateProjectionUnionColumnCompatibility(
+      alias,
+      existing.column,
+      next.column,
+    );
+  }
+
+  let column = existing.column;
+
+  if (column === null) {
+    column = next.column;
+  }
+
+  return {
+    column,
+    nullable: existing.nullable || next.nullable,
+  };
+}
+
+function validateProjectionUnionColumnCompatibility(
+  alias: string,
+  left: ProjectionColumnMetadata,
+  right: ProjectionColumnMetadata,
+): void {
+  if (left.kind !== right.kind || left.eventName !== right.eventName) {
+    throw new Error(`union selection ${alias} has incompatible column types`);
+  }
+}
+
 function createProjectionNullOrderClause(
   table: ProjectionTableMetadata,
   columnName: string,
@@ -3357,6 +3960,68 @@ function validateProjectionColumns(
       throw new Error(`${context} references unknown column ${columnName}`);
     }
   }
+}
+
+function validateProjectionUnionAlias(
+  alias: string,
+  seenAliases: Set<string>,
+): void {
+  if (alias.length === 0) {
+    throw new Error("union selection alias must not be empty");
+  }
+
+  const normalizedAlias = alias.toLocaleLowerCase("en-US");
+
+  if (seenAliases.has(normalizedAlias)) {
+    throw new Error(`union selection alias ${alias} is duplicated`);
+  }
+
+  seenAliases.add(normalizedAlias);
+}
+
+function validateProjectionUnionAliasExists(
+  shape: ProjectionUnionShapeMetadata,
+  alias: string,
+  context: string,
+): ProjectionUnionColumnMetadata {
+  const column = shape.columns[alias];
+
+  if (column === undefined) {
+    throw new Error(`${context} references unknown alias ${alias}`);
+  }
+
+  return column;
+}
+
+function validateProjectionUnionLiteralValue(
+  value: ProjectionUnionLiteralValue,
+): void {
+  if (value === null) {
+    return;
+  }
+
+  switch (typeof value) {
+    case "boolean":
+    case "number":
+    case "string":
+      return;
+  }
+
+  throw new Error("unionValue only accepts boolean, number, string, or null");
+}
+
+function isProjectionUnionValue(
+  value: unknown,
+): value is ProjectionUnionValue<ProjectionUnionLiteralValue> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  return (
+    (value as { readonly [projectionUnionValueBrand]?: unknown })[
+      projectionUnionValueBrand
+    ] === true
+  );
 }
 
 function validateProjectionJoinColumns(
@@ -3682,6 +4347,34 @@ function decodeProjectionSelectedRow(
       table.columns[columnName],
       row[columnName],
       `${table.name}.${columnName}`,
+    );
+  }
+
+  return decoded;
+}
+
+function decodeProjectionUnionRow(
+  shape: ProjectionUnionShapeMetadata,
+  row: LedgerStorageRow,
+): Readonly<Record<string, unknown>> {
+  const decoded: Record<string, unknown> = {};
+
+  for (const alias of shape.aliases) {
+    const column = shape.columns[alias];
+
+    if (column === undefined) {
+      throw new Error(`union selection ${alias} was not declared`);
+    }
+
+    if (column.column === null) {
+      decoded[alias] = row[alias];
+      continue;
+    }
+
+    decoded[alias] = decodeProjectionColumnValue(
+      column.column,
+      row[alias],
+      `union.${alias}`,
     );
   }
 

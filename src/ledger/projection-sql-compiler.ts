@@ -17,6 +17,18 @@ export type ProjectionCompilerColumnReference = {
   readonly tableName: string | null;
 };
 
+export type ProjectionCompilerSelection =
+  | {
+      readonly alias: string;
+      readonly column: ProjectionCompilerColumnReference;
+      readonly kind: "column";
+    }
+  | {
+      readonly alias: string;
+      readonly kind: "value";
+      readonly value: unknown;
+    };
+
 export type ProjectionCompilerExpression =
   | {
       readonly kind: "add";
@@ -157,6 +169,18 @@ export type ProjectionCompilerSelectStatement = {
   readonly where: readonly ProjectionCompilerWhereClause[];
 };
 
+export type ProjectionCompilerUnionSelectArm = {
+  readonly fromTableName: string;
+  readonly selections: readonly ProjectionCompilerSelection[];
+  readonly where: readonly ProjectionCompilerWhereClause[];
+};
+
+export type ProjectionCompilerUnionSelectStatement = {
+  readonly arms: readonly ProjectionCompilerUnionSelectArm[];
+  readonly limit: number | null;
+  readonly orderBy: readonly ProjectionCompilerOrderClause[];
+};
+
 export type ProjectionCompilerAggregateStatement = {
   readonly aggregates: readonly ProjectionCompilerAggregate[];
   readonly fromTableName: string;
@@ -211,6 +235,9 @@ export type ProjectionStatementCompiler = {
   compileSelect(
     statement: ProjectionCompilerSelectStatement,
   ): ProjectionCompiledSql;
+  compileUnionSelect(
+    statement: ProjectionCompilerUnionSelectStatement,
+  ): ProjectionCompiledSql;
   compileUpdate(
     statement: ProjectionCompilerUpdateStatement,
   ): ProjectionCompiledSql;
@@ -225,6 +252,7 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileEventRead: compileEventReadStatement,
     compileInsert: compileInsertStatement,
     compileSelect: compileSelectStatement,
+    compileUnionSelect: compileUnionSelectStatement,
     compileUpdate: compileUpdateStatement,
   };
 }
@@ -465,6 +493,90 @@ function compileSelectStatement(
     params,
     text,
   };
+}
+
+function compileUnionSelectStatement(
+  statement: ProjectionCompilerUnionSelectStatement,
+): ProjectionCompiledSql {
+  if (statement.arms.length < 2) {
+    throw new Error("union select must include at least two arms");
+  }
+
+  const params: unknown[] = [];
+  const armSql = statement.arms
+    .map((arm) => {
+      const compiled = compileUnionSelectArm(arm);
+      params.push(...compiled.params);
+
+      return compiled.text;
+    })
+    .join(" UNION ALL ");
+  let text = `SELECT * FROM (${armSql})`;
+
+  if (statement.orderBy.length > 0) {
+    const orderBySql = compileOrderBy(statement.orderBy);
+    params.push(...orderBySql.params);
+    text += ` ORDER BY ${orderBySql.text}`;
+  }
+
+  if (statement.limit !== null) {
+    text += " LIMIT ?";
+    params.push(statement.limit);
+  }
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileUnionSelectArm(
+  arm: ProjectionCompilerUnionSelectArm,
+): ProjectionCompiledSql {
+  if (arm.selections.length === 0) {
+    throw new Error("union select arm must include at least one selection");
+  }
+
+  const params: unknown[] = [];
+  const selectedSql = arm.selections
+    .map((selection) => {
+      const compiled = compileSelection(selection);
+      params.push(...compiled.params);
+
+      return compiled.text;
+    })
+    .join(", ");
+  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(arm.fromTableName)}`;
+  const whereSql = compileWhere(arm.where);
+
+  if (whereSql.text.length > 0) {
+    text += ` WHERE ${whereSql.text}`;
+    params.push(...whereSql.params);
+  }
+
+  return {
+    params,
+    text,
+  };
+}
+
+function compileSelection(
+  selection: ProjectionCompilerSelection,
+): ProjectionCompiledSql {
+  const alias = quoteIdentifier(selection.alias);
+
+  switch (selection.kind) {
+    case "column":
+      return {
+        params: [],
+        text: `${compileColumnReference(selection.column)} AS ${alias}`,
+      };
+    case "value":
+      return {
+        params: [selection.value],
+        text: `? AS ${alias}`,
+      };
+  }
 }
 
 function compileOrderBy(

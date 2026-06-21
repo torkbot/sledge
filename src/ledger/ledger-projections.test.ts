@@ -1561,6 +1561,233 @@ test("projection access supports typed disjunction predicate groups", async () =
   });
 });
 
+test("projection access supports typed union candidate reads", async () => {
+  const decisionSchema = defineMaterializationSchema({
+    namespace: "network-decision",
+    version: 1,
+    tables: {
+      grants: (t) =>
+        t
+          .columns({
+            grantId: t.text().notNull(),
+            instanceId: t.text(),
+            scope: t.text().notNull(),
+            decision: t.text().notNull(),
+            remainingUses: t.integer(),
+            createdAtMs: t.integer().notNull(),
+            consumedAtMs: t.integer(),
+          })
+          .primaryKey(["grantId"]),
+      lanePolicies: (t) =>
+        t
+          .columns({
+            policyEntryId: t.text().notNull(),
+            instanceId: t.text().notNull(),
+            scope: t.text().notNull(),
+            decision: t.text().notNull(),
+            updatedAtMs: t.integer().notNull(),
+            revokedAtMs: t.integer(),
+          })
+          .primaryKey(["policyEntryId"]),
+    },
+  });
+  const decisionMaterializations = defineMaterializations({
+    history: defineMaterializationHistory(decisionSchema, (m) => [
+      m.migration(1, "create network decision tables", (s) => [
+        s.createTable("grants", (t) =>
+          t
+            .columns({
+              grantId: t.text().notNull(),
+              instanceId: t.text(),
+              scope: t.text().notNull(),
+              decision: t.text().notNull(),
+              remainingUses: t.integer(),
+              createdAtMs: t.integer().notNull(),
+              consumedAtMs: t.integer(),
+            })
+            .primaryKey(["grantId"]),
+        ),
+        s.createTable("lanePolicies", (t) =>
+          t
+            .columns({
+              policyEntryId: t.text().notNull(),
+              instanceId: t.text().notNull(),
+              scope: t.text().notNull(),
+              decision: t.text().notNull(),
+              updatedAtMs: t.integer().notNull(),
+              revokedAtMs: t.integer(),
+            })
+            .primaryKey(["policyEntryId"]),
+        ),
+      ]),
+    ]),
+    indexers: {},
+    queries: {
+      checkDecision: {
+        params: Type.Object({
+          instanceId: Type.String(),
+          scope: Type.String(),
+        }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            decisionId: Type.String(),
+            decision: Type.String(),
+            remainingUses: Type.Union([Type.Null(), Type.Number()]),
+          }),
+        ]),
+      },
+    },
+  });
+  const decisionModel = withMaterializations(
+    shape,
+    decisionMaterializations,
+  ).register({
+    queries: {
+      checkDecision: async ({ params, db }) => {
+        const usableGrantPredicates = [
+          {
+            columnName: "remainingUses",
+            kind: "is_null",
+          },
+          {
+            columnName: "remainingUses",
+            kind: "comparison",
+            operator: ">",
+            value: 0,
+          },
+        ] as const;
+        const globalDenyGrants = db
+          .unionFrom("grants")
+          .select({
+            decisionId: "grantId",
+            decision: "decision",
+            remainingUses: "remainingUses",
+            priority: db.unionValue(0),
+            createdAtMs: "createdAtMs",
+          })
+          .where("scope", "=", params.scope)
+          .whereNull("instanceId")
+          .where("decision", "=", "always_deny")
+          .whereNull("consumedAtMs")
+          .whereAny(usableGrantPredicates);
+        const lanePolicies = db
+          .unionFrom("lanePolicies")
+          .select({
+            decisionId: "policyEntryId",
+            decision: "decision",
+            remainingUses: db.unionValue(null),
+            priority: db.unionValue(1),
+            createdAtMs: "updatedAtMs",
+          })
+          .where("instanceId", "=", params.instanceId)
+          .where("scope", "=", params.scope)
+          .whereNull("revokedAtMs");
+        const instanceGrants = db
+          .unionFrom("grants")
+          .select({
+            decisionId: "grantId",
+            decision: "decision",
+            remainingUses: "remainingUses",
+            priority: db.unionValue(2),
+            createdAtMs: "createdAtMs",
+          })
+          .where("scope", "=", params.scope)
+          .where("instanceId", "=", params.instanceId)
+          .whereNull("consumedAtMs")
+          .whereAny(usableGrantPredicates);
+        const globalGrants = db
+          .unionFrom("grants")
+          .select({
+            decisionId: "grantId",
+            decision: "decision",
+            remainingUses: "remainingUses",
+            priority: db.unionValue(3),
+            createdAtMs: "createdAtMs",
+          })
+          .where("scope", "=", params.scope)
+          .whereNull("instanceId")
+          .where("decision", "!=", "always_deny")
+          .whereNull("consumedAtMs")
+          .whereAny(usableGrantPredicates);
+        const row = await db
+          .unionAll([
+            globalDenyGrants,
+            lanePolicies,
+            instanceGrants,
+            globalGrants,
+          ])
+          .orderBy("priority", "asc")
+          .orderByNulls("remainingUses", "last")
+          .orderBy("createdAtMs", "desc")
+          .limit(1)
+          .executeTakeFirst();
+
+        if (row === null) {
+          return null;
+        }
+
+        return {
+          decisionId: row.decisionId,
+          decision: row.decision,
+          remainingUses: row.remainingUses,
+        };
+      },
+    },
+  });
+  const checkDecision =
+    readTestLedgerImplementations(decisionModel).queries?.checkDecision;
+
+  if (checkDecision === undefined) {
+    throw new Error("expected checkDecision query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      decisionId: "policy_1",
+      decision: "allow",
+      remainingUses: null,
+      priority: 1,
+      createdAtMs: 2_000,
+    },
+  });
+
+  const result = await checkDecision(fake.scope, {
+    instanceId: "instance_1",
+    scope: "github.com",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: [
+      0,
+      "github.com",
+      "always_deny",
+      0,
+      null,
+      1,
+      "instance_1",
+      "github.com",
+      2,
+      "github.com",
+      "instance_1",
+      0,
+      3,
+      "github.com",
+      "always_deny",
+      0,
+      1,
+    ],
+    sql: 'SELECT * FROM (SELECT "grantId" AS "decisionId", "decision" AS "decision", "remainingUses" AS "remainingUses", ? AS "priority", "createdAtMs" AS "createdAtMs" FROM "grants" WHERE "scope" = ? AND "instanceId" IS NULL AND "decision" = ? AND "consumedAtMs" IS NULL AND ("remainingUses" IS NULL OR "remainingUses" > ?) UNION ALL SELECT "policyEntryId" AS "decisionId", "decision" AS "decision", ? AS "remainingUses", ? AS "priority", "updatedAtMs" AS "createdAtMs" FROM "lanePolicies" WHERE "instanceId" = ? AND "scope" = ? AND "revokedAtMs" IS NULL UNION ALL SELECT "grantId" AS "decisionId", "decision" AS "decision", "remainingUses" AS "remainingUses", ? AS "priority", "createdAtMs" AS "createdAtMs" FROM "grants" WHERE "scope" = ? AND "instanceId" = ? AND "consumedAtMs" IS NULL AND ("remainingUses" IS NULL OR "remainingUses" > ?) UNION ALL SELECT "grantId" AS "decisionId", "decision" AS "decision", "remainingUses" AS "remainingUses", ? AS "priority", "createdAtMs" AS "createdAtMs" FROM "grants" WHERE "scope" = ? AND "instanceId" IS NULL AND "decision" != ? AND "consumedAtMs" IS NULL AND ("remainingUses" IS NULL OR "remainingUses" > ?)) ORDER BY "priority" ASC, CASE WHEN "remainingUses" IS NULL THEN 1 ELSE 0 END ASC, "createdAtMs" DESC LIMIT ?',
+  });
+  assert.deepEqual(result, {
+    decisionId: "policy_1",
+    decision: "allow",
+    remainingUses: null,
+  });
+});
+
 test("projection access supports typed inner joins between materialization tables", async () => {
   const networkSchema = defineMaterializationSchema({
     namespace: "network",
@@ -3432,6 +3659,77 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .select(["email"])
           // @ts-expect-error orderByNulls only accepts nullable columns.
           .orderByNulls("email", "last");
+
+        const firstUnionArm = db.unionFrom("users").select({
+          deletedAtMs: db.unionValue(null),
+          priority: db.unionValue(0),
+          userId: "userId",
+        });
+        const secondUnionArm = db.unionFrom("users").select({
+          deletedAtMs: db.unionValue(null),
+          priority: db.unionValue(1),
+          userId: "email",
+        });
+        const unionRow = await db
+          .unionAll([firstUnionArm, secondUnionArm])
+          .orderBy("priority", "asc")
+          .orderByNulls("deletedAtMs", "last")
+          .executeTakeFirst();
+
+        if (unionRow !== null) {
+          const unionUserId: string = unionRow.userId;
+          const unionPriority: number = unionRow.priority;
+          const unionDeletedAtMs: null = unionRow.deletedAtMs;
+
+          void unionUserId;
+          void unionPriority;
+          void unionDeletedAtMs;
+        }
+
+        const nullableFirstUnionRow = await db
+          .unionAll([
+            db.unionFrom("users").select({
+              maybeEmail: db.unionValue(null),
+              priority: db.unionValue(0),
+              userId: "userId",
+            }),
+            db.unionFrom("users").select({
+              maybeEmail: "email",
+              priority: db.unionValue(1),
+              userId: "userId",
+            }),
+          ])
+          .executeTakeFirst();
+
+        if (nullableFirstUnionRow !== null) {
+          const maybeEmail: string | null = nullableFirstUnionRow.maybeEmail;
+          void maybeEmail;
+        }
+
+        db.unionAll([
+          firstUnionArm,
+          // @ts-expect-error union arms must select the same aliases.
+          db.unionFrom("users").select({
+            deletedAtMs: db.unionValue(null),
+            priority: db.unionValue(2),
+            missing: "email",
+          }),
+        ]);
+        db.unionAll([
+          firstUnionArm,
+          // @ts-expect-error union arm values must match by alias.
+          db.unionFrom("users").select({
+            deletedAtMs: db.unionValue(null),
+            priority: db.unionValue("high"),
+            userId: "email",
+          }),
+        ]);
+        db.unionAll([firstUnionArm, secondUnionArm])
+          // @ts-expect-error union orderBy only accepts selected aliases.
+          .orderBy("email", "asc");
+        db.unionAll([firstUnionArm, secondUnionArm])
+          // @ts-expect-error union orderByNulls only accepts nullable aliases.
+          .orderByNulls("priority", "last");
 
         const event = await db.readEvent(createEventRef("user.created", 1));
 

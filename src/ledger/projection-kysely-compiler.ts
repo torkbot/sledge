@@ -18,7 +18,10 @@ import type {
   ProjectionCompilerJoinClause,
   ProjectionCompilerOrderClause,
   ProjectionCompilerSelectStatement,
+  ProjectionCompilerSelection,
   ProjectionCompilerUpdateStatement,
+  ProjectionCompilerUnionSelectArm,
+  ProjectionCompilerUnionSelectStatement,
   ProjectionCompilerWhereClause,
   ProjectionStatementCompiler,
 } from "./projection-sql-compiler.ts";
@@ -72,6 +75,8 @@ export function createKyselyProjectionStatementCompiler(
       compileEventReadStatement(input, statement),
     compileInsert: (statement) => compileInsertStatement(input, statement),
     compileSelect: (statement) => compileSelectStatement(input, statement),
+    compileUnionSelect: (statement) =>
+      compileUnionSelectStatement(input, statement),
     compileUpdate: (statement) => compileUpdateStatement(input, statement),
   };
 }
@@ -329,6 +334,76 @@ function compileSelectStatement(
   return compileQuery(input.queryCompiler, query);
 }
 
+function compileUnionSelectStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerUnionSelectStatement,
+): ProjectionCompiledSql {
+  const firstArm = statement.arms[0];
+
+  if (firstArm === undefined || statement.arms.length < 2) {
+    throw new Error("union select must include at least two arms");
+  }
+
+  let unionQuery = unionSelectArmNode(firstArm);
+  const setOperations = statement.arms.slice(1).map((arm) => {
+    return {
+      all: true,
+      expression: unionSelectArmNode(arm),
+      kind: "SetOperationNode",
+      operator: "union",
+    };
+  });
+
+  if (setOperations.length > 0) {
+    setNodeProperty(unionQuery, "setOperations", setOperations);
+  }
+
+  const unionAlias = "sledge_union";
+  const query: KyselyProjectionOperationNode = {
+    from: fromNode([aliasNode(parensNode(unionQuery), unionAlias)]),
+    kind: "SelectQueryNode",
+    selections: firstArm.selections.map((selection) =>
+      selectionNode(
+        aliasNode(referenceNode(unionAlias, selection.alias), selection.alias),
+      ),
+    ),
+  };
+
+  if (statement.orderBy.length > 0) {
+    setNodeProperty(query, "orderBy", orderByNode(statement.orderBy));
+  }
+
+  if (statement.limit !== null) {
+    setNodeProperty(query, "limit", limitNode(valueNode(statement.limit)));
+  }
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function unionSelectArmNode(
+  arm: ProjectionCompilerUnionSelectArm,
+): KyselyProjectionOperationNode {
+  if (arm.selections.length === 0) {
+    throw new Error("union select arm must include at least one selection");
+  }
+
+  const query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode(arm.fromTableName)]),
+    kind: "SelectQueryNode",
+    selections: arm.selections.map(selectionNodeForSelection),
+  };
+  const where = whereNodeForClauses(arm.where);
+
+  if (where !== null) {
+    return {
+      ...query,
+      where,
+    };
+  }
+
+  return query;
+}
+
 function compileUpdateStatement(
   input: KyselyProjectionStatementCompilerInput,
   statement: ProjectionCompilerUpdateStatement,
@@ -377,6 +452,27 @@ function selectionNodeForColumnReference(
       column.columnName,
     ),
   );
+}
+
+function selectionNodeForSelection(
+  selection: ProjectionCompilerSelection,
+): KyselyProjectionOperationNode {
+  switch (selection.kind) {
+    case "column":
+      return selectionNode(
+        aliasNode(
+          referenceNode(
+            selection.column.tableName,
+            selection.column.columnName,
+          ),
+          selection.alias,
+        ),
+      );
+    case "value":
+      return selectionNode(
+        aliasNode(valueNode(selection.value), selection.alias),
+      );
+  }
 }
 
 function selectionNodeForAggregate(
@@ -756,6 +852,14 @@ function foreignKeyActionSql(action: ProjectionForeignKeyAction): string {
     case "set_null":
       return "set null";
   }
+}
+
+function setNodeProperty(
+  node: KyselyProjectionOperationNode,
+  key: string,
+  value: unknown,
+): void {
+  (node as Record<string, unknown>)[key] = value;
 }
 
 function aggregateFunctionNode(

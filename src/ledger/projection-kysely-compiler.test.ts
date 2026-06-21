@@ -252,6 +252,114 @@ test("kysely projection compiler lowers explicit null ordering", () => {
   assert.equal(fallback["immediate"], true);
 });
 
+test("kysely projection compiler lowers union candidate reads", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: [0, "github.com", 1],
+        sql: 'select "sledge_union"."decisionId" as "decisionId", "sledge_union"."priority" as "priority" from (select "grantId" as "decisionId", ? as "priority" from "grants" where "scope" = ? union all select "policyEntryId" as "decisionId", ? as "priority" from "lanePolicies") as "sledge_union" order by "priority" asc',
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileUnionSelect({
+      arms: [
+        {
+          fromTableName: "grants",
+          selections: [
+            {
+              alias: "decisionId",
+              column: {
+                columnName: "grantId",
+                tableName: null,
+              },
+              kind: "column",
+            },
+            {
+              alias: "priority",
+              kind: "value",
+              value: 0,
+            },
+          ],
+          where: [
+            {
+              column: {
+                columnName: "scope",
+                tableName: null,
+              },
+              kind: "comparison",
+              operator: "=",
+              value: "github.com",
+            },
+          ],
+        },
+        {
+          fromTableName: "lanePolicies",
+          selections: [
+            {
+              alias: "decisionId",
+              column: {
+                columnName: "policyEntryId",
+                tableName: null,
+              },
+              kind: "column",
+            },
+            {
+              alias: "priority",
+              kind: "value",
+              value: 1,
+            },
+          ],
+          where: [],
+        },
+      ],
+      limit: null,
+      orderBy: [
+        {
+          column: {
+            columnName: "priority",
+            tableName: null,
+          },
+          direction: "asc",
+          kind: "column",
+        },
+      ],
+    }),
+    {
+      params: [0, "github.com", 1],
+      text: 'select "sledge_union"."decisionId" as "decisionId", "sledge_union"."priority" as "priority" from (select "grantId" as "decisionId", ? as "priority" from "grants" where "scope" = ? union all select "policyEntryId" as "decisionId", ? as "priority" from "lanePolicies") as "sledge_union" order by "priority" asc',
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const from = readRecord(query["from"], "query from");
+  const froms = readArray(from["froms"], "query froms");
+  const aliasedUnion = readRecord(froms[0], "aliased union");
+  const parens = readRecord(aliasedUnion["node"], "union parens");
+  const unionQuery = readRecord(parens["node"], "union query");
+  const setOperations = readArray(
+    unionQuery["setOperations"],
+    "set operations",
+  );
+  const setOperation = readRecord(setOperations[0], "first set operation");
+
+  assert.equal(query["kind"], "SelectQueryNode");
+  assert.equal(aliasedUnion["kind"], "AliasNode");
+  assert.equal(parens["kind"], "ParensNode");
+  assert.equal(unionQuery["kind"], "SelectQueryNode");
+  assert.equal(setOperation["kind"], "SetOperationNode");
+  assert.equal(setOperation["operator"], "union");
+  assert.equal(setOperation["all"], true);
+});
+
 test("kysely projection compiler lowers typed integer add expressions", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {

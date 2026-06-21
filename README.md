@@ -347,6 +347,8 @@ Indexer and query implementations receive sledge-owned facades:
   `orderBy(...)`, explicit nullable-column `orderByNulls(...)`,
   domain-specific `orderByList(...)` value ordering, `limit(...)`,
   `execute()`, `executeTakeFirst()`, and `stream()`
+- reads can compose typed candidate streams with `unionFrom(...)`,
+  `unionValue(...)`, and `unionAll(...)` without exposing raw SQL
 - writes return affected-row metadata and support typed integer `add(...)`,
   `MAX(...)`, `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 

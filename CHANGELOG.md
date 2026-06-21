@@ -55,6 +55,9 @@
   priority ordering without exposing raw `CASE` SQL.
 - Add typed `orderByNulls(...)` projection reads for explicit nullable-column
   ordering without exposing raw `CASE` SQL.
+- Add typed `unionFrom(...)` / `unionValue(...)` / `unionAll(...)`
+  projection reads for prioritized candidate streams without exposing raw
+  `UNION` SQL.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and
