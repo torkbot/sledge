@@ -53,6 +53,8 @@
   SQL.
 - Add batched semantic event-ref hydration with `readEvents(...)` so queries
   can avoid event-table N+1 reads without receiving the internal events table.
+- Add semantic `scanEvents(eventName)` reads so backfills and queries can stream
+  typed event history without receiving the internal events table.
 - Add typed `orderByList(...)` projection reads for application-defined
   priority ordering without exposing raw `CASE` SQL.
 - Add typed `orderByNulls(...)` projection reads for explicit nullable-column

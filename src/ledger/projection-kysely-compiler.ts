@@ -13,6 +13,7 @@ import type {
   ProjectionCompilerCreateTableStatement,
   ProjectionCompilerDeleteStatement,
   ProjectionCompilerEventReadStatement,
+  ProjectionCompilerEventScanStatement,
   ProjectionCompilerExpression,
   ProjectionCompilerInsertStatement,
   ProjectionCompilerJoinClause,
@@ -59,6 +60,14 @@ export type KyselySqliteProjectionStatementCompilerInput = {
 };
 
 const insertValuePlaceholder = Symbol("sledge.projection.insertValue");
+const projectionEventRowColumnNames = [
+  "event_id",
+  "ts_ms",
+  "event_name",
+  "payload_json",
+  "causation_event_id",
+  "dedupe_key",
+] as const;
 
 export function createKyselyProjectionStatementCompiler(
   input: KyselyProjectionStatementCompilerInput,
@@ -73,6 +82,8 @@ export function createKyselyProjectionStatementCompiler(
     compileDelete: (statement) => compileDeleteStatement(input, statement),
     compileEventRead: (statement) =>
       compileEventReadStatement(input, statement),
+    compileEventScan: (statement) =>
+      compileEventScanStatement(input, statement),
     compileInsert: (statement) => compileInsertStatement(input, statement),
     compileSelect: (statement) => compileSelectStatement(input, statement),
     compileUnionSelect: (statement) =>
@@ -204,14 +215,9 @@ function compileEventReadStatement(
   const query: KyselyProjectionOperationNode = {
     from: fromNode([tableNode("events")]),
     kind: "SelectQueryNode",
-    selections: [
-      "event_id",
-      "ts_ms",
-      "event_name",
-      "payload_json",
-      "causation_event_id",
-      "dedupe_key",
-    ].map((columnName) => selectionNode(referenceNode(null, columnName))),
+    selections: projectionEventRowColumnNames.map((columnName) =>
+      selectionNode(referenceNode(null, columnName)),
+    ),
     where: whereNode(
       andOperationNodes([
         binaryOperationNode(
@@ -224,6 +230,58 @@ function compileEventReadStatement(
       ]),
     ),
   };
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileEventScanStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerEventScanStatement,
+): ProjectionCompiledSql {
+  const whereClauses: KyselyProjectionOperationNode[] = [
+    binaryOperationNode(
+      referenceNode(null, "event_name"),
+      "=",
+      valueNode(statement.eventName),
+    ),
+    binaryOperationNode(referenceNode(null, "signal"), "=", valueNode(0)),
+  ];
+
+  if (statement.afterEventId !== null) {
+    whereClauses.push(
+      binaryOperationNode(
+        referenceNode(null, "event_id"),
+        ">",
+        valueNode(statement.afterEventId),
+      ),
+    );
+  }
+
+  let query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode("events")]),
+    kind: "SelectQueryNode",
+    orderBy: orderByNode([
+      {
+        column: {
+          columnName: "event_id",
+          tableName: null,
+        },
+        direction: "asc",
+        kind: "column",
+      },
+    ]),
+    selections: projectionEventRowColumnNames.map((columnName) =>
+      selectionNode(referenceNode(null, columnName)),
+    ),
+    where: whereNode(andOperationNodes(whereClauses)),
+  };
+
+  if (statement.limit !== null) {
+    query = {
+      ...query,
+      limit: limitNode(valueNode(statement.limit)),
+    };
+  }
 
   return compileQuery(input.queryCompiler, query);
 }

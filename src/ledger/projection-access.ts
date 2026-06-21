@@ -1000,6 +1000,9 @@ export type ProjectionReadDatabase<
   readEvents<const TEventName extends Extract<keyof TEvents, string>>(
     refs: readonly EventRef<TEventName>[],
   ): Promise<readonly (EventEnvelope<TEvents, TEventName> | null)[]>;
+  scanEvents<const TEventName extends Extract<keyof TEvents, string>>(
+    eventName: TEventName,
+  ): ProjectionEventScanBuilder<TEvents, TEventName>;
   selectFrom<
     const TTableName extends ProjectionTableName<
       ProjectionSchemaTables<TProjectionSchema>
@@ -1031,6 +1034,18 @@ export type ProjectionReadDatabase<
   unionValue<const TValue extends ProjectionUnionLiteralValue>(
     value: TValue,
   ): ProjectionUnionValue<ProjectionWidenUnionLiteral<TValue>>;
+};
+
+export type ProjectionEventScanBuilder<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+> = {
+  afterEventId(
+    eventId: number,
+  ): ProjectionEventScanBuilder<TEvents, TEventName>;
+  limit(limit: number): ProjectionEventScanBuilder<TEvents, TEventName>;
+  execute(): Promise<readonly EventEnvelope<TEvents, TEventName>[]>;
+  stream(): AsyncIterable<EventEnvelope<TEvents, TEventName>>;
 };
 
 export type ProjectionUnionArm<TRow> = {
@@ -1951,6 +1966,16 @@ function createProjectionReadDatabase<
     },
     readEvents: async (refs) => {
       return await readProjectionEvents(scope, events, refs, statementCompiler);
+    },
+    scanEvents: (eventName) => {
+      return createProjectionEventScanBuilder(
+        scope,
+        events,
+        eventName,
+        null,
+        null,
+        statementCompiler,
+      );
     },
     unionAll: (arms) => {
       return createProjectionExecutableUnionSelect(
@@ -3523,6 +3548,19 @@ function buildReadProjectionEventsSql(
   });
 }
 
+function buildScanProjectionEventsSql(
+  statementCompiler: ProjectionStatementCompiler,
+  eventName: string,
+  afterEventId: number | null,
+  limit: number | null,
+): CompiledProjectionSql {
+  return statementCompiler.compileEventScan({
+    afterEventId,
+    eventName,
+    limit,
+  });
+}
+
 function buildUpdateSql(
   statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
@@ -4343,6 +4381,71 @@ async function readProjectionEvent<
   return eventResults[0] ?? null;
 }
 
+function createProjectionEventScanBuilder<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  scope: LedgerStorageScope,
+  events: TEvents,
+  eventName: TEventName,
+  afterEventId: number | null,
+  limit: number | null,
+  statementCompiler: ProjectionStatementCompiler,
+): ProjectionEventScanBuilder<TEvents, TEventName> {
+  validateProjectionEventName(events, eventName);
+
+  return {
+    afterEventId: (eventId) => {
+      validateProjectionEventScanAfterEventId(eventId);
+
+      return createProjectionEventScanBuilder(
+        scope,
+        events,
+        eventName,
+        eventId,
+        limit,
+        statementCompiler,
+      );
+    },
+    execute: async () => {
+      return await scanProjectionEvents(
+        scope,
+        events,
+        eventName,
+        afterEventId,
+        limit,
+        statementCompiler,
+      );
+    },
+    limit: (nextLimit) => {
+      validateProjectionLimit(nextLimit);
+
+      return createProjectionEventScanBuilder(
+        scope,
+        events,
+        eventName,
+        afterEventId,
+        nextLimit,
+        statementCompiler,
+      );
+    },
+    stream: async function* () {
+      const scannedEvents = await scanProjectionEvents(
+        scope,
+        events,
+        eventName,
+        afterEventId,
+        limit,
+        statementCompiler,
+      );
+
+      for (const event of scannedEvents) {
+        yield event;
+      }
+    },
+  };
+}
+
 type ProjectionEventReadGroup<TEventName extends string> = {
   readonly eventName: TEventName;
   readonly eventIds: number[];
@@ -4439,6 +4542,46 @@ async function readProjectionEvents<
   }) as readonly (EventEnvelope<TEvents, TEventName> | null)[];
 }
 
+async function scanProjectionEvents<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  scope: LedgerStorageScope,
+  events: TEvents,
+  eventName: TEventName,
+  afterEventId: number | null,
+  limit: number | null,
+  statementCompiler: ProjectionStatementCompiler,
+): Promise<readonly EventEnvelope<TEvents, TEventName>[]> {
+  const eventSchema = validateProjectionEventName(events, eventName);
+  const sql = buildScanProjectionEventsSql(
+    statementCompiler,
+    eventName,
+    afterEventId,
+    limit,
+  );
+  const rows = await scope.prepare(sql.text).all(...sql.params);
+
+  return rows.map((row) => {
+    return decodeProjectionEventRow(eventSchema, eventName, row);
+  });
+}
+
+function validateProjectionEventName<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(events: TEvents, eventName: TEventName): TEvents[TEventName] {
+  const eventSchema = events[eventName];
+
+  if (eventSchema === undefined) {
+    throw new Error(
+      `projection event scan references unknown event ${eventName}`,
+    );
+  }
+
+  return eventSchema;
+}
+
 function validateProjectionEventRef<
   TEvents extends Record<string, TSchema>,
   TEventName extends Extract<keyof TEvents, string>,
@@ -4452,6 +4595,12 @@ function validateProjectionEventRef<
   createEventRef(ref.eventName, ref.eventId);
 
   return ref;
+}
+
+function validateProjectionEventScanAfterEventId(eventId: number): void {
+  if (!Number.isSafeInteger(eventId) || eventId < 0) {
+    throw new Error("projection event scan cursor must be a safe integer");
+  }
 }
 
 function decodeProjectionEventRow<

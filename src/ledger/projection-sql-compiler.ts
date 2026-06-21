@@ -192,6 +192,12 @@ export type ProjectionCompilerEventReadStatement = {
   readonly eventName: string;
 };
 
+export type ProjectionCompilerEventScanStatement = {
+  readonly afterEventId: number | null;
+  readonly eventName: string;
+  readonly limit: number | null;
+};
+
 export type ProjectionCompilerUpdateStatement = {
   readonly assignments: readonly ProjectionCompilerAssignment[];
   readonly tableName: string;
@@ -229,6 +235,9 @@ export type ProjectionStatementCompiler = {
   compileEventRead(
     statement: ProjectionCompilerEventReadStatement,
   ): ProjectionCompiledSql;
+  compileEventScan(
+    statement: ProjectionCompilerEventScanStatement,
+  ): ProjectionCompiledSql;
   compileInsert(
     statement: ProjectionCompilerInsertStatement,
   ): ProjectionCompiledSql;
@@ -250,6 +259,7 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileCreateTable: compileCreateTableStatement,
     compileDelete: compileDeleteStatement,
     compileEventRead: compileEventReadStatement,
+    compileEventScan: compileEventScanStatement,
     compileInsert: compileInsertStatement,
     compileSelect: compileSelectStatement,
     compileUnionSelect: compileUnionSelectStatement,
@@ -397,6 +407,31 @@ function compileEventReadStatement(
   return {
     params: [statement.eventName, 0, ...statement.eventIds],
     text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
+  };
+}
+
+function compileEventScanStatement(
+  statement: ProjectionCompilerEventScanStatement,
+): ProjectionCompiledSql {
+  const params: unknown[] = [statement.eventName, 0];
+  let text =
+    'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ?';
+
+  if (statement.afterEventId !== null) {
+    text += ' AND "event_id" > ?';
+    params.push(statement.afterEventId);
+  }
+
+  text += ' ORDER BY "event_id" ASC';
+
+  if (statement.limit !== null) {
+    text += " LIMIT ?";
+    params.push(statement.limit);
+  }
+
+  return {
+    params,
+    text,
   };
 }
 

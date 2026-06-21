@@ -182,6 +182,57 @@ test("kysely projection compiler lowers left joins", () => {
   assert.equal(join["joinType"], "LeftJoin");
 });
 
+test("kysely projection compiler lowers semantic event scans", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: ["user.created", 0, 42, 25],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileEventScan({
+      afterEventId: 42,
+      eventName: "user.created",
+      limit: 25,
+    }),
+    {
+      params: ["user.created", 0, 42, 25],
+      text: "compiled:SelectQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const from = readRecord(query["from"], "query from");
+  const froms = readArray(from["froms"], "query froms");
+  const table = readRecord(froms[0], "events table");
+  const tableName = readRecord(table["table"], "events table name");
+  const tableIdentifier = readRecord(
+    tableName["identifier"],
+    "events table identifier",
+  );
+  const orderBy = readRecord(query["orderBy"], "order by");
+  const orderItems = readArray(orderBy["items"], "order by items");
+  const limit = readRecord(query["limit"], "limit");
+  const limitValue = readRecord(limit["limit"], "limit value");
+  const where = readRecord(query["where"], "where");
+
+  assert.equal(query["kind"], "SelectQueryNode");
+  assert.equal(tableIdentifier["name"], "events");
+  assert.equal(orderItems.length, 1);
+  assert.equal(limitValue["value"], 25);
+  assert.equal(where["kind"], "WhereNode");
+});
+
 test("kysely projection compiler strips externally-bound insert value params", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {

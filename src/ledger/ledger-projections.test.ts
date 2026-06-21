@@ -2548,6 +2548,13 @@ test("projection access hydrates semantic event references without exposing even
         }),
         result: Type.Array(Type.Union([Type.Null(), UserCreatedSchema])),
       },
+      sourceEventScan: {
+        params: Type.Object({
+          afterEventId: Type.Number(),
+          limit: Type.Number(),
+        }),
+        result: Type.Array(UserCreatedSchema),
+      },
     },
   });
   const eventModel = withMaterializations(
@@ -2573,11 +2580,23 @@ test("projection access hydrates semantic event references without exposing even
           return event === null ? null : event.payload;
         });
       },
+      sourceEventScan: async ({ params, db }) => {
+        const events = await db
+          .scanEvents("user.created")
+          .afterEventId(params.afterEventId)
+          .limit(params.limit)
+          .execute();
+
+        return events.map((event) => {
+          return event.payload;
+        });
+      },
     },
   });
   const eventQueries = readTestLedgerImplementations(eventModel).queries;
   const sourceEvent = eventQueries?.sourceEvent;
   const sourceEvents = eventQueries?.sourceEvents;
+  const sourceEventScan = eventQueries?.sourceEventScan;
 
   if (sourceEvent === undefined) {
     throw new Error("expected sourceEvent query implementation");
@@ -2585,6 +2604,10 @@ test("projection access hydrates semantic event references without exposing even
 
   if (sourceEvents === undefined) {
     throw new Error("expected sourceEvents query implementation");
+  }
+
+  if (sourceEventScan === undefined) {
+    throw new Error("expected sourceEventScan query implementation");
   }
 
   const fake = createFakeScope({
@@ -2707,6 +2730,39 @@ test("projection access hydrates semantic event references without exposing even
     [],
   );
   assert.deepEqual(emptyBatchFake.calls, []);
+
+  const scanFake = createFakeScope({
+    allRows: [
+      {
+        causation_event_id: null,
+        dedupe_key: null,
+        event_id: 43,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_456",
+          email: "bob@example.com",
+        }),
+        ts_ms: 1_100,
+      },
+    ],
+    getRow: undefined,
+  });
+  const scannedPayloads = await sourceEventScan(scanFake.scope, {
+    afterEventId: 42,
+    limit: 25,
+  });
+
+  assert.deepEqual(scanFake.calls[0], {
+    method: "all",
+    params: ["user.created", 0, 42, 25],
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
+  });
+  assert.deepEqual(scannedPayloads, [
+    {
+      userId: "u_456",
+      email: "bob@example.com",
+    },
+  ]);
 });
 
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
@@ -3999,6 +4055,19 @@ async function assertLedgerProjectionTypes(): Promise<void> {
 
         // @ts-expect-error batch event reads must reference known ledger events.
         db.readEvents([createEventRef("session.created", 1)]);
+
+        for await (const scannedEvent of db
+          .scanEvents("user.created")
+          .afterEventId(0)
+          .limit(10)
+          .stream()) {
+          const userId: string = scannedEvent.payload.userId;
+
+          void userId;
+        }
+
+        // @ts-expect-error event scans must reference known ledger events.
+        db.scanEvents("session.created");
 
         const aggregateRow = await db
           .selectFrom("users")

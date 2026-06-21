@@ -350,6 +350,8 @@ Indexer and query implementations receive sledge-owned facades:
   `execute()`, `executeTakeFirst()`, and `stream()`
 - reads can compose typed candidate streams with `unionFrom(...)`,
   `unionValue(...)`, and `unionAll(...)` without exposing raw SQL
+- reads can stream historical events with `scanEvents(eventName)` without
+  exposing the internal `events` table
 - writes return affected-row metadata and support typed integer `add(...)`,
   `MAX(...)`, `COALESCE(...)`, and upsert `excluded` expressions without raw SQL
 
