@@ -17,6 +17,10 @@
   create table, add column, create index, create unique index, add foreign key,
   and data migration operations are recorded as data instead of `from` / `to`
   callbacks.
+- Bind materialization histories to the ledger shape so migration data
+  callbacks can use typed semantic `readEvent(...)`, `readEvents(...)`, and
+  `scanEvents(...)` handles during backfills without seeing the internal
+  `events` table.
 - Split materialization contracts from implementations. `defineMaterializations`
   declares plain-object indexer/query contracts, while `.register(...)` supplies
   typed indexer/query implementations.

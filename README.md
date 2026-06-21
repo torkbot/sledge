@@ -70,6 +70,7 @@ const materializationSchema = defineMaterializationSchema({
 });
 
 const materializationHistory = defineMaterializationHistory(
+  ledgerShape,
   materializationSchema,
   (m) => [
     m.migration(1, "create app tables", (s) => [
@@ -252,12 +253,12 @@ relations: (r) => ({
 ### 3. Define Migration History
 
 Call `defineMaterializationHistory(...)` to describe the schema-change history
-for the current materialization schema. The current DDL remains the canonical
-typed shape for indexers and queries; the history records the ordered database
-operations Sledge can later execute during hygiene.
+for the current materialization schema and ledger shape. The current DDL
+remains the canonical typed shape for indexers and queries; the history records
+the ordered database operations Sledge can later execute during hygiene.
 
 ```ts
-const history = defineMaterializationHistory(schemaV2, (m) => [
+const history = defineMaterializationHistory(ledgerShape, schemaV2, (m) => [
   m.migration(1, "create users", (s) => [
     s.createTable("users", (t) =>
       t
@@ -270,14 +271,17 @@ const history = defineMaterializationHistory(schemaV2, (m) => [
   m.migration(2, "add user email", (s) => [
     s.addColumn("users", "email", (t) => t.text()),
     s.data("backfill user email", async ({ db }) => {
-      for await (const row of db
-        .selectFrom("users")
-        .select(["userId"])
-        .stream()) {
+      const events = await db.scanEvents("user.created").execute();
+
+      for (const event of events) {
         await db
-          .updateTable("users")
-          .set({ email: `${row.userId}@example.invalid` })
-          .where("userId", "=", row.userId)
+          .insertInto("users")
+          .values({
+            userId: event.payload.userId,
+            email: event.payload.email,
+          })
+          .onConflict(["userId"])
+          .doUpdateSet({ email: event.payload.email })
           .execute();
       }
     }),
@@ -287,10 +291,13 @@ const history = defineMaterializationHistory(schemaV2, (m) => [
 ```
 
 Migration steps are typed against the current schema's known tables, columns,
-and semantic event references. Data migration steps receive a Sledge-owned
-typed migration database facade, not a raw SQL handle, so future executors can
-inject tenancy and storage-specific behavior before operations reach the
-database. This slice records operation metadata but does not yet execute it.
+and semantic event references. Because history is bound to `ledgerShape`, data
+migration steps can also read or scan typed ledger events with `readEvent(...)`,
+`readEvents(...)`, and `scanEvents(...)` without seeing the internal `events`
+table. Data migration steps receive a Sledge-owned typed migration database
+facade, not a raw SQL handle, so future executors can inject tenancy and
+storage-specific behavior before operations reach the database. This slice
+records operation metadata but does not yet execute it.
 
 Sledge validates that the history starts at version 1, versions are unique
 positive integers, versions have no gaps, and the latest migration version

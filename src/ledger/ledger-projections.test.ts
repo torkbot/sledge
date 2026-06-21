@@ -65,7 +65,7 @@ const schema = defineMaterializationSchema({
   },
 });
 
-const history = defineMaterializationHistory(schema, (m) => [
+const history = defineMaterializationHistory(shape, schema, (m) => [
   m.migration(1, "create users", (s) => [
     s.createTable("users", (t) =>
       t
@@ -463,18 +463,22 @@ test("projection access supports typed integer increments without raw SQL", asyn
           .primaryKey(["counterId"]),
     },
   });
-  const counterHistory = defineMaterializationHistory(counterSchema, (m) => [
-    m.migration(1, "create counters", (s) => [
-      s.createTable("counters", (t) =>
-        t
-          .columns({
-            attempts: t.integer().notNull(),
-            counterId: t.text().notNull(),
-          })
-          .primaryKey(["counterId"]),
-      ),
-    ]),
-  ]);
+  const counterHistory = defineMaterializationHistory(
+    shape,
+    counterSchema,
+    (m) => [
+      m.migration(1, "create counters", (s) => [
+        s.createTable("counters", (t) =>
+          t
+            .columns({
+              attempts: t.integer().notNull(),
+              counterId: t.text().notNull(),
+            })
+            .primaryKey(["counterId"]),
+        ),
+      ]),
+    ],
+  );
   const counterMaterializations = defineMaterializations({
     history: counterHistory,
     indexers: {
@@ -796,7 +800,7 @@ test("projection access rejects non-serializable JSON values before storage", as
     },
   });
   const jsonMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(jsonSchema, (m) => [
+    history: defineMaterializationHistory(shape, jsonSchema, (m) => [
       m.migration(1, "create json rows", (s) => [
         s.createTable("jsonRows", (t) =>
           t
@@ -1093,7 +1097,7 @@ test("projection access supports stateful indexers and ordered range queries", a
     },
   });
   const stateMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(stateSchema, (m) => [
+    history: defineMaterializationHistory(shape, stateSchema, (m) => [
       m.migration(1, "create run state", (s) => [
         s.createTable("runState", (t) =>
           t
@@ -1300,7 +1304,7 @@ test("projection access supports typed application-defined ordering", async () =
     },
   });
   const profileMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(profileSchema, (m) => [
+    history: defineMaterializationHistory(shape, profileSchema, (m) => [
       m.migration(1, "create profile docs", (s) => [
         s.createTable("profileDocs", (t) =>
           t
@@ -1397,7 +1401,7 @@ test("projection access supports typed disjunction predicate groups", async () =
     },
   });
   const followupMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(followupSchema, (m) => [
+    history: defineMaterializationHistory(shape, followupSchema, (m) => [
       m.migration(1, "create followups", (s) => [
         s.createTable("followups", (t) =>
           t
@@ -1645,7 +1649,7 @@ test("projection access executeTakeFirst honors explicit zero limits", async () 
     },
   });
   const limitMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(limitSchema, (m) => [
+    history: defineMaterializationHistory(shape, limitSchema, (m) => [
       m.migration(1, "create limit-zero tables", (s) => [
         s.createTable("sessions", (t) =>
           t
@@ -1768,7 +1772,7 @@ test("projection access supports typed union candidate reads", async () => {
     },
   });
   const decisionMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(decisionSchema, (m) => [
+    history: defineMaterializationHistory(shape, decisionSchema, (m) => [
       m.migration(1, "create network decision tables", (s) => [
         s.createTable("grants", (t) =>
           t
@@ -1992,7 +1996,7 @@ test("projection access supports typed inner joins between materialization table
     },
   });
   const networkMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(networkSchema, (m) => [
+    history: defineMaterializationHistory(shape, networkSchema, (m) => [
       m.migration(1, "create network request tables", (s) => [
         s.createTable("policyPromptRequests", (t) =>
           t
@@ -2140,7 +2144,7 @@ test("projection access supports typed anti-join predicates", async () => {
     },
   });
   const networkMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(networkSchema, (m) => [
+    history: defineMaterializationHistory(shape, networkSchema, (m) => [
       m.migration(1, "create network request tables", (s) => [
         s.createTable("policyPromptRequests", (t) =>
           t
@@ -2259,7 +2263,7 @@ test("projection access supports left-joined optional rows", async () => {
     },
   });
   const operationMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(operationSchema, (m) => [
+    history: defineMaterializationHistory(shape, operationSchema, (m) => [
       m.migration(1, "create operation status tables", (s) => [
         s.createTable("operations", (t) =>
           t
@@ -2355,7 +2359,7 @@ test("projection access rejects unsafe predicate and self-join shapes", async ()
     },
   });
   const nodeMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(nodeSchema, (m) => [
+    history: defineMaterializationHistory(shape, nodeSchema, (m) => [
       m.migration(1, "create nodes", (s) => [
         s.createTable("nodes", (t) =>
           t
@@ -2486,7 +2490,7 @@ test("projection access supports typed aggregate reads", async () => {
     },
   });
   const toolMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(toolSchema, (m) => [
+    history: defineMaterializationHistory(shape, toolSchema, (m) => [
       m.migration(1, "create tool call tables", (s) => [
         s.createTable("toolCalls", (t) =>
           t
@@ -2883,32 +2887,36 @@ test("projection facade supports TorkBot-style surface operation materialization
           ]),
     },
   });
-  const surfaceHistory = defineMaterializationHistory(surfaceSchema, (m) => [
-    m.migration(1, "create surface operations", (s) => [
-      s.createTable("surfaceOperations", (t) =>
-        t
-          .columns({
-            completed: t.eventRef("surface.operation.completed"),
-            completedAtMs: t.integer(),
-            error: t.text(),
-            failed: t.eventRef("surface.operation.failed"),
-            failedAtMs: t.integer(),
-            operationKey: t.text().notNull(),
-            requested: t.eventRef("surface.operation.requested").notNull(),
-            requestedAtMs: t.integer().notNull(),
-            surfaceInstanceId: t.text().notNull(),
-            surfaceRefUrl: t.text().notNull(),
-            surfaceType: t.text().notNull(),
-          })
-          .primaryKey(["operationKey"])
-          .index("surface_operations_pending", [
-            "completedAtMs",
-            "failedAtMs",
-            "requestedAtMs",
-          ]),
-      ),
-    ]),
-  ]);
+  const surfaceHistory = defineMaterializationHistory(
+    surfaceShape,
+    surfaceSchema,
+    (m) => [
+      m.migration(1, "create surface operations", (s) => [
+        s.createTable("surfaceOperations", (t) =>
+          t
+            .columns({
+              completed: t.eventRef("surface.operation.completed"),
+              completedAtMs: t.integer(),
+              error: t.text(),
+              failed: t.eventRef("surface.operation.failed"),
+              failedAtMs: t.integer(),
+              operationKey: t.text().notNull(),
+              requested: t.eventRef("surface.operation.requested").notNull(),
+              requestedAtMs: t.integer().notNull(),
+              surfaceInstanceId: t.text().notNull(),
+              surfaceRefUrl: t.text().notNull(),
+              surfaceType: t.text().notNull(),
+            })
+            .primaryKey(["operationKey"])
+            .index("surface_operations_pending", [
+              "completedAtMs",
+              "failedAtMs",
+              "requestedAtMs",
+            ]),
+        ),
+      ]),
+    ],
+  );
   const surfaceMaterializations = defineMaterializations({
     history: surfaceHistory,
     indexers: {
@@ -3391,7 +3399,7 @@ test("ledger projection definition applies relations over inferred tables", () =
   const model = withMaterializations(
     shape,
     defineMaterializations({
-      history: defineMaterializationHistory(relationSchema, (m) => [
+      history: defineMaterializationHistory(shape, relationSchema, (m) => [
         m.migration(1, "create relation tables", (s) => [
           s.createTable("users", (t) =>
             t
@@ -3522,7 +3530,7 @@ test("materialization histories validate versions and record typed operations", 
     },
   });
 
-  const historyV2 = defineMaterializationHistory(schemaV2, (m) => [
+  const historyV2 = defineMaterializationHistory(shape, schemaV2, (m) => [
     m.migration(1, "create users", (s) => [
       s.createTable("users", (t) =>
         t
@@ -3618,7 +3626,7 @@ test("materialization histories validate versions and record typed operations", 
   });
 
   assert.throws(() => {
-    defineMaterializationHistory(requiredColumnSchemaV2, (m) => [
+    defineMaterializationHistory(shape, requiredColumnSchemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3635,7 +3643,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /materialization add column users\.email cannot add a non-null column without a default/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3649,7 +3657,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /latest migration must match current schema version/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(2, "add user email", (s) => [
         s.addColumn("users", "email", (t) => t.text()),
       ]),
@@ -3657,7 +3665,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /must start at version 1/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3674,7 +3682,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /duplicate materialization migration version 1/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(2, "add user email", (s) => [
         s.addColumn("users", "email", (t) => t.text()),
       ]),
@@ -3691,7 +3699,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /ascending version order/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3708,7 +3716,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /materialization history table users must match current schema columns/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3726,7 +3734,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /materialization history index usersByEmail references unknown column email/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3744,7 +3752,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /materialization data operation requires current schema table users columns/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3764,7 +3772,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /materialization data operation requires current schema table users keys/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3781,7 +3789,7 @@ test("materialization histories validate versions and record typed operations", 
   }, /materialization history table users must match current schema keys/);
 
   assert.throws(() => {
-    defineMaterializationHistory(schemaV2, (m) => [
+    defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3827,7 +3835,7 @@ test("materialization histories replay foreign keys against current state", () =
   });
 
   assert.throws(() => {
-    defineMaterializationHistory(relationSchema, (m) => [
+    defineMaterializationHistory(shape, relationSchema, (m) => [
       m.migration(1, "create relation tables", (s) => [
         s.createTable("sessions", (t) =>
           t
@@ -3852,7 +3860,7 @@ test("materialization histories replay foreign keys against current state", () =
   }, /materialization history relation sessionUser references unknown table users/);
 
   assert.throws(() => {
-    defineMaterializationHistory(relationSchema, (m) => [
+    defineMaterializationHistory(shape, relationSchema, (m) => [
       m.migration(1, "create relation tables", (s) => [
         s.createTable("sessions", (t) =>
           t
@@ -3901,7 +3909,7 @@ test("materialization histories replay foreign keys against current state", () =
   });
 
   assert.throws(() => {
-    defineMaterializationHistory(relationByEmailSchema, (m) => [
+    defineMaterializationHistory(shape, relationByEmailSchema, (m) => [
       m.migration(1, "create relation tables", (s) => [
         s.createTable("users", (t) =>
           t
@@ -3946,6 +3954,7 @@ test("materialization histories compare replayed columns by name", () => {
     },
   });
   const reorderedHistory = defineMaterializationHistory(
+    shape,
     reorderedSchema,
     (m) => [
       m.migration(1, "create users", (s) => [
@@ -3967,7 +3976,7 @@ test("materialization histories compare replayed columns by name", () => {
   assert.equal(reorderedHistory.current, reorderedSchema);
 });
 
-test("withMaterializations rejects materialization event refs outside the ledger shape", () => {
+test("materialization histories reject event refs outside the ledger shape", () => {
   const invalidSchema = defineMaterializationSchema({
     namespace: "invalid-events",
     version: 1,
@@ -3981,26 +3990,20 @@ test("withMaterializations rejects materialization event refs outside the ledger
           .primaryKey(["sessionId"]),
     },
   });
-  const invalidMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(invalidSchema, (m) => [
+  assert.throws(() => {
+    defineMaterializationHistory(shape, invalidSchema as never, (m) => [
       m.migration(1, "create invalid sessions", (s) => [
         s.createTable("sessions", (t) =>
           t
             .columns({
               sessionId: t.text().notNull(),
+              // @ts-expect-error runtime validation protects unchecked callers too.
               source: t.eventRef("session.created").notNull(),
             })
             .primaryKey(["sessionId"]),
         ),
       ]),
-    ]),
-    indexers: {},
-    queries: {},
-  });
-
-  assert.throws(() => {
-    // @ts-expect-error runtime validation protects unchecked callers too.
-    withMaterializations(shape, invalidMaterializations);
+    ]);
   }, /references unknown event session\.created/);
 
   const validSchemaV2 = defineMaterializationSchema({
@@ -4016,7 +4019,7 @@ test("withMaterializations rejects materialization event refs outside the ledger
     },
   });
   assert.throws(() => {
-    defineMaterializationHistory(validSchemaV2, (m) => [
+    defineMaterializationHistory(shape, validSchemaV2, (m) => [
       m.migration(1, "create sessions", (s) => [
         s.createTable("sessions", (t) =>
           t
@@ -4078,17 +4081,21 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     },
   });
   const multiEventMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(multiEventSchema, (m) => [
-      m.migration(1, "create users", (s) => [
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-      ]),
-    ]),
+    history: defineMaterializationHistory(
+      multiEventShape,
+      multiEventSchema,
+      (m) => [
+        m.migration(1, "create users", (s) => [
+          s.createTable("users", (t) =>
+            t
+              .columns({
+                userId: t.text().notNull(),
+              })
+              .primaryKey(["userId"]),
+          ),
+        ]),
+      ],
+    ),
     indexers: {
       upsertUser: {
         sourceEvent: "user.created",
@@ -4138,7 +4145,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     },
   });
 
-  const typedHistory = defineMaterializationHistory(typedSchema, (m) => [
+  const typedHistory = defineMaterializationHistory(shape, typedSchema, (m) => [
     m.migration(1, "create users", (s) => [
       s.createTable("users", (t) =>
         t
@@ -4181,8 +4188,37 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .execute();
         await db.deleteFrom("users").where("userId", "=", "u_123").execute();
 
+        const sourceEvent = await db.readEvent(
+          createEventRef("user.created", 1),
+        );
+
+        if (sourceEvent !== null) {
+          const sourceUserId: string = sourceEvent.payload.userId;
+          const sourceEmail: string = sourceEvent.payload.email;
+          // @ts-expect-error migration event reads use ledger event payload types.
+          const sessionId: string = sourceEvent.payload.sessionId;
+
+          void sourceUserId;
+          void sourceEmail;
+          void sessionId;
+        }
+
+        const sourceEvents = await db
+          .scanEvents("user.created")
+          .afterEventId(0)
+          .limit(10)
+          .execute();
+
+        for (const source of sourceEvents) {
+          const sourceEmail: string = source.payload.email;
+
+          void sourceEmail;
+        }
+
         // @ts-expect-error migration data cannot select unknown tables.
         db.selectFrom("sessions");
+        // @ts-expect-error migration data cannot scan unknown events.
+        db.scanEvents("session.created");
         // @ts-expect-error migration data can only select known columns.
         db.selectFrom("users").select(["missing"]);
         // @ts-expect-error migration data can only update known columns.
@@ -4192,6 +4228,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
   ]);
 
   const invalidMigrationHistory = defineMaterializationHistory(
+    shape,
     typedSchema,
     (m) => [
       m.migration(1, "invalid", (s) => [
@@ -4244,7 +4281,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .primaryKey(["parentId"]),
     },
   });
-  const joinHistory = defineMaterializationHistory(joinSchema, (m) => [
+  const joinHistory = defineMaterializationHistory(shape, joinSchema, (m) => [
     m.migration(1, "create join tables", (s) => [
       s.createTable("children", (t) =>
         t

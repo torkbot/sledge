@@ -110,20 +110,24 @@ const ledgerContractSchema = defineMaterializationSchema({
 });
 
 const ledgerContractMaterializations = defineMaterializations({
-  history: defineMaterializationHistory(ledgerContractSchema, (m) => [
-    m.migration(1, "create contract projection", (s) => [
-      s.createTable("contractProjection", (t) =>
-        t
-          .columns({
-            sourceEventId: t.integer().notNull(),
-            decisionAttempts: t.integer().notNull(),
-            dispatchCount: t.integer().notNull(),
-            plannedIntentEventId: t.integer(),
-          })
-          .primaryKey(["sourceEventId"]),
-      ),
-    ]),
-  ]),
+  history: defineMaterializationHistory(
+    ledgerContractShape,
+    ledgerContractSchema,
+    (m) => [
+      m.migration(1, "create contract projection", (s) => [
+        s.createTable("contractProjection", (t) =>
+          t
+            .columns({
+              sourceEventId: t.integer().notNull(),
+              decisionAttempts: t.integer().notNull(),
+              dispatchCount: t.integer().notNull(),
+              plannedIntentEventId: t.integer(),
+            })
+            .primaryKey(["sourceEventId"]),
+        ),
+      ]),
+    ],
+  ),
   indexers: {
     upsertObserved: {
       sourceEvent: "message.received",

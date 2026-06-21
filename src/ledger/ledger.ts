@@ -14,6 +14,7 @@ import {
   type ProjectionIndexerSchemas,
   type ProjectionIndexerSchemasForEvent,
   type ProjectionInsertBuilder,
+  type ProjectionEventScanBuilder,
   type ProjectionQueryDefinitions,
   type ProjectionQuerySchemas,
   type ProjectionUpdateRow,
@@ -51,6 +52,7 @@ export type {
   ProjectionExecutableUnionSelect,
   ProjectionExecutableJoinedSelect,
   ProjectionExecutableWrite,
+  ProjectionEventScanBuilder,
   ProjectionDatabase,
   ProjectionDeleteBuilder,
   ProjectionExpression,
@@ -783,40 +785,65 @@ export type MaterializationMigrationDeleteBuilder<TTable> = {
 };
 
 export type MaterializationMigrationDatabase<
-  TSchema extends AnyProjectionSchema,
+  TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema>,
 > = {
-  deleteFrom<const TTableName extends MaterializationTableName<TSchema>>(
+  deleteFrom<
+    const TTableName extends MaterializationTableName<TProjectionSchema>,
+  >(
     tableName: TTableName,
   ): MaterializationMigrationDeleteBuilder<
-    MaterializationTableForName<TSchema, TTableName>
+    MaterializationTableForName<TProjectionSchema, TTableName>
   >;
-  insertInto<const TTableName extends MaterializationTableName<TSchema>>(
+  insertInto<
+    const TTableName extends MaterializationTableName<TProjectionSchema>,
+  >(
     tableName: TTableName,
-  ): ProjectionInsertBuilder<MaterializationTableForName<TSchema, TTableName>>;
-  selectFrom<const TTableName extends MaterializationTableName<TSchema>>(
+  ): ProjectionInsertBuilder<
+    MaterializationTableForName<TProjectionSchema, TTableName>
+  >;
+  selectFrom<
+    const TTableName extends MaterializationTableName<TProjectionSchema>,
+  >(
     tableName: TTableName,
   ): MaterializationMigrationSelectBuilder<
-    MaterializationTableForName<TSchema, TTableName>
+    MaterializationTableForName<TProjectionSchema, TTableName>
   >;
-  updateTable<const TTableName extends MaterializationTableName<TSchema>>(
+  updateTable<
+    const TTableName extends MaterializationTableName<TProjectionSchema>,
+  >(
     tableName: TTableName,
   ): MaterializationMigrationUpdateBuilder<
-    MaterializationTableForName<TSchema, TTableName>
+    MaterializationTableForName<TProjectionSchema, TTableName>
   >;
+  readEvent<const TEventName extends Extract<keyof TEvents, string>>(
+    ref: EventRef<TEventName>,
+  ): Promise<EventEnvelope<TEvents, TEventName> | null>;
+  readEvents<const TEventName extends Extract<keyof TEvents, string>>(
+    refs: readonly EventRef<TEventName>[],
+  ): Promise<readonly (EventEnvelope<TEvents, TEventName> | null)[]>;
+  scanEvents<const TEventName extends Extract<keyof TEvents, string>>(
+    eventName: TEventName,
+  ): ProjectionEventScanBuilder<TEvents, TEventName>;
 };
 
 export type MaterializationMigrationDataInput<
-  TSchema extends AnyProjectionSchema,
+  TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema>,
 > = {
-  readonly db: MaterializationMigrationDatabase<TSchema>;
+  readonly db: MaterializationMigrationDatabase<TProjectionSchema, TEvents>;
 };
 
 export type MaterializationMigrationDataFunction<
-  TSchema extends AnyProjectionSchema,
-> = (input: MaterializationMigrationDataInput<TSchema>) => void | Promise<void>;
+  TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema>,
+> = (
+  input: MaterializationMigrationDataInput<TProjectionSchema, TEvents>,
+) => void | Promise<void>;
 
 export type MaterializationMigrationOperation<
-  TSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > =
   | {
       readonly kind: "create_table";
@@ -842,14 +869,18 @@ export type MaterializationMigrationOperation<
   | {
       readonly description: string;
       readonly kind: "data";
-      readonly run: MaterializationMigrationDataFunction<TSchema>;
+      readonly run: MaterializationMigrationDataFunction<
+        TProjectionSchema,
+        TEvents
+      >;
     };
 
 export type MaterializationMigrationOperations<
-  TSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
 > = readonly [
-  MaterializationMigrationOperation<TSchema>,
-  ...MaterializationMigrationOperation<TSchema>[],
+  MaterializationMigrationOperation<TProjectionSchema, TEvents>,
+  ...MaterializationMigrationOperation<TProjectionSchema, TEvents>[],
 ];
 
 export type MaterializationMigration<
@@ -863,13 +894,25 @@ export type MaterializationMigration<
   readonly version: TVersion;
 };
 
-export type MaterializationMigrationList = readonly [
-  MaterializationMigration,
-  ...MaterializationMigration[],
+export type MaterializationMigrationList<
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+> = readonly [
+  MaterializationMigration<
+    number,
+    string,
+    MaterializationMigrationOperations<TProjectionSchema, TEvents>
+  >,
+  ...MaterializationMigration<
+    number,
+    string,
+    MaterializationMigrationOperations<TProjectionSchema, TEvents>
+  >[],
 ];
 
 export type MaterializationMigrationStepBuilder<
   TCurrentSchema extends AnyMaterializationSchema,
+  TEvents extends Record<string, TSchema>,
 > = {
   addColumn<
     const TTableName extends MaterializationTableName<TCurrentSchema>,
@@ -887,7 +930,7 @@ export type MaterializationMigrationStepBuilder<
     ) => ProjectionTableColumns<
       MaterializationTableForName<TCurrentSchema, TTableName>
     >[TColumnName],
-  ): MaterializationMigrationOperation;
+  ): MaterializationMigrationOperation<TCurrentSchema, TEvents>;
 
   addForeignKey<const TName extends string>(
     name: TName,
@@ -896,7 +939,7 @@ export type MaterializationMigrationStepBuilder<
         ProjectionSchemaTables<TCurrentSchema>
       >,
     ) => ProjectionRelationDefinition,
-  ): MaterializationMigrationOperation;
+  ): MaterializationMigrationOperation<TCurrentSchema, TEvents>;
 
   createIndex<
     const TTableName extends MaterializationTableName<TCurrentSchema>,
@@ -908,7 +951,7 @@ export type MaterializationMigrationStepBuilder<
     name: string,
     tableName: TTableName,
     columns: TColumnNames,
-  ): MaterializationMigrationOperation;
+  ): MaterializationMigrationOperation<TCurrentSchema, TEvents>;
 
   createTable<
     const TTableName extends MaterializationTableName<TCurrentSchema>,
@@ -919,7 +962,7 @@ export type MaterializationMigrationStepBuilder<
     ) => {
       readonly metadata: ProjectionTableMetadata;
     },
-  ): MaterializationMigrationOperation;
+  ): MaterializationMigrationOperation<TCurrentSchema, TEvents>;
 
   createUniqueIndex<
     const TTableName extends MaterializationTableName<TCurrentSchema>,
@@ -931,26 +974,30 @@ export type MaterializationMigrationStepBuilder<
     name: string,
     tableName: TTableName,
     columns: TColumnNames,
-  ): MaterializationMigrationOperation;
+  ): MaterializationMigrationOperation<TCurrentSchema, TEvents>;
 
   data<const TDescription extends string>(
     description: TDescription,
-    run: MaterializationMigrationDataFunction<TCurrentSchema>,
-  ): MaterializationMigrationOperation<TCurrentSchema>;
+    run: MaterializationMigrationDataFunction<TCurrentSchema, TEvents>,
+  ): MaterializationMigrationOperation<TCurrentSchema, TEvents>;
 };
 
 export type MaterializationHistoryBuilder<
   TCurrentSchema extends AnyMaterializationSchema,
+  TEvents extends Record<string, TSchema>,
 > = {
   migration<
     const TVersion extends number,
     const TDescription extends string,
-    const TOperations extends MaterializationMigrationOperations,
+    const TOperations extends MaterializationMigrationOperations<
+      TCurrentSchema,
+      TEvents
+    >,
   >(
     version: TVersion,
     description: TDescription,
     build: (
-      steps: MaterializationMigrationStepBuilder<TCurrentSchema>,
+      steps: MaterializationMigrationStepBuilder<TCurrentSchema, TEvents>,
     ) => TOperations,
   ): MaterializationMigration<TVersion, TDescription, TOperations>;
 };
@@ -1030,24 +1077,46 @@ export function defineMaterializationSchema<
 }
 
 export function defineMaterializationHistory<
+  const TEvents extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema>,
+  const TSignals extends Record<string, TSchema>,
+  const TSignalQueues extends Record<string, TSchema>,
   const TCurrentSchema extends AnyMaterializationSchema,
-  const TMigrations extends MaterializationMigrationList,
+  const TMigrations extends MaterializationMigrationList<
+    TCurrentSchema,
+    TEvents
+  >,
 >(
-  current: TCurrentSchema,
+  shape: DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
+  current: TCurrentSchema &
+    (Exclude<
+      ProjectionSchemaEventName<TCurrentSchema>,
+      Extract<keyof TEvents, string>
+    > extends never
+      ? unknown
+      : never),
   build: (
-    history: MaterializationHistoryBuilder<TCurrentSchema>,
+    history: MaterializationHistoryBuilder<TCurrentSchema, TEvents>,
   ) => TMigrations,
 ): MaterializationHistory<TCurrentSchema, TMigrations> {
   validateMaterializationSchemaIdentity(current.namespace, current.version);
-  const migrations = build(createMaterializationHistoryBuilder(current));
-  validateMaterializationHistory(current, migrations);
+  const eventNames = new Set(Object.keys(shape.shape.events));
 
-  return {
+  validateMaterializationSchemaEventRefs(current, eventNames);
+  const migrations = build(
+    createMaterializationHistoryBuilder<TCurrentSchema, TEvents>(current),
+  );
+  validateMaterializationHistory(current, migrations);
+  const history = {
     current,
     currentVersion: current.version,
     migrations,
     namespace: current.namespace,
   };
+
+  validateMaterializationHistoryEventRefs(history, eventNames);
+
+  return history;
 }
 
 export function defineMaterializations<
@@ -1255,11 +1324,16 @@ function createMaterializationProjectionSchema<
 
 function createMaterializationHistoryBuilder<
   TCurrentSchema extends AnyMaterializationSchema,
->(current: TCurrentSchema): MaterializationHistoryBuilder<TCurrentSchema> {
+  TEvents extends Record<string, TSchema>,
+>(
+  current: TCurrentSchema,
+): MaterializationHistoryBuilder<TCurrentSchema, TEvents> {
   return {
     migration: (version, description, build) => {
       const operations = build(
-        createMaterializationMigrationStepBuilder(current),
+        createMaterializationMigrationStepBuilder<TCurrentSchema, TEvents>(
+          current,
+        ),
       );
 
       return {
@@ -1273,9 +1347,10 @@ function createMaterializationHistoryBuilder<
 
 function createMaterializationMigrationStepBuilder<
   TCurrentSchema extends AnyMaterializationSchema,
+  TEvents extends Record<string, TSchema>,
 >(
   current: TCurrentSchema,
-): MaterializationMigrationStepBuilder<TCurrentSchema> {
+): MaterializationMigrationStepBuilder<TCurrentSchema, TEvents> {
   return {
     addColumn: (tableName, columnName, build) => {
       readMaterializationTable(
