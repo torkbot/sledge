@@ -221,6 +221,64 @@ function createFakeScope(input: {
   };
 }
 
+function createFakeScopeWithRunChanges(input: {
+  readonly allRows: readonly LedgerStorageRow[];
+  readonly changes: number;
+  readonly getRow: LedgerStorageRow | undefined;
+}): {
+  readonly calls: readonly FakeStatementCall[];
+  readonly scope: LedgerStorageScope;
+} {
+  const calls: FakeStatementCall[] = [];
+
+  return {
+    calls,
+    scope: {
+      exec: async (sql) => {
+        calls.push({
+          method: "exec",
+          params: [],
+          sql,
+        });
+      },
+      prepare: (sql) => {
+        return {
+          all: async (...params) => {
+            calls.push({
+              method: "all",
+              params,
+              sql,
+            });
+
+            return input.allRows;
+          },
+          get: async (...params) => {
+            calls.push({
+              method: "get",
+              params,
+              sql,
+            });
+
+            return input.getRow;
+          },
+          run: async (...params) => {
+            calls.push({
+              method: "run",
+              params,
+              sql,
+            });
+
+            return {
+              changes: input.changes,
+              lastInsertRowid: 0,
+            };
+          },
+        };
+      },
+    },
+  };
+}
+
 function createQueuedFakeScope(input: {
   readonly allRows: readonly (readonly LedgerStorageRow[])[];
   readonly getRows: readonly (LedgerStorageRow | undefined)[];
@@ -617,6 +675,95 @@ test("projection access supports typed integer increments without raw SQL", asyn
     createUserCreatedContext(42),
   );
 
+  assert.deepEqual(fake.calls, [
+    {
+      method: "run",
+      params: [1, "c_1"],
+      sql: 'UPDATE "counters" SET "attempts" = "attempts" + ? WHERE "counterId" = ?',
+    },
+  ]);
+});
+
+test("projection access tracks unawaited executeExpectingOne assertions", async () => {
+  const counterSchema = defineMaterializationSchema({
+    namespace: "counter-assertions",
+    version: 1,
+    tables: {
+      counters: (t) =>
+        t
+          .columns({
+            attempts: t.integer().notNull(),
+            counterId: t.text().notNull(),
+          })
+          .primaryKey(["counterId"]),
+    },
+  });
+  const counterHistory = defineMaterializationHistory(
+    shape,
+    counterSchema,
+    (m) => [
+      m.migration(1, "create counters", (s) => [
+        s.createTable("counters", (t) =>
+          t
+            .columns({
+              attempts: t.integer().notNull(),
+              counterId: t.text().notNull(),
+            })
+            .primaryKey(["counterId"]),
+        ),
+      ]),
+    ],
+  );
+  const counterMaterializations = defineMaterializations({
+    history: counterHistory,
+    indexers: {
+      incrementCounter: {
+        sourceEvent: "user.created",
+        input: Type.Object({
+          counterId: Type.String(),
+        }),
+      },
+    },
+    queries: {},
+  });
+  const counterModel = withMaterializations(
+    shape,
+    counterMaterializations,
+  ).register({
+    indexers: {
+      incrementCounter: ({ input, db }) => {
+        void db
+          .updateTable("counters")
+          .set((e) => ({
+            attempts: e.add("attempts", 1),
+          }))
+          .where("counterId", "=", input.counterId)
+          .executeExpectingOne();
+      },
+    },
+  });
+  const indexer =
+    readTestLedgerImplementations(counterModel).indexers?.incrementCounter;
+
+  if (indexer === undefined) {
+    throw new Error("expected incrementCounter indexer implementation");
+  }
+
+  const fake = createFakeScopeWithRunChanges({
+    allRows: [],
+    changes: 0,
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await indexer(
+      fake.scope,
+      {
+        counterId: "c_1",
+      },
+      createUserCreatedContext(42),
+    );
+  }, /expected projection write to change one row but changed 0/);
   assert.deepEqual(fake.calls, [
     {
       method: "run",
@@ -2139,6 +2286,78 @@ test("projection access supports typed union candidate reads", async () => {
     decisionId: "policy_1",
     decision: "allow",
     remainingUses: null,
+  });
+});
+
+test("projection access decodes boolean and nullable union literals", async () => {
+  const unionMaterializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {
+      checkUnion: {
+        params: Type.Object({}),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            isPrimary: Type.Boolean(),
+            maybeEmail: Type.Union([Type.Null(), Type.String()]),
+            userId: Type.String(),
+          }),
+        ]),
+      },
+    },
+  });
+  const unionModel = withMaterializations(
+    shape,
+    unionMaterializations,
+  ).register({
+    queries: {
+      checkUnion: async ({ db }) => {
+        return await db
+          .unionAll([
+            db.unionFrom("users").select({
+              maybeEmail: db.unionValue(null),
+              isPrimary: db.unionValue(true),
+              userId: "userId",
+            }),
+            db.unionFrom("users").select({
+              maybeEmail: "email",
+              isPrimary: db.unionValue(false),
+              userId: "userId",
+            }),
+          ])
+          .orderBy("isPrimary", "desc")
+          .executeTakeFirst();
+      },
+    },
+  });
+  const checkUnion =
+    readTestLedgerImplementations(unionModel).queries?.checkUnion;
+
+  if (checkUnion === undefined) {
+    throw new Error("expected checkUnion query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: {
+      isPrimary: 1,
+      maybeEmail: null,
+      userId: "u_1",
+    },
+  });
+
+  const result = await checkUnion(fake.scope, {});
+
+  assert.deepEqual(fake.calls[0], {
+    method: "get",
+    params: [null, 1, 0, 1],
+    sql: 'SELECT * FROM (SELECT ? AS "maybeEmail", ? AS "isPrimary", "userId" AS "userId" FROM "users" UNION ALL SELECT "email" AS "maybeEmail", ? AS "isPrimary", "userId" AS "userId" FROM "users") ORDER BY "isPrimary" DESC LIMIT ?',
+  });
+  assert.deepEqual(result, {
+    isPrimary: true,
+    maybeEmail: null,
+    userId: "u_1",
   });
 });
 
@@ -4126,7 +4345,7 @@ test("materialization histories validate versions and record typed operations", 
     ]);
   }, /materialization history index usersByEmail references unknown column email/);
 
-  assert.throws(() => {
+  assert.doesNotThrow(() => {
     defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
@@ -4140,11 +4359,13 @@ test("materialization histories validate versions and record typed operations", 
       ]),
       m.migration(2, "add user email", (s) => [
         s.addColumn("users", "email", (t) => t.text()),
+        s.createIndex("usersByEmail", "users", ["email"]),
+        s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
       ]),
     ]);
-  }, /materialization data operation requires current schema table users columns/);
+  });
 
-  assert.throws(() => {
+  assert.doesNotThrow(() => {
     defineMaterializationHistory(shape, schemaV2, (m) => [
       m.migration(1, "create users", (s) => [
         s.createTable("users", (t) =>
@@ -4162,7 +4383,7 @@ test("materialization histories validate versions and record typed operations", 
         s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
       ]),
     ]);
-  }, /materialization data operation requires current schema table users keys/);
+  });
 
   assert.throws(() => {
     defineMaterializationHistory(shape, schemaV2, (m) => [

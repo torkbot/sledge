@@ -47,7 +47,11 @@ import type {
   ProjectionQueryDefinitions,
 } from "./projection-access.ts";
 import { runProjectionDatabaseScope } from "./projection-access.ts";
-import type { ProjectionSchemaMetadata } from "./projections.ts";
+import type {
+  ProjectionForeignKeyMetadata,
+  ProjectionSchemaMetadata,
+  ProjectionTableMetadata,
+} from "./projections.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -79,6 +83,11 @@ type AppendSignalInput = {
   readonly nowMs: number;
   readonly dedupeKey?: string;
   readonly causationEventId: number | null;
+};
+
+type MaterializationReplayState = {
+  readonly relations: Map<string, ProjectionForeignKeyMetadata>;
+  readonly tables: Map<string, ProjectionTableMetadata>;
 };
 
 type StorageRow = LedgerStorageRow;
@@ -878,6 +887,11 @@ function openDatabaseLedgerEngine<
         await createProjectionSchema(database, history.current.metadata);
       }
 
+      const replayState = createMaterializationReplayState(
+        history,
+        currentVersion,
+      );
+
       for (const migration of history.migrations) {
         if (migration.version <= currentVersion) {
           continue;
@@ -888,6 +902,7 @@ function openDatabaseLedgerEngine<
           history,
           migration,
           currentVersion === 0,
+          replayState,
         );
         await recordMaterializationVersion(
           database,
@@ -954,13 +969,19 @@ function openDatabaseLedgerEngine<
     history: THistory,
     migration: THistory["migrations"][number],
     freshNamespace: boolean,
+    replayState: MaterializationReplayState,
   ): Promise<void> {
+    const relationsForCreatedTables =
+      readMaterializationMigrationRelationsForCreatedTables(migration);
+
     for (const operation of migration.operations) {
       await applyMaterializationMigrationOperation(
         database,
         history,
         operation,
         freshNamespace,
+        replayState,
+        relationsForCreatedTables,
       );
     }
   }
@@ -972,43 +993,59 @@ function openDatabaseLedgerEngine<
     history: THistory,
     operation: THistory["migrations"][number]["operations"][number],
     freshNamespace: boolean,
+    replayState: MaterializationReplayState,
+    relationsForCreatedTables: ReadonlyMap<
+      string,
+      Readonly<Record<string, ProjectionForeignKeyMetadata>>
+    >,
   ): Promise<void> {
     switch (operation.kind) {
       case "create_table":
-        if (freshNamespace) {
-          return;
+        if (!freshNamespace) {
+          await createMaterializationTable(
+            database,
+            operation,
+            relationsForCreatedTables.get(operation.tableName) ?? {},
+          );
+          await createMaterializationTableIndexes(database, operation);
         }
 
-        await createMaterializationTable(database, operation);
-        await createMaterializationTableIndexes(database, operation);
+        replayState.tables.set(operation.tableName, operation.table);
         return;
       case "create_index":
-        if (freshNamespace) {
-          return;
+        if (!freshNamespace) {
+          await createMaterializationIndex(database, operation);
         }
 
-        await createMaterializationIndex(database, operation);
+        addMaterializationReplayIndex(replayState, operation);
         return;
       case "add_column":
-        if (freshNamespace) {
-          return;
+        if (!freshNamespace) {
+          await addMaterializationColumn(database, operation);
         }
 
-        await addMaterializationColumn(database, operation);
+        addMaterializationReplayColumn(replayState, operation);
         return;
       case "add_foreign_key":
-        if (freshNamespace) {
-          return;
+        if (!freshNamespace) {
+          const relations = relationsForCreatedTables.get(
+            operation.foreignKey.fromTable,
+          );
+
+          if (relations?.[operation.name] === undefined) {
+            throw new Error(
+              `materialization ${history.namespace} migration cannot add foreign key ${operation.name} incrementally on SQLite`,
+            );
+          }
         }
 
-        throw new Error(
-          `materialization ${history.namespace} migration cannot add foreign key ${operation.name} incrementally on SQLite`,
-        );
+        replayState.relations.set(operation.name, operation.foreignKey);
+        return;
       case "data":
         await runProjectionDatabaseScope({
           events: model.events,
           signals: model.signals,
-          projections: history.current,
+          projections: createMaterializationReplaySchema(replayState),
           scope: database,
           statementCompiler: input.projectionCompiler,
           run: async (db) => {
@@ -1021,16 +1058,169 @@ function openDatabaseLedgerEngine<
     }
   }
 
+  function createMaterializationReplayState<
+    const THistory extends AnyMaterializationHistory<TEvents>,
+  >(history: THistory, version: number): MaterializationReplayState {
+    const replayState: MaterializationReplayState = {
+      relations: new Map(),
+      tables: new Map(),
+    };
+
+    for (const migration of history.migrations) {
+      if (migration.version > version) {
+        break;
+      }
+
+      for (const operation of migration.operations) {
+        applyMaterializationReplayOperation(replayState, operation);
+      }
+    }
+
+    return replayState;
+  }
+
+  function applyMaterializationReplayOperation(
+    replayState: MaterializationReplayState,
+    operation: MaterializationMigrationOperation,
+  ): void {
+    switch (operation.kind) {
+      case "create_table":
+        replayState.tables.set(operation.tableName, operation.table);
+        return;
+      case "create_index":
+        addMaterializationReplayIndex(replayState, operation);
+        return;
+      case "add_column":
+        addMaterializationReplayColumn(replayState, operation);
+        return;
+      case "add_foreign_key":
+        replayState.relations.set(operation.name, operation.foreignKey);
+        return;
+      case "data":
+        return;
+    }
+  }
+
+  function addMaterializationReplayColumn(
+    replayState: MaterializationReplayState,
+    operation: Extract<
+      MaterializationMigrationOperation,
+      { kind: "add_column" }
+    >,
+  ): void {
+    const table = replayState.tables.get(operation.tableName);
+
+    if (table === undefined) {
+      throw new Error(
+        `materialization replay cannot add column to unknown table ${operation.tableName}`,
+      );
+    }
+
+    replayState.tables.set(operation.tableName, {
+      ...table,
+      columns: {
+        ...table.columns,
+        [operation.columnName]: operation.column,
+      },
+    });
+  }
+
+  function addMaterializationReplayIndex(
+    replayState: MaterializationReplayState,
+    operation: Extract<
+      MaterializationMigrationOperation,
+      { kind: "create_index" }
+    >,
+  ): void {
+    const table = replayState.tables.get(operation.tableName);
+
+    if (table === undefined) {
+      throw new Error(
+        `materialization replay cannot create index on unknown table ${operation.tableName}`,
+      );
+    }
+
+    const keys = operation.index.unique
+      ? [
+          ...table.keys,
+          {
+            columns: operation.index.columns,
+            kind: "unique" as const,
+            name: operation.index.name,
+          },
+        ]
+      : table.keys;
+
+    replayState.tables.set(operation.tableName, {
+      ...table,
+      indexes: [...table.indexes, operation.index],
+      keys,
+    });
+  }
+
+  function createMaterializationReplaySchema(
+    replayState: MaterializationReplayState,
+  ): AnyProjectionSchema {
+    return {
+      metadata: {
+        relations: Object.fromEntries(replayState.relations),
+        tables: Object.fromEntries(replayState.tables),
+      },
+    };
+  }
+
+  function readMaterializationMigrationRelationsForCreatedTables(migration: {
+    readonly operations: readonly MaterializationMigrationOperation[];
+  }): ReadonlyMap<
+    string,
+    Readonly<Record<string, ProjectionForeignKeyMetadata>>
+  > {
+    const openCreatedTableNames = new Set<string>();
+    const relationsByTable = new Map<
+      string,
+      Record<string, ProjectionForeignKeyMetadata>
+    >();
+
+    for (const operation of migration.operations) {
+      if (operation.kind === "create_table") {
+        openCreatedTableNames.add(operation.tableName);
+        continue;
+      }
+
+      if (operation.kind === "data") {
+        openCreatedTableNames.clear();
+        continue;
+      }
+
+      if (
+        operation.kind === "add_foreign_key" &&
+        openCreatedTableNames.has(operation.foreignKey.fromTable)
+      ) {
+        let relations = relationsByTable.get(operation.foreignKey.fromTable);
+
+        if (relations === undefined) {
+          relations = {};
+          relationsByTable.set(operation.foreignKey.fromTable, relations);
+        }
+
+        relations[operation.name] = operation.foreignKey;
+      }
+    }
+
+    return relationsByTable;
+  }
+
   async function createMaterializationTable(
     database: StorageDatabase,
     operation: Extract<
       MaterializationMigrationOperation,
       { kind: "create_table" }
     >,
+    relations: Readonly<Record<string, ProjectionForeignKeyMetadata>>,
   ): Promise<void> {
     const sql = input.projectionCompiler.compileCreateTable({
       metadata: {
-        relations: {},
+        relations,
         tables: {
           [operation.tableName]: operation.table,
         },

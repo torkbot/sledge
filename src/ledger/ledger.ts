@@ -1927,7 +1927,7 @@ function validateMaterializationHistoryResult(
 
   for (const migration of migrations) {
     for (const operation of migration.operations) {
-      applyMaterializationMigrationOperation(current, state, operation);
+      applyMaterializationMigrationOperation(state, operation);
     }
   }
 
@@ -1971,7 +1971,6 @@ type MaterializationHistoryReplayState = {
 };
 
 function applyMaterializationMigrationOperation(
-  current: AnyMaterializationSchema,
   state: MaterializationHistoryReplayState,
   operation: MaterializationMigrationOperation,
 ): void {
@@ -2061,7 +2060,7 @@ function applyMaterializationMigrationOperation(
       state.relations.set(operation.name, operation.foreignKey);
       return;
     case "data":
-      validateMaterializationDataReplay(current, state);
+      validateMaterializationDataReplay(state);
       return;
   }
 }
@@ -2083,94 +2082,14 @@ function validateMaterializationReplayIndexName(
 }
 
 function validateMaterializationDataReplay(
-  current: AnyMaterializationSchema,
   state: MaterializationHistoryReplayState,
 ): void {
-  for (const [tableName, expectedTable] of Object.entries(
-    current.metadata.tables,
-  )) {
-    const actualTable = state.tables.get(tableName);
-
-    if (actualTable === undefined) {
-      throw new Error(
-        `materialization data operation requires current schema table ${tableName}`,
-      );
-    }
-
-    if (
-      !equalStringLists(
-        Object.keys(expectedTable.columns).sort(),
-        Object.keys(actualTable.columns).sort(),
-      )
-    ) {
-      throw new Error(
-        `materialization data operation requires current schema table ${tableName} columns`,
-      );
-    }
-
-    for (const [columnName, expectedColumn] of Object.entries(
-      expectedTable.columns,
-    )) {
-      const actualColumn = actualTable.columns[columnName];
-
-      if (
-        actualColumn === undefined ||
-        !equalMaterializationColumnMetadata(expectedColumn, actualColumn)
-      ) {
-        throw new Error(
-          `materialization data operation requires current schema column ${tableName}.${columnName}`,
-        );
-      }
-    }
-
-    if (!equalStringLists(expectedTable.primaryKey, actualTable.primaryKey)) {
-      throw new Error(
-        `materialization data operation requires current schema table ${tableName} primary key`,
-      );
-    }
-
-    if (!equalProjectionKeys(expectedTable.keys, actualTable.keys)) {
-      throw new Error(
-        `materialization data operation requires current schema table ${tableName} keys`,
-      );
-    }
-
-    if (!equalProjectionIndexes(expectedTable.indexes, actualTable.indexes)) {
-      throw new Error(
-        `materialization data operation requires current schema table ${tableName} indexes`,
-      );
-    }
-  }
-
-  validateMaterializationDataRelationsReplay(current, state);
-}
-
-function validateMaterializationDataRelationsReplay(
-  current: AnyMaterializationSchema,
-  state: MaterializationHistoryReplayState,
-): void {
-  const expectedNames = Object.keys(current.metadata.relations).sort();
-  const actualNames = [...state.relations.keys()].sort();
-
-  if (!equalStringLists(expectedNames, actualNames)) {
-    throw new Error(
-      "materialization data operation requires current schema relations",
+  for (const [relationName, foreignKey] of state.relations) {
+    validateMaterializationForeignKeyReplay(
+      state.tables,
+      relationName,
+      foreignKey,
     );
-  }
-
-  for (const relationName of expectedNames) {
-    const expectedRelation = current.metadata.relations[relationName];
-    const actualRelation = state.relations.get(relationName);
-
-    if (
-      expectedRelation === undefined ||
-      actualRelation === undefined ||
-      !equalProjectionForeignKeyMetadata(expectedRelation, actualRelation)
-    ) {
-      throw new Error(
-        `materialization data operation requires current schema relation ${relationName}`,
-      );
-    }
   }
 }
 

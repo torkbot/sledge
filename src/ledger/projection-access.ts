@@ -1564,19 +1564,19 @@ export async function runProjectionDatabaseScope<
 }): Promise<TResult> {
   const pendingWrites = new Set<Promise<unknown>>();
   let acceptingWrites = true;
-  const trackWrite: ProjectionWriteTracker = (run) => {
+  const trackWrite: ProjectionWriteTracker = <T>(run: () => Promise<T>) => {
     if (!acceptingWrites) {
       return Promise.reject(new Error("projection write scope is closed"));
     }
 
-    let tracked: Promise<unknown>;
+    let tracked: Promise<T>;
     const runPromise = run();
     tracked = runPromise.finally(() => {
       pendingWrites.delete(tracked);
     });
     pendingWrites.add(tracked);
 
-    return runPromise;
+    return tracked;
   };
   let result: { readonly value: TResult } | null = null;
   let implementationError: unknown = null;
@@ -1638,19 +1638,19 @@ async function runProjectionIndexer(
   const event = createProjectionIndexerEvent(definition.sourceEvent, context);
   const pendingWrites = new Set<Promise<unknown>>();
   let acceptingWrites = true;
-  const trackWrite: ProjectionWriteTracker = (run) => {
+  const trackWrite: ProjectionWriteTracker = <T>(run: () => Promise<T>) => {
     if (!acceptingWrites) {
       return Promise.reject(new Error("projection write scope is closed"));
     }
 
-    let tracked: Promise<unknown>;
+    let tracked: Promise<T>;
     const runPromise = run();
     tracked = runPromise.finally(() => {
       pendingWrites.delete(tracked);
     });
     pendingWrites.add(tracked);
 
-    return runPromise;
+    return tracked;
   };
 
   let implementationError: unknown = null;
@@ -1995,11 +1995,11 @@ function createProjectionExecutableWrite(
         return await scope.prepare(sql).run(...params);
       });
     },
-    executeExpectingOne: async () => {
-      const result = await trackWrite(async () => {
-        return await scope.prepare(sql).run(...params);
+    executeExpectingOne: () => {
+      return trackWrite(async () => {
+        const result = await scope.prepare(sql).run(...params);
+        assertProjectionWriteChangedOne(result);
       });
-      assertProjectionWriteChangedOne(result);
     },
   };
 }
@@ -2569,9 +2569,12 @@ type CompiledProjectionSql = ProjectionCompiledSql;
 
 type ProjectionUpdateAssignment = ProjectionCompilerAssignment;
 
+type ProjectionUnionLiteralKind = "boolean" | "number" | "string";
+
 type ProjectionUnionSelectionMetadata = {
   readonly alias: string;
   readonly column: ProjectionColumnMetadata | null;
+  readonly literalKind: ProjectionUnionLiteralKind | null;
   readonly nullable: boolean;
   readonly selection: ProjectionCompilerSelection;
 };
@@ -2584,6 +2587,7 @@ type ProjectionUnionArmMetadata = {
 
 type ProjectionUnionColumnMetadata = {
   readonly column: ProjectionColumnMetadata | null;
+  readonly literalKind: ProjectionUnionLiteralKind | null;
   readonly nullable: boolean;
 };
 
@@ -4186,14 +4190,17 @@ function readProjectionUnionSelections(
     const value = selection[alias];
 
     if (isProjectionUnionValue(value)) {
+      const literalKind = readProjectionUnionLiteralKind(value.value);
+
       return {
         alias,
         column: null,
+        literalKind,
         nullable: value.value === null,
         selection: {
           alias,
           kind: "value",
-          value: value.value,
+          value: serializeProjectionUnionLiteralValue(value.value),
         },
       };
     }
@@ -4214,6 +4221,7 @@ function readProjectionUnionSelections(
     return {
       alias,
       column,
+      literalKind: null,
       nullable: column.nullable,
       selection: {
         alias,
@@ -4239,6 +4247,7 @@ function readProjectionUnionShape(
   for (const alias of aliases) {
     columns[alias] = {
       column: null,
+      literalKind: null,
       nullable: false,
     };
   }
@@ -4258,6 +4267,7 @@ function readProjectionUnionShape(
         existing,
         {
           column: selection.column,
+          literalKind: selection.literalKind,
           nullable: selection.nullable,
         },
       );
@@ -4292,33 +4302,83 @@ function mergeProjectionUnionColumnMetadata(
   existing: ProjectionUnionColumnMetadata,
   next: ProjectionUnionColumnMetadata,
 ): ProjectionUnionColumnMetadata {
-  if (existing.column !== null && next.column !== null) {
-    validateProjectionUnionColumnCompatibility(
-      alias,
-      existing.column,
-      next.column,
-    );
-  }
+  validateProjectionUnionColumnCompatibility(alias, existing, next);
 
-  let column = existing.column;
+  let column: ProjectionColumnMetadata | null = existing.column;
 
   if (column === null) {
     column = next.column;
   }
 
+  let literalKind = existing.literalKind;
+
+  if (literalKind === null) {
+    literalKind = next.literalKind;
+  }
+
   return {
     column,
+    literalKind,
     nullable: existing.nullable || next.nullable,
   };
 }
 
 function validateProjectionUnionColumnCompatibility(
   alias: string,
-  left: ProjectionColumnMetadata,
-  right: ProjectionColumnMetadata,
+  left: ProjectionUnionColumnMetadata,
+  right: ProjectionUnionColumnMetadata,
 ): void {
-  if (left.kind !== right.kind || left.eventName !== right.eventName) {
+  if (left.column !== null && right.column !== null) {
+    if (
+      left.column.kind !== right.column.kind ||
+      left.column.eventName !== right.column.eventName
+    ) {
+      throw new Error(`union selection ${alias} has incompatible column types`);
+    }
+  }
+
+  if (
+    left.column !== null &&
+    right.literalKind !== null &&
+    !isProjectionUnionLiteralKindCompatibleWithColumn(
+      right.literalKind,
+      left.column,
+    )
+  ) {
     throw new Error(`union selection ${alias} has incompatible column types`);
+  }
+
+  if (
+    right.column !== null &&
+    left.literalKind !== null &&
+    !isProjectionUnionLiteralKindCompatibleWithColumn(
+      left.literalKind,
+      right.column,
+    )
+  ) {
+    throw new Error(`union selection ${alias} has incompatible column types`);
+  }
+
+  if (
+    left.literalKind !== null &&
+    right.literalKind !== null &&
+    left.literalKind !== right.literalKind
+  ) {
+    throw new Error(`union selection ${alias} has incompatible column types`);
+  }
+}
+
+function isProjectionUnionLiteralKindCompatibleWithColumn(
+  literalKind: ProjectionUnionLiteralKind,
+  column: ProjectionColumnMetadata,
+): boolean {
+  switch (literalKind) {
+    case "boolean":
+      return column.kind === "boolean";
+    case "number":
+      return column.kind === "integer";
+    case "string":
+      return column.kind === "text";
   }
 }
 
@@ -4593,6 +4653,33 @@ function validateProjectionUnionLiteralValue(
   }
 
   throw new Error("unionValue only accepts boolean, number, string, or null");
+}
+
+function readProjectionUnionLiteralKind(
+  value: ProjectionUnionLiteralValue,
+): ProjectionUnionLiteralKind | null {
+  if (value === null) {
+    return null;
+  }
+
+  switch (typeof value) {
+    case "boolean":
+      return "boolean";
+    case "number":
+      return "number";
+    case "string":
+      return "string";
+  }
+}
+
+function serializeProjectionUnionLiteralValue(
+  value: ProjectionUnionLiteralValue,
+): unknown {
+  if (typeof value === "boolean") {
+    return serializeBoolean(value, "union value");
+  }
+
+  return value;
 }
 
 function isProjectionUnionValue(
@@ -5292,19 +5379,47 @@ function decodeProjectionUnionRow(
       throw new Error(`union selection ${alias} was not declared`);
     }
 
-    if (column.column === null) {
-      decoded[alias] = row[alias];
-      continue;
-    }
-
-    decoded[alias] = decodeProjectionColumnValue(
-      column.column,
+    decoded[alias] = decodeProjectionUnionValue(
+      column,
       row[alias],
       `union.${alias}`,
     );
   }
 
   return decoded;
+}
+
+function decodeProjectionUnionValue(
+  metadata: ProjectionUnionColumnMetadata,
+  value: unknown,
+  context: string,
+): unknown {
+  if (value === null) {
+    if (!metadata.nullable) {
+      throw new Error(`${context} cannot be null`);
+    }
+
+    return null;
+  }
+
+  if (metadata.column !== null) {
+    return decodeProjectionColumnValue(metadata.column, value, context);
+  }
+
+  switch (metadata.literalKind) {
+    case "boolean":
+      return decodeBoolean(value, context);
+    case "number":
+      if (typeof value !== "number") {
+        throw new Error(`${context} must be a number`);
+      }
+
+      return value;
+    case "string":
+      return decodeString(value, context);
+    case null:
+      throw new Error(`${context} was not returned by projection query`);
+  }
 }
 
 function decodeProjectionAggregateRow(

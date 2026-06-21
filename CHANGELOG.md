@@ -30,6 +30,12 @@
   observations.
 - Create indexes declared on tables introduced by incremental materialization
   migrations so upgraded namespaces match fresh namespaces.
+- Preserve same-migration foreign keys on tables introduced by incremental
+  materialization migrations while still rejecting SQLite foreign-key additions
+  to pre-existing tables.
+- Run data migration callbacks against the replayed materialization schema
+  state for that migration step instead of exposing future tables/indexes from
+  the final schema.
 - Prune live-only signals that do not materialize durable signal work instead
   of retaining observer-only rows forever.
 - Split materialization contracts from implementations. `defineMaterializations`
@@ -91,6 +97,10 @@
 - Add typed `unionFrom(...)` / `unionValue(...)` / `unionAll(...)`
   projection reads for prioritized candidate streams without exposing raw
   `UNION` SQL.
+- Serialize boolean `unionValue(...)` literals for SQLite and decode nullable
+  union aliases using merged nullability across all arms.
+- Track `executeExpectingOne()` affected-row assertions as pending projection
+  writes so unawaited assertion failures still fail the indexer/data scope.
 - Reject non-serializable JSON projection values at the facade boundary before
   storage adapters receive bind parameters.
 - Preserve materialization definition types through ledger construction and

@@ -312,6 +312,175 @@ test("database ledger startup creates indexes for incremental create-table migra
   );
 });
 
+test("database ledger startup preserves foreign keys for incrementally created tables", async () => {
+  const shape = defineLedgerShape({
+    events: {},
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const schema = defineMaterializationSchema({
+    namespace: "sessions-with-users",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    },
+    relations: (r) => ({
+      sessionUser: r
+        .foreignKey("sessions", ["userId"])
+        .references("users", ["userId"]),
+    }),
+  });
+  const history = defineMaterializationHistory(shape, schema, (m) => [
+    m.migration(1, "create users", (s) => [
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    ]),
+    m.migration(2, "create sessions", (s) => [
+      s.createTable("sessions", (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+      ),
+      s.addForeignKey("sessionUser", (r) =>
+        r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
+      ),
+    ]),
+  ]);
+  const materializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {},
+  });
+  const model = withMaterializations(shape, materializations).register({});
+  const storage = createMaterializationHygieneStorage({
+    materializationVersions: [1, 1],
+  });
+  const ledger = createDatabaseLedger({
+    model,
+    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    storage: storage.runtime,
+    timing: {
+      clock: {
+        nowMs: () => 12_345,
+      },
+    },
+  });
+
+  await ledger.close();
+
+  const createSessions = storage.calls.find((call) => {
+    return call.sql.includes('CREATE TABLE IF NOT EXISTS "sessions"');
+  });
+
+  assert.ok(createSessions !== undefined);
+  assert.match(
+    createSessions.sql,
+    /CONSTRAINT "sessionUser" FOREIGN KEY \("userId"\) REFERENCES "users" \("userId"\) ON DELETE RESTRICT/,
+  );
+});
+
+test("database ledger startup runs data migrations against replayed schema state", async () => {
+  const shape = defineLedgerShape({
+    events: {},
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const schema = defineMaterializationSchema({
+    namespace: "replayed-data",
+    version: 2,
+    tables: {
+      users: (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      sessions: (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+    },
+  });
+  const history = defineMaterializationHistory(shape, schema, (m) => [
+    m.migration(1, "create users", (s) => [
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+      s.data("try future table", async ({ db }) => {
+        await db
+          .insertInto("sessions")
+          .values({
+            sessionId: "s_1",
+          })
+          .execute();
+      }),
+    ]),
+    m.migration(2, "create sessions", (s) => [
+      s.createTable("sessions", (t) =>
+        t
+          .columns({
+            sessionId: t.text().notNull(),
+          })
+          .primaryKey(["sessionId"]),
+      ),
+    ]),
+  ]);
+  const materializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {},
+  });
+  const model = withMaterializations(shape, materializations).register({});
+  const storage = createMaterializationHygieneStorage();
+  const ledger = createDatabaseLedger({
+    model,
+    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    storage: storage.runtime,
+    timing: {
+      clock: {
+        nowMs: () => 12_345,
+      },
+    },
+  });
+
+  await assert.rejects(
+    async () => {
+      await ledger.close();
+    },
+    (error: unknown) => {
+      return errorTreeIncludesMessage(error, "projection table sessions");
+    },
+  );
+});
+
 function createMaterializationHygieneStorage(input?: {
   readonly materializationVersions?: readonly (number | undefined)[];
 }): {
@@ -437,4 +606,18 @@ function createTableInfoRows(
   return columnNames.map((name) => {
     return { name };
   });
+}
+
+function errorTreeIncludesMessage(error: unknown, message: string): boolean {
+  if (error instanceof Error && error.message.includes(message)) {
+    return true;
+  }
+
+  if (error instanceof AggregateError) {
+    return error.errors.some((cause: unknown) => {
+      return errorTreeIncludesMessage(cause, message);
+    });
+  }
+
+  return false;
 }
