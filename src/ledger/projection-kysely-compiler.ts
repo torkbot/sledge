@@ -15,6 +15,7 @@ import type {
   ProjectionCompilerDeleteStatement,
   ProjectionCompilerEventReadStatement,
   ProjectionCompilerEventScanStatement,
+  ProjectionCompilerEventStreamKind,
   ProjectionCompilerExpression,
   ProjectionCompilerInsertStatement,
   ProjectionCompilerJoinClause,
@@ -264,7 +265,11 @@ function compileEventScanStatement(
       "=",
       valueNode(statement.eventName),
     ),
-    binaryOperationNode(referenceNode(null, "signal"), "=", valueNode(0)),
+    binaryOperationNode(
+      referenceNode(null, "signal"),
+      "=",
+      valueNode(eventStreamSignalValue(statement.streamKind)),
+    ),
   ];
 
   if (statement.afterEventId !== null) {
@@ -363,6 +368,17 @@ function eventPayloadPredicateValue(
       return value;
     case "postgres":
       return String(value);
+  }
+}
+
+function eventStreamSignalValue(
+  streamKind: ProjectionCompilerEventStreamKind,
+): 0 | 1 {
+  switch (streamKind) {
+    case "event":
+      return 0;
+    case "signal":
+      return 1;
   }
 }
 

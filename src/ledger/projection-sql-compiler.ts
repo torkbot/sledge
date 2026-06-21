@@ -153,6 +153,8 @@ export type ProjectionCompilerEventPayloadWhereClause = {
   readonly value: boolean | number | string;
 };
 
+export type ProjectionCompilerEventStreamKind = "event" | "signal";
+
 export type ProjectionCompilerInsertStatement = {
   readonly conflict:
     | null
@@ -207,6 +209,7 @@ export type ProjectionCompilerEventScanStatement = {
   readonly limit: number | null;
   readonly orderDirection: "asc" | "desc";
   readonly payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[];
+  readonly streamKind: ProjectionCompilerEventStreamKind;
 };
 
 export type ProjectionCompilerUpdateStatement = {
@@ -451,7 +454,10 @@ function compileEventReadStatement(
 function compileEventScanStatement(
   statement: ProjectionCompilerEventScanStatement,
 ): ProjectionCompiledSql {
-  const params: unknown[] = [statement.eventName, 0];
+  const params: unknown[] = [
+    statement.eventName,
+    eventStreamSignalValue(statement.streamKind),
+  ];
   let text =
     'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ?';
 
@@ -479,6 +485,17 @@ function compileEventScanStatement(
     params,
     text,
   };
+}
+
+function eventStreamSignalValue(
+  streamKind: ProjectionCompilerEventStreamKind,
+): 0 | 1 {
+  switch (streamKind) {
+    case "event":
+      return 0;
+    case "signal":
+      return 1;
+  }
 }
 
 function createProjectionEventPayloadJsonPath(fieldName: string): string {

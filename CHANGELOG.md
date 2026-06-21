@@ -49,6 +49,8 @@
   grant/use counters without raw `CASE` SQL.
 - Add typed event scan payload predicates and event-id ordering so callbacks
   can query semantic event history without reaching for `json_extract(...)`.
+- Add typed `scanSignals(...)` reads for retained signal history using the same
+  payload filtering facade and internal Kysely-backed compiler path.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

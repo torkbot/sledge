@@ -43,6 +43,12 @@ const UserCreatedSchema = Type.Object({
   email: Type.String(),
 });
 
+const RunStreamFrameSchema = Type.Object({
+  runId: Type.String(),
+  frame: Type.String(),
+  sequence: Type.Number(),
+});
+
 const shape = defineLedgerShape({
   events: {
     "user.created": UserCreatedSchema,
@@ -636,6 +642,7 @@ test("projection implementations compile through the supplied statement compiler
   };
   const generatedImplementations = createProjectionImplementations({
     events: shape.shape.events,
+    signals: shape.shape.signals,
     statementCompiler,
     projections: schema,
     indexers: {},
@@ -2975,6 +2982,94 @@ test("projection access hydrates semantic event references without exposing even
   ]);
 });
 
+test("projection access scans semantic signals without exposing events table", async () => {
+  const signalShape = defineLedgerShape({
+    events: {
+      "user.created": UserCreatedSchema,
+    },
+    queues: {},
+    signals: {
+      "run.stream.frame": RunStreamFrameSchema,
+    },
+    signalQueues: {},
+  });
+  const signalMaterializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {
+      framesByRun: {
+        params: Type.Object({
+          afterSignalEventId: Type.Number(),
+          limit: Type.Number(),
+          runId: Type.String(),
+        }),
+        result: Type.Array(RunStreamFrameSchema),
+      },
+    },
+  });
+  const signalModel = withMaterializations(
+    signalShape,
+    signalMaterializations,
+  ).register({
+    queries: {
+      framesByRun: async ({ params, db }) => {
+        const frames = await db
+          .scanSignals("run.stream.frame")
+          .wherePayload("runId", params.runId)
+          .afterEventId(params.afterSignalEventId)
+          .limit(params.limit)
+          .execute();
+
+        return frames.map((frame) => {
+          return frame.payload;
+        });
+      },
+    },
+  });
+  const framesByRun =
+    readTestLedgerImplementations(signalModel).queries?.framesByRun;
+
+  if (framesByRun === undefined) {
+    throw new Error("expected framesByRun query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        causation_event_id: null,
+        dedupe_key: null,
+        event_id: 101,
+        event_name: "run.stream.frame",
+        payload_json: JSON.stringify({
+          runId: "run_1",
+          frame: "thinking",
+          sequence: 1,
+        }),
+        ts_ms: 1_000,
+      },
+    ],
+    getRow: undefined,
+  });
+  const frames = await framesByRun(fake.scope, {
+    afterSignalEventId: 100,
+    limit: 25,
+    runId: "run_1",
+  });
+
+  assert.deepEqual(fake.calls[0], {
+    method: "all",
+    params: ["run.stream.frame", 1, "$.runId", "run_1", 100, 25],
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
+  });
+  assert.deepEqual(frames, [
+    {
+      runId: "run_1",
+      frame: "thinking",
+      sequence: 1,
+    },
+  ]);
+});
+
 test("projection facade supports TorkBot-style surface operation materialization", async () => {
   const SurfaceOperationRequestedSchema = Type.Object({
     operationKey: Type.String(),
@@ -5004,7 +5099,69 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     typeof shape.shape.events
   >;
 
+  const typedSignalShape = defineLedgerShape({
+    events: {
+      "user.created": UserCreatedSchema,
+    },
+    queues: {},
+    signals: {
+      "run.stream.frame": RunStreamFrameSchema,
+    },
+    signalQueues: {},
+  });
+  const typedSignalMaterializations = defineMaterializations({
+    history,
+    indexers: {},
+    queries: {
+      framesByRun: {
+        params: Type.Object({
+          runId: Type.String(),
+        }),
+        result: Type.Array(RunStreamFrameSchema),
+      },
+    },
+  });
+  const typedSignalImplementations = {
+    queries: {
+      framesByRun: async ({ db }) => {
+        for await (const signal of db
+          .scanSignals("run.stream.frame")
+          .wherePayload("runId", "run_1")
+          .wherePayload("sequence", 1)
+          .stream()) {
+          const runId: string = signal.payload.runId;
+          const frame: string = signal.payload.frame;
+          const sequence: number = signal.payload.sequence;
+
+          void runId;
+          void frame;
+          void sequence;
+        }
+
+        db.scanSignals("run.stream.frame")
+          // @ts-expect-error signal payload filters must reference known signal payload fields.
+          .wherePayload("missing", "value");
+
+        db.scanSignals("run.stream.frame")
+          // @ts-expect-error signal payload filters must use values compatible with the payload field type.
+          .wherePayload("sequence", "1");
+
+        // @ts-expect-error signal scans must reference known ledger signals.
+        db.scanSignals("user.created");
+
+        return [];
+      },
+    },
+  } satisfies MaterializationImplementationRegistration<
+    typeof schema,
+    typeof typedSignalMaterializations.indexers,
+    typeof typedSignalMaterializations.queries,
+    typeof typedSignalShape.shape.events,
+    typeof typedSignalShape.shape.signals
+  >;
+
   void typedImplementations;
+  void typedSignalImplementations;
 }
 
 void assertLedgerProjectionTypes;

@@ -17,6 +17,7 @@ import type {
   ProjectionCompilerAggregate,
   ProjectionCompilerAssignment,
   ProjectionCompilerColumnReference,
+  ProjectionCompilerEventStreamKind,
   ProjectionCompilerEventPayloadWhereClause,
   ProjectionCompilerExpression,
   ProjectionCompilerJoinClause,
@@ -1025,6 +1026,7 @@ export type ProjectionExecutableJoinedSelect<
 export type ProjectionReadDatabase<
   TProjectionSchema extends AnyProjectionSchema,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = {
   readEvent<const TEventName extends Extract<keyof TEvents, string>>(
     ref: EventRef<TEventName>,
@@ -1035,6 +1037,9 @@ export type ProjectionReadDatabase<
   scanEvents<const TEventName extends Extract<keyof TEvents, string>>(
     eventName: TEventName,
   ): ProjectionEventScanBuilder<TEvents, TEventName>;
+  scanSignals<const TSignalName extends Extract<keyof TSignals, string>>(
+    signalName: TSignalName,
+  ): ProjectionEventScanBuilder<TSignals, TSignalName>;
   selectFrom<
     const TTableName extends ProjectionTableName<
       ProjectionSchemaTables<TProjectionSchema>
@@ -1144,7 +1149,8 @@ export type ProjectionExecutableUnionSelect<TRow> = {
 export type ProjectionDatabase<
   TProjectionSchema extends AnyProjectionSchema,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
-> = ProjectionReadDatabase<TProjectionSchema, TEvents> &
+  TSignals extends Record<string, TSchema> = {},
+> = ProjectionReadDatabase<TProjectionSchema, TEvents, TSignals> &
   ProjectionWriteDatabase<TProjectionSchema>;
 
 export type ProjectionIndexerRunInput<
@@ -1152,10 +1158,11 @@ export type ProjectionIndexerRunInput<
   TInputSchema extends TSchema,
   TSourceEventName extends string,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = {
   readonly input: Static<TInputSchema>;
   readonly event: ProjectionIndexerEvent<TSourceEventName>;
-  readonly db: ProjectionDatabase<TProjectionSchema, TEvents>;
+  readonly db: ProjectionDatabase<TProjectionSchema, TEvents, TSignals>;
 };
 
 export type ProjectionIndexerContract<
@@ -1184,9 +1191,10 @@ export type ProjectionQueryRunInput<
   TProjectionSchema extends AnyProjectionSchema,
   TParamsSchema extends TSchema,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = {
   readonly params: Static<TParamsSchema>;
-  readonly db: ProjectionReadDatabase<TProjectionSchema, TEvents>;
+  readonly db: ProjectionReadDatabase<TProjectionSchema, TEvents, TSignals>;
 };
 
 export type ProjectionQueryContract<
@@ -1215,6 +1223,7 @@ export type ProjectionIndexerImplementations<
   TProjectionSchema extends AnyProjectionSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = {
   readonly [TName in keyof TIndexerDefinitions]: TIndexerDefinitions[TName] extends {
     readonly input: infer TInputSchema extends TSchema;
@@ -1225,7 +1234,8 @@ export type ProjectionIndexerImplementations<
           TProjectionSchema,
           TInputSchema,
           TSourceEventName,
-          TEvents
+          TEvents,
+          TSignals
         >,
       ) => void | Promise<void>
     : never;
@@ -1235,6 +1245,7 @@ export type ProjectionQueryImplementations<
   TProjectionSchema extends AnyProjectionSchema,
   TQueryDefinitions extends ProjectionQueryDefinitions,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = {
   readonly [TName in keyof TQueryDefinitions]: TQueryDefinitions[TName] extends {
     readonly params: infer TParamsSchema extends TSchema;
@@ -1244,7 +1255,8 @@ export type ProjectionQueryImplementations<
         input: ProjectionQueryRunInput<
           TProjectionSchema,
           TParamsSchema,
-          TEvents
+          TEvents,
+          TSignals
         >,
       ) => Static<TResultSchema> | Promise<Static<TResultSchema>>
     : never;
@@ -1365,6 +1377,7 @@ export type ProjectionImplementationRegistration<
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = (keyof TIndexerDefinitions extends never
   ? {
       readonly indexers?: never;
@@ -1373,7 +1386,8 @@ export type ProjectionImplementationRegistration<
       readonly indexers: ProjectionIndexerImplementations<
         TProjectionSchema,
         TIndexerDefinitions,
-        TEvents
+        TEvents,
+        TSignals
       >;
     }) &
   (keyof TQueryDefinitions extends never
@@ -1384,17 +1398,20 @@ export type ProjectionImplementationRegistration<
         readonly queries: ProjectionQueryImplementations<
           TProjectionSchema,
           TQueryDefinitions,
-          TEvents
+          TEvents,
+          TSignals
         >;
       });
 
 export function createProjectionImplementations<
   const TEvents extends Record<string, TSchema>,
+  const TSignals extends Record<string, TSchema>,
   const TProjectionSchema extends AnyProjectionSchema,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   const TQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
   readonly events: TEvents;
+  readonly signals: TSignals;
   readonly statementCompiler: ProjectionStatementCompiler;
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexerDefinitions;
@@ -1403,7 +1420,8 @@ export function createProjectionImplementations<
     TProjectionSchema,
     TIndexerDefinitions,
     TQueryDefinitions,
-    TEvents
+    TEvents,
+    TSignals
   >;
 }): unknown {
   const indexerImplementations: Record<
@@ -1441,6 +1459,7 @@ export function createProjectionImplementations<
         indexerInput,
         context,
         input.events,
+        input.signals,
         input.statementCompiler,
       );
     };
@@ -1460,6 +1479,7 @@ export function createProjectionImplementations<
           input.projections.metadata,
           scope,
           input.events,
+          input.signals,
           input.statementCompiler,
         ),
       });
@@ -1475,12 +1495,14 @@ export function createProjectionImplementations<
 export async function runProjectionDatabaseScope<
   TProjectionSchema extends AnyProjectionSchema,
   TEvents extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
   TResult,
 >(input: {
   readonly events: TEvents;
+  readonly signals: TSignals;
   readonly projections: TProjectionSchema;
   readonly run: (
-    db: ProjectionDatabase<TProjectionSchema, TEvents>,
+    db: ProjectionDatabase<TProjectionSchema, TEvents, TSignals>,
   ) => TResult | Promise<TResult>;
   readonly scope: LedgerStorageScope;
   readonly statementCompiler: ProjectionStatementCompiler;
@@ -1511,6 +1533,7 @@ export async function runProjectionDatabaseScope<
           input.projections.metadata,
           input.scope,
           input.events,
+          input.signals,
           trackWrite,
           input.statementCompiler,
         ),
@@ -1546,6 +1569,7 @@ async function runProjectionIndexer(
       AnyProjectionSchema,
       TSchema,
       string,
+      Record<string, TSchema>,
       Record<string, TSchema>
     >,
   ) => void | Promise<void>,
@@ -1553,6 +1577,7 @@ async function runProjectionIndexer(
   input: unknown,
   context: LedgerIndexerContext,
   events: Record<string, TSchema>,
+  signals: Record<string, TSchema>,
   statementCompiler: ProjectionStatementCompiler,
 ): Promise<void> {
   const event = createProjectionIndexerEvent(definition.sourceEvent, context);
@@ -1583,6 +1608,7 @@ async function runProjectionIndexer(
         projections.metadata,
         scope,
         events,
+        signals,
         trackWrite,
         statementCompiler,
       ),
@@ -1638,15 +1664,23 @@ function createProjectionIndexerEvent(
 function createProjectionDatabase<
   TProjectionSchema extends AnyProjectionSchema,
   TEvents extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   events: TEvents,
+  signals: TSignals,
   trackWrite: ProjectionWriteTracker,
   statementCompiler: ProjectionStatementCompiler,
-): ProjectionDatabase<TProjectionSchema, TEvents> {
+): ProjectionDatabase<TProjectionSchema, TEvents, TSignals> {
   return {
-    ...createProjectionReadDatabase(metadata, scope, events, statementCompiler),
+    ...createProjectionReadDatabase(
+      metadata,
+      scope,
+      events,
+      signals,
+      statementCompiler,
+    ),
     ...createProjectionWriteDatabase(
       metadata,
       scope,
@@ -2064,12 +2098,14 @@ function createProjectionDeleteBuilder<TTable>(
 function createProjectionReadDatabase<
   TProjectionSchema extends AnyProjectionSchema,
   TEvents extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
   events: TEvents,
+  signals: TSignals,
   statementCompiler: ProjectionStatementCompiler,
-): ProjectionReadDatabase<TProjectionSchema, TEvents> {
+): ProjectionReadDatabase<TProjectionSchema, TEvents, TSignals> {
   return {
     readEvent: async (ref) => {
       return await readProjectionEvent(scope, events, ref, statementCompiler);
@@ -2081,7 +2117,21 @@ function createProjectionReadDatabase<
       return createProjectionEventScanBuilder(
         scope,
         events,
+        "event",
         eventName,
+        null,
+        null,
+        "asc",
+        [],
+        statementCompiler,
+      );
+    },
+    scanSignals: (signalName) => {
+      return createProjectionEventScanBuilder(
+        scope,
+        signals,
+        "signal",
+        signalName,
         null,
         null,
         "asc",
@@ -3684,6 +3734,7 @@ function buildReadProjectionEventsSql(
 
 function buildScanProjectionEventsSql(
   statementCompiler: ProjectionStatementCompiler,
+  streamKind: ProjectionCompilerEventStreamKind,
   eventName: string,
   afterEventId: number | null,
   limit: number | null,
@@ -3696,6 +3747,7 @@ function buildScanProjectionEventsSql(
     limit,
     orderDirection,
     payloadWhere,
+    streamKind,
   });
 }
 
@@ -4525,6 +4577,7 @@ function createProjectionEventScanBuilder<
 >(
   scope: LedgerStorageScope,
   events: TEvents,
+  streamKind: ProjectionCompilerEventStreamKind,
   eventName: TEventName,
   afterEventId: number | null,
   limit: number | null,
@@ -4532,7 +4585,11 @@ function createProjectionEventScanBuilder<
   payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
   statementCompiler: ProjectionStatementCompiler,
 ): ProjectionEventScanBuilder<TEvents, TEventName> {
-  const eventSchema = validateProjectionEventName(events, eventName);
+  const eventSchema = validateProjectionEventStreamName(
+    events,
+    streamKind,
+    eventName,
+  );
 
   return {
     afterEventId: (eventId) => {
@@ -4541,6 +4598,7 @@ function createProjectionEventScanBuilder<
       return createProjectionEventScanBuilder(
         scope,
         events,
+        streamKind,
         eventName,
         eventId,
         limit,
@@ -4553,6 +4611,7 @@ function createProjectionEventScanBuilder<
       return await scanProjectionEvents(
         scope,
         events,
+        streamKind,
         eventName,
         afterEventId,
         limit,
@@ -4567,6 +4626,7 @@ function createProjectionEventScanBuilder<
       return createProjectionEventScanBuilder(
         scope,
         events,
+        streamKind,
         eventName,
         afterEventId,
         nextLimit,
@@ -4581,6 +4641,7 @@ function createProjectionEventScanBuilder<
       return createProjectionEventScanBuilder(
         scope,
         events,
+        streamKind,
         eventName,
         afterEventId,
         limit,
@@ -4593,6 +4654,7 @@ function createProjectionEventScanBuilder<
       const scannedEvents = await scanProjectionEvents(
         scope,
         events,
+        streamKind,
         eventName,
         afterEventId,
         limit,
@@ -4616,6 +4678,7 @@ function createProjectionEventScanBuilder<
       return createProjectionEventScanBuilder(
         scope,
         events,
+        streamKind,
         eventName,
         afterEventId,
         limit,
@@ -4709,6 +4772,7 @@ async function readProjectionEvents<
       for (const row of rows) {
         const event = decodeProjectionEventRow(
           eventSchema,
+          "event",
           group.eventName,
           row,
         ) as AnyProjectionEventEnvelope<TEvents>;
@@ -4735,6 +4799,7 @@ async function scanProjectionEvents<
 >(
   scope: LedgerStorageScope,
   events: TEvents,
+  streamKind: ProjectionCompilerEventStreamKind,
   eventName: TEventName,
   afterEventId: number | null,
   limit: number | null,
@@ -4742,9 +4807,14 @@ async function scanProjectionEvents<
   payloadWhere: readonly ProjectionCompilerEventPayloadWhereClause[],
   statementCompiler: ProjectionStatementCompiler,
 ): Promise<readonly EventEnvelope<TEvents, TEventName>[]> {
-  const eventSchema = validateProjectionEventName(events, eventName);
+  const eventSchema = validateProjectionEventStreamName(
+    events,
+    streamKind,
+    eventName,
+  );
   const sql = buildScanProjectionEventsSql(
     statementCompiler,
+    streamKind,
     eventName,
     afterEventId,
     limit,
@@ -4754,19 +4824,23 @@ async function scanProjectionEvents<
   const rows = await scope.prepare(sql.text).all(...sql.params);
 
   return rows.map((row) => {
-    return decodeProjectionEventRow(eventSchema, eventName, row);
+    return decodeProjectionEventRow(eventSchema, streamKind, eventName, row);
   });
 }
 
-function validateProjectionEventName<
+function validateProjectionEventStreamName<
   TEvents extends Record<string, TSchema>,
   TEventName extends Extract<keyof TEvents, string>,
->(events: TEvents, eventName: TEventName): TEvents[TEventName] {
+>(
+  events: TEvents,
+  streamKind: ProjectionCompilerEventStreamKind,
+  eventName: TEventName,
+): TEvents[TEventName] {
   const eventSchema = events[eventName];
 
   if (eventSchema === undefined) {
     throw new Error(
-      `projection event scan references unknown event ${eventName}`,
+      `projection ${streamKind} scan references unknown ${streamKind} ${eventName}`,
     );
   }
 
@@ -4845,6 +4919,7 @@ function decodeProjectionEventRow<
   TEventSchema extends TSchema,
 >(
   eventSchema: TEventSchema,
+  streamKind: ProjectionCompilerEventStreamKind,
   eventName: TEventName,
   row: LedgerStorageRow,
 ): EventEnvelope<Record<TEventName, TEventSchema>, TEventName> {
@@ -4852,7 +4927,7 @@ function decodeProjectionEventRow<
 
   if (decodedRow.event_name !== eventName) {
     throw new Error(
-      `projection event ref expected ${eventName} but storage returned ${decodedRow.event_name}`,
+      `projection ${streamKind} expected ${eventName} but storage returned ${decodedRow.event_name}`,
     );
   }
 

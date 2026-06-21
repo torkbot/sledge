@@ -610,7 +610,8 @@ export type RegisteredLedgerModel<
       TProjectionSchema,
       TIndexerDefinitions,
       TQueryDefinitions,
-      TEvents
+      TEvents,
+      TSignals
     >;
 };
 
@@ -1039,11 +1040,13 @@ export type MaterializationImplementationRegistration<
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
 > = ProjectionImplementationRegistration<
   TMaterializationSchema,
   TIndexerDefinitions,
   TQueryDefinitions,
-  TEvents
+  TEvents,
+  TSignals
 >;
 
 export function defineMaterializationSchema<
@@ -1211,7 +1214,8 @@ export type DefinedLedgerModel<
         TProjectionSchema,
         TIndexerDefinitions,
         TQueryDefinitions,
-        TEvents
+        TEvents,
+        TSignals
       >,
   ): RegisteredLedgerModel<
     TEvents,
@@ -2429,6 +2433,7 @@ function createDefinedLedgerModel<
       return attachLedgerImplementationFactory(registeredModel, (factory) => {
         return createProjectionImplementations({
           events: input.shape.events,
+          signals: input.shape.signals,
           statementCompiler: factory.statementCompiler,
           projections: input.access.projections,
           indexers: input.access.indexerDefinitions,

@@ -273,6 +273,7 @@ test("kysely projection compiler lowers semantic event scans", () => {
       limit: 25,
       orderDirection: "asc",
       payloadWhere: [],
+      streamKind: "event",
     }),
     {
       params: ["user.created", 0, 42, 25],
@@ -331,6 +332,7 @@ test("kysely projection compiler lowers event payload predicates", () => {
           value: "u_123",
         },
       ],
+      streamKind: "event",
     }),
     {
       params: ["user.created", 0, "$.userId", "u_123", 1],
@@ -376,6 +378,53 @@ test("kysely projection compiler lowers event payload predicates", () => {
   assert.equal(payloadField["func"], "json_extract");
   assert.equal(payloadPath["value"], "$.userId");
   assert.equal(payloadValue["value"], "u_123");
+});
+
+test("kysely projection compiler lowers semantic signal scans", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: ["run.stream.frame", 1],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileEventScan({
+      afterEventId: null,
+      eventName: "run.stream.frame",
+      limit: null,
+      orderDirection: "asc",
+      payloadWhere: [],
+      streamKind: "signal",
+    }),
+    {
+      params: ["run.stream.frame", 1],
+      text: "compiled:SelectQueryNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  const query = readRecord(calls[0], "compiled query");
+  const where = readRecord(query["where"], "where");
+  const whereExpression = readRecord(where["where"], "where expression");
+  const signalPredicate = readRecord(
+    whereExpression["right"],
+    "signal predicate",
+  );
+  const signalValue = readRecord(
+    signalPredicate["rightOperand"],
+    "signal value",
+  );
+
+  assert.equal(signalValue["value"], 1);
 });
 
 test("kysely projection compiler strips externally-bound insert value params", () => {

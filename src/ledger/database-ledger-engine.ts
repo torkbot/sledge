@@ -990,6 +990,7 @@ function openDatabaseLedgerEngine<
       case "data":
         await runProjectionDatabaseScope({
           events: model.events,
+          signals: model.signals,
           projections: history.current,
           scope: database,
           statementCompiler: input.projectionCompiler,
