@@ -14,6 +14,7 @@ const reservedProjectionTableNames = new Set([
   "events",
   "idx_work_due",
   "idx_work_ref",
+  "sledge_materialization_versions",
   "work",
 ]);
 const reservedProjectionIndexNames = new Set(["idx_work_due", "idx_work_ref"]);

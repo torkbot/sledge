@@ -124,6 +124,7 @@ function defineEngineFixtureModel<
       // Engine tests exercise custom storage hooks that the public v2
       // construction path deliberately no longer exposes.
       const registeredModel = {
+        materializationHistory: null,
         model,
         projections,
         register: input.register,

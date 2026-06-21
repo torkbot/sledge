@@ -1429,6 +1429,72 @@ export function createProjectionImplementations<
   };
 }
 
+export async function runProjectionDatabaseScope<
+  TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema>,
+  TResult,
+>(input: {
+  readonly events: TEvents;
+  readonly projections: TProjectionSchema;
+  readonly run: (
+    db: ProjectionDatabase<TProjectionSchema, TEvents>,
+  ) => TResult | Promise<TResult>;
+  readonly scope: LedgerStorageScope;
+  readonly statementCompiler: ProjectionStatementCompiler;
+}): Promise<TResult> {
+  const pendingWrites = new Set<Promise<unknown>>();
+  let acceptingWrites = true;
+  const trackWrite: ProjectionWriteTracker = (run) => {
+    if (!acceptingWrites) {
+      return Promise.reject(new Error("projection write scope is closed"));
+    }
+
+    let tracked: Promise<unknown>;
+    const runPromise = run();
+    tracked = runPromise.finally(() => {
+      pendingWrites.delete(tracked);
+    });
+    pendingWrites.add(tracked);
+
+    return runPromise;
+  };
+  let result: { readonly value: TResult } | null = null;
+  let implementationError: unknown = null;
+
+  try {
+    result = {
+      value: await input.run(
+        createProjectionDatabase(
+          input.projections.metadata,
+          input.scope,
+          input.events,
+          trackWrite,
+          input.statementCompiler,
+        ),
+      ),
+    };
+  } catch (error: unknown) {
+    implementationError = error;
+  }
+
+  acceptingWrites = false;
+  const writeError = await settleProjectionWrites(pendingWrites);
+
+  if (implementationError !== null) {
+    throw implementationError;
+  }
+
+  if (writeError !== null) {
+    throw writeError;
+  }
+
+  if (result === null) {
+    throw new Error("projection database scope failed without an error");
+  }
+
+  return result.value;
+}
+
 async function runProjectionIndexer(
   projections: AnyProjectionSchema,
   definition: ProjectionIndexerContractLike,
@@ -1528,13 +1594,14 @@ function createProjectionIndexerEvent(
 
 function createProjectionDatabase<
   TProjectionSchema extends AnyProjectionSchema,
+  TEvents extends Record<string, TSchema>,
 >(
   metadata: ProjectionSchemaMetadata,
   scope: LedgerStorageScope,
-  events: Record<string, TSchema>,
+  events: TEvents,
   trackWrite: ProjectionWriteTracker,
   statementCompiler: ProjectionStatementCompiler,
-): ProjectionDatabase<TProjectionSchema, Record<string, TSchema>> {
+): ProjectionDatabase<TProjectionSchema, TEvents> {
   return {
     ...createProjectionReadDatabase(metadata, scope, events, statementCompiler),
     ...createProjectionWriteDatabase(

@@ -21,6 +21,10 @@
   callbacks can use typed semantic `readEvent(...)`, `readEvents(...)`, and
   `scanEvents(...)` handles during backfills without seeing the internal
   `events` table.
+- Run materialization history hygiene during ledger startup: track applied
+  namespace versions, create fresh namespaces from the current schema, replay
+  data migration steps, and apply supported incremental DDL without exposing raw
+  SQL.
 - Split materialization contracts from implementations. `defineMaterializations`
   declares plain-object indexer/query contracts, while `.register(...)` supplies
   typed indexer/query implementations.

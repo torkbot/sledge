@@ -407,8 +407,13 @@ separate bind step.
 
 Opening a ledger creates Sledge's internal tables and ensures the declared
 materialization tables and indexes exist from the typed materialization schema.
-This v2 slice records typed migration operation metadata, but does not yet run
-versioned materialization migrations or data migration steps.
+When a materialization history is attached, startup records applied namespace
+versions and runs pending migration steps through Sledge-owned typed facades. A
+fresh namespace creates the current schema in one pass, then replays data
+migration steps. Existing namespaces apply supported incremental DDL and data
+steps. SQLite cannot add foreign-key constraints incrementally, so
+`addForeignKey(...)` migrations are rejected after a namespace has already been
+created.
 
 ### 7. Open a Runtime
 

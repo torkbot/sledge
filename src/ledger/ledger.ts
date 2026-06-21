@@ -18,6 +18,7 @@ import {
   type ProjectionQueryDefinitions,
   type ProjectionQuerySchemas,
   type ProjectionUpdateRow,
+  type ProjectionWriteResult,
 } from "./projection-access.ts";
 import {
   defineProjectionSchemaForEvents,
@@ -582,6 +583,8 @@ export type RegisteredLedgerModel<
   TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
   TQueryDefinitions extends ProjectionQueryDefinitions = {},
+  TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null =
+    AnyMaterializationHistory<TEvents> | null,
 > = {
   readonly [registeredLedgerModelBrand]: true;
   readonly model: LedgerModel<
@@ -592,6 +595,7 @@ export type RegisteredLedgerModel<
     TSignals,
     TSignalQueues
   >;
+  readonly materializationHistory: TMaterializationHistory;
   readonly projections: TProjectionSchema;
   readonly register: RegisterFunction<
     TEvents,
@@ -767,7 +771,7 @@ export type MaterializationMigrationUpdateBuilder<TTable> = {
 };
 
 export type MaterializationMigrationUpdateWhereBuilder<TTable> = {
-  execute(): Promise<void>;
+  execute(): Promise<ProjectionWriteResult>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     operator: "=",
@@ -776,7 +780,7 @@ export type MaterializationMigrationUpdateWhereBuilder<TTable> = {
 };
 
 export type MaterializationMigrationDeleteBuilder<TTable> = {
-  execute(): Promise<void>;
+  execute(): Promise<ProjectionWriteResult>;
   where<const TColumnName extends ProjectionTableColumnName<TTable>>(
     columnName: TColumnName,
     operator: "=",
@@ -1012,9 +1016,12 @@ export type MaterializationHistory<
   readonly namespace: TCurrentSchema["namespace"];
 };
 
-export type AnyMaterializationHistory = MaterializationHistory<
-  AnyMaterializationSchema,
-  MaterializationMigrationList
+export type AnyMaterializationHistory<
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TCurrentSchema extends AnyMaterializationSchema = AnyMaterializationSchema,
+> = MaterializationHistory<
+  TCurrentSchema,
+  MaterializationMigrationList<TCurrentSchema, TEvents>
 >;
 
 export type Materializations<
@@ -1160,7 +1167,10 @@ export type DefinedLedgerShape<
     {},
     TSignals,
     TSignalQueues,
-    ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>
+    ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>,
+    {},
+    {},
+    null
   >;
 };
 
@@ -1174,7 +1184,10 @@ export type DefinedLedgerModel<
   TSignalQueues extends Record<string, TSchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
   TQueryDefinitions extends ProjectionQueryDefinitions = {},
+  TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null =
+    AnyMaterializationHistory<TEvents> | null,
 > = {
+  readonly materializationHistory: TMaterializationHistory;
   readonly model: LedgerModel<
     TEvents,
     TQueues,
@@ -1209,7 +1222,8 @@ export type DefinedLedgerModel<
     TSignalQueues,
     TProjectionSchema,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TMaterializationHistory
   >;
 };
 
@@ -1237,6 +1251,7 @@ export function defineLedgerShape<
       return createDefinedLedgerModel({
         shape,
         access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
+        materializationHistory: null,
       }).register(register);
     },
   };
@@ -1247,7 +1262,7 @@ export function withMaterializations<
   const TQueues extends Record<string, TSchema>,
   const TSignals extends Record<string, TSchema>,
   const TSignalQueues extends Record<string, TSchema>,
-  const THistory extends AnyMaterializationHistory,
+  const THistory extends AnyMaterializationHistory<TEvents>,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<
     Extract<keyof TEvents, string>
   >,
@@ -1274,7 +1289,8 @@ export function withMaterializations<
   TSignals,
   TSignalQueues,
   TIndexerDefinitions,
-  TQueryDefinitions
+  TQueryDefinitions,
+  THistory
 > {
   validateMaterializationEvents(shape.shape, materializations);
   const access = createProjectionAccess({
@@ -1286,6 +1302,7 @@ export function withMaterializations<
   return createDefinedLedgerModel({
     shape: shape.shape,
     access,
+    materializationHistory: materializations.history,
   });
 }
 
@@ -2230,7 +2247,7 @@ function validateMaterializationEvents<
   TQueues extends Record<string, TSchema>,
   TSignals extends Record<string, TSchema>,
   TSignalQueues extends Record<string, TSchema>,
-  THistory extends AnyMaterializationHistory,
+  THistory extends AnyMaterializationHistory<TEvents>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
 >(
@@ -2346,8 +2363,10 @@ function createDefinedLedgerModel<
   TSignalQueues extends Record<string, TSchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null,
 >(input: {
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
+  readonly materializationHistory: TMaterializationHistory;
   readonly access: ProjectionAccess<
     TProjectionSchema,
     TIndexers,
@@ -2364,7 +2383,8 @@ function createDefinedLedgerModel<
   TSignals,
   TSignalQueues,
   TIndexerDefinitions,
-  TQueryDefinitions
+  TQueryDefinitions,
+  TMaterializationHistory
 > {
   const model: LedgerModel<
     TEvents,
@@ -2383,6 +2403,7 @@ function createDefinedLedgerModel<
   };
 
   return {
+    materializationHistory: input.materializationHistory,
     model,
     projections: input.access.projections,
     register: (register) => {
@@ -2395,9 +2416,11 @@ function createDefinedLedgerModel<
         TSignalQueues,
         TProjectionSchema,
         TIndexerDefinitions,
-        TQueryDefinitions
+        TQueryDefinitions,
+        TMaterializationHistory
       > = {
         [registeredLedgerModelBrand]: true,
+        materializationHistory: input.materializationHistory,
         model,
         projections: input.access.projections,
         register,

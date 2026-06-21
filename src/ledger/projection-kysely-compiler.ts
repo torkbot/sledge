@@ -5,6 +5,7 @@ import type {
 } from "./projections.ts";
 import type {
   ProjectionCompiledSql,
+  ProjectionCompilerAddColumnStatement,
   ProjectionCompilerAggregate,
   ProjectionCompilerAggregateStatement,
   ProjectionCompilerAssignment,
@@ -73,6 +74,8 @@ export function createKyselyProjectionStatementCompiler(
   input: KyselyProjectionStatementCompilerInput,
 ): ProjectionStatementCompiler {
   return {
+    compileAddColumn: (statement) =>
+      compileAddColumnStatement(input, statement),
     compileAggregate: (statement) =>
       compileAggregateStatement(input, statement),
     compileCreateIndex: (statement) =>
@@ -98,6 +101,22 @@ export function createKyselySqliteProjectionStatementCompiler(
   return createKyselyProjectionStatementCompiler({
     dialect: "sqlite",
     queryCompiler: new input.SqliteQueryCompiler(),
+  });
+}
+
+function compileAddColumnStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerAddColumnStatement,
+): ProjectionCompiledSql {
+  return compileQuery(input.queryCompiler, {
+    columnAlterations: [
+      {
+        column: columnDefinitionNode(statement.columnName, statement.column),
+        kind: "AddColumnNode",
+      },
+    ],
+    kind: "AlterTableNode",
+    table: tableNode(statement.tableName),
   });
 }
 

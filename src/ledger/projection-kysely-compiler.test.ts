@@ -124,6 +124,73 @@ test("kysely projection compiler lowers Sledge select IR to operation nodes", ()
   assert.equal(whereValue["value"], "a@example.com");
 });
 
+test("kysely projection compiler lowers add-column DDL", () => {
+  const calls: KyselyProjectionOperationNode[] = [];
+  const queryCompiler: KyselyProjectionQueryCompiler = {
+    compileQuery: (node) => {
+      calls.push(node);
+
+      return {
+        parameters: [],
+        sql: `compiled:${node.kind}`,
+      };
+    },
+  };
+  const compiler = createKyselyProjectionStatementCompiler({
+    dialect: "sqlite",
+    queryCompiler,
+  });
+
+  assert.deepEqual(
+    compiler.compileAddColumn({
+      column: {
+        eventName: null,
+        kind: "text",
+        nullable: true,
+      },
+      columnName: "email",
+      tableName: "users",
+    }),
+    {
+      params: [],
+      text: "compiled:AlterTableNode",
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {
+    columnAlterations: [
+      {
+        column: {
+          column: {
+            column: {
+              kind: "IdentifierNode",
+              name: "email",
+            },
+            kind: "ColumnNode",
+          },
+          dataType: {
+            dataType: "text",
+            kind: "DataTypeNode",
+          },
+          kind: "ColumnDefinitionNode",
+        },
+        kind: "AddColumnNode",
+      },
+    ],
+    kind: "AlterTableNode",
+    table: {
+      kind: "TableNode",
+      table: {
+        kind: "SchemableIdentifierNode",
+        identifier: {
+          kind: "IdentifierNode",
+          name: "users",
+        },
+      },
+    },
+  });
+});
+
 test("kysely projection compiler lowers left joins", () => {
   const calls: KyselyProjectionOperationNode[] = [];
   const queryCompiler: KyselyProjectionQueryCompiler = {

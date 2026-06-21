@@ -3352,6 +3352,8 @@ test("ledger projection construction feeds generated contracts and implementatio
     typeof readTestLedgerImplementations(registeredModel).indexers?.upsertUser,
     "function",
   );
+  assert.equal(definedModel.materializationHistory, history);
+  assert.equal(registeredModel.materializationHistory, history);
   assert.equal(registeredModel.projections, definedModel.projections);
 });
 
@@ -3367,6 +3369,7 @@ test("ledger shape can register without projections", () => {
   assert.equal(registeredModel.model.events["user.created"], UserCreatedSchema);
   assert.deepEqual(registeredModel.model.indexers, {});
   assert.deepEqual(registeredModel.model.queries, {});
+  assert.equal(registeredModel.materializationHistory, null);
   assert.deepEqual(registeredModel.projections.metadata, {
     tables: {},
     relations: {},
@@ -3511,6 +3514,21 @@ test("sqlite projection compiler compiles materialization schema DDL", () => {
     {
       params: [],
       text: 'CREATE INDEX IF NOT EXISTS "sessionsByUser" ON "sessions" ("userId")',
+    },
+  );
+  assert.deepEqual(
+    compiler.compileAddColumn({
+      column: {
+        eventName: null,
+        kind: "text",
+        nullable: true,
+      },
+      columnName: "email",
+      tableName: "users",
+    }),
+    {
+      params: [],
+      text: 'ALTER TABLE "users" ADD COLUMN "email" TEXT',
     },
   );
 });

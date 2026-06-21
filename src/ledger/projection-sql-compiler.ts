@@ -214,12 +214,21 @@ export type ProjectionCompilerCreateTableStatement = {
   readonly table: ProjectionTableMetadata;
 };
 
+export type ProjectionCompilerAddColumnStatement = {
+  readonly column: ProjectionColumnMetadata;
+  readonly columnName: string;
+  readonly tableName: string;
+};
+
 export type ProjectionCompilerCreateIndexStatement = {
   readonly index: ProjectionIndexMetadata;
   readonly tableName: string;
 };
 
 export type ProjectionStatementCompiler = {
+  compileAddColumn(
+    statement: ProjectionCompilerAddColumnStatement,
+  ): ProjectionCompiledSql;
   compileAggregate(
     statement: ProjectionCompilerAggregateStatement,
   ): ProjectionCompiledSql;
@@ -254,6 +263,7 @@ export type ProjectionStatementCompiler = {
 
 export function createSqliteProjectionStatementCompiler(): ProjectionStatementCompiler {
   return {
+    compileAddColumn: compileAddColumnStatement,
     compileAggregate: compileAggregateStatement,
     compileCreateIndex: compileCreateIndexStatement,
     compileCreateTable: compileCreateTableStatement,
@@ -264,6 +274,21 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileSelect: compileSelectStatement,
     compileUnionSelect: compileUnionSelectStatement,
     compileUpdate: compileUpdateStatement,
+  };
+}
+
+function compileAddColumnStatement(
+  statement: ProjectionCompilerAddColumnStatement,
+): ProjectionCompiledSql {
+  return {
+    params: [],
+    text: `ALTER TABLE ${quoteIdentifier(
+      statement.tableName,
+    )} ADD COLUMN ${quoteIdentifier(
+      statement.columnName,
+    )} ${projectionColumnSqlType(statement.column)}${
+      statement.column.nullable ? "" : " NOT NULL"
+    }`,
   };
 }
 

@@ -14,6 +14,7 @@ import {
 } from "./internal-storage.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
+  AnyMaterializationHistory,
   RegisteredLedgerModel,
   EventEnvelope,
   Ledger,
@@ -38,13 +39,15 @@ import type {
   WorkRef,
   WorkSnapshot,
   WorkState,
+  MaterializationMigrationOperation,
 } from "./ledger.ts";
-import type { ProjectionSchemaMetadata } from "./projections.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
   ProjectionQueryDefinitions,
 } from "./projection-access.ts";
+import { runProjectionDatabaseScope } from "./projection-access.ts";
+import type { ProjectionSchemaMetadata } from "./projections.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -80,6 +83,11 @@ type AppendSignalInput = {
 
 type StorageRow = LedgerStorageRow;
 
+const materializationVersionTableName = "sledge_materialization_versions";
+const MaterializationVersionRowSchema = Type.Object({
+  version: Type.Number(),
+});
+
 export type StorageStatement = LedgerStorageStatement;
 
 export type StorageDatabase = LedgerStorageScope;
@@ -102,6 +110,7 @@ type OpenDatabaseLedgerEngineInput<
   TProjectionSchema extends AnyProjectionSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null,
 > = {
   readonly model: RegisteredLedgerModel<
     TEvents,
@@ -112,7 +121,8 @@ type OpenDatabaseLedgerEngineInput<
     TSignalQueues,
     TProjectionSchema,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TMaterializationHistory
   >;
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
@@ -129,6 +139,8 @@ export type CreateDatabaseLedgerInput<
   TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
   TQueryDefinitions extends ProjectionQueryDefinitions = {},
+  TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null =
+    AnyMaterializationHistory<TEvents> | null,
 > = {
   readonly storage: StorageRuntime;
   readonly model: RegisteredLedgerModel<
@@ -140,7 +152,8 @@ export type CreateDatabaseLedgerInput<
     TSignalQueues,
     TProjectionSchema,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TMaterializationHistory
   >;
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
@@ -156,6 +169,9 @@ export function createDatabaseLedger<
   const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
   const TQueryDefinitions extends ProjectionQueryDefinitions = {},
+  const TMaterializationHistory extends
+    AnyMaterializationHistory<TEvents> | null =
+    AnyMaterializationHistory<TEvents> | null,
 >(
   input: CreateDatabaseLedgerInput<
     TEvents,
@@ -166,7 +182,8 @@ export function createDatabaseLedger<
     TSignalQueues,
     TProjectionSchema,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TMaterializationHistory
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
@@ -387,6 +404,8 @@ function openDatabaseLedgerEngine<
   const TProjectionSchema extends AnyProjectionSchema,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   const TQueryDefinitions extends ProjectionQueryDefinitions,
+  const TMaterializationHistory extends
+    AnyMaterializationHistory<TEvents> | null,
 >(
   input: OpenDatabaseLedgerEngineInput<
     TEvents,
@@ -397,7 +416,8 @@ function openDatabaseLedgerEngine<
     TQueries,
     TProjectionSchema,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TMaterializationHistory
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
@@ -575,7 +595,10 @@ function openDatabaseLedgerEngine<
       `);
     });
     await storage.write(async (database) => {
-      await createProjectionSchema(database, input.model.projections.metadata);
+      await ensureMaterializationHygiene(
+        database,
+        input.model.materializationHistory,
+      );
     });
     committedEventId = await storage.read(async (database) => {
       return await readStoredLatestEventId(database);
@@ -798,6 +821,244 @@ function openDatabaseLedgerEngine<
         });
         await database.exec(sql.text);
       }
+    }
+  }
+
+  async function ensureMaterializationHygiene<
+    const THistory extends AnyMaterializationHistory<TEvents> | null,
+  >(database: StorageDatabase, history: THistory): Promise<void> {
+    if (history === null) {
+      await createProjectionSchema(database, input.model.projections.metadata);
+      return;
+    }
+
+    await database.exec(`
+      CREATE TABLE IF NOT EXISTS ${materializationVersionTableName} (
+        namespace TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      )
+    `);
+
+    const currentVersion = await readMaterializationVersion(
+      database,
+      history.namespace,
+    );
+
+    if (currentVersion > history.currentVersion) {
+      throw new Error(
+        `materialization ${history.namespace} is at version ${currentVersion}, newer than model version ${history.currentVersion}`,
+      );
+    }
+
+    if (currentVersion === history.currentVersion) {
+      return;
+    }
+
+    await database.exec("BEGIN IMMEDIATE");
+
+    try {
+      if (currentVersion === 0) {
+        await createProjectionSchema(database, history.current.metadata);
+      }
+
+      for (const migration of history.migrations) {
+        if (migration.version <= currentVersion) {
+          continue;
+        }
+
+        await applyMaterializationMigration(
+          database,
+          history,
+          migration,
+          currentVersion === 0,
+        );
+        await recordMaterializationVersion(
+          database,
+          history.namespace,
+          migration.version,
+        );
+      }
+
+      await database.exec("COMMIT");
+    } catch (error: unknown) {
+      await database.exec("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async function readMaterializationVersion(
+    database: StorageDatabase,
+    namespace: string,
+  ): Promise<number> {
+    const row = await database
+      .prepare(
+        `SELECT version FROM ${materializationVersionTableName} WHERE namespace = ?`,
+      )
+      .get(namespace);
+
+    if (row === undefined) {
+      return 0;
+    }
+
+    const decoded = Value.Decode(MaterializationVersionRowSchema, row);
+
+    if (!Number.isSafeInteger(decoded.version) || decoded.version < 0) {
+      throw new Error(
+        `materialization ${namespace} stored invalid version ${decoded.version}`,
+      );
+    }
+
+    return decoded.version;
+  }
+
+  async function recordMaterializationVersion(
+    database: StorageDatabase,
+    namespace: string,
+    version: number,
+  ): Promise<void> {
+    await database
+      .prepare(
+        `INSERT INTO ${materializationVersionTableName} (
+          namespace,
+          version,
+          updated_at_ms
+        ) VALUES (?, ?, ?)
+        ON CONFLICT(namespace) DO UPDATE SET
+          version = excluded.version,
+          updated_at_ms = excluded.updated_at_ms`,
+      )
+      .run(namespace, version, clock.nowMs());
+  }
+
+  async function applyMaterializationMigration<
+    const THistory extends AnyMaterializationHistory<TEvents>,
+  >(
+    database: StorageDatabase,
+    history: THistory,
+    migration: THistory["migrations"][number],
+    freshNamespace: boolean,
+  ): Promise<void> {
+    for (const operation of migration.operations) {
+      await applyMaterializationMigrationOperation(
+        database,
+        history,
+        operation,
+        freshNamespace,
+      );
+    }
+  }
+
+  async function applyMaterializationMigrationOperation<
+    const THistory extends AnyMaterializationHistory<TEvents>,
+  >(
+    database: StorageDatabase,
+    history: THistory,
+    operation: THistory["migrations"][number]["operations"][number],
+    freshNamespace: boolean,
+  ): Promise<void> {
+    switch (operation.kind) {
+      case "create_table":
+        if (freshNamespace) {
+          return;
+        }
+
+        await createMaterializationTable(database, operation);
+        return;
+      case "create_index":
+        if (freshNamespace) {
+          return;
+        }
+
+        await createMaterializationIndex(database, operation);
+        return;
+      case "add_column":
+        if (freshNamespace) {
+          return;
+        }
+
+        await addMaterializationColumn(database, operation);
+        return;
+      case "add_foreign_key":
+        if (freshNamespace) {
+          return;
+        }
+
+        throw new Error(
+          `materialization ${history.namespace} migration cannot add foreign key ${operation.name} incrementally on SQLite`,
+        );
+      case "data":
+        await runProjectionDatabaseScope({
+          events: model.events,
+          projections: history.current,
+          scope: database,
+          statementCompiler: input.projectionCompiler,
+          run: async (db) => {
+            await operation.run({
+              db,
+            });
+          },
+        });
+        return;
+    }
+  }
+
+  async function createMaterializationTable(
+    database: StorageDatabase,
+    operation: Extract<
+      MaterializationMigrationOperation,
+      { kind: "create_table" }
+    >,
+  ): Promise<void> {
+    const sql = input.projectionCompiler.compileCreateTable({
+      metadata: {
+        relations: {},
+        tables: {
+          [operation.tableName]: operation.table,
+        },
+      },
+      table: operation.table,
+    });
+
+    await database.exec(sql.text);
+  }
+
+  async function createMaterializationIndex(
+    database: StorageDatabase,
+    operation: Extract<
+      MaterializationMigrationOperation,
+      { kind: "create_index" }
+    >,
+  ): Promise<void> {
+    const sql = input.projectionCompiler.compileCreateIndex({
+      index: operation.index,
+      tableName: operation.tableName,
+    });
+
+    await database.exec(sql.text);
+  }
+
+  async function addMaterializationColumn(
+    database: StorageDatabase,
+    operation: Extract<
+      MaterializationMigrationOperation,
+      { kind: "add_column" }
+    >,
+  ): Promise<void> {
+    const sql = input.projectionCompiler.compileAddColumn({
+      column: operation.column,
+      columnName: operation.columnName,
+      tableName: operation.tableName,
+    });
+
+    try {
+      await database.exec(sql.text);
+    } catch (error: unknown) {
+      if (isDuplicateColumnError(error)) {
+        return;
+      }
+
+      throw error;
     }
   }
 
