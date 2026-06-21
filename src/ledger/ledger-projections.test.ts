@@ -213,6 +213,69 @@ function createFakeScope(input: {
   };
 }
 
+function createQueuedFakeScope(input: {
+  readonly allRows: readonly (readonly LedgerStorageRow[])[];
+  readonly getRows: readonly (LedgerStorageRow | undefined)[];
+}): {
+  readonly calls: readonly FakeStatementCall[];
+  readonly scope: LedgerStorageScope;
+} {
+  const calls: FakeStatementCall[] = [];
+  let allIndex = 0;
+  let getIndex = 0;
+
+  return {
+    calls,
+    scope: {
+      exec: async (sql) => {
+        calls.push({
+          method: "exec",
+          params: [],
+          sql,
+        });
+      },
+      prepare: (sql) => {
+        return {
+          all: async (...params) => {
+            const rows = input.allRows[allIndex];
+            allIndex += 1;
+            calls.push({
+              method: "all",
+              params,
+              sql,
+            });
+
+            return rows ?? [];
+          },
+          get: async (...params) => {
+            const row = input.getRows[getIndex];
+            getIndex += 1;
+            calls.push({
+              method: "get",
+              params,
+              sql,
+            });
+
+            return row;
+          },
+          run: async (...params) => {
+            calls.push({
+              method: "run",
+              params,
+              sql,
+            });
+
+            return {
+              changes: 1,
+              lastInsertRowid: 0,
+            };
+          },
+        };
+      },
+    },
+  };
+}
+
 function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
   readonly "user.created": typeof UserCreatedSchema;
 }> {
@@ -2761,6 +2824,493 @@ test("projection access hydrates semantic event references without exposing even
     {
       userId: "u_456",
       email: "bob@example.com",
+    },
+  ]);
+});
+
+test("projection facade supports TorkBot-style surface operation materialization", async () => {
+  const SurfaceOperationRequestedSchema = Type.Object({
+    operationKey: Type.String(),
+    requestedAtMs: Type.Number(),
+    surfaceInstanceId: Type.String(),
+    surfaceRefUrl: Type.String(),
+    surfaceType: Type.String(),
+  });
+  const SurfaceOperationCompletedSchema = Type.Object({
+    completedAtMs: Type.Number(),
+    operationKey: Type.String(),
+  });
+  const SurfaceOperationFailedSchema = Type.Object({
+    error: Type.String(),
+    failedAtMs: Type.Number(),
+    operationKey: Type.String(),
+  });
+  const surfaceEvents = {
+    "surface.operation.completed": SurfaceOperationCompletedSchema,
+    "surface.operation.failed": SurfaceOperationFailedSchema,
+    "surface.operation.requested": SurfaceOperationRequestedSchema,
+  };
+  const surfaceShape = defineLedgerShape({
+    events: surfaceEvents,
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const surfaceSchema = defineMaterializationSchema({
+    namespace: "surface-operations",
+    version: 1,
+    tables: {
+      surfaceOperations: (t) =>
+        t
+          .columns({
+            completed: t.eventRef("surface.operation.completed"),
+            completedAtMs: t.integer(),
+            error: t.text(),
+            failed: t.eventRef("surface.operation.failed"),
+            failedAtMs: t.integer(),
+            operationKey: t.text().notNull(),
+            requested: t.eventRef("surface.operation.requested").notNull(),
+            requestedAtMs: t.integer().notNull(),
+            surfaceInstanceId: t.text().notNull(),
+            surfaceRefUrl: t.text().notNull(),
+            surfaceType: t.text().notNull(),
+          })
+          .primaryKey(["operationKey"])
+          .index("surface_operations_pending", [
+            "completedAtMs",
+            "failedAtMs",
+            "requestedAtMs",
+          ]),
+    },
+  });
+  const surfaceHistory = defineMaterializationHistory(surfaceSchema, (m) => [
+    m.migration(1, "create surface operations", (s) => [
+      s.createTable("surfaceOperations", (t) =>
+        t
+          .columns({
+            completed: t.eventRef("surface.operation.completed"),
+            completedAtMs: t.integer(),
+            error: t.text(),
+            failed: t.eventRef("surface.operation.failed"),
+            failedAtMs: t.integer(),
+            operationKey: t.text().notNull(),
+            requested: t.eventRef("surface.operation.requested").notNull(),
+            requestedAtMs: t.integer().notNull(),
+            surfaceInstanceId: t.text().notNull(),
+            surfaceRefUrl: t.text().notNull(),
+            surfaceType: t.text().notNull(),
+          })
+          .primaryKey(["operationKey"])
+          .index("surface_operations_pending", [
+            "completedAtMs",
+            "failedAtMs",
+            "requestedAtMs",
+          ]),
+      ),
+    ]),
+  ]);
+  const surfaceMaterializations = defineMaterializations({
+    history: surfaceHistory,
+    indexers: {
+      recordCompleted: {
+        input: SurfaceOperationCompletedSchema,
+        sourceEvent: "surface.operation.completed",
+      },
+      recordFailed: {
+        input: SurfaceOperationFailedSchema,
+        sourceEvent: "surface.operation.failed",
+      },
+      recordRequested: {
+        input: SurfaceOperationRequestedSchema,
+        sourceEvent: "surface.operation.requested",
+      },
+    },
+    queries: {
+      operationByKey: {
+        params: Type.Object({ operationKey: Type.String() }),
+        result: Type.Unknown(),
+      },
+      pendingOperations: {
+        params: Type.Object({ limit: Type.Number() }),
+        result: Type.Unknown(),
+      },
+      rebuildPreview: {
+        params: Type.Object({ afterEventId: Type.Number() }),
+        result: Type.Unknown(),
+      },
+    },
+  });
+  const surfaceModel = withMaterializations(
+    surfaceShape,
+    surfaceMaterializations,
+  ).register({
+    indexers: {
+      recordCompleted: async ({ input, event, db }) => {
+        await db
+          .updateTable("surfaceOperations")
+          .set({
+            completed: event.ref,
+            completedAtMs: input.completedAtMs,
+            error: null,
+            failed: null,
+            failedAtMs: null,
+          })
+          .where("operationKey", "=", input.operationKey)
+          .whereNull("completed")
+          .execute();
+      },
+      recordFailed: async ({ input, event, db }) => {
+        await db
+          .updateTable("surfaceOperations")
+          .set({
+            error: input.error,
+            failed: event.ref,
+            failedAtMs: input.failedAtMs,
+          })
+          .where("operationKey", "=", input.operationKey)
+          .whereNull("completed")
+          .whereNull("failed")
+          .execute();
+      },
+      recordRequested: async ({ input, event, db }) => {
+        await db
+          .insertInto("surfaceOperations")
+          .values({
+            completed: null,
+            completedAtMs: null,
+            error: null,
+            failed: null,
+            failedAtMs: null,
+            operationKey: input.operationKey,
+            requested: event.ref,
+            requestedAtMs: input.requestedAtMs,
+            surfaceInstanceId: input.surfaceInstanceId,
+            surfaceRefUrl: input.surfaceRefUrl,
+            surfaceType: input.surfaceType,
+          })
+          .onConflict(["operationKey"])
+          .doUpdateSet({
+            requested: event.ref,
+            requestedAtMs: input.requestedAtMs,
+            surfaceInstanceId: input.surfaceInstanceId,
+            surfaceRefUrl: input.surfaceRefUrl,
+            surfaceType: input.surfaceType,
+          })
+          .execute();
+      },
+    },
+    queries: {
+      operationByKey: async ({ params, db }) => {
+        const row = await db
+          .selectFrom("surfaceOperations")
+          .select([
+            "completed",
+            "completedAtMs",
+            "error",
+            "failed",
+            "failedAtMs",
+            "operationKey",
+            "requested",
+            "requestedAtMs",
+            "surfaceInstanceId",
+            "surfaceRefUrl",
+            "surfaceType",
+          ])
+          .where("operationKey", "=", params.operationKey)
+          .executeTakeFirst();
+
+        if (row === null) {
+          return null;
+        }
+
+        const requested = await db.readEvent(row.requested);
+        const completed =
+          row.completed === null ? null : await db.readEvent(row.completed);
+
+        return {
+          completedPayload: completed?.payload ?? null,
+          operationKey: row.operationKey,
+          requestedPayload: requested?.payload ?? null,
+          surfaceRefUrl: row.surfaceRefUrl,
+        };
+      },
+      pendingOperations: async ({ params, db }) => {
+        const rows = await db
+          .selectFrom("surfaceOperations")
+          .select(["operationKey", "requested", "requestedAtMs"])
+          .whereNull("completed")
+          .whereNull("failed")
+          .orderBy("requestedAtMs", "asc")
+          .orderBy("operationKey", "asc")
+          .limit(params.limit)
+          .execute();
+
+        return rows.map((row) => {
+          return {
+            operationKey: row.operationKey,
+            requestedEventId: row.requested.eventId,
+            requestedAtMs: row.requestedAtMs,
+          };
+        });
+      },
+      rebuildPreview: async ({ params, db }) => {
+        const requestedEvents = await db
+          .scanEvents("surface.operation.requested")
+          .afterEventId(params.afterEventId)
+          .execute();
+        const completedEvents = await db
+          .scanEvents("surface.operation.completed")
+          .afterEventId(params.afterEventId)
+          .execute();
+        const failedEvents = await db
+          .scanEvents("surface.operation.failed")
+          .afterEventId(params.afterEventId)
+          .execute();
+        const latestCompleted = new Map<string, number>();
+        const latestFailed = new Map<string, number>();
+
+        for (const event of completedEvents) {
+          latestCompleted.set(event.payload.operationKey, event.eventId);
+        }
+
+        for (const event of failedEvents) {
+          latestFailed.set(event.payload.operationKey, event.eventId);
+        }
+
+        return requestedEvents.map((event) => {
+          const completedEventId =
+            latestCompleted.get(event.payload.operationKey) ?? null;
+
+          return {
+            completedEventId,
+            failedEventId:
+              completedEventId === null
+                ? (latestFailed.get(event.payload.operationKey) ?? null)
+                : null,
+            operationKey: event.payload.operationKey,
+            requestedEventId: event.eventId,
+          };
+        });
+      },
+    },
+  });
+  const implementations = readTestLedgerImplementations(surfaceModel);
+  const recordRequested = implementations.indexers?.recordRequested;
+  const recordCompleted = implementations.indexers?.recordCompleted;
+  const pendingOperations = implementations.queries?.pendingOperations;
+  const operationByKey = implementations.queries?.operationByKey;
+  const rebuildPreview = implementations.queries?.rebuildPreview;
+
+  if (recordRequested === undefined) {
+    throw new Error("expected recordRequested indexer implementation");
+  }
+
+  if (recordCompleted === undefined) {
+    throw new Error("expected recordCompleted indexer implementation");
+  }
+
+  if (pendingOperations === undefined) {
+    throw new Error("expected pendingOperations query implementation");
+  }
+
+  if (operationByKey === undefined) {
+    throw new Error("expected operationByKey query implementation");
+  }
+
+  if (rebuildPreview === undefined) {
+    throw new Error("expected rebuildPreview query implementation");
+  }
+
+  const requestedInput = {
+    operationKey: "op_1",
+    requestedAtMs: 1_000,
+    surfaceInstanceId: "discord:123",
+    surfaceRefUrl: "discord://channels/123/456",
+    surfaceType: "discord",
+  };
+  const completedInput = {
+    completedAtMs: 1_100,
+    operationKey: "op_1",
+  };
+  const requestedContext: LedgerIndexerContext<typeof surfaceEvents> = {
+    event: {
+      causationEventId: null,
+      dedupeKey: null,
+      eventId: 101,
+      eventName: "surface.operation.requested",
+      payload: requestedInput,
+      ref: createEventRef("surface.operation.requested", 101),
+      tsMs: 1_000,
+    },
+  };
+  const completedContext: LedgerIndexerContext<typeof surfaceEvents> = {
+    event: {
+      causationEventId: 101,
+      dedupeKey: null,
+      eventId: 102,
+      eventName: "surface.operation.completed",
+      payload: completedInput,
+      ref: createEventRef("surface.operation.completed", 102),
+      tsMs: 1_100,
+    },
+  };
+
+  const requestedFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+  await recordRequested(requestedFake.scope, requestedInput, requestedContext);
+
+  assert.equal(requestedFake.calls[0]?.method, "run");
+  assert.match(
+    requestedFake.calls[0]?.sql ?? "",
+    /^INSERT INTO "surfaceOperations"/,
+  );
+  assert.match(
+    requestedFake.calls[0]?.sql ?? "",
+    /ON CONFLICT \("operationKey"\) DO UPDATE SET/,
+  );
+
+  const completedFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+  await recordCompleted(completedFake.scope, completedInput, completedContext);
+
+  assert.deepEqual(completedFake.calls[0], {
+    method: "run",
+    params: [102, 1_100, null, null, null, "op_1"],
+    sql: 'UPDATE "surfaceOperations" SET "completed" = ?, "completedAtMs" = ?, "error" = ?, "failed" = ?, "failedAtMs" = ? WHERE "operationKey" = ? AND "completed" IS NULL',
+  });
+
+  const pendingFake = createFakeScope({
+    allRows: [
+      {
+        operationKey: "op_1",
+        requested: 101,
+        requestedAtMs: 1_000,
+      },
+    ],
+    getRow: undefined,
+  });
+  const pendingRows = await pendingOperations(pendingFake.scope, { limit: 50 });
+
+  assert.deepEqual(pendingFake.calls[0], {
+    method: "all",
+    params: [50],
+    sql: 'SELECT "operationKey" AS "operationKey", "requested" AS "requested", "requestedAtMs" AS "requestedAtMs" FROM "surfaceOperations" WHERE "completed" IS NULL AND "failed" IS NULL ORDER BY "requestedAtMs" ASC, "operationKey" ASC LIMIT ?',
+  });
+  assert.deepEqual(pendingRows, [
+    {
+      operationKey: "op_1",
+      requestedAtMs: 1_000,
+      requestedEventId: 101,
+    },
+  ]);
+
+  const getFake = createQueuedFakeScope({
+    allRows: [
+      [
+        {
+          causation_event_id: null,
+          dedupe_key: null,
+          event_id: 101,
+          event_name: "surface.operation.requested",
+          payload_json: JSON.stringify(requestedInput),
+          ts_ms: 1_000,
+        },
+      ],
+      [
+        {
+          causation_event_id: 101,
+          dedupe_key: null,
+          event_id: 102,
+          event_name: "surface.operation.completed",
+          payload_json: JSON.stringify(completedInput),
+          ts_ms: 1_100,
+        },
+      ],
+    ],
+    getRows: [
+      {
+        completed: 102,
+        completedAtMs: 1_100,
+        error: null,
+        failed: null,
+        failedAtMs: null,
+        operationKey: "op_1",
+        requested: 101,
+        requestedAtMs: 1_000,
+        surfaceInstanceId: "discord:123",
+        surfaceRefUrl: "discord://channels/123/456",
+        surfaceType: "discord",
+      },
+    ],
+  });
+  const operation = await operationByKey(getFake.scope, {
+    operationKey: "op_1",
+  });
+
+  assert.deepEqual(operation, {
+    completedPayload: {
+      completedAtMs: 1_100,
+      operationKey: "op_1",
+    },
+    operationKey: "op_1",
+    requestedPayload: {
+      operationKey: "op_1",
+      requestedAtMs: 1_000,
+      surfaceInstanceId: "discord:123",
+      surfaceRefUrl: "discord://channels/123/456",
+      surfaceType: "discord",
+    },
+    surfaceRefUrl: "discord://channels/123/456",
+  });
+
+  const rebuildFake = createQueuedFakeScope({
+    allRows: [
+      [
+        {
+          causation_event_id: null,
+          dedupe_key: null,
+          event_id: 101,
+          event_name: "surface.operation.requested",
+          payload_json: JSON.stringify(requestedInput),
+          ts_ms: 1_000,
+        },
+      ],
+      [
+        {
+          causation_event_id: 101,
+          dedupe_key: null,
+          event_id: 102,
+          event_name: "surface.operation.completed",
+          payload_json: JSON.stringify(completedInput),
+          ts_ms: 1_100,
+        },
+      ],
+      [],
+    ],
+    getRows: [],
+  });
+  const rebuilt = await rebuildPreview(rebuildFake.scope, {
+    afterEventId: 0,
+  });
+
+  assert.deepEqual(
+    rebuildFake.calls.map((call) => call.params),
+    [
+      ["surface.operation.requested", 0, 0],
+      ["surface.operation.completed", 0, 0],
+      ["surface.operation.failed", 0, 0],
+    ],
+  );
+  assert.deepEqual(rebuilt, [
+    {
+      completedEventId: 102,
+      failedEventId: null,
+      operationKey: "op_1",
+      requestedEventId: 101,
     },
   ]);
 });
