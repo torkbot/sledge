@@ -365,6 +365,8 @@ Indexer and query implementations receive sledge-owned facades:
 - writes return affected-row metadata and support typed integer `add(...)`,
   bounded `decrementIfPositive(...)`, `MAX(...)`, `COALESCE(...)`, and upsert
   `excluded` expressions without raw SQL
+- inserts can bind one typed row or an array of typed rows, including conflict
+  handling, so migration backfills can batch projection writes without raw SQL
 
 Semantic event refs can be hydrated one at a time with `readEvent(ref)` or in
 batches with `readEvents(refs)`. Batch reads preserve the input order and avoid

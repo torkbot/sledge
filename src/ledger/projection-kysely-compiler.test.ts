@@ -568,8 +568,14 @@ test("kysely projection compiler strips externally-bound insert value params", (
       calls.push(node);
 
       return {
-        parameters: ["insert-user-id", "insert-email", "updated@example.com"],
-        sql: "insert into projection values ($1, $2) on conflict do update set email = greatest(email, $3)",
+        parameters: [
+          "insert-user-id-1",
+          "insert-email-1",
+          "insert-user-id-2",
+          "insert-email-2",
+          "updated@example.com",
+        ],
+        sql: "insert into projection values ($1, $2), ($3, $4) on conflict do update set email = greatest(email, $5)",
       };
     },
   };
@@ -599,13 +605,16 @@ test("kysely projection compiler strips externally-bound insert value params", (
         kind: "do_update",
       },
       tableName: "users",
+      rowCount: 2,
     }),
     {
       params: ["updated@example.com"],
-      text: "insert into projection values ($1, $2) on conflict do update set email = greatest(email, $3)",
+      text: "insert into projection values ($1, $2), ($3, $4) on conflict do update set email = greatest(email, $5)",
     },
   );
   assert.equal(calls.length, 1);
+  const values = readRecord(calls[0]?.["values"], "insert values");
+  const valueRows = readArray(values["values"], "insert value rows");
   const onConflict = readRecord(calls[0]?.["onConflict"], "on conflict");
   const updates = readArray(onConflict["updates"], "on conflict updates");
   const update = readRecord(updates[0], "first conflict update");
@@ -614,6 +623,7 @@ test("kysely projection compiler strips externally-bound insert value params", (
   const leftCoalesce = readRecord(maxArgs[0], "left max coalesce");
   const rightCoalesce = readRecord(maxArgs[1], "right max coalesce");
 
+  assert.equal(valueRows.length, 2);
   assert.equal(onConflict["kind"], "OnConflictNode");
   assert.equal(update["kind"], "ColumnUpdateNode");
   assert.equal(maxValue["func"], "greatest");
@@ -1043,6 +1053,18 @@ test(
       {
         params: ["a@example.com", 1],
         text: 'select "users"."userId" as "userId" from "users" where "users"."email" = ? limit ?',
+      },
+    );
+    assert.deepEqual(
+      compiler.compileInsert({
+        columns: ["userId", "email"],
+        conflict: null,
+        rowCount: 2,
+        tableName: "users",
+      }),
+      {
+        params: [],
+        text: 'insert into "users" ("userId", "email") values (?, ?), (?, ?)',
       },
     );
     assert.deepEqual(

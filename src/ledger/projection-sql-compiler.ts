@@ -168,6 +168,7 @@ export type ProjectionCompilerInsertStatement = {
         readonly kind: "do_update";
       };
   readonly columns: readonly string[];
+  readonly rowCount: number;
   readonly tableName: string;
 };
 
@@ -586,9 +587,15 @@ function serializeProjectionEventPayloadPredicateValue(
 function compileInsertStatement(
   statement: ProjectionCompilerInsertStatement,
 ): ProjectionCompiledSql {
+  if (!Number.isSafeInteger(statement.rowCount) || statement.rowCount <= 0) {
+    throw new Error("insert statement must include at least one row");
+  }
+
   const columnSql = statement.columns.map(quoteIdentifier).join(", ");
-  const valuesSql = statement.columns.map(() => "?").join(", ");
-  let text = `INSERT INTO ${quoteIdentifier(statement.tableName)} (${columnSql}) VALUES (${valuesSql})`;
+  const valuesSql = Array.from({ length: statement.rowCount }, () => {
+    return `(${statement.columns.map(() => "?").join(", ")})`;
+  }).join(", ");
+  let text = `INSERT INTO ${quoteIdentifier(statement.tableName)} (${columnSql}) VALUES ${valuesSql}`;
 
   if (statement.conflict === null) {
     return {

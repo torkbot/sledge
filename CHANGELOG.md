@@ -55,6 +55,8 @@
   queries without raw `MIN(event_id)` / `MAX(event_id)` SQL.
 - Add typed `latestEventRefsByPayload(...)` on event and signal scans for
   grouped latest-ref queries without raw JSON extraction or `GROUP BY` SQL.
+- Add typed batch insert values so data migrations and indexers can write many
+  projection rows in one statement without raw `INSERT ... VALUES` SQL.
 - Make that statement compiler an explicit adapter-supplied internal dependency
   for projection implementation factories and materialization table/index DDL,
   removing the register-time SQLite compiler assumption.

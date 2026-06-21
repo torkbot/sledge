@@ -564,7 +564,7 @@ export type ProjectionWriteResult = {
 
 export type ProjectionInsertBuilder<TTable> = {
   values(
-    row: ProjectionWriteRow<TTable>,
+    row: ProjectionWriteRow<TTable> | readonly ProjectionWriteRow<TTable>[],
   ): ProjectionInsertConflictBuilder<TTable>;
 };
 
@@ -1747,29 +1747,17 @@ function createProjectionWriteDatabase<
       const table = readProjectionTable(metadata, String(tableName));
 
       return {
-        values: (row) => {
-          const rowValues = row as Readonly<Record<string, unknown>>;
-          const insertColumns = validateProjectionWriteRow(
-            "insert values",
-            table,
-            rowValues,
-            true,
-          );
-          const insertValues = insertColumns.map((columnName) => {
-            return serializeProjectionColumnValue(
-              table.columns[columnName],
-              rowValues[columnName],
-              `${table.name}.${columnName}`,
-            );
-          });
+        values: (rowOrRows) => {
+          const insertRows = readProjectionInsertRows(table, rowOrRows);
 
           return createInsertConflictBuilder<
             ProjectionSchemaTables<TProjectionSchema>[typeof tableName]
           >(
             scope,
             table,
-            insertColumns,
-            insertValues,
+            insertRows.columns,
+            insertRows.values,
+            insertRows.rowCount,
             trackWrite,
             statementCompiler,
           );
@@ -1801,6 +1789,78 @@ function createProjectionWriteDatabase<
   };
 }
 
+type ProjectionInsertRows = {
+  readonly columns: readonly string[];
+  readonly rowCount: number;
+  readonly values: readonly unknown[];
+};
+
+function readProjectionInsertRows<TTable>(
+  table: ProjectionTableMetadata,
+  rowOrRows: ProjectionWriteRow<TTable> | readonly ProjectionWriteRow<TTable>[],
+): ProjectionInsertRows {
+  if (Array.isArray(rowOrRows)) {
+    if (rowOrRows.length === 0) {
+      throw new Error("insert values must include at least one row");
+    }
+
+    return readProjectionInsertRowsForArray(
+      table,
+      rowOrRows as readonly ProjectionWriteRow<TTable>[],
+    );
+  }
+
+  return readProjectionInsertRowsForArray(table, [
+    rowOrRows as ProjectionWriteRow<TTable>,
+  ]);
+}
+
+function readProjectionInsertRowsForArray<TTable>(
+  table: ProjectionTableMetadata,
+  rows: readonly ProjectionWriteRow<TTable>[],
+): ProjectionInsertRows {
+  const firstRow = rows[0];
+
+  if (firstRow === undefined) {
+    throw new Error("insert values must include at least one row");
+  }
+
+  const firstRowValues = firstRow as Readonly<Record<string, unknown>>;
+  const insertColumns = validateProjectionWriteRow(
+    "insert values",
+    table,
+    firstRowValues,
+    true,
+  );
+  const insertValues: unknown[] = [];
+
+  for (const [index, row] of rows.entries()) {
+    const rowValues = row as Readonly<Record<string, unknown>>;
+    validateProjectionWriteRow(
+      `insert values row ${index}`,
+      table,
+      rowValues,
+      true,
+    );
+
+    for (const columnName of insertColumns) {
+      insertValues.push(
+        serializeProjectionColumnValue(
+          table.columns[columnName],
+          rowValues[columnName],
+          `${table.name}.${columnName}`,
+        ),
+      );
+    }
+  }
+
+  return {
+    columns: insertColumns,
+    rowCount: rows.length,
+    values: insertValues,
+  };
+}
+
 type ProjectionWriteTracker = <T>(run: () => Promise<T>) => Promise<T>;
 
 function createInsertConflictBuilder<TTable>(
@@ -1808,12 +1868,19 @@ function createInsertConflictBuilder<TTable>(
   table: ProjectionTableMetadata,
   insertColumns: readonly string[],
   insertValues: readonly unknown[],
+  rowCount: number,
   trackWrite: ProjectionWriteTracker,
   statementCompiler: ProjectionStatementCompiler,
 ): ProjectionInsertConflictBuilder<TTable> {
   return {
     execute: () => {
-      const sql = buildInsertSql(statementCompiler, table, insertColumns, null);
+      const sql = buildInsertSql(
+        statementCompiler,
+        table,
+        insertColumns,
+        rowCount,
+        null,
+      );
       return trackWrite(async () => {
         return await scope
           .prepare(sql.text)
@@ -1825,10 +1892,16 @@ function createInsertConflictBuilder<TTable>(
 
       return {
         doNothing: () => {
-          const sql = buildInsertSql(statementCompiler, table, insertColumns, {
-            kind: "do_nothing",
-            conflictColumns,
-          });
+          const sql = buildInsertSql(
+            statementCompiler,
+            table,
+            insertColumns,
+            rowCount,
+            {
+              kind: "do_nothing",
+              conflictColumns,
+            },
+          );
 
           return createProjectionExecutableWrite(
             scope,
@@ -1850,6 +1923,7 @@ function createInsertConflictBuilder<TTable>(
                 statementCompiler,
                 table,
                 insertColumns,
+                rowCount,
                 {
                   kind: "do_update",
                   conflictColumns,
@@ -1867,6 +1941,7 @@ function createInsertConflictBuilder<TTable>(
                 statementCompiler,
                 table,
                 insertColumns,
+                rowCount,
                 {
                   kind: "do_update",
                   conflictColumns,
@@ -3673,6 +3748,7 @@ function buildInsertSql(
   statementCompiler: ProjectionStatementCompiler,
   table: ProjectionTableMetadata,
   insertColumns: readonly string[],
+  rowCount: number,
   conflict:
     | null
     | {
@@ -3700,6 +3776,7 @@ function buildInsertSql(
               conflictColumns: conflict.conflictColumns,
               kind: "do_update",
             },
+    rowCount,
     tableName: table.name,
   });
 }

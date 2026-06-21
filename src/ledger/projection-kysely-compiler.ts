@@ -476,22 +476,29 @@ function compileInsertStatement(
   input: KyselyProjectionStatementCompilerInput,
   statement: ProjectionCompilerInsertStatement,
 ): ProjectionCompiledSql {
+  if (!Number.isSafeInteger(statement.rowCount) || statement.rowCount <= 0) {
+    throw new Error("insert statement must include at least one row");
+  }
+
   const query: KyselyProjectionOperationNode = {
     columns: statement.columns.map(columnNode),
     into: tableNode(statement.tableName),
     kind: "InsertQueryNode",
-    values: valuesNode([
-      valueListNode(
-        statement.columns.map(() => valueNode(insertValuePlaceholder)),
+    values: valuesNode(
+      Array.from({ length: statement.rowCount }, () =>
+        valueListNode(
+          statement.columns.map(() => valueNode(insertValuePlaceholder)),
+        ),
       ),
-    ]),
+    ),
   };
 
   const queryWithConflict = attachInsertConflict(input, query, statement);
   const compiled = compileQuery(input.queryCompiler, queryWithConflict);
+  const insertPlaceholderCount = statement.columns.length * statement.rowCount;
 
   return {
-    params: compiled.params.slice(statement.columns.length),
+    params: compiled.params.slice(insertPlaceholderCount),
     text: compiled.text,
   };
 }

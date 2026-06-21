@@ -457,6 +457,88 @@ test("projection access compiles typed indexer and query definitions to storage 
   }, /users\.source event reference id must be a positive safe integer/);
 });
 
+test("projection access batches typed insert values into one statement", async () => {
+  const batchMaterializations = defineMaterializations({
+    history,
+    indexers: {
+      seedUsers: {
+        sourceEvent: "user.created",
+        input: Type.Array(UserCreatedSchema),
+      },
+    },
+    queries: {},
+  });
+  const batchModel = withMaterializations(
+    shape,
+    batchMaterializations,
+  ).register({
+    indexers: {
+      seedUsers: async ({ input, event, db }) => {
+        await db
+          .insertInto("users")
+          .values(
+            input.map((user) => {
+              return {
+                email: user.email,
+                source: event.ref,
+                userId: user.userId,
+              };
+            }),
+          )
+          .onConflict(["userId"])
+          .doUpdateSet((e) => ({
+            email: e.excluded("email"),
+            source: e.excluded("source"),
+          }))
+          .execute();
+      },
+    },
+  });
+  const indexer = readTestLedgerImplementations(batchModel).indexers?.seedUsers;
+
+  if (indexer === undefined) {
+    throw new Error("expected seedUsers indexer implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await indexer(
+    fake.scope,
+    [
+      {
+        userId: "u_1",
+        email: "alice@example.com",
+      },
+      {
+        userId: "u_2",
+        email: "bob@example.com",
+      },
+    ],
+    createUserCreatedContext(42),
+  );
+
+  assert.deepEqual(fake.calls, [
+    {
+      method: "run",
+      params: ["u_1", "alice@example.com", 42, "u_2", "bob@example.com", 42],
+      sql: 'INSERT INTO "users" ("userId", "email", "source") VALUES (?, ?, ?), (?, ?, ?) ON CONFLICT ("userId") DO UPDATE SET "email" = excluded."email", "source" = excluded."source"',
+    },
+  ]);
+
+  const emptyFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(async () => {
+    await indexer(emptyFake.scope, [], createUserCreatedContext(43));
+  }, /insert values must include at least one row/);
+  assert.deepEqual(emptyFake.calls, []);
+});
+
 test("projection access supports typed integer increments without raw SQL", async () => {
   const counterSchema = defineMaterializationSchema({
     namespace: "counter",
@@ -4912,6 +4994,28 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .execute();
       },
       incompleteInsert: async ({ db, event }) => {
+        await db
+          .insertInto("users")
+          .values([
+            {
+              userId: "u_123",
+              email: "alice@example.com",
+              source: event.ref,
+            },
+            {
+              userId: "u_456",
+              email: "bob@example.com",
+              source: event.ref,
+            },
+          ])
+          .execute();
+        db.insertInto("users").values([
+          // @ts-expect-error batch inserts must provide every projection column.
+          {
+            userId: "u_456",
+            source: event.ref,
+          },
+        ]);
         await db
           .insertInto("users")
           // @ts-expect-error inserts must provide every projection column.
