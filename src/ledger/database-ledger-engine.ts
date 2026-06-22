@@ -883,10 +883,6 @@ function openDatabaseLedgerEngine<
         return;
       }
 
-      if (currentVersion === 0) {
-        await createProjectionSchema(database, history.current.metadata);
-      }
-
       const replayState = createMaterializationReplayState(
         history,
         currentVersion,
@@ -901,7 +897,6 @@ function openDatabaseLedgerEngine<
           database,
           history,
           migration,
-          currentVersion === 0,
           replayState,
         );
         await recordMaterializationVersion(
@@ -968,7 +963,6 @@ function openDatabaseLedgerEngine<
     database: StorageDatabase,
     history: THistory,
     migration: THistory["migrations"][number],
-    freshNamespace: boolean,
     replayState: MaterializationReplayState,
   ): Promise<void> {
     const relationsForCreatedTables =
@@ -979,7 +973,6 @@ function openDatabaseLedgerEngine<
         database,
         history,
         operation,
-        freshNamespace,
         replayState,
         relationsForCreatedTables,
       );
@@ -992,7 +985,6 @@ function openDatabaseLedgerEngine<
     database: StorageDatabase,
     history: THistory,
     operation: THistory["migrations"][number]["operations"][number],
-    freshNamespace: boolean,
     replayState: MaterializationReplayState,
     relationsForCreatedTables: ReadonlyMap<
       string,
@@ -1001,42 +993,34 @@ function openDatabaseLedgerEngine<
   ): Promise<void> {
     switch (operation.kind) {
       case "create_table":
-        if (!freshNamespace) {
-          await createMaterializationTable(
-            database,
-            operation,
-            relationsForCreatedTables.get(operation.tableName) ?? {},
-          );
-          await createMaterializationTableIndexes(database, operation);
-        }
+        await createMaterializationTable(
+          database,
+          operation,
+          relationsForCreatedTables.get(operation.tableName) ?? {},
+        );
+        await createMaterializationTableIndexes(database, operation);
 
         replayState.tables.set(operation.tableName, operation.table);
         return;
       case "create_index":
-        if (!freshNamespace) {
-          await createMaterializationIndex(database, operation);
-        }
+        await createMaterializationIndex(database, operation);
 
         addMaterializationReplayIndex(replayState, operation);
         return;
       case "add_column":
-        if (!freshNamespace) {
-          await addMaterializationColumn(database, operation);
-        }
+        await addMaterializationColumn(database, operation);
 
         addMaterializationReplayColumn(replayState, operation);
         return;
       case "add_foreign_key":
-        if (!freshNamespace) {
-          const relations = relationsForCreatedTables.get(
-            operation.foreignKey.fromTable,
-          );
+        const relations = relationsForCreatedTables.get(
+          operation.foreignKey.fromTable,
+        );
 
-          if (relations?.[operation.name] === undefined) {
-            throw new Error(
-              `materialization ${history.namespace} migration cannot add foreign key ${operation.name} incrementally on SQLite`,
-            );
-          }
+        if (relations?.[operation.name] === undefined) {
+          throw new Error(
+            `materialization ${history.namespace} migration cannot add foreign key ${operation.name} incrementally on SQLite`,
+          );
         }
 
         replayState.relations.set(operation.name, operation.foreignKey);
@@ -1175,7 +1159,7 @@ function openDatabaseLedgerEngine<
     string,
     Readonly<Record<string, ProjectionForeignKeyMetadata>>
   > {
-    const openCreatedTableNames = new Set<string>();
+    const openCreatedTables = new Map<string, ProjectionTableMetadata>();
     const relationsByTable = new Map<
       string,
       Record<string, ProjectionForeignKeyMetadata>
@@ -1183,19 +1167,33 @@ function openDatabaseLedgerEngine<
 
     for (const operation of migration.operations) {
       if (operation.kind === "create_table") {
-        openCreatedTableNames.add(operation.tableName);
+        openCreatedTables.set(operation.tableName, operation.table);
         continue;
       }
 
       if (operation.kind === "data") {
-        openCreatedTableNames.clear();
+        openCreatedTables.clear();
         continue;
       }
 
-      if (
-        operation.kind === "add_foreign_key" &&
-        openCreatedTableNames.has(operation.foreignKey.fromTable)
-      ) {
+      if (operation.kind === "add_foreign_key") {
+        const createdTable = openCreatedTables.get(
+          operation.foreignKey.fromTable,
+        );
+
+        if (createdTable === undefined) {
+          continue;
+        }
+
+        const sourceColumnsExistInCreateTable =
+          operation.foreignKey.fromColumns.every((columnName) => {
+            return createdTable.columns[columnName] !== undefined;
+          });
+
+        if (!sourceColumnsExistInCreateTable) {
+          continue;
+        }
+
         let relations = relationsByTable.get(operation.foreignKey.fromTable);
 
         if (relations === undefined) {

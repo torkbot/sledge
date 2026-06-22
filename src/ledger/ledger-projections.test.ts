@@ -2228,6 +2228,76 @@ test("projection access decodes boolean and nullable union literals", async () =
   });
 });
 
+test("projection access rejects non-integer union literals for integer aliases", async () => {
+  const rankedMaterializations = defineMaterialization(shape, {
+    namespace: "ranked-union",
+  })
+    .version(1, "create ranked users", (s) =>
+      s.createTable("rankedUsers", (t) =>
+        t
+          .columns({
+            rank: t.integer().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        invalidRankUnion: {
+          params: Type.Object({
+            rank: Type.Number(),
+          }),
+          result: Type.Null(),
+        },
+      },
+    });
+  const rankedModel = withMaterializations(
+    shape,
+    rankedMaterializations,
+  ).register({
+    queries: {
+      invalidRankUnion: async ({ db, params }) => {
+        await db
+          .unionAll([
+            db.unionFrom("rankedUsers").select({
+              rank: "rank",
+              userId: "userId",
+            }),
+            db.unionFrom("rankedUsers").select({
+              rank: db.unionValue(params.rank),
+              userId: "userId",
+            }),
+          ])
+          .execute();
+
+        return null;
+      },
+    },
+  });
+  const invalidRankUnion =
+    readTestLedgerImplementations(rankedModel).queries?.invalidRankUnion;
+
+  if (invalidRankUnion === undefined) {
+    throw new Error("expected invalidRankUnion query implementation");
+  }
+
+  for (const rank of [1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const fake = createFakeScope({
+      allRows: [],
+      getRow: undefined,
+    });
+
+    await assert.rejects(async () => {
+      await invalidRankUnion(fake.scope, {
+        rank,
+      });
+    }, /union selection rank has incompatible column types/);
+    assert.deepEqual(fake.calls, []);
+  }
+});
+
 test("projection access supports typed inner joins between materialization tables", async () => {
   const networkMaterializations = defineMaterialization(shape, {
     namespace: "network",
@@ -4184,6 +4254,68 @@ test("materialization migrations derive schema and record typed operations", () 
           .createIndex("usersByEmail", "users", ["userId"]),
       );
   }, /materialization history index usersByEmail conflicts with usersByEmail/);
+
+  assert.throws(() => {
+    defineMaterialization(shape, {
+      namespace: "reserved-index",
+    })
+      .version(1, "create users", (s) =>
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      )
+      .version(2, "create reserved index", (s) =>
+        s.createIndex("idx_work_due", "users", ["email"]),
+      );
+  }, /materialization history index idx_work_due conflicts with idx_work_due/);
+
+  assert.throws(() => {
+    defineMaterialization(shape, {
+      namespace: "case-folded-column",
+    })
+      .version(1, "create users", (s) =>
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      )
+      .version(2, "add folded email", (s) =>
+        s.addColumn("users", "Email", (t) => t.text()),
+      );
+  }, /materialization add column users\.Email conflicts with existing column email/);
+
+  assert.throws(() => {
+    defineMaterialization(shape, {
+      namespace: "case-folded-table",
+    })
+      .version(1, "create users", (s) =>
+        s.createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      )
+      .version(2, "create folded users", (s) =>
+        s.createTable("Users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        ),
+      );
+  }, /materialization create table Users conflicts with existing table users/);
 });
 
 test("materialization data migrations can scan typed ledger events", async () => {

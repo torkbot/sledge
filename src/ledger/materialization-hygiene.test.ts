@@ -103,6 +103,72 @@ test("database ledger startup applies materialization history hygiene", async ()
   );
 });
 
+test("database ledger startup replays fresh materializations in migration order", async () => {
+  const shape = defineLedgerShape({
+    events: {},
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const materializations = defineMaterialization(shape, {
+    namespace: "ordered-fresh",
+  })
+    .version(1, "create and seed users", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              email: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .data("seed user", async ({ db }) => {
+          await db
+            .insertInto("users")
+            .values({
+              email: "ada@example.com",
+              userId: "ada",
+            })
+            .execute();
+        }),
+    )
+    .version(2, "enforce unique emails", (s) =>
+      s.createUniqueIndex("usersByEmail", "users", ["email"]),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
+  const model = withMaterializations(shape, materializations).register({});
+  const storage = createMaterializationHygieneStorage();
+  const ledger = createDatabaseLedger({
+    model,
+    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    storage: storage.runtime,
+    timing: {
+      clock: {
+        nowMs: () => 12_345,
+      },
+    },
+  });
+
+  await ledger.close();
+
+  const insertUserCallIndex = storage.calls.findIndex((call) => {
+    return call.sql.includes('INSERT INTO "users"');
+  });
+  const createEmailIndexCallIndex = storage.calls.findIndex((call) => {
+    return call.sql.includes(
+      'CREATE UNIQUE INDEX IF NOT EXISTS "usersByEmail"',
+    );
+  });
+
+  assert.notEqual(insertUserCallIndex, -1);
+  assert.notEqual(createEmailIndexCallIndex, -1);
+  assert.equal(insertUserCallIndex < createEmailIndexCallIndex, true);
+});
+
 test("database ledger startup re-reads materialization version under the migration lock", async () => {
   const shape = defineLedgerShape({
     events: {
@@ -328,6 +394,77 @@ test("database ledger startup preserves foreign keys for incrementally created t
   assert.match(
     createSessions.sql,
     /CONSTRAINT "sessionUser" FOREIGN KEY \("userId"\) REFERENCES "users" \("userId"\) ON DELETE RESTRICT/,
+  );
+});
+
+test("database ledger startup rejects foreign keys that depend on same-migration added columns", async () => {
+  const shape = defineLedgerShape({
+    events: {},
+    queues: {},
+    signals: {},
+    signalQueues: {},
+  });
+  const materializations = defineMaterialization(shape, {
+    namespace: "late-foreign-key-columns",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .version(2, "create sessions", (s) =>
+      s
+        .createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        )
+        .addColumn("sessions", "userId", (t) => t.text())
+        .addForeignKey("sessionUser", (r) =>
+          r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
+        ),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
+  const model = withMaterializations(shape, materializations).register({});
+  const storage = createMaterializationHygieneStorage({
+    materializationVersions: [1, 1],
+  });
+  const ledger = createDatabaseLedger({
+    model,
+    projectionCompiler: createSqliteProjectionStatementCompiler(),
+    storage: storage.runtime,
+    timing: {
+      clock: {
+        nowMs: () => 12_345,
+      },
+    },
+  });
+
+  await assert.rejects(
+    async () => {
+      await ledger.close();
+    },
+    (error: unknown) => {
+      return errorTreeIncludesMessage(
+        error,
+        "materialization late-foreign-key-columns migration cannot add foreign key sessionUser incrementally on SQLite",
+      );
+    },
+  );
+  assert.equal(
+    storage.calls.some((call) => {
+      return call.sql.includes('CONSTRAINT "sessionUser"');
+    }),
+    false,
   );
 });
 

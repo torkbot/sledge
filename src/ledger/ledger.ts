@@ -55,6 +55,14 @@ const registeredLedgerModelBrand: unique symbol = Symbol(
 const materializationMigrationChainStateBrand: unique symbol = Symbol(
   "sledge.materializationMigrationChainState",
 );
+const reservedMaterializationSqliteObjectNames = [
+  "events",
+  "idx_work_due",
+  "idx_work_ref",
+  "sledge_materialization_versions",
+  "work",
+] as const;
+const sqliteInternalMaterializationNamePrefix = "sqlite_";
 
 export type {
   ProjectionAggregateBuilder,
@@ -1595,14 +1603,15 @@ function createMaterializationMigrationChain<
   const chain = {
     [materializationMigrationChainStateBrand]: input,
     addColumn: (tableName, columnName, build) => {
-      readMaterializationTable(
+      const table = readMaterializationTable(
         input.current,
         String(tableName),
         "materialization add column",
       );
-      validateMaterializationIdentifier(
-        "materialization column name",
+      validateNewMaterializationColumnName(
+        table,
         String(columnName),
+        `materialization add column ${String(tableName)}.${String(columnName)}`,
       );
       const column = build(
         createMaterializationMigrationColumnBuilder<
@@ -1673,9 +1682,10 @@ function createMaterializationMigrationChain<
       });
     },
     createTable: (tableName, build) => {
-      validateMaterializationIdentifier(
-        "materialization table name",
+      validateNewMaterializationTableName(
+        input.current,
         String(tableName),
+        `materialization create table ${String(tableName)}`,
       );
       const schema = defineProjectionSchemaForEvents<
         ProjectionSchemaEventName<TCurrentSchema>
@@ -1833,21 +1843,33 @@ function createMaterializationReplayStateFromSchema(
   schema: AnyMaterializationSchema,
 ): MaterializationHistoryReplayState {
   const state: MaterializationHistoryReplayState = {
-    indexNames: new Map(),
+    sqliteObjectNames: createMaterializationReplaySqliteObjectNames(),
     relations: new Map(Object.entries(schema.metadata.relations)),
     tables: new Map(Object.entries(schema.metadata.tables)),
   };
 
   for (const table of Object.values(schema.metadata.tables)) {
+    validateMaterializationReplayTableName(state, table.name);
+
     for (const index of table.indexes) {
-      state.indexNames.set(
-        normalizeMaterializationSqliteIdentifier(index.name),
-        index.name,
-      );
+      validateMaterializationReplayIndexName(state, index.name);
     }
   }
 
   return state;
+}
+
+function createMaterializationReplaySqliteObjectNames(): Map<string, string> {
+  const objectNames = new Map<string, string>();
+
+  for (const reservedName of reservedMaterializationSqliteObjectNames) {
+    objectNames.set(
+      normalizeMaterializationSqliteIdentifier(reservedName),
+      reservedName,
+    );
+  }
+
+  return objectNames;
 }
 
 function createMaterializationSchemaFromMetadata(input: {
@@ -1969,6 +1991,34 @@ function readMaterializationTable(
   }
 
   return table;
+}
+
+function validateNewMaterializationTableName(
+  schema: AnyMaterializationSchema,
+  tableName: string,
+  context: string,
+): void {
+  validateMaterializationIdentifier("materialization table name", tableName);
+
+  const existing = findCaseFoldedKey(schema.metadata.tables, tableName);
+
+  if (existing !== null) {
+    throw new Error(`${context} conflicts with existing table ${existing}`);
+  }
+}
+
+function validateNewMaterializationColumnName(
+  table: ProjectionTableMetadata,
+  columnName: string,
+  context: string,
+): void {
+  validateMaterializationIdentifier("materialization column name", columnName);
+
+  const existing = findCaseFoldedKey(table.columns, columnName);
+
+  if (existing !== null) {
+    throw new Error(`${context} conflicts with existing column ${existing}`);
+  }
 }
 
 function validateMaterializationColumnName(
@@ -2289,7 +2339,7 @@ function validateMaterializationHistoryResult(
   migrations: readonly MaterializationMigration[],
 ): void {
   const state: MaterializationHistoryReplayState = {
-    indexNames: new Map(),
+    sqliteObjectNames: createMaterializationReplaySqliteObjectNames(),
     relations: new Map(),
     tables: new Map(),
   };
@@ -2334,7 +2384,7 @@ function validateMaterializationHistoryResult(
 }
 
 type MaterializationHistoryReplayState = {
-  readonly indexNames: Map<string, string>;
+  readonly sqliteObjectNames: Map<string, string>;
   readonly relations: Map<string, ProjectionForeignKeyMetadata>;
   readonly tables: Map<string, ProjectionTableMetadata>;
 };
@@ -2345,11 +2395,7 @@ function applyMaterializationMigrationOperation(
 ): void {
   switch (operation.kind) {
     case "create_table":
-      if (state.tables.has(operation.tableName)) {
-        throw new Error(
-          `materialization history creates duplicate table ${operation.tableName}`,
-        );
-      }
+      validateMaterializationReplayTableName(state, operation.tableName);
 
       for (const index of operation.table.indexes) {
         validateMaterializationReplayIndexName(state, index.name);
@@ -2366,9 +2412,14 @@ function applyMaterializationMigrationOperation(
         );
       }
 
-      if (table.columns[operation.columnName] !== undefined) {
+      const existingColumnName = findCaseFoldedKey(
+        table.columns,
+        operation.columnName,
+      );
+
+      if (existingColumnName !== null) {
         throw new Error(
-          `materialization history adds duplicate column ${operation.tableName}.${operation.columnName}`,
+          `materialization history adds duplicate column ${operation.tableName}.${operation.columnName} conflicts with existing column ${existingColumnName}`,
         );
       }
 
@@ -2434,20 +2485,46 @@ function applyMaterializationMigrationOperation(
   }
 }
 
+function validateMaterializationReplayTableName(
+  state: MaterializationHistoryReplayState,
+  tableName: string,
+): void {
+  validateMaterializationReplaySqliteObjectName(
+    state,
+    `materialization history table ${tableName}`,
+    tableName,
+  );
+}
+
 function validateMaterializationReplayIndexName(
   state: MaterializationHistoryReplayState,
   indexName: string,
 ): void {
-  const normalized = normalizeMaterializationSqliteIdentifier(indexName);
-  const existing = state.indexNames.get(normalized);
+  validateMaterializationReplaySqliteObjectName(
+    state,
+    `materialization history index ${indexName}`,
+    indexName,
+  );
+}
 
-  if (existing !== undefined) {
-    throw new Error(
-      `materialization history index ${indexName} conflicts with ${existing}`,
-    );
+function validateMaterializationReplaySqliteObjectName(
+  state: MaterializationHistoryReplayState,
+  context: string,
+  objectName: string,
+): void {
+  const normalized = normalizeMaterializationSqliteIdentifier(objectName);
+
+  if (normalized.startsWith(sqliteInternalMaterializationNamePrefix)) {
+    throw new Error(`${context} is reserved for ledger storage`);
   }
 
-  state.indexNames.set(normalized, indexName);
+  const existing = state.sqliteObjectNames.get(normalized);
+
+  if (existing !== undefined) {
+    throw new Error(`${context} conflicts with ${existing}`);
+  }
+
+  state.sqliteObjectNames.set(normalized, objectName);
 }
 
 function validateMaterializationDataReplay(
@@ -2508,6 +2585,21 @@ function validateMaterializationForeignKeyReplay(
 
 function normalizeMaterializationSqliteIdentifier(identifier: string): string {
   return identifier.toLocaleLowerCase("en-US");
+}
+
+function findCaseFoldedKey(
+  record: Readonly<Record<string, unknown>>,
+  key: string,
+): string | null {
+  const normalized = normalizeMaterializationSqliteIdentifier(key);
+
+  for (const existing of Object.keys(record)) {
+    if (normalizeMaterializationSqliteIdentifier(existing) === normalized) {
+      return existing;
+    }
+  }
+
+  return null;
 }
 
 function validateMaterializationMigrationOperation(

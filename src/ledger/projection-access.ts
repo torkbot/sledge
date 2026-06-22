@@ -2575,6 +2575,7 @@ type ProjectionUnionSelectionMetadata = {
   readonly alias: string;
   readonly column: ProjectionColumnMetadata | null;
   readonly literalKind: ProjectionUnionLiteralKind | null;
+  readonly literalNumber: number | null;
   readonly nullable: boolean;
   readonly selection: ProjectionCompilerSelection;
 };
@@ -2588,6 +2589,7 @@ type ProjectionUnionArmMetadata = {
 type ProjectionUnionColumnMetadata = {
   readonly column: ProjectionColumnMetadata | null;
   readonly literalKind: ProjectionUnionLiteralKind | null;
+  readonly literalNumber: number | null;
   readonly nullable: boolean;
 };
 
@@ -4196,6 +4198,7 @@ function readProjectionUnionSelections(
         alias,
         column: null,
         literalKind,
+        literalNumber: typeof value.value === "number" ? value.value : null,
         nullable: value.value === null,
         selection: {
           alias,
@@ -4222,6 +4225,7 @@ function readProjectionUnionSelections(
       alias,
       column,
       literalKind: null,
+      literalNumber: null,
       nullable: column.nullable,
       selection: {
         alias,
@@ -4248,6 +4252,7 @@ function readProjectionUnionShape(
     columns[alias] = {
       column: null,
       literalKind: null,
+      literalNumber: null,
       nullable: false,
     };
   }
@@ -4268,6 +4273,7 @@ function readProjectionUnionShape(
         {
           column: selection.column,
           literalKind: selection.literalKind,
+          literalNumber: selection.literalNumber,
           nullable: selection.nullable,
         },
       );
@@ -4316,9 +4322,16 @@ function mergeProjectionUnionColumnMetadata(
     literalKind = next.literalKind;
   }
 
+  let literalNumber = existing.literalNumber;
+
+  if (literalNumber === null) {
+    literalNumber = next.literalNumber;
+  }
+
   return {
     column,
     literalKind,
+    literalNumber,
     nullable: existing.nullable || next.nullable,
   };
 }
@@ -4340,8 +4353,10 @@ function validateProjectionUnionColumnCompatibility(
   if (
     left.column !== null &&
     right.literalKind !== null &&
-    !isProjectionUnionLiteralKindCompatibleWithColumn(
+    !isProjectionUnionLiteralCompatibleWithColumn(
+      alias,
       right.literalKind,
+      right.literalNumber,
       left.column,
     )
   ) {
@@ -4351,8 +4366,10 @@ function validateProjectionUnionColumnCompatibility(
   if (
     right.column !== null &&
     left.literalKind !== null &&
-    !isProjectionUnionLiteralKindCompatibleWithColumn(
+    !isProjectionUnionLiteralCompatibleWithColumn(
+      alias,
       left.literalKind,
+      left.literalNumber,
       right.column,
     )
   ) {
@@ -4366,6 +4383,27 @@ function validateProjectionUnionColumnCompatibility(
   ) {
     throw new Error(`union selection ${alias} has incompatible column types`);
   }
+}
+
+function isProjectionUnionLiteralCompatibleWithColumn(
+  alias: string,
+  literalKind: ProjectionUnionLiteralKind,
+  literalNumber: number | null,
+  column: ProjectionColumnMetadata,
+): boolean {
+  if (!isProjectionUnionLiteralKindCompatibleWithColumn(literalKind, column)) {
+    return false;
+  }
+
+  if (
+    literalKind === "number" &&
+    column.kind === "integer" &&
+    !Number.isSafeInteger(literalNumber)
+  ) {
+    throw new Error(`union selection ${alias} has incompatible column types`);
+  }
+
+  return true;
 }
 
 function isProjectionUnionLiteralKindCompatibleWithColumn(

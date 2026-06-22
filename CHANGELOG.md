@@ -28,9 +28,9 @@
   `scanEvents(...)` handles during backfills without seeing the internal
   `events` table.
 - Run materialization history hygiene during ledger startup: track applied
-  namespace versions, create fresh namespaces from the current schema, replay
-  data migration steps, and apply supported incremental DDL without exposing raw
-  SQL.
+  namespace versions, create fresh namespaces by replaying the ordered
+  migration history, replay data migration steps, and apply supported
+  incremental DDL without exposing raw SQL.
 - Re-read materialization namespace versions after acquiring the migration lock
   so concurrent runtimes do not replay data migrations from stale version
   observations.
@@ -121,8 +121,8 @@
 - Reject non-positive event reference IDs when projection access serializes or
   decodes event-ref columns.
 - Ensure declared materialization tables and indexes during ledger startup from
-  the typed materialization schema instead of requiring callers to run raw SQL
-  setup.
+  the typed materialization migration history instead of requiring callers to
+  run raw SQL setup.
 - Remove the low-level `@torkbot/sledge/database-ledger-engine` package export
   and hide generated raw-scope implementations behind an internal attachment
   that is not part of the public registered-model type.
@@ -130,7 +130,8 @@
   event-ref IDs at construction time.
 - Harden materialization/projection validation for migration-order data steps,
   data steps before declared keys/relations, foreign-key target keys, duplicate
-  index names, SQLite-internal object names, case-only duplicate columns, null
+  index names, ledger-reserved object names, SQLite-internal object names,
+  case-only duplicate tables/columns, unsafe integer union literals, null
   predicate values, unsupported same-table joins, and late projection writes
   after indexer completion.
 - Reject projection table/index names that would collide under SQLite's
