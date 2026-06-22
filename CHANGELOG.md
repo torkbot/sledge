@@ -4,9 +4,9 @@
 
 - Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /
   `bindLedgerModel` construction path with
-  `defineLedgerShape(...)`, `defineMaterializationSchema(...)`,
-  `defineMaterializationHistory(...)`, `defineMaterializations(...)`,
-  `withMaterializations(...)`, and `.register(...)`.
+  `defineLedgerShape(...)`, migration-derived
+  `defineMaterialization(...)`, `withMaterializations(...)`, and
+  `.register(...)`.
 - Breaking: storage adapters now receive a registered `model` instead of a
   `boundModel`.
 - Add v2 materialization APIs: `@torkbot/sledge/ledger` records typed
@@ -38,9 +38,10 @@
   the final schema.
 - Prune live-only signals that do not materialize durable signal work instead
   of retaining observer-only rows forever.
-- Split materialization contracts from implementations. `defineMaterializations`
-  declares plain-object indexer/query contracts, while `.register(...)` supplies
-  typed indexer/query implementations.
+- Split materialization contracts from implementations. Materialization
+  migrations derive the current schema and `.define(...)` attaches plain-object
+  indexer/query contracts, while `.register(...)` supplies typed indexer/query
+  implementations.
 - Add ledger-owned event refs on event envelopes so projection access callbacks
   can write semantic event references without exposing the internal events
   table.

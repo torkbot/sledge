@@ -10,9 +10,7 @@ import type {
 } from "./internal-storage.ts";
 import {
   defineLedgerShape,
-  defineMaterializationHistory,
-  defineMaterializationSchema,
-  defineMaterializations,
+  defineMaterialization,
   withMaterializations,
 } from "./ledger.ts";
 import {
@@ -39,45 +37,33 @@ test("database ledger startup applies materialization history hygiene", async ()
     signals: {},
     signalQueues: {},
   });
-  const schema = defineMaterializationSchema({
+  const materializations = defineMaterialization(shape, {
     namespace: "users",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            email: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
-  const history = defineMaterializationHistory(shape, schema, (m) => [
-    m.migration(1, "create users", (s) => [
-      s.createTable("users", (t) =>
-        t
-          .columns({
-            email: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      ),
-      s.data("seed user", async ({ db }) => {
-        await db
-          .insertInto("users")
-          .values({
-            email: "ada@example.com",
-            userId: "ada",
-          })
-          .execute();
-      }),
-    ]),
-  ]);
-  const materializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {},
-  });
+  })
+    .version(1, "create users", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              email: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .data("seed user", async ({ db }) => {
+          await db
+            .insertInto("users")
+            .values({
+              email: "ada@example.com",
+              userId: "ada",
+            })
+            .execute();
+        }),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
   const model = withMaterializations(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage();
   const ledger = createDatabaseLedger({
@@ -129,45 +115,33 @@ test("database ledger startup re-reads materialization version under the migrati
     signals: {},
     signalQueues: {},
   });
-  const schema = defineMaterializationSchema({
+  const materializations = defineMaterialization(shape, {
     namespace: "users",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            email: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
-  const history = defineMaterializationHistory(shape, schema, (m) => [
-    m.migration(1, "create users", (s) => [
-      s.createTable("users", (t) =>
-        t
-          .columns({
-            email: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      ),
-      s.data("seed user", async ({ db }) => {
-        await db
-          .insertInto("users")
-          .values({
-            email: "ada@example.com",
-            userId: "ada",
-          })
-          .execute();
-      }),
-    ]),
-  ]);
-  const materializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {},
-  });
+  })
+    .version(1, "create users", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              email: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .data("seed user", async ({ db }) => {
+          await db
+            .insertInto("users")
+            .values({
+              email: "ada@example.com",
+              userId: "ada",
+            })
+            .execute();
+        }),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
   const model = withMaterializations(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [undefined, 1],
@@ -218,28 +192,10 @@ test("database ledger startup creates indexes for incremental create-table migra
     signals: {},
     signalQueues: {},
   });
-  const schema = defineMaterializationSchema({
+  const materializations = defineMaterialization(shape, {
     namespace: "sessions",
-    version: 2,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"])
-          .index("sessionsByUser", ["userId"]),
-    },
-  });
-  const history = defineMaterializationHistory(shape, schema, (m) => [
-    m.migration(1, "create users", (s) => [
+  })
+    .version(1, "create users", (s) =>
       s.createTable("users", (t) =>
         t
           .columns({
@@ -247,8 +203,8 @@ test("database ledger startup creates indexes for incremental create-table migra
           })
           .primaryKey(["userId"]),
       ),
-    ]),
-    m.migration(2, "create sessions", (s) => [
+    )
+    .version(2, "create sessions", (s) =>
       s.createTable("sessions", (t) =>
         t
           .columns({
@@ -258,13 +214,11 @@ test("database ledger startup creates indexes for incremental create-table migra
           .primaryKey(["sessionId"])
           .index("sessionsByUser", ["userId"]),
       ),
-    ]),
-  ]);
-  const materializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {},
-  });
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
   const model = withMaterializations(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [1, 1],
@@ -319,32 +273,10 @@ test("database ledger startup preserves foreign keys for incrementally created t
     signals: {},
     signalQueues: {},
   });
-  const schema = defineMaterializationSchema({
+  const materializations = defineMaterialization(shape, {
     namespace: "sessions-with-users",
-    version: 2,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-    relations: (r) => ({
-      sessionUser: r
-        .foreignKey("sessions", ["userId"])
-        .references("users", ["userId"]),
-    }),
-  });
-  const history = defineMaterializationHistory(shape, schema, (m) => [
-    m.migration(1, "create users", (s) => [
+  })
+    .version(1, "create users", (s) =>
       s.createTable("users", (t) =>
         t
           .columns({
@@ -352,26 +284,25 @@ test("database ledger startup preserves foreign keys for incrementally created t
           })
           .primaryKey(["userId"]),
       ),
-    ]),
-    m.migration(2, "create sessions", (s) => [
-      s.createTable("sessions", (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-      ),
-      s.addForeignKey("sessionUser", (r) =>
-        r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
-      ),
-    ]),
-  ]);
-  const materializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {},
-  });
+    )
+    .version(2, "create sessions", (s) =>
+      s
+        .createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        )
+        .addForeignKey("sessionUser", (r) =>
+          r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
+        ),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
   const model = withMaterializations(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [1, 1],
@@ -407,43 +338,30 @@ test("database ledger startup runs data migrations against replayed schema state
     signals: {},
     signalQueues: {},
   });
-  const schema = defineMaterializationSchema({
+  const materializations = defineMaterialization(shape, {
     namespace: "replayed-data",
-    version: 2,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-  });
-  const history = defineMaterializationHistory(shape, schema, (m) => [
-    m.migration(1, "create users", (s) => [
-      s.createTable("users", (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      ),
-      s.data("try future table", async ({ db }) => {
-        await db
-          .insertInto("sessions")
-          .values({
-            sessionId: "s_1",
-          })
-          .execute();
-      }),
-    ]),
-    m.migration(2, "create sessions", (s) => [
+  })
+    .version(1, "create users", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .data("try future table", async ({ db }) => {
+          await db
+            // @ts-expect-error Future tables are not visible to earlier data migrations.
+            .insertInto("sessions")
+            .values({
+              // @ts-expect-error Future table columns are not visible either.
+              sessionId: "s_1",
+            })
+            .execute();
+        }),
+    )
+    .version(2, "create sessions", (s) =>
       s.createTable("sessions", (t) =>
         t
           .columns({
@@ -451,13 +369,11 @@ test("database ledger startup runs data migrations against replayed schema state
           })
           .primaryKey(["sessionId"]),
       ),
-    ]),
-  ]);
-  const materializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {},
-  });
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
   const model = withMaterializations(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage();
   const ledger = createDatabaseLedger({

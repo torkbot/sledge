@@ -32,9 +32,7 @@ import {
 import {
   createEventRef,
   defineLedgerShape,
-  defineMaterializationHistory,
-  defineMaterializationSchema,
-  defineMaterializations,
+  defineMaterialization,
   withMaterializations,
 } from "./ledger.ts";
 
@@ -58,23 +56,10 @@ const shape = defineLedgerShape({
   signalQueues: {},
 });
 
-const schema = defineMaterializationSchema({
+const materializations = defineMaterialization(shape, {
   namespace: "test",
-  version: 1,
-  tables: {
-    users: (t) =>
-      t
-        .columns({
-          userId: t.text().notNull(),
-          email: t.text().notNull(),
-          source: t.eventRef("user.created").notNull(),
-        })
-        .primaryKey(["userId"]),
-  },
-});
-
-const history = defineMaterializationHistory(shape, schema, (m) => [
-  m.migration(1, "create users", (s) => [
+})
+  .version(1, "create users", (s) =>
     s.createTable("users", (t) =>
       t
         .columns({
@@ -84,39 +69,38 @@ const history = defineMaterializationHistory(shape, schema, (m) => [
         })
         .primaryKey(["userId"]),
     ),
-  ]),
-]);
-
-const materializations = defineMaterializations({
-  history,
-  indexers: {
-    upsertUser: {
-      sourceEvent: "user.created",
-      input: Type.Object({
-        userId: Type.String(),
-        email: Type.String(),
-      }),
-    },
-  },
-  queries: {
-    userById: {
-      params: Type.Object({
-        userId: Type.String(),
-      }),
-      result: Type.Union([
-        Type.Null(),
-        Type.Object({
+  )
+  .define({
+    indexers: {
+      upsertUser: {
+        sourceEvent: "user.created",
+        input: Type.Object({
           userId: Type.String(),
           email: Type.String(),
-          source: Type.Object({
-            eventName: Type.Literal("user.created"),
-            eventId: Type.Number(),
-          }),
         }),
-      ]),
+      },
     },
-  },
-});
+    queries: {
+      userById: {
+        params: Type.Object({
+          userId: Type.String(),
+        }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            userId: Type.String(),
+            email: Type.String(),
+            source: Type.Object({
+              eventName: Type.Literal("user.created"),
+              eventId: Type.Number(),
+            }),
+          }),
+        ]),
+      },
+    },
+  });
+const schema = materializations.history.current;
+const history = materializations.history;
 
 const definedModel = withMaterializations(shape, materializations);
 
@@ -516,16 +500,29 @@ test("projection access compiles typed indexer and query definitions to storage 
 });
 
 test("projection access batches typed insert values into one statement", async () => {
-  const batchMaterializations = defineMaterializations({
-    history,
-    indexers: {
-      seedUsers: {
-        sourceEvent: "user.created",
-        input: Type.Array(UserCreatedSchema),
+  const batchMaterializations = defineMaterialization(shape, {
+    namespace: "batch",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {
+        seedUsers: {
+          sourceEvent: "user.created",
+          input: Type.Array(UserCreatedSchema),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
   const batchModel = withMaterializations(
     shape,
     batchMaterializations,
@@ -598,47 +595,30 @@ test("projection access batches typed insert values into one statement", async (
 });
 
 test("projection access supports typed integer increments without raw SQL", async () => {
-  const counterSchema = defineMaterializationSchema({
+  const counterMaterializations = defineMaterialization(shape, {
     namespace: "counter",
-    version: 1,
-    tables: {
-      counters: (t) =>
+  })
+    .version(1, "create counters", (s) =>
+      s.createTable("counters", (t) =>
         t
           .columns({
             attempts: t.integer().notNull(),
             counterId: t.text().notNull(),
           })
           .primaryKey(["counterId"]),
-    },
-  });
-  const counterHistory = defineMaterializationHistory(
-    shape,
-    counterSchema,
-    (m) => [
-      m.migration(1, "create counters", (s) => [
-        s.createTable("counters", (t) =>
-          t
-            .columns({
-              attempts: t.integer().notNull(),
-              counterId: t.text().notNull(),
-            })
-            .primaryKey(["counterId"]),
-        ),
-      ]),
-    ],
-  );
-  const counterMaterializations = defineMaterializations({
-    history: counterHistory,
-    indexers: {
-      incrementCounter: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          counterId: Type.String(),
-        }),
+      ),
+    )
+    .define({
+      indexers: {
+        incrementCounter: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            counterId: Type.String(),
+          }),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
   const counterModel = withMaterializations(
     shape,
     counterMaterializations,
@@ -685,47 +665,30 @@ test("projection access supports typed integer increments without raw SQL", asyn
 });
 
 test("projection access tracks unawaited executeExpectingOne assertions", async () => {
-  const counterSchema = defineMaterializationSchema({
+  const counterMaterializations = defineMaterialization(shape, {
     namespace: "counter-assertions",
-    version: 1,
-    tables: {
-      counters: (t) =>
+  })
+    .version(1, "create counters", (s) =>
+      s.createTable("counters", (t) =>
         t
           .columns({
             attempts: t.integer().notNull(),
             counterId: t.text().notNull(),
           })
           .primaryKey(["counterId"]),
-    },
-  });
-  const counterHistory = defineMaterializationHistory(
-    shape,
-    counterSchema,
-    (m) => [
-      m.migration(1, "create counters", (s) => [
-        s.createTable("counters", (t) =>
-          t
-            .columns({
-              attempts: t.integer().notNull(),
-              counterId: t.text().notNull(),
-            })
-            .primaryKey(["counterId"]),
-        ),
-      ]),
-    ],
-  );
-  const counterMaterializations = defineMaterializations({
-    history: counterHistory,
-    indexers: {
-      incrementCounter: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          counterId: Type.String(),
-        }),
+      ),
+    )
+    .define({
+      indexers: {
+        incrementCounter: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            counterId: Type.String(),
+          }),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
   const counterModel = withMaterializations(
     shape,
     counterMaterializations,
@@ -774,21 +737,10 @@ test("projection access tracks unawaited executeExpectingOne assertions", async 
 });
 
 test("projection access supports bounded integer decrements without raw SQL", async () => {
-  const grantSchema = defineMaterializationSchema({
+  const grantMaterializations = defineMaterialization(shape, {
     namespace: "grant_consumes",
-    version: 1,
-    tables: {
-      grants: (t) =>
-        t
-          .columns({
-            grantId: t.text().notNull(),
-            remainingUses: t.integer(),
-          })
-          .primaryKey(["grantId"]),
-    },
-  });
-  const grantHistory = defineMaterializationHistory(shape, grantSchema, (m) => [
-    m.migration(1, "create grants", (s) => [
+  })
+    .version(1, "create grants", (s) =>
       s.createTable("grants", (t) =>
         t
           .columns({
@@ -797,20 +749,18 @@ test("projection access supports bounded integer decrements without raw SQL", as
           })
           .primaryKey(["grantId"]),
       ),
-    ]),
-  ]);
-  const grantMaterializations = defineMaterializations({
-    history: grantHistory,
-    indexers: {
-      consumeGrant: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          grantId: Type.String(),
-        }),
+    )
+    .define({
+      indexers: {
+        consumeGrant: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            grantId: Type.String(),
+          }),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
   const grantModel = withMaterializations(
     shape,
     grantMaterializations,
@@ -1107,71 +1057,59 @@ test("projection access rejects writes started after indexer completion", async 
 });
 
 test("projection access rejects non-serializable JSON values before storage", async () => {
-  const jsonSchema = defineMaterializationSchema({
+  const jsonMaterializations = defineMaterialization(shape, {
     namespace: "json",
-    version: 1,
-    tables: {
-      jsonRows: (t) =>
+  })
+    .version(1, "create json rows", (s) =>
+      s.createTable("jsonRows", (t) =>
         t
           .columns({
             userId: t.text().notNull(),
             metadata: t.json<unknown>().notNull(),
           })
           .primaryKey(["userId"]),
-    },
-  });
-  const jsonMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, jsonSchema, (m) => [
-      m.migration(1, "create json rows", (s) => [
-        s.createTable("jsonRows", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-              metadata: t.json<unknown>().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-      ]),
-    ]),
-    indexers: {
-      insertJson: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          userId: Type.String(),
-          metadata: Type.Unknown(),
-        }),
-      },
-      updateJson: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          userId: Type.String(),
-          metadata: Type.Unknown(),
-        }),
-      },
-    },
-    queries: {
-      jsonByMetadata: {
-        params: Type.Object({
-          metadata: Type.Unknown(),
-        }),
-        result: Type.Array(
-          Type.Object({
+      ),
+    )
+    .define({
+      indexers: {
+        insertJson: {
+          sourceEvent: "user.created",
+          input: Type.Object({
             userId: Type.String(),
+            metadata: Type.Unknown(),
           }),
-        ),
-      },
-      jsonByMetadataIn: {
-        params: Type.Object({
-          values: Type.Array(Type.Unknown()),
-        }),
-        result: Type.Array(
-          Type.Object({
+        },
+        updateJson: {
+          sourceEvent: "user.created",
+          input: Type.Object({
             userId: Type.String(),
+            metadata: Type.Unknown(),
           }),
-        ),
+        },
       },
-    },
-  });
+      queries: {
+        jsonByMetadata: {
+          params: Type.Object({
+            metadata: Type.Unknown(),
+          }),
+          result: Type.Array(
+            Type.Object({
+              userId: Type.String(),
+            }),
+          ),
+        },
+        jsonByMetadataIn: {
+          params: Type.Object({
+            values: Type.Array(Type.Unknown()),
+          }),
+          result: Type.Array(
+            Type.Object({
+              userId: Type.String(),
+            }),
+          ),
+        },
+      },
+    });
   const registeredJsonModel = withMaterializations(
     shape,
     jsonMaterializations,
@@ -1403,11 +1341,11 @@ test("projection access rejects non-serializable JSON values before storage", as
 });
 
 test("projection access supports stateful indexers and ordered range queries", async () => {
-  const stateSchema = defineMaterializationSchema({
+  const stateMaterializations = defineMaterialization(shape, {
     namespace: "stateful",
-    version: 1,
-    tables: {
-      runState: (t) =>
+  })
+    .version(1, "create run state", (s) =>
+      s.createTable("runState", (t) =>
         t
           .columns({
             runId: t.text().notNull(),
@@ -1415,54 +1353,41 @@ test("projection access supports stateful indexers and ordered range queries", a
             messageJson: t.text(),
           })
           .primaryKey(["runId"]),
-    },
-  });
-  const stateMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, stateSchema, (m) => [
-      m.migration(1, "create run state", (s) => [
-        s.createTable("runState", (t) =>
-          t
-            .columns({
-              runId: t.text().notNull(),
-              latestInputEventId: t.integer().notNull(),
-              messageJson: t.text(),
-            })
-            .primaryKey(["runId"]),
-        ),
-      ]),
-    ]),
-    indexers: {
-      checkpoint: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          runId: Type.String(),
-          inputEventId: Type.Number(),
-          messageJson: Type.String(),
-        }),
-      },
-      remove: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          runId: Type.String(),
-        }),
-      },
-    },
-    queries: {
-      due: {
-        params: Type.Object({
-          afterEventId: Type.Number(),
-          limit: Type.Number(),
-        }),
-        result: Type.Array(
-          Type.Object({
+      ),
+    )
+    .define({
+      indexers: {
+        checkpoint: {
+          sourceEvent: "user.created",
+          input: Type.Object({
             runId: Type.String(),
-            latestInputEventId: Type.Number(),
-            messageJson: Type.Union([Type.Null(), Type.String()]),
+            inputEventId: Type.Number(),
+            messageJson: Type.String(),
           }),
-        ),
+        },
+        remove: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            runId: Type.String(),
+          }),
+        },
       },
-    },
-  });
+      queries: {
+        due: {
+          params: Type.Object({
+            afterEventId: Type.Number(),
+            limit: Type.Number(),
+          }),
+          result: Type.Array(
+            Type.Object({
+              runId: Type.String(),
+              latestInputEventId: Type.Number(),
+              messageJson: Type.Union([Type.Null(), Type.String()]),
+            }),
+          ),
+        },
+      },
+    });
   const stateModel = withMaterializations(
     shape,
     stateMaterializations,
@@ -1609,11 +1534,11 @@ test("projection access supports stateful indexers and ordered range queries", a
 });
 
 test("projection access supports typed application-defined ordering", async () => {
-  const profileSchema = defineMaterializationSchema({
+  const profileMaterializations = defineMaterialization(shape, {
     namespace: "profile-docs",
-    version: 1,
-    tables: {
-      profileDocs: (t) =>
+  })
+    .version(1, "create profile docs", (s) =>
+      s.createTable("profileDocs", (t) =>
         t
           .columns({
             docId: t.text().notNull(),
@@ -1622,37 +1547,23 @@ test("projection access supports typed application-defined ordering", async () =
             archivedAtMs: t.integer(),
           })
           .primaryKey(["docId"]),
-    },
-  });
-  const profileMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, profileSchema, (m) => [
-      m.migration(1, "create profile docs", (s) => [
-        s.createTable("profileDocs", (t) =>
-          t
-            .columns({
-              docId: t.text().notNull(),
-              version: t.integer().notNull(),
-              content: t.text().notNull(),
-              archivedAtMs: t.integer(),
-            })
-            .primaryKey(["docId"]),
-        ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      list: {
-        params: Type.Object({}),
-        result: Type.Array(
-          Type.Object({
-            docId: Type.String(),
-            version: Type.Number(),
-            content: Type.String(),
-          }),
-        ),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        list: {
+          params: Type.Object({}),
+          result: Type.Array(
+            Type.Object({
+              docId: Type.String(),
+              version: Type.Number(),
+              content: Type.String(),
+            }),
+          ),
+        },
       },
-    },
-  });
+    });
   const profileModel = withMaterializations(
     shape,
     profileMaterializations,
@@ -1704,11 +1615,11 @@ test("projection access supports typed application-defined ordering", async () =
 });
 
 test("projection access supports typed disjunction predicate groups", async () => {
-  const followupSchema = defineMaterializationSchema({
+  const followupMaterializations = defineMaterialization(shape, {
     namespace: "followups",
-    version: 1,
-    tables: {
-      followups: (t) =>
+  })
+    .version(1, "create followups", (s) =>
+      s.createTable("followups", (t) =>
         t
           .columns({
             followupId: t.text().notNull(),
@@ -1719,60 +1630,44 @@ test("projection access supports typed disjunction predicate groups", async () =
           })
           .primaryKey(["followupId"])
           .index("followups_by_state", ["state", "requestedAtMs"]),
-    },
-  });
-  const followupMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, followupSchema, (m) => [
-      m.migration(1, "create followups", (s) => [
-        s.createTable("followups", (t) =>
-          t
-            .columns({
-              followupId: t.text().notNull(),
-              targetRunId: t.text().notNull(),
-              state: t.text().notNull(),
-              requestedAtMs: t.integer().notNull(),
-              nextAttemptAfterMs: t.integer(),
-            })
-            .primaryKey(["followupId"])
-            .index("followups_by_state", ["state", "requestedAtMs"]),
-        ),
-      ]),
-    ]),
-    indexers: {
-      removeFollowups: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          followupId: Type.String(),
-          targetRunId: Type.String(),
-        }),
-      },
-      resolveFollowups: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          followupId: Type.String(),
-          targetRunId: Type.String(),
-        }),
-      },
-    },
-    queries: {
-      dueFollowups: {
-        params: Type.Object({
-          limit: Type.Number(),
-          nowMs: Type.Number(),
-          targetRunId: Type.String(),
-        }),
-        result: Type.Array(
-          Type.Object({
+      ),
+    )
+    .define({
+      indexers: {
+        removeFollowups: {
+          sourceEvent: "user.created",
+          input: Type.Object({
             followupId: Type.String(),
             targetRunId: Type.String(),
-            state: Type.String(),
-            requestedAtMs: Type.Number(),
-            nextAttemptAfterMs: Type.Union([Type.Null(), Type.Number()]),
           }),
-        ),
+        },
+        resolveFollowups: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            followupId: Type.String(),
+            targetRunId: Type.String(),
+          }),
+        },
       },
-    },
-  });
+      queries: {
+        dueFollowups: {
+          params: Type.Object({
+            limit: Type.Number(),
+            nowMs: Type.Number(),
+            targetRunId: Type.String(),
+          }),
+          result: Type.Array(
+            Type.Object({
+              followupId: Type.String(),
+              targetRunId: Type.String(),
+              state: Type.String(),
+              requestedAtMs: Type.Number(),
+              nextAttemptAfterMs: Type.Union([Type.Null(), Type.Number()]),
+            }),
+          ),
+        },
+      },
+    });
   const followupModel = withMaterializations(
     shape,
     followupMaterializations,
@@ -1950,53 +1845,36 @@ test("projection access supports typed disjunction predicate groups", async () =
 });
 
 test("projection access executeTakeFirst honors explicit zero limits", async () => {
-  const limitSchema = defineMaterializationSchema({
+  const limitMaterializations = defineMaterialization(shape, {
     namespace: "limit-zero",
-    version: 1,
-    tables: {
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
-  const limitMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, limitSchema, (m) => [
-      m.migration(1, "create limit-zero tables", (s) => [
-        s.createTable("sessions", (t) =>
+  })
+    .version(1, "create limit-zero tables", (s) =>
+      s
+        .createTable("sessions", (t) =>
           t
             .columns({
               sessionId: t.text().notNull(),
               userId: t.text().notNull(),
             })
             .primaryKey(["sessionId"]),
-        ),
-        s.createTable("users", (t) =>
+        )
+        .createTable("users", (t) =>
           t
             .columns({
               userId: t.text().notNull(),
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      checkLimitZero: {
-        params: Type.Object({}),
-        result: Type.Null(),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        checkLimitZero: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
       },
-    },
-  });
+    });
   const limitModel = withMaterializations(
     shape,
     limitMaterializations,
@@ -2063,39 +1941,12 @@ test("projection access executeTakeFirst honors explicit zero limits", async () 
 });
 
 test("projection access supports typed union candidate reads", async () => {
-  const decisionSchema = defineMaterializationSchema({
+  const decisionMaterializations = defineMaterialization(shape, {
     namespace: "network-decision",
-    version: 1,
-    tables: {
-      grants: (t) =>
-        t
-          .columns({
-            grantId: t.text().notNull(),
-            instanceId: t.text(),
-            scope: t.text().notNull(),
-            decision: t.text().notNull(),
-            remainingUses: t.integer(),
-            createdAtMs: t.integer().notNull(),
-            consumedAtMs: t.integer(),
-          })
-          .primaryKey(["grantId"]),
-      lanePolicies: (t) =>
-        t
-          .columns({
-            policyEntryId: t.text().notNull(),
-            instanceId: t.text().notNull(),
-            scope: t.text().notNull(),
-            decision: t.text().notNull(),
-            updatedAtMs: t.integer().notNull(),
-            revokedAtMs: t.integer(),
-          })
-          .primaryKey(["policyEntryId"]),
-    },
-  });
-  const decisionMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, decisionSchema, (m) => [
-      m.migration(1, "create network decision tables", (s) => [
-        s.createTable("grants", (t) =>
+  })
+    .version(1, "create network decision tables", (s) =>
+      s
+        .createTable("grants", (t) =>
           t
             .columns({
               grantId: t.text().notNull(),
@@ -2107,8 +1958,8 @@ test("projection access supports typed union candidate reads", async () => {
               consumedAtMs: t.integer(),
             })
             .primaryKey(["grantId"]),
-        ),
-        s.createTable("lanePolicies", (t) =>
+        )
+        .createTable("lanePolicies", (t) =>
           t
             .columns({
               policyEntryId: t.text().notNull(),
@@ -2120,26 +1971,26 @@ test("projection access supports typed union candidate reads", async () => {
             })
             .primaryKey(["policyEntryId"]),
         ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      checkDecision: {
-        params: Type.Object({
-          instanceId: Type.String(),
-          scope: Type.String(),
-        }),
-        result: Type.Union([
-          Type.Null(),
-          Type.Object({
-            decisionId: Type.String(),
-            decision: Type.String(),
-            remainingUses: Type.Union([Type.Null(), Type.Number()]),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        checkDecision: {
+          params: Type.Object({
+            instanceId: Type.String(),
+            scope: Type.String(),
           }),
-        ]),
+          result: Type.Union([
+            Type.Null(),
+            Type.Object({
+              decisionId: Type.String(),
+              decision: Type.String(),
+              remainingUses: Type.Union([Type.Null(), Type.Number()]),
+            }),
+          ]),
+        },
       },
-    },
-  });
+    });
   const decisionModel = withMaterializations(
     shape,
     decisionMaterializations,
@@ -2290,23 +2141,36 @@ test("projection access supports typed union candidate reads", async () => {
 });
 
 test("projection access decodes boolean and nullable union literals", async () => {
-  const unionMaterializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {
-      checkUnion: {
-        params: Type.Object({}),
-        result: Type.Union([
-          Type.Null(),
-          Type.Object({
-            isPrimary: Type.Boolean(),
-            maybeEmail: Type.Union([Type.Null(), Type.String()]),
-            userId: Type.String(),
-          }),
-        ]),
+  const unionMaterializations = defineMaterialization(shape, {
+    namespace: "union",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        checkUnion: {
+          params: Type.Object({}),
+          result: Type.Union([
+            Type.Null(),
+            Type.Object({
+              isPrimary: Type.Boolean(),
+              maybeEmail: Type.Union([Type.Null(), Type.String()]),
+              userId: Type.String(),
+            }),
+          ]),
+        },
       },
-    },
-  });
+    });
   const unionModel = withMaterializations(
     shape,
     unionMaterializations,
@@ -2362,38 +2226,12 @@ test("projection access decodes boolean and nullable union literals", async () =
 });
 
 test("projection access supports typed inner joins between materialization tables", async () => {
-  const networkSchema = defineMaterializationSchema({
+  const networkMaterializations = defineMaterialization(shape, {
     namespace: "network",
-    version: 1,
-    tables: {
-      policyPromptRequests: (t) =>
-        t
-          .columns({
-            policyPromptId: t.text().notNull(),
-            requestId: t.text().notNull(),
-            tenantId: t.text().notNull(),
-          })
-          .primaryKey(["tenantId", "policyPromptId", "requestId"])
-          .index("policy_prompt_requests_by_request", ["requestId"]),
-      requests: (t) =>
-        t
-          .columns({
-            requestId: t.text().notNull(),
-            instanceId: t.text().notNull(),
-            runId: t.text().notNull(),
-            requestedAtMs: t.integer().notNull(),
-            resolvedAtMs: t.integer(),
-            summary: t.text().notNull(),
-            tenantId: t.text().notNull(),
-          })
-          .primaryKey(["requestId"])
-          .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
-    },
-  });
-  const networkMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, networkSchema, (m) => [
-      m.migration(1, "create network request tables", (s) => [
-        s.createTable("policyPromptRequests", (t) =>
+  })
+    .version(1, "create network request tables", (s) =>
+      s
+        .createTable("policyPromptRequests", (t) =>
           t
             .columns({
               policyPromptId: t.text().notNull(),
@@ -2402,8 +2240,8 @@ test("projection access supports typed inner joins between materialization table
             })
             .primaryKey(["tenantId", "policyPromptId", "requestId"])
             .index("policy_prompt_requests_by_request", ["requestId"]),
-        ),
-        s.createTable("requests", (t) =>
+        )
+        .createTable("requests", (t) =>
           t
             .columns({
               requestId: t.text().notNull(),
@@ -2417,27 +2255,27 @@ test("projection access supports typed inner joins between materialization table
             .primaryKey(["requestId"])
             .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
         ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      promptRequests: {
-        params: Type.Object({
-          policyPromptId: Type.String(),
-        }),
-        result: Type.Array(
-          Type.Object({
-            requestId: Type.String(),
-            instanceId: Type.String(),
-            runId: Type.String(),
-            requestedAtMs: Type.Number(),
-            resolvedAtMs: Type.Union([Type.Null(), Type.Number()]),
-            summary: Type.String(),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        promptRequests: {
+          params: Type.Object({
+            policyPromptId: Type.String(),
           }),
-        ),
+          result: Type.Array(
+            Type.Object({
+              requestId: Type.String(),
+              instanceId: Type.String(),
+              runId: Type.String(),
+              requestedAtMs: Type.Number(),
+              resolvedAtMs: Type.Union([Type.Null(), Type.Number()]),
+              summary: Type.String(),
+            }),
+          ),
+        },
       },
-    },
-  });
+    });
   const networkModel = withMaterializations(
     shape,
     networkMaterializations,
@@ -2522,34 +2360,12 @@ test("projection access supports typed inner joins between materialization table
 });
 
 test("projection access supports typed anti-join predicates", async () => {
-  const networkSchema = defineMaterializationSchema({
+  const networkMaterializations = defineMaterialization(shape, {
     namespace: "network-anti-join",
-    version: 1,
-    tables: {
-      policyPromptRequests: (t) =>
-        t
-          .columns({
-            policyPromptId: t.text().notNull(),
-            requestId: t.text().notNull(),
-          })
-          .primaryKey(["policyPromptId", "requestId"])
-          .index("policy_prompt_requests_by_request", ["requestId"]),
-      requests: (t) =>
-        t
-          .columns({
-            requestId: t.text().notNull(),
-            requestedAtMs: t.integer().notNull(),
-            resolvedAtMs: t.integer(),
-            summary: t.text().notNull(),
-          })
-          .primaryKey(["requestId"])
-          .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
-    },
-  });
-  const networkMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, networkSchema, (m) => [
-      m.migration(1, "create network request tables", (s) => [
-        s.createTable("policyPromptRequests", (t) =>
+  })
+    .version(1, "create network request tables", (s) =>
+      s
+        .createTable("policyPromptRequests", (t) =>
           t
             .columns({
               policyPromptId: t.text().notNull(),
@@ -2557,8 +2373,8 @@ test("projection access supports typed anti-join predicates", async () => {
             })
             .primaryKey(["policyPromptId", "requestId"])
             .index("policy_prompt_requests_by_request", ["requestId"]),
-        ),
-        s.createTable("requests", (t) =>
+        )
+        .createTable("requests", (t) =>
           t
             .columns({
               requestId: t.text().notNull(),
@@ -2569,23 +2385,23 @@ test("projection access supports typed anti-join predicates", async () => {
             .primaryKey(["requestId"])
             .index("requests_pending", ["resolvedAtMs", "requestedAtMs"]),
         ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      unpromptedPending: {
-        params: Type.Object({}),
-        result: Type.Array(
-          Type.Object({
-            requestId: Type.String(),
-            requestedAtMs: Type.Number(),
-            resolvedAtMs: Type.Union([Type.Null(), Type.Number()]),
-            summary: Type.String(),
-          }),
-        ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        unpromptedPending: {
+          params: Type.Object({}),
+          result: Type.Array(
+            Type.Object({
+              requestId: Type.String(),
+              requestedAtMs: Type.Number(),
+              resolvedAtMs: Type.Union([Type.Null(), Type.Number()]),
+              summary: Type.String(),
+            }),
+          ),
+        },
       },
-    },
-  });
+    });
   const networkModel = withMaterializations(
     shape,
     networkMaterializations,
@@ -2645,38 +2461,20 @@ test("projection access supports typed anti-join predicates", async () => {
 });
 
 test("projection access supports left-joined optional rows", async () => {
-  const operationSchema = defineMaterializationSchema({
+  const operationMaterializations = defineMaterialization(shape, {
     namespace: "operation-status",
-    version: 1,
-    tables: {
-      completions: (t) =>
-        t
-          .columns({
-            completedAtMs: t.integer().notNull(),
-            operationKey: t.text().notNull(),
-          })
-          .primaryKey(["operationKey"]),
-      operations: (t) =>
-        t
-          .columns({
-            operationKey: t.text().notNull(),
-            requestedAtMs: t.integer().notNull(),
-          })
-          .primaryKey(["operationKey"]),
-    },
-  });
-  const operationMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, operationSchema, (m) => [
-      m.migration(1, "create operation status tables", (s) => [
-        s.createTable("operations", (t) =>
+  })
+    .version(1, "create operation status tables", (s) =>
+      s
+        .createTable("operations", (t) =>
           t
             .columns({
               operationKey: t.text().notNull(),
               requestedAtMs: t.integer().notNull(),
             })
             .primaryKey(["operationKey"]),
-        ),
-        s.createTable("completions", (t) =>
+        )
+        .createTable("completions", (t) =>
           t
             .columns({
               completedAtMs: t.integer().notNull(),
@@ -2684,23 +2482,23 @@ test("projection access supports left-joined optional rows", async () => {
             })
             .primaryKey(["operationKey"]),
         ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      completionByOperation: {
-        params: Type.Object({
-          operationKey: Type.String(),
-        }),
-        result: Type.Union([
-          Type.Null(),
-          Type.Object({
-            completedAtMs: Type.Union([Type.Null(), Type.Number()]),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        completionByOperation: {
+          params: Type.Object({
+            operationKey: Type.String(),
           }),
-        ]),
+          result: Type.Union([
+            Type.Null(),
+            Type.Object({
+              completedAtMs: Type.Union([Type.Null(), Type.Number()]),
+            }),
+          ]),
+        },
       },
-    },
-  });
+    });
   const operationModel = withMaterializations(
     shape,
     operationMaterializations,
@@ -2748,52 +2546,40 @@ test("projection access supports left-joined optional rows", async () => {
 });
 
 test("projection access rejects unsafe predicate and self-join shapes", async () => {
-  const nodeSchema = defineMaterializationSchema({
+  const nodeMaterializations = defineMaterialization(shape, {
     namespace: "node-shapes",
-    version: 1,
-    tables: {
-      nodes: (t) =>
+  })
+    .version(1, "create nodes", (s) =>
+      s.createTable("nodes", (t) =>
         t
           .columns({
             nodeId: t.text().notNull(),
             parentId: t.text(),
           })
           .primaryKey(["nodeId"]),
-    },
-  });
-  const nodeMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, nodeSchema, (m) => [
-      m.migration(1, "create nodes", (s) => [
-        s.createTable("nodes", (t) =>
-          t
-            .columns({
-              nodeId: t.text().notNull(),
-              parentId: t.text(),
-            })
-            .primaryKey(["nodeId"]),
-        ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      nullComparison: {
-        params: Type.Object({}),
-        result: Type.Null(),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        nullComparison: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
+        nullIn: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
+        selfAntiJoin: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
+        selfJoin: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
       },
-      nullIn: {
-        params: Type.Object({}),
-        result: Type.Null(),
-      },
-      selfAntiJoin: {
-        params: Type.Object({}),
-        result: Type.Null(),
-      },
-      selfJoin: {
-        params: Type.Object({}),
-        result: Type.Null(),
-      },
-    },
-  });
+    });
   const nodeModel = withMaterializations(shape, nodeMaterializations).register({
     queries: {
       nullComparison: async ({ db }) => {
@@ -2876,11 +2662,11 @@ test("projection access rejects unsafe predicate and self-join shapes", async ()
 });
 
 test("projection access supports typed aggregate reads", async () => {
-  const toolSchema = defineMaterializationSchema({
+  const toolMaterializations = defineMaterialization(shape, {
     namespace: "tool-aggregates",
-    version: 1,
-    tables: {
-      toolCalls: (t) =>
+  })
+    .version(1, "create tool call tables", (s) =>
+      s.createTable("toolCalls", (t) =>
         t
           .columns({
             toolCallId: t.text().notNull(),
@@ -2890,45 +2676,30 @@ test("projection access supports typed aggregate reads", async () => {
           })
           .primaryKey(["toolCallId"])
           .index("tool_calls_by_run", ["runId"]),
-    },
-  });
-  const toolMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(shape, toolSchema, (m) => [
-      m.migration(1, "create tool call tables", (s) => [
-        s.createTable("toolCalls", (t) =>
-          t
-            .columns({
-              toolCallId: t.text().notNull(),
-              createdAtMs: t.integer().notNull(),
-              runId: t.text().notNull(),
-              resultMessageJson: t.text(),
-            })
-            .primaryKey(["toolCallId"])
-            .index("tool_calls_by_run", ["runId"]),
-        ),
-      ]),
-    ]),
-    indexers: {},
-    queries: {
-      duplicateAlias: {
-        params: Type.Object({}),
-        result: Type.Object({
-          total: Type.Number(),
-        }),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        duplicateAlias: {
+          params: Type.Object({}),
+          result: Type.Object({
+            total: Type.Number(),
+          }),
+        },
+        toolSummary: {
+          params: Type.Object({
+            runId: Type.String(),
+          }),
+          result: Type.Object({
+            completedToolCallCount: Type.Number(),
+            firstToolCallAtMs: Type.Union([Type.Null(), Type.Number()]),
+            latestToolCallAtMs: Type.Union([Type.Null(), Type.Number()]),
+            totalToolCallCount: Type.Number(),
+          }),
+        },
       },
-      toolSummary: {
-        params: Type.Object({
-          runId: Type.String(),
-        }),
-        result: Type.Object({
-          completedToolCallCount: Type.Number(),
-          firstToolCallAtMs: Type.Union([Type.Null(), Type.Number()]),
-          latestToolCallAtMs: Type.Union([Type.Null(), Type.Number()]),
-          totalToolCallCount: Type.Number(),
-        }),
-      },
-    },
-  });
+    });
   const toolModel = withMaterializations(shape, toolMaterializations).register({
     queries: {
       duplicateAlias: async ({ db }) => {
@@ -3002,37 +2773,50 @@ test("projection access supports typed aggregate reads", async () => {
 });
 
 test("projection access hydrates semantic event references without exposing events table", async () => {
-  const eventMaterializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {
-      sourceEvent: {
-        params: Type.Object({
-          eventId: Type.Number(),
-        }),
-        result: Type.Union([Type.Null(), UserCreatedSchema]),
+  const eventMaterializations = defineMaterialization(shape, {
+    namespace: "events",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        sourceEvent: {
+          params: Type.Object({
+            eventId: Type.Number(),
+          }),
+          result: Type.Union([Type.Null(), UserCreatedSchema]),
+        },
+        sourceEvents: {
+          params: Type.Object({
+            eventIds: Type.Array(Type.Number()),
+          }),
+          result: Type.Array(Type.Union([Type.Null(), UserCreatedSchema])),
+        },
+        sourceEventScan: {
+          params: Type.Object({
+            afterEventId: Type.Number(),
+            limit: Type.Number(),
+          }),
+          result: Type.Array(UserCreatedSchema),
+        },
+        sourceEventScanByUser: {
+          params: Type.Object({
+            userId: Type.String(),
+          }),
+          result: Type.Array(UserCreatedSchema),
+        },
       },
-      sourceEvents: {
-        params: Type.Object({
-          eventIds: Type.Array(Type.Number()),
-        }),
-        result: Type.Array(Type.Union([Type.Null(), UserCreatedSchema])),
-      },
-      sourceEventScan: {
-        params: Type.Object({
-          afterEventId: Type.Number(),
-          limit: Type.Number(),
-        }),
-        result: Type.Array(UserCreatedSchema),
-      },
-      sourceEventScanByUser: {
-        params: Type.Object({
-          userId: Type.String(),
-        }),
-        result: Type.Array(UserCreatedSchema),
-      },
-    },
-  });
+    });
   const eventModel = withMaterializations(
     shape,
     eventMaterializations,
@@ -3304,30 +3088,43 @@ test("projection access scans semantic signals without exposing events table", a
     },
     signalQueues: {},
   });
-  const signalMaterializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {
-      frameBoundsByRun: {
-        params: Type.Object({
-          afterSignalEventId: Type.Number(),
-          runId: Type.String(),
-        }),
-        result: Type.Object({
-          maxEventId: Type.Union([Type.Null(), Type.Number()]),
-          minEventId: Type.Union([Type.Null(), Type.Number()]),
-        }),
+  const signalMaterializations = defineMaterialization(signalShape, {
+    namespace: "signals",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        frameBoundsByRun: {
+          params: Type.Object({
+            afterSignalEventId: Type.Number(),
+            runId: Type.String(),
+          }),
+          result: Type.Object({
+            maxEventId: Type.Union([Type.Null(), Type.Number()]),
+            minEventId: Type.Union([Type.Null(), Type.Number()]),
+          }),
+        },
+        framesByRun: {
+          params: Type.Object({
+            afterSignalEventId: Type.Number(),
+            limit: Type.Number(),
+            runId: Type.String(),
+          }),
+          result: Type.Array(RunStreamFrameSchema),
+        },
       },
-      framesByRun: {
-        params: Type.Object({
-          afterSignalEventId: Type.Number(),
-          limit: Type.Number(),
-          runId: Type.String(),
-        }),
-        result: Type.Array(RunStreamFrameSchema),
-      },
-    },
-  });
+    });
   const signalModel = withMaterializations(
     signalShape,
     signalMaterializations,
@@ -3454,11 +3251,11 @@ test("projection facade supports TorkBot-style surface operation materialization
     signals: {},
     signalQueues: {},
   });
-  const surfaceSchema = defineMaterializationSchema({
+  const surfaceMaterializations = defineMaterialization(surfaceShape, {
     namespace: "surface-operations",
-    version: 1,
-    tables: {
-      surfaceOperations: (t) =>
+  })
+    .version(1, "create surface operations", (s) =>
+      s.createTable("surfaceOperations", (t) =>
         t
           .columns({
             completed: t.eventRef("surface.operation.completed"),
@@ -3479,69 +3276,38 @@ test("projection facade supports TorkBot-style surface operation materialization
             "failedAtMs",
             "requestedAtMs",
           ]),
-    },
-  });
-  const surfaceHistory = defineMaterializationHistory(
-    surfaceShape,
-    surfaceSchema,
-    (m) => [
-      m.migration(1, "create surface operations", (s) => [
-        s.createTable("surfaceOperations", (t) =>
-          t
-            .columns({
-              completed: t.eventRef("surface.operation.completed"),
-              completedAtMs: t.integer(),
-              error: t.text(),
-              failed: t.eventRef("surface.operation.failed"),
-              failedAtMs: t.integer(),
-              operationKey: t.text().notNull(),
-              requested: t.eventRef("surface.operation.requested").notNull(),
-              requestedAtMs: t.integer().notNull(),
-              surfaceInstanceId: t.text().notNull(),
-              surfaceRefUrl: t.text().notNull(),
-              surfaceType: t.text().notNull(),
-            })
-            .primaryKey(["operationKey"])
-            .index("surface_operations_pending", [
-              "completedAtMs",
-              "failedAtMs",
-              "requestedAtMs",
-            ]),
-        ),
-      ]),
-    ],
-  );
-  const surfaceMaterializations = defineMaterializations({
-    history: surfaceHistory,
-    indexers: {
-      recordCompleted: {
-        input: SurfaceOperationCompletedSchema,
-        sourceEvent: "surface.operation.completed",
+      ),
+    )
+    .define({
+      indexers: {
+        recordCompleted: {
+          input: SurfaceOperationCompletedSchema,
+          sourceEvent: "surface.operation.completed",
+        },
+        recordFailed: {
+          input: SurfaceOperationFailedSchema,
+          sourceEvent: "surface.operation.failed",
+        },
+        recordRequested: {
+          input: SurfaceOperationRequestedSchema,
+          sourceEvent: "surface.operation.requested",
+        },
       },
-      recordFailed: {
-        input: SurfaceOperationFailedSchema,
-        sourceEvent: "surface.operation.failed",
+      queries: {
+        operationByKey: {
+          params: Type.Object({ operationKey: Type.String() }),
+          result: Type.Unknown(),
+        },
+        pendingOperations: {
+          params: Type.Object({ limit: Type.Number() }),
+          result: Type.Unknown(),
+        },
+        rebuildPreview: {
+          params: Type.Object({ afterEventId: Type.Number() }),
+          result: Type.Unknown(),
+        },
       },
-      recordRequested: {
-        input: SurfaceOperationRequestedSchema,
-        sourceEvent: "surface.operation.requested",
-      },
-    },
-    queries: {
-      operationByKey: {
-        params: Type.Object({ operationKey: Type.String() }),
-        result: Type.Unknown(),
-      },
-      pendingOperations: {
-        params: Type.Object({ limit: Type.Number() }),
-        result: Type.Unknown(),
-      },
-      rebuildPreview: {
-        params: Type.Object({ afterEventId: Type.Number() }),
-        result: Type.Unknown(),
-      },
-    },
-  });
+    });
   const surfaceModel = withMaterializations(
     surfaceShape,
     surfaceMaterializations,
@@ -3968,62 +3734,36 @@ test("ledger shape can register without projections", () => {
   });
 });
 
-test("ledger projection definition applies relations over inferred tables", () => {
-  const relationSchema = defineMaterializationSchema({
+test("ledger materialization migrations apply relations over inferred tables", () => {
+  const relationMaterializations = defineMaterialization(shape, {
     namespace: "relations",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-    relations: (r) => ({
-      sessionUser: r
-        .foreignKey("sessions", ["userId"])
-        .references("users", ["userId"]),
-    }),
-  });
-  const model = withMaterializations(
-    shape,
-    defineMaterializations({
-      history: defineMaterializationHistory(shape, relationSchema, (m) => [
-        m.migration(1, "create relation tables", (s) => [
-          s.createTable("users", (t) =>
-            t
-              .columns({
-                userId: t.text().notNull(),
-              })
-              .primaryKey(["userId"]),
-          ),
-          s.createTable("sessions", (t) =>
-            t
-              .columns({
-                sessionId: t.text().notNull(),
-                userId: t.text().notNull(),
-              })
-              .primaryKey(["sessionId"]),
-          ),
-          s.addForeignKey("sessionUser", (r) =>
-            r
-              .foreignKey("sessions", ["userId"])
-              .references("users", ["userId"]),
-          ),
-        ]),
-      ]),
+  })
+    .version(1, "create relation tables", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"]),
+        )
+        .addForeignKey("sessionUser", (r) =>
+          r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
+        ),
+    )
+    .define({
       indexers: {},
       queries: {},
-    }),
-  );
+    });
+  const model = withMaterializations(shape, relationMaterializations);
 
   assert.deepEqual(model.projections.metadata.relations, {
     sessionUser: {
@@ -4037,32 +3777,39 @@ test("ledger projection definition applies relations over inferred tables", () =
 });
 
 test("sqlite projection compiler compiles materialization schema DDL", () => {
-  const relationSchema = defineMaterializationSchema({
+  const relationMaterializations = defineMaterialization(shape, {
     namespace: "ddl",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"])
-          .index("sessionsByUser", ["userId"]),
-    },
-    relations: (r) => ({
-      sessionUser: r
-        .foreignKey("sessions", ["userId"])
-        .references("users", ["userId"])
-        .onDelete("cascade"),
-    }),
-  });
+  })
+    .version(1, "create ddl tables", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .createTable("sessions", (t) =>
+          t
+            .columns({
+              sessionId: t.text().notNull(),
+              userId: t.text().notNull(),
+            })
+            .primaryKey(["sessionId"])
+            .index("sessionsByUser", ["userId"]),
+        )
+        .addForeignKey("sessionUser", (r) =>
+          r
+            .foreignKey("sessions", ["userId"])
+            .references("users", ["userId"])
+            .onDelete("cascade"),
+        ),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
+  const relationSchema = relationMaterializations.history.current;
   const usersTable = relationSchema.metadata.tables.users;
   const sessionsTable = relationSchema.metadata.tables.sessions;
 
@@ -4125,25 +3872,11 @@ test("sqlite projection compiler compiles materialization schema DDL", () => {
   );
 });
 
-test("materialization histories validate versions and record typed operations", () => {
-  const schemaV2 = defineMaterializationSchema({
+test("materialization migrations derive schema and record typed operations", () => {
+  const materializationsV2 = defineMaterialization(shape, {
     namespace: "plan",
-    version: 2,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text(),
-          })
-          .primaryKey(["userId"])
-          .index("usersByEmail", ["email"])
-          .unique("usersByEmailUnique", ["email"]),
-    },
-  });
-
-  const historyV2 = defineMaterializationHistory(shape, schemaV2, (m) => [
-    m.migration(1, "create users", (s) => [
+  })
+    .version(1, "create users", (s) =>
       s.createTable("users", (t) =>
         t
           .columns({
@@ -4151,36 +3884,75 @@ test("materialization histories validate versions and record typed operations", 
           })
           .primaryKey(["userId"]),
       ),
-    ]),
-    m.migration(2, "add user email", (s) => [
-      s.addColumn("users", "email", (t) => t.text()),
-      s.createIndex("usersByEmail", "users", ["email"]),
-      s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
-      s.data("backfill user email", async ({ db }) => {
-        for await (const row of db
-          .selectFrom("users")
-          .select(["userId"])
-          .stream()) {
-          await db
-            .updateTable("users")
-            .set({
-              email: `${row.userId}@example.invalid`,
-            })
-            .where("userId", "=", row.userId)
-            .execute();
-        }
-      }),
-    ]),
-  ]);
-
-  assert.equal(
-    defineMaterializations({
-      history: historyV2,
+    )
+    .version(2, "add user email", (s) =>
+      s
+        .addColumn("users", "email", (t) => t.text())
+        .createIndex("usersByEmail", "users", ["email"])
+        .createUniqueIndex("usersByEmailUnique", "users", ["email"])
+        .data("backfill user email", async ({ db }) => {
+          for await (const row of db
+            .selectFrom("users")
+            .select(["userId"])
+            .stream()) {
+            await db
+              .updateTable("users")
+              .set({
+                email: `${row.userId}@example.invalid`,
+              })
+              .where("userId", "=", row.userId)
+              .execute();
+          }
+        }),
+    )
+    .define({
       indexers: {},
       queries: {},
-    }).history.current,
-    schemaV2,
-  );
+    });
+  const historyV2 = materializationsV2.history;
+
+  assert.equal(historyV2.namespace, "plan");
+  assert.equal(historyV2.currentVersion, 2);
+  assert.deepEqual(historyV2.current.metadata.tables.users, {
+    columns: {
+      email: {
+        eventName: null,
+        kind: "text",
+        nullable: true,
+      },
+      userId: {
+        eventName: null,
+        kind: "text",
+        nullable: false,
+      },
+    },
+    indexes: [
+      {
+        columns: ["email"],
+        name: "usersByEmail",
+        unique: false,
+      },
+      {
+        columns: ["email"],
+        name: "usersByEmailUnique",
+        unique: true,
+      },
+    ],
+    keys: [
+      {
+        columns: ["userId"],
+        kind: "primary",
+        name: null,
+      },
+      {
+        columns: ["email"],
+        kind: "unique",
+        name: "usersByEmailUnique",
+      },
+    ],
+    name: "users",
+    primaryKey: ["userId"],
+  });
   const secondMigration = historyV2.migrations[1];
 
   assert.ok(secondMigration !== undefined);
@@ -4216,6 +3988,10 @@ test("materialization histories validate versions and record typed operations", 
 
   const dataOperation = secondMigration.operations[3];
 
+  if (dataOperation === undefined) {
+    throw new Error("expected data migration operation");
+  }
+
   if (dataOperation.kind !== "data") {
     throw new Error("expected data migration operation");
   }
@@ -4223,23 +3999,11 @@ test("materialization histories validate versions and record typed operations", 
   assert.equal(dataOperation.description, "backfill user email");
   assert.equal(typeof dataOperation.run, "function");
 
-  const requiredColumnSchemaV2 = defineMaterializationSchema({
-    namespace: "required-plan",
-    version: 2,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
-
   assert.throws(() => {
-    defineMaterializationHistory(shape, requiredColumnSchemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
+    defineMaterialization(shape, {
+      namespace: "required-plan",
+    })
+      .version(1, "create users", (s) =>
         s.createTable("users", (t) =>
           t
             .columns({
@@ -4247,16 +4011,21 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-      m.migration(2, "add required user email", (s) => [
+      )
+      .version(2, "add required user email", (s) =>
         s.addColumn("users", "email", (t) => t.text().notNull()),
-      ]),
-    ]);
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   }, /materialization add column users\.email cannot add a non-null column without a default/);
 
   assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
+    defineMaterialization(shape, {
+      namespace: "starts-at-two",
+    })
+      .version(2, "create users", (s) =>
         s.createTable("users", (t) =>
           t
             .columns({
@@ -4264,21 +4033,18 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-    ]);
-  }, /latest migration must match current schema version/);
-
-  assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(2, "add user email", (s) => [
-        s.addColumn("users", "email", (t) => t.text()),
-      ]),
-    ]);
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   }, /must start at version 1/);
 
   assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
+    defineMaterialization(shape, {
+      namespace: "duplicate-version",
+    })
+      .version(1, "create users", (s) =>
         s.createTable("users", (t) =>
           t
             .columns({
@@ -4286,19 +4052,21 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-      m.migration(1, "duplicate", (s) => [
+      )
+      .version(1, "duplicate", (s) =>
         s.addColumn("users", "email", (t) => t.text()),
-      ]),
-    ]);
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   }, /duplicate materialization migration version 1/);
 
   assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(2, "add user email", (s) => [
-        s.addColumn("users", "email", (t) => t.text()),
-      ]),
-      m.migration(1, "create users", (s) => [
+    defineMaterialization(shape, {
+      namespace: "out-of-order",
+    })
+      .version(2, "create users", (s) =>
         s.createTable("users", (t) =>
           t
             .columns({
@@ -4306,68 +4074,64 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-    ]);
+      )
+      .version(1, "add user email", (s) =>
+        s.addColumn("users", "email", (t) => t.text()),
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   }, /ascending version order/);
 
   assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
-        s.createTable("users", (t) =>
+    defineMaterialization(shape, {
+      namespace: "unknown-index-column",
+    }).version(1, "create users", (s) =>
+      s
+        .createTable("users", (t) =>
           t
             .columns({
               userId: t.text().notNull(),
             })
             .primaryKey(["userId"]),
-        ),
-      ]),
-      m.migration(2, "forget user email", (s) => [
-        s.createIndex("usersByUserId", "users", ["userId"]),
-      ]),
-    ]);
-  }, /materialization history table users must match current schema columns/);
-
-  assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-        s.createIndex("usersByEmail", "users", ["email"]),
-      ]),
-      m.migration(2, "add user email", (s) => [
-        s.addColumn("users", "email", (t) => t.text()),
-      ]),
-    ]);
-  }, /materialization history index usersByEmail references unknown column email/);
+        )
+        .createIndex("usersByEmail", "users", ["email" as never]),
+    );
+  }, /materialization create index references unknown column email/);
 
   assert.doesNotThrow(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-        s.data("premature backfill", () => undefined),
-      ]),
-      m.migration(2, "add user email", (s) => [
-        s.addColumn("users", "email", (t) => t.text()),
-        s.createIndex("usersByEmail", "users", ["email"]),
-        s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
-      ]),
-    ]);
+    defineMaterialization(shape, {
+      namespace: "data-before-column",
+    })
+      .version(1, "create users", (s) =>
+        s
+          .createTable("users", (t) =>
+            t
+              .columns({
+                userId: t.text().notNull(),
+              })
+              .primaryKey(["userId"]),
+          )
+          .data("premature backfill", () => undefined),
+      )
+      .version(2, "add user email", (s) =>
+        s
+          .addColumn("users", "email", (t) => t.text())
+          .createIndex("usersByEmail", "users", ["email"])
+          .createUniqueIndex("usersByEmailUnique", "users", ["email"]),
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   });
 
   assert.doesNotThrow(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
+    defineMaterialization(shape, {
+      namespace: "data-after-column",
+    })
+      .version(1, "create users", (s) =>
         s.createTable("users", (t) =>
           t
             .columns({
@@ -4375,36 +4139,25 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-      m.migration(2, "add user email", (s) => [
-        s.addColumn("users", "email", (t) => t.text()),
-        s.data("premature keyed backfill", () => undefined),
-        s.createIndex("usersByEmail", "users", ["email"]),
-        s.createUniqueIndex("usersByEmailUnique", "users", ["email"]),
-      ]),
-    ]);
+      )
+      .version(2, "add user email", (s) =>
+        s
+          .addColumn("users", "email", (t) => t.text())
+          .data("premature keyed backfill", () => undefined)
+          .createIndex("usersByEmail", "users", ["email"])
+          .createUniqueIndex("usersByEmailUnique", "users", ["email"]),
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   });
 
   assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-      ]),
-      m.migration(2, "forget user email index", (s) => [
-        s.addColumn("users", "email", (t) => t.text()),
-      ]),
-    ]);
-  }, /materialization history table users must match current schema keys/);
-
-  assert.throws(() => {
-    defineMaterializationHistory(shape, schemaV2, (m) => [
-      m.migration(1, "create users", (s) => [
+    defineMaterialization(shape, {
+      namespace: "duplicate-index",
+    })
+      .version(1, "create users", (s) =>
         s.createTable("users", (t) =>
           t
             .columns({
@@ -4413,44 +4166,31 @@ test("materialization histories validate versions and record typed operations", 
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-      m.migration(2, "duplicate user email index", (s) => [
-        s.createIndex("usersByEmail", "users", ["email"]),
-        s.createIndex("usersByEmail", "users", ["userId"]),
-      ]),
-    ]);
+      )
+      .version(2, "duplicate user email index", (s) =>
+        s
+          .createIndex("usersByEmail", "users", ["email"])
+          .createIndex("usersByEmail", "users", ["userId"]),
+      );
   }, /materialization history index usersByEmail conflicts with usersByEmail/);
 });
 
 test("materialization data migrations can scan typed ledger events", async () => {
-  const migrationSchema = defineMaterializationSchema({
-    namespace: "event-backfill",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
   const backfilled: string[] = [];
-  const migrationHistory = defineMaterializationHistory(
-    shape,
-    migrationSchema,
-    (m) => [
-      m.migration(1, "create and backfill users", (s) => [
-        s.createTable("users", (t) =>
+  const migrationMaterializations = defineMaterialization(shape, {
+    namespace: "event-backfill",
+  })
+    .version(1, "create and backfill users", (s) =>
+      s
+        .createTable("users", (t) =>
           t
             .columns({
               userId: t.text().notNull(),
               email: t.text().notNull(),
             })
             .primaryKey(["userId"]),
-        ),
-        s.data("backfill users from events", async ({ db }) => {
+        )
+        .data("backfill users from events", async ({ db }) => {
           const events = await db
             .scanEvents("user.created")
             .afterEventId(0)
@@ -4461,11 +4201,24 @@ test("materialization data migrations can scan typed ledger events", async () =>
             backfilled.push(`${event.payload.userId}:${event.payload.email}`);
           }
         }),
-      ]),
-    ],
-  );
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
+  const migrationHistory = migrationMaterializations.history;
+  const migrationSchema = migrationHistory.current;
   const migration = migrationHistory.migrations[0];
+
+  if (migration === undefined) {
+    throw new Error("expected migration");
+  }
+
   const dataOperation = migration.operations[1];
+
+  if (dataOperation === undefined) {
+    throw new Error("expected data migration operation");
+  }
 
   if (dataOperation.kind !== "data") {
     throw new Error("expected data migration operation");
@@ -4545,247 +4298,172 @@ test("materialization data migrations can scan typed ledger events", async () =>
   assert.deepEqual(backfilled, ["u_123:alice@example.com"]);
 });
 
-test("materialization histories replay foreign keys against current state", () => {
-  const relationSchema = defineMaterializationSchema({
-    namespace: "relation-history",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["userId"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            userId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-    relations: (r) => ({
-      sessionUser: r
-        .foreignKey("sessions", ["userId"])
-        .references("users", ["userId"]),
-    }),
-  });
-
+test("materialization migrations replay foreign keys against current state", () => {
   assert.throws(() => {
-    defineMaterializationHistory(shape, relationSchema, (m) => [
-      m.migration(1, "create relation tables", (s) => [
-        s.createTable("sessions", (t) =>
+    defineMaterialization(shape, {
+      namespace: "relation-history",
+    }).version(1, "create relation tables", (s) =>
+      s
+        .createTable("sessions", (t) =>
           t
             .columns({
               sessionId: t.text().notNull(),
               userId: t.text().notNull(),
             })
             .primaryKey(["sessionId"]),
-        ),
-        s.addForeignKey("sessionUser", (r) =>
-          r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
-        ),
-        s.createTable("users", (t) =>
+        )
+        .addForeignKey("sessionUser", (r) =>
+          r
+            .foreignKey("sessions", ["userId"])
+            .references("users" as never, ["userId"] as never),
+        )
+        .createTable("users", (t) =>
           t
             .columns({
               userId: t.text().notNull(),
             })
             .primaryKey(["userId"]),
         ),
-      ]),
-    ]);
-  }, /materialization history relation sessionUser references unknown table users/);
+    );
+  }, /foreign key reference references unknown table users/);
 
   assert.throws(() => {
-    defineMaterializationHistory(shape, relationSchema, (m) => [
-      m.migration(1, "create relation tables", (s) => [
-        s.createTable("sessions", (t) =>
-          t
-            .columns({
-              sessionId: t.text().notNull(),
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["sessionId"]),
-        ),
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-      ]),
-    ]);
-  }, /materialization history must match current schema relations/);
-
-  const relationByEmailSchema = defineMaterializationSchema({
-    namespace: "relation-key-history",
-    version: 2,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-          })
-          .primaryKey(["userId"])
-          .unique("usersByEmail", ["email"]),
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            email: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-    relations: (r) => ({
-      sessionUserEmail: r
-        .foreignKey("sessions", ["email"])
-        .references("users", ["email"]),
-    }),
-  });
-
-  assert.throws(() => {
-    defineMaterializationHistory(shape, relationByEmailSchema, (m) => [
-      m.migration(1, "create relation tables", (s) => [
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-              email: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-        ),
-        s.createTable("sessions", (t) =>
-          t
-            .columns({
-              sessionId: t.text().notNull(),
-              email: t.text().notNull(),
-            })
-            .primaryKey(["sessionId"]),
-        ),
-        s.addForeignKey("sessionUserEmail", (r) =>
-          r.foreignKey("sessions", ["email"]).references("users", ["email"]),
-        ),
-      ]),
-      m.migration(2, "add email key", (s) => [
+    defineMaterialization(shape, {
+      namespace: "relation-key-history",
+    })
+      .version(1, "create relation tables", (s) =>
+        s
+          .createTable("users", (t) =>
+            t
+              .columns({
+                userId: t.text().notNull(),
+                email: t.text().notNull(),
+              })
+              .primaryKey(["userId"]),
+          )
+          .createTable("sessions", (t) =>
+            t
+              .columns({
+                sessionId: t.text().notNull(),
+                email: t.text().notNull(),
+              })
+              .primaryKey(["sessionId"]),
+          )
+          .addForeignKey("sessionUserEmail", (r) =>
+            r
+              .foreignKey("sessions", ["email"])
+              .references("users", ["email" as never]),
+          ),
+      )
+      .version(2, "add email key", (s) =>
         s.createUniqueIndex("usersByEmail", "users", ["email"]),
-      ]),
-    ]);
-  }, /materialization history relation sessionUserEmail must target a primary or unique key on users/);
+      );
+  }, /foreign key reference must target a primary or unique key on users/);
 });
 
-test("materialization histories compare replayed columns by name", () => {
-  const reorderedSchema = defineMaterializationSchema({
+test("materialization migrations derive columns by operation order", () => {
+  const reorderedMaterializations = defineMaterialization(shape, {
     namespace: "column-order",
-    version: 2,
-    tables: {
-      users: (t) =>
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
         t
           .columns({
             userId: t.text().notNull(),
-            displayName: t.text(),
             email: t.text(),
           })
           .primaryKey(["userId"]),
-    },
-  });
-  const reorderedHistory = defineMaterializationHistory(
-    shape,
-    reorderedSchema,
-    (m) => [
-      m.migration(1, "create users", (s) => [
-        s.createTable("users", (t) =>
-          t
-            .columns({
-              userId: t.text().notNull(),
-              email: t.text(),
-            })
-            .primaryKey(["userId"]),
-        ),
-      ]),
-      m.migration(2, "add display name", (s) => [
-        s.addColumn("users", "displayName", (t) => t.text()),
-      ]),
-    ],
-  );
+      ),
+    )
+    .version(2, "add display name", (s) =>
+      s.addColumn("users", "displayName", (t) => t.text()),
+    )
+    .define({
+      indexers: {},
+      queries: {},
+    });
 
-  assert.equal(reorderedHistory.current, reorderedSchema);
+  assert.deepEqual(
+    Object.keys(
+      reorderedMaterializations.history.current.metadata.tables.users
+        ?.columns ?? {},
+    ),
+    ["userId", "email", "displayName"],
+  );
 });
 
-test("materialization histories reject event refs outside the ledger shape", () => {
-  const invalidSchema = defineMaterializationSchema({
-    namespace: "invalid-events",
-    version: 1,
-    tables: {
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-            source: t.eventRef("session.created").notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-  });
+test("materialization migrations reject event refs outside the ledger shape", () => {
   assert.throws(() => {
-    defineMaterializationHistory(shape, invalidSchema as never, (m) => [
-      m.migration(1, "create invalid sessions", (s) => [
+    defineMaterialization(shape, {
+      namespace: "invalid-events",
+    })
+      .version(1, "create invalid sessions", (s) =>
         s.createTable("sessions", (t) =>
           t
             .columns({
               sessionId: t.text().notNull(),
-              // @ts-expect-error runtime validation protects unchecked callers too.
-              source: t.eventRef("session.created").notNull(),
+              source: t
+                // @ts-expect-error runtime validation protects unchecked callers too.
+                .eventRef("session.created")
+                .notNull(),
             })
             .primaryKey(["sessionId"]),
         ),
-      ]),
-    ]);
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
   }, /references unknown event session\.created/);
 
-  const validSchemaV2 = defineMaterializationSchema({
-    namespace: "invalid-events",
-    version: 2,
-    tables: {
-      sessions: (t) =>
-        t
-          .columns({
-            sessionId: t.text().notNull(),
-          })
-          .primaryKey(["sessionId"]),
-    },
-  });
   assert.throws(() => {
-    defineMaterializationHistory(shape, validSchemaV2, (m) => [
-      m.migration(1, "create sessions", (s) => [
+    defineMaterialization(shape, {
+      namespace: "invalid-added-events",
+    })
+      .version(1, "create sessions", (s) =>
         s.createTable("sessions", (t) =>
           t
             .columns({
               sessionId: t.text().notNull(),
-              // @ts-expect-error runtime validation protects unchecked callers too.
-              source: t.eventRef("session.created").notNull(),
             })
             .primaryKey(["sessionId"]),
         ),
-      ]),
-      m.migration(2, "index sessions", (s) => [
-        s.createIndex("sessionsBySessionId", "sessions", ["sessionId"]),
-      ]),
-    ]);
-  }, /materialization history table sessions must match current schema columns/);
+      )
+      .version(2, "add invalid source", (s) =>
+        s.addColumn("sessions", "source", (t) =>
+          // @ts-expect-error runtime validation protects unchecked callers too.
+          t.eventRef("session.created"),
+        ),
+      )
+      .define({
+        indexers: {},
+        queries: {},
+      });
+  }, /references unknown event session\.created/);
 });
 
 test("withMaterializations rejects unchecked indexer source events outside the ledger shape", () => {
-  const invalidIndexerMaterializations = defineMaterializations({
-    history,
-    indexers: {
-      invalidSource: {
-        sourceEvent: "session.created",
-        input: Type.Object({}),
+  const invalidIndexerMaterializations = defineMaterialization(shape, {
+    namespace: "invalid-indexer-source",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {
+        invalidSource: {
+          sourceEvent: "session.created",
+          input: Type.Object({}),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
 
   assert.throws(() => {
     // @ts-expect-error runtime validation protects unchecked callers too.
@@ -4805,44 +4483,29 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     signals: {},
     signalQueues: {},
   });
-  const multiEventSchema = defineMaterializationSchema({
+  const multiEventMaterializations = defineMaterialization(multiEventShape, {
     namespace: "source-events",
-    version: 1,
-    tables: {
-      users: (t) =>
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
         t
           .columns({
             userId: t.text().notNull(),
           })
           .primaryKey(["userId"]),
-    },
-  });
-  const multiEventMaterializations = defineMaterializations({
-    history: defineMaterializationHistory(
-      multiEventShape,
-      multiEventSchema,
-      (m) => [
-        m.migration(1, "create users", (s) => [
-          s.createTable("users", (t) =>
-            t
-              .columns({
-                userId: t.text().notNull(),
-              })
-              .primaryKey(["userId"]),
-          ),
-        ]),
-      ],
-    ),
-    indexers: {
-      upsertUser: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          userId: Type.String(),
-        }),
+      ),
+    )
+    .define({
+      indexers: {
+        upsertUser: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            userId: Type.String(),
+          }),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
   const multiEventModel = withMaterializations(
     multiEventShape,
     multiEventMaterializations,
@@ -4867,188 +4530,200 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     },
   });
 
-  const typedSchema = defineMaterializationSchema({
+  const typedMaterializations = defineMaterialization(shape, {
     namespace: "types",
-    version: 1,
-    tables: {
-      users: (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-            source: t.eventRef("user.created").notNull(),
-          })
-          .primaryKey(["userId"]),
-    },
-  });
+  })
+    .version(1, "create users", (s) =>
+      s
+        .createTable("users", (t) =>
+          t
+            .columns({
+              userId: t.text().notNull(),
+              email: t.text().notNull(),
+              source: t.eventRef("user.created").notNull(),
+            })
+            .primaryKey(["userId"]),
+        )
+        .data("typed user data", async ({ db }) => {
+          const row = await db
+            .selectFrom("users")
+            .select(["email"])
+            .executeTakeFirst();
 
-  const typedHistory = defineMaterializationHistory(shape, typedSchema, (m) => [
-    m.migration(1, "create users", (s) => [
+          if (row !== null) {
+            const email: string = row.email;
+            // @ts-expect-error only selected columns are available.
+            const userId: string = row.userId;
+
+            void email;
+            void userId;
+          }
+
+          await db
+            .insertInto("users")
+            .values({
+              userId: "u_123",
+              email: "alice@example.com",
+              source: createEventRef("user.created", 1),
+            })
+            .execute();
+          await db
+            .updateTable("users")
+            .set({
+              email: "alice@example.com",
+            })
+            .where("userId", "=", "u_123")
+            .execute();
+          await db.deleteFrom("users").where("userId", "=", "u_123").execute();
+
+          const sourceEvent = await db.readEvent(
+            createEventRef("user.created", 1),
+          );
+
+          if (sourceEvent !== null) {
+            const sourceUserId: string = sourceEvent.payload.userId;
+            const sourceEmail: string = sourceEvent.payload.email;
+            // @ts-expect-error migration event reads use ledger event payload types.
+            const sessionId: string = sourceEvent.payload.sessionId;
+
+            void sourceUserId;
+            void sourceEmail;
+            void sessionId;
+          }
+
+          const sourceEvents = await db
+            .scanEvents("user.created")
+            .afterEventId(0)
+            .limit(10)
+            .execute();
+
+          for (const source of sourceEvents) {
+            const sourceEmail: string = source.payload.email;
+
+            void sourceEmail;
+          }
+
+          // @ts-expect-error migration data cannot select unknown tables.
+          db.selectFrom("sessions");
+          // @ts-expect-error migration data cannot scan unknown events.
+          db.scanEvents("session.created");
+          // @ts-expect-error migration data can only select known columns.
+          db.selectFrom("users").select(["missing"]);
+          // @ts-expect-error migration data can only update known columns.
+          db.updateTable("users").set({ missing: "" });
+        }),
+    )
+    .define({
+      indexers: {
+        wrongEventRef: {
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+        },
+        incompleteInsert: {
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+        },
+        nonKeyConflict: {
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+        },
+      },
+      queries: {
+        selectedColumns: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
+      },
+    });
+  const typedHistory = typedMaterializations.history;
+  const typedSchema = typedHistory.current;
+
+  const invalidMigrationBuilder = defineMaterialization(shape, {
+    namespace: "invalid-migration-types",
+  }).version(1, "create users", (s) =>
+    s.createTable("users", (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          email: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+    ),
+  );
+
+  invalidMigrationBuilder.version(2, "unknown table", (s) =>
+    // @ts-expect-error migration operations only reference known tables.
+    s.createIndex("missing", "sessions", ["sessionId"]),
+  );
+  invalidMigrationBuilder.version(2, "unknown column", (s) =>
+    // @ts-expect-error migration operations only reference known columns.
+    s.createIndex("missing", "users", ["missing"]),
+  );
+  invalidMigrationBuilder.version(2, "invalid event ref", (s) =>
+    s.addColumn("users", "sessionSource", (t) =>
+      // @ts-expect-error migration event refs must come from the ledger shape.
+      t.eventRef("session.created").notNull(),
+    ),
+  );
+
+  const invalidSource = defineMaterialization(shape, {
+    namespace: "invalid-source-types",
+  })
+    .version(1, "create users", (s) =>
       s.createTable("users", (t) =>
         t
           .columns({
             userId: t.text().notNull(),
-            email: t.text().notNull(),
-            source: t.eventRef("user.created").notNull(),
           })
           .primaryKey(["userId"]),
       ),
-      s.data("typed user data", async ({ db }) => {
-        const row = await db
-          .selectFrom("users")
-          .select(["email"])
-          .executeTakeFirst();
-
-        if (row !== null) {
-          const email: string = row.email;
-          // @ts-expect-error only selected columns are available.
-          const userId: string = row.userId;
-
-          void email;
-          void userId;
-        }
-
-        await db
-          .insertInto("users")
-          .values({
-            userId: "u_123",
-            email: "alice@example.com",
-            source: createEventRef("user.created", 1),
-          })
-          .execute();
-        await db
-          .updateTable("users")
-          .set({
-            email: "alice@example.com",
-          })
-          .where("userId", "=", "u_123")
-          .execute();
-        await db.deleteFrom("users").where("userId", "=", "u_123").execute();
-
-        const sourceEvent = await db.readEvent(
-          createEventRef("user.created", 1),
-        );
-
-        if (sourceEvent !== null) {
-          const sourceUserId: string = sourceEvent.payload.userId;
-          const sourceEmail: string = sourceEvent.payload.email;
-          // @ts-expect-error migration event reads use ledger event payload types.
-          const sessionId: string = sourceEvent.payload.sessionId;
-
-          void sourceUserId;
-          void sourceEmail;
-          void sessionId;
-        }
-
-        const sourceEvents = await db
-          .scanEvents("user.created")
-          .afterEventId(0)
-          .limit(10)
-          .execute();
-
-        for (const source of sourceEvents) {
-          const sourceEmail: string = source.payload.email;
-
-          void sourceEmail;
-        }
-
-        // @ts-expect-error migration data cannot select unknown tables.
-        db.selectFrom("sessions");
-        // @ts-expect-error migration data cannot scan unknown events.
-        db.scanEvents("session.created");
-        // @ts-expect-error migration data can only select known columns.
-        db.selectFrom("users").select(["missing"]);
-        // @ts-expect-error migration data can only update known columns.
-        db.updateTable("users").set({ missing: "" });
-      }),
-    ]),
-  ]);
-
-  const invalidMigrationHistory = defineMaterializationHistory(
-    shape,
-    typedSchema,
-    (m) => [
-      m.migration(1, "invalid", (s) => [
-        // @ts-expect-error migration operations only reference known tables.
-        s.createIndex("missing", "sessions", ["sessionId"]),
-        // @ts-expect-error migration operations only reference known columns.
-        s.addColumn("users", "missing", (t) => t.text()),
-        s.addColumn("users", "source", (t) =>
-          // @ts-expect-error migration event refs must come from the current schema.
-          t.eventRef("session.created").notNull(),
-        ),
-      ]),
-    ],
-  );
-
-  void invalidMigrationHistory;
-
-  const invalidSource = defineMaterializations({
-    history: typedHistory,
-    indexers: {
-      invalidSource: {
-        sourceEvent: "session.created",
-        input: Type.Object({}),
+    )
+    .define({
+      indexers: {
+        invalidSource: {
+          sourceEvent: "session.created",
+          input: Type.Object({}),
+        },
       },
-    },
-    queries: {},
-  });
+      queries: {},
+    });
 
   // @ts-expect-error indexer source events must come from the ledger shape.
   withMaterializations(shape, invalidSource);
 
-  const joinSchema = defineMaterializationSchema({
+  const joinMaterializations = defineMaterialization(shape, {
     namespace: "join-types",
-    version: 1,
-    tables: {
-      children: (t) =>
-        t
-          .columns({
-            childId: t.text().notNull(),
-            parentId: t.text().notNull(),
-          })
-          .primaryKey(["childId"]),
-      parents: (t) =>
-        t
-          .columns({
-            deletedAtMs: t.integer(),
-            parentId: t.text().notNull(),
-            rank: t.integer().notNull(),
-          })
-          .primaryKey(["parentId"]),
-    },
-  });
-  const joinHistory = defineMaterializationHistory(shape, joinSchema, (m) => [
-    m.migration(1, "create join tables", (s) => [
-      s.createTable("children", (t) =>
-        t
-          .columns({
-            childId: t.text().notNull(),
-            parentId: t.text().notNull(),
-          })
-          .primaryKey(["childId"]),
-      ),
-      s.createTable("parents", (t) =>
-        t
-          .columns({
-            deletedAtMs: t.integer(),
-            parentId: t.text().notNull(),
-            rank: t.integer().notNull(),
-          })
-          .primaryKey(["parentId"]),
-      ),
-    ]),
-  ]);
-  const joinMaterializations = defineMaterializations({
-    history: joinHistory,
-    indexers: {},
-    queries: {
-      joined: {
-        params: Type.Object({}),
-        result: Type.Null(),
+  })
+    .version(1, "create join tables", (s) =>
+      s
+        .createTable("children", (t) =>
+          t
+            .columns({
+              childId: t.text().notNull(),
+              parentId: t.text().notNull(),
+            })
+            .primaryKey(["childId"]),
+        )
+        .createTable("parents", (t) =>
+          t
+            .columns({
+              deletedAtMs: t.integer(),
+              parentId: t.text().notNull(),
+              rank: t.integer().notNull(),
+            })
+            .primaryKey(["parentId"]),
+        ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        joined: {
+          params: Type.Object({}),
+          result: Type.Null(),
+        },
       },
-    },
-  });
+    });
 
   withMaterializations(shape, joinMaterializations).register({
     queries: {
@@ -5196,30 +4871,6 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           .min("badRank", "parentId");
 
         return null;
-      },
-    },
-  });
-
-  const typedMaterializations = defineMaterializations({
-    history: typedHistory,
-    indexers: {
-      wrongEventRef: {
-        sourceEvent: "user.created",
-        input: Type.Object({}),
-      },
-      incompleteInsert: {
-        sourceEvent: "user.created",
-        input: Type.Object({}),
-      },
-      nonKeyConflict: {
-        sourceEvent: "user.created",
-        input: Type.Object({}),
-      },
-    },
-    queries: {
-      selectedColumns: {
-        params: Type.Object({}),
-        result: Type.Null(),
       },
     },
   });
@@ -5529,18 +5180,29 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     },
     signalQueues: {},
   });
-  const typedSignalMaterializations = defineMaterializations({
-    history,
-    indexers: {},
-    queries: {
-      framesByRun: {
-        params: Type.Object({
-          runId: Type.String(),
-        }),
-        result: Type.Array(RunStreamFrameSchema),
+  const typedSignalMaterializations = defineMaterialization(typedSignalShape, {
+    namespace: "signal-types",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        framesByRun: {
+          params: Type.Object({
+            runId: Type.String(),
+          }),
+          result: Type.Array(RunStreamFrameSchema),
+        },
       },
-    },
-  });
+    });
   const typedSignalImplementations = {
     queries: {
       framesByRun: async ({ db }) => {

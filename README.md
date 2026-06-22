@@ -25,9 +25,7 @@ import { Type } from "typebox";
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
   defineLedgerShape,
-  defineMaterializationHistory,
-  defineMaterializationSchema,
-  defineMaterializations,
+  defineMaterialization,
   withMaterializations,
 } from "@torkbot/sledge/ledger";
 import {
@@ -54,11 +52,11 @@ const ledgerShape = defineLedgerShape({
   signalQueues: {},
 });
 
-const materializationSchema = defineMaterializationSchema({
+const materializations = defineMaterialization(ledgerShape, {
   namespace: "app",
-  version: 1,
-  tables: {
-    users: (t) =>
+})
+  .version(1, "create app tables", (s) =>
+    s.createTable("users", (t) =>
       t
         .columns({
           userId: t.text().notNull(),
@@ -66,51 +64,31 @@ const materializationSchema = defineMaterializationSchema({
           source: t.eventRef("user.created").notNull(),
         })
         .primaryKey(["userId"]),
-  },
-});
-
-const materializationHistory = defineMaterializationHistory(
-  ledgerShape,
-  materializationSchema,
-  (m) => [
-    m.migration(1, "create app tables", (s) => [
-      s.createTable("users", (t) =>
-        t
-          .columns({
-            userId: t.text().notNull(),
-            email: t.text().notNull(),
-            source: t.eventRef("user.created").notNull(),
-          })
-          .primaryKey(["userId"]),
-      ),
-    ]),
-  ],
-);
-
-const materializations = defineMaterializations({
-  history: materializationHistory,
-  indexers: {
-    upsertUser: {
-      sourceEvent: "user.created",
-      input: Type.Object({
-        userId: Type.String(),
-        email: Type.String(),
-      }),
-    },
-  },
-  queries: {
-    userById: {
-      params: Type.Object({ userId: Type.String() }),
-      result: Type.Union([
-        Type.Null(),
-        Type.Object({
+    ),
+  )
+  .define({
+    indexers: {
+      upsertUser: {
+        sourceEvent: "user.created",
+        input: Type.Object({
           userId: Type.String(),
           email: Type.String(),
         }),
-      ]),
+      },
     },
-  },
-});
+    queries: {
+      userById: {
+        params: Type.Object({ userId: Type.String() }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            userId: Type.String(),
+            email: Type.String(),
+          }),
+        ]),
+      },
+    },
+  });
 
 const definedModel = withMaterializations(ledgerShape, materializations);
 
@@ -209,123 +187,101 @@ console.log(user);
 All four fields are explicit. Use `{}` when a shape has no contracts in that
 category.
 
-### 2. Define Materialization Schemas
+### 2. Define Materializations From Migrations
 
-Call `defineMaterializationSchema(...)` to define the complete table schema for
-one materialization namespace/version.
+Call `defineMaterialization(ledgerShape, { namespace })` to define one
+materialization namespace. The table schema is the outcome of the ordered
+version chain; there is no separate current-schema DDL to keep in sync.
 
-Each table key owns one table-local builder function:
+Each `.version(...)` callback receives a typed migration chain. Operations
+append metadata and advance the schema type visible to later operations:
 
 ```ts
-defineMaterializationSchema({
+const materializations = defineMaterialization(ledgerShape, {
   namespace: "app",
-  version: 1,
-  tables: {
-    users: (t) =>
+})
+  .version(1, "create users", (s) =>
+    s.createTable("users", (t) =>
       t
         .columns({
           userId: t.text().notNull(),
           source: t.eventRef("user.created").notNull(),
         })
         .primaryKey(["userId"]),
-  },
-});
+    ),
+  )
+  .version(2, "add user email", (s) =>
+    s
+      .addColumn("users", "email", (t) => t.text())
+      .createIndex("usersByEmail", "users", ["email"])
+      .data("backfill user email", async ({ db }) => {
+        const events = await db.scanEvents("user.created").execute();
+
+        for (const event of events) {
+          await db
+            .updateTable("users")
+            .set({ email: event.payload.email })
+            .where("userId", "=", event.payload.userId)
+            .execute();
+        }
+      }),
+  )
+  .define({
+    indexers: {
+      upsertUser: {
+        sourceEvent: "user.created",
+        input: Type.Object({ userId: Type.String() }),
+      },
+    },
+    queries: {
+      userById: {
+        params: Type.Object({ userId: Type.String() }),
+        result: Type.Null(),
+      },
+    },
+  });
 ```
 
-Semantic event refs are first-class columns and must point at real ledger events
-when materializations are attached:
+Semantic event refs are first-class columns and must point at real ledger
+events:
 
 ```ts
 source: t.eventRef("user.created").notNull();
 ```
 
-Foreign keys are declared in the optional second phase so relation builders can
-see all inferred tables:
+Foreign keys are migration operations. Because operations advance the carried
+schema type, the relation builder sees tables created earlier in the chain:
 
 ```ts
-relations: (r) => ({
-  sessionUser: r
-    .foreignKey("sessions", ["userId"])
-    .references("users", ["userId"]),
-});
-```
-
-### 3. Define Migration History
-
-Call `defineMaterializationHistory(...)` to describe the schema-change history
-for the current materialization schema and ledger shape. The current DDL
-remains the canonical typed shape for indexers and queries; the history records
-the ordered database operations Sledge can later execute during hygiene.
-
-```ts
-const history = defineMaterializationHistory(ledgerShape, schemaV2, (m) => [
-  m.migration(1, "create users", (s) => [
-    s.createTable("users", (t) =>
+.version(1, "create session tables", (s) =>
+  s
+    .createTable("users", (t) =>
+      t.columns({ userId: t.text().notNull() }).primaryKey(["userId"]),
+    )
+    .createTable("sessions", (t) =>
       t
         .columns({
+          sessionId: t.text().notNull(),
           userId: t.text().notNull(),
         })
-        .primaryKey(["userId"]),
+        .primaryKey(["sessionId"]),
+    )
+    .addForeignKey("sessionUser", (r) =>
+      r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
     ),
-  ]),
-  m.migration(2, "add user email", (s) => [
-    s.addColumn("users", "email", (t) => t.text()),
-    s.createIndex("usersByEmail", "users", ["email"]),
-    s.data("backfill user email", async ({ db }) => {
-      const events = await db.scanEvents("user.created").execute();
-
-      for (const event of events) {
-        await db
-          .insertInto("users")
-          .values({
-            userId: event.payload.userId,
-            email: event.payload.email,
-          })
-          .onConflict(["userId"])
-          .doUpdateSet({ email: event.payload.email })
-          .execute();
-      }
-    }),
-  ]),
-]);
+)
 ```
 
-Migration steps are typed against the current schema's known tables, columns,
-and semantic event references. Because history is bound to `ledgerShape`, data
-migration steps can also read or scan typed ledger events with `readEvent(...)`,
+Data migration steps are typed against the schema state at that point in the
+chain. They can also read or scan typed ledger events with `readEvent(...)`,
 `readEvents(...)`, and `scanEvents(...)` without seeing the internal `events`
-table. Data migration steps receive a Sledge-owned typed migration database
-facade, not a raw SQL handle, so future executors can inject tenancy and
-storage-specific behavior before operations reach the database. Sledge runs
-pending materialization migrations during ledger startup hygiene before runtime
-indexers and queries use the materialized tables.
+table. Data migrations receive a Sledge-owned typed database facade, not a raw
+SQL handle, so executors can inject tenancy and storage-specific behavior
+before operations reach the database.
 
-Sledge validates that the history starts at version 1, versions are unique
-positive integers, versions have no gaps, and the latest migration version
-matches the current schema version.
-
-### 4. Define Materializations
-
-Call `defineMaterializations(...)` to collect migration history, indexer
-contracts, and query contracts:
-
-```ts
-const materializations = defineMaterializations({
-  history,
-  indexers: {
-    upsertUser: {
-      sourceEvent: "user.created",
-      input: Type.Object({ userId: Type.String() }),
-    },
-  },
-  queries: {
-    userById: {
-      params: Type.Object({ userId: Type.String() }),
-      result: Type.Null(),
-    },
-  },
-});
-```
+Sledge validates that materialization histories start at version 1, versions
+are unique positive integers, versions have no gaps, and later operations only
+reference schema objects available at that point in the chain.
 
 Attach materializations to the ledger shape with `withMaterializations(...)`:
 
@@ -336,7 +292,7 @@ const definedModel = withMaterializations(ledgerShape, materializations);
 Ledgers without materialization tables can skip this step and call
 `defineLedgerShape(...).register(...)` directly.
 
-### 5. Register Orchestration
+### 3. Register Orchestration
 
 Call `definedModel.register(...)` to attach indexer implementations, query
 implementations, event handlers, queue handlers, signal handlers, and
@@ -411,19 +367,19 @@ details, not package exports.
 Registration returns the model passed to a storage adapter. There is no
 separate bind step.
 
-### 6. Run Database Hygiene
+### 4. Run Database Hygiene
 
 Opening a ledger creates Sledge's internal tables and ensures the declared
-materialization tables and indexes exist from the typed materialization schema.
-When a materialization history is attached, startup records applied namespace
-versions and runs pending migration steps through Sledge-owned typed facades. A
-fresh namespace creates the current schema in one pass, then replays data
-migration steps. Existing namespaces apply supported incremental DDL and data
-steps. SQLite cannot add foreign-key constraints incrementally, so
+materialization tables and indexes exist from the migration-derived current
+schema. Startup records applied namespace versions and runs pending migration
+steps through Sledge-owned typed facades. A fresh namespace creates the current
+schema in one pass, then replays data migration steps. Existing namespaces
+apply supported incremental DDL and data steps. SQLite cannot add foreign-key
+constraints incrementally, so
 `addForeignKey(...)` migrations are rejected after a namespace has already been
 created.
 
-### 7. Open a Runtime
+### 5. Open a Runtime
 
 Use one adapter to open the ledger:
 

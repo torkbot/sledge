@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import test from "node:test";
 
-import { defineMaterializationSchema } from "./ledger.ts";
 import {
   createKyselyProjectionStatementCompiler,
   createKyselySqliteProjectionStatementCompiler,
   type KyselyProjectionOperationNode,
   type KyselyProjectionQueryCompiler,
 } from "./projection-kysely-compiler.ts";
+import { defineProjectionSchema } from "./projections.ts";
 
 test("kysely projection compiler lowers Sledge select IR to operation nodes", () => {
   const calls: KyselyProjectionOperationNode[] = [];
@@ -1018,18 +1018,14 @@ test(
       dialect: "sqlite",
       queryCompiler: new SqliteQueryCompiler(),
     });
-    const schema = defineMaterializationSchema({
-      namespace: "kysely",
-      tables: {
-        users: (t) =>
-          t
-            .columns({
-              email: t.text().notNull(),
-              userId: t.text().notNull(),
-            })
-            .primaryKey(["userId"]),
-      },
-      version: 1,
+    const schema = defineProjectionSchema({
+      users: (t) =>
+        t
+          .columns({
+            email: t.text().notNull(),
+            userId: t.text().notNull(),
+          })
+          .primaryKey(["userId"]),
     });
     const usersTable = schema.metadata.tables.users;
 

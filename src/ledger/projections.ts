@@ -74,6 +74,14 @@ export type ProjectionSchemaTables<TSchema> = TSchema extends {
   ? TTables
   : never;
 
+export type ProjectionSchemaRelations<TSchema> = TSchema extends {
+  readonly [projectionSchemaRelationsBrand]?: infer TRelations;
+}
+  ? TRelations extends ProjectionRelations
+    ? TRelations
+    : never
+  : never;
+
 export type ProjectionSchemaEventName<TSchema> = TSchema extends {
   readonly [projectionSchemaEventNamesBrand]?: infer TEventName;
 }
@@ -168,6 +176,43 @@ export type ProjectionTableDefinition<
     readonly [...TUniqueKeys, TColumnsToIndex]
   >;
 };
+
+export type ProjectionTableWithColumn<
+  TTable,
+  TColumnName extends string,
+  TColumn extends ProjectionColumn<ProjectionColumnKind, unknown, boolean>,
+> =
+  TTable extends ProjectionTableDefinition<
+    infer TColumns,
+    infer TPrimaryKey,
+    infer TUniqueKeys
+  >
+    ? ProjectionTableDefinition<
+        TColumns & Record<TColumnName, TColumn>,
+        TPrimaryKey &
+          ProjectionNotNullColumnList<TColumns & Record<TColumnName, TColumn>>,
+        TUniqueKeys & ProjectionKeyList<TColumns & Record<TColumnName, TColumn>>
+      >
+    : never;
+
+export type ProjectionTableWithUniqueKey<
+  TTable,
+  TColumnsToIndex extends readonly string[],
+> =
+  TTable extends ProjectionTableDefinition<
+    infer TColumns,
+    infer TPrimaryKey,
+    infer TUniqueKeys
+  >
+    ? ProjectionTableDefinition<
+        TColumns,
+        TPrimaryKey,
+        readonly [
+          ...TUniqueKeys,
+          TColumnsToIndex & ProjectionColumnList<TColumns>,
+        ]
+      >
+    : never;
 
 export type ProjectionTableDraft<TColumns extends ProjectionColumns> = {
   primaryKey<const TPrimaryKey extends ProjectionNotNullColumnList<TColumns>>(
@@ -651,6 +696,12 @@ function createRelationBuilder<TTables>(
       };
     },
   };
+}
+
+export function createProjectionRelationBuilder<TTables>(
+  tables: Readonly<Record<string, ProjectionTableMetadata>>,
+): ProjectionRelationBuilder<TTables> {
+  return createRelationBuilder(tables);
 }
 
 function createRelationDefinition(

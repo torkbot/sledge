@@ -8,9 +8,7 @@ import type {
 } from "./ledger.ts";
 import {
   defineLedgerShape,
-  defineMaterializationHistory,
-  defineMaterializationSchema,
-  defineMaterializations,
+  defineMaterialization,
   withMaterializations,
 } from "./ledger.ts";
 
@@ -93,11 +91,14 @@ const ledgerContractShape = defineLedgerShape({
   signalQueues: {},
 });
 
-const ledgerContractSchema = defineMaterializationSchema({
-  namespace: "contract",
-  version: 1,
-  tables: {
-    contractProjection: (t) =>
+const ledgerContractMaterializations = defineMaterialization(
+  ledgerContractShape,
+  {
+    namespace: "contract",
+  },
+)
+  .version(1, "create contract projection", (s) =>
+    s.createTable("contractProjection", (t) =>
       t
         .columns({
           sourceEventId: t.integer().notNull(),
@@ -106,61 +107,44 @@ const ledgerContractSchema = defineMaterializationSchema({
           plannedIntentEventId: t.integer(),
         })
         .primaryKey(["sourceEventId"]),
-  },
-});
+    ),
+  )
+  .define({
+    indexers: {
+      upsertObserved: {
+        sourceEvent: "message.received",
+        input: UpsertObservedIndexerInputSchema,
+      },
+      incrementDecisionAttempts: {
+        sourceEvent: "decision.attempted",
+        input: IncrementDecisionAttemptsIndexerInputSchema,
+      },
+      setPlannedIntent: {
+        sourceEvent: "intent.planned",
+        input: SetPlannedIntentIndexerInputSchema,
+      },
+      incrementDispatchCount: {
+        sourceEvent: "dispatch.completed",
+        input: IncrementDispatchCountIndexerInputSchema,
+      },
+    },
+    queries: {
+      decisionAttempts: {
+        params: DecisionAttemptsQueryParamsSchema,
+        result: CountQueryResultSchema,
+      },
+      dispatchCount: {
+        params: DispatchCountQueryParamsSchema,
+        result: CountQueryResultSchema,
+      },
+      seenSourceEventIds: {
+        params: SeenSourceEventIdsQueryParamsSchema,
+        result: SourceEventIdsResultSchema,
+      },
+    },
+  });
 
-const ledgerContractMaterializations = defineMaterializations({
-  history: defineMaterializationHistory(
-    ledgerContractShape,
-    ledgerContractSchema,
-    (m) => [
-      m.migration(1, "create contract projection", (s) => [
-        s.createTable("contractProjection", (t) =>
-          t
-            .columns({
-              sourceEventId: t.integer().notNull(),
-              decisionAttempts: t.integer().notNull(),
-              dispatchCount: t.integer().notNull(),
-              plannedIntentEventId: t.integer(),
-            })
-            .primaryKey(["sourceEventId"]),
-        ),
-      ]),
-    ],
-  ),
-  indexers: {
-    upsertObserved: {
-      sourceEvent: "message.received",
-      input: UpsertObservedIndexerInputSchema,
-    },
-    incrementDecisionAttempts: {
-      sourceEvent: "decision.attempted",
-      input: IncrementDecisionAttemptsIndexerInputSchema,
-    },
-    setPlannedIntent: {
-      sourceEvent: "intent.planned",
-      input: SetPlannedIntentIndexerInputSchema,
-    },
-    incrementDispatchCount: {
-      sourceEvent: "dispatch.completed",
-      input: IncrementDispatchCountIndexerInputSchema,
-    },
-  },
-  queries: {
-    decisionAttempts: {
-      params: DecisionAttemptsQueryParamsSchema,
-      result: CountQueryResultSchema,
-    },
-    dispatchCount: {
-      params: DispatchCountQueryParamsSchema,
-      result: CountQueryResultSchema,
-    },
-    seenSourceEventIds: {
-      params: SeenSourceEventIdsQueryParamsSchema,
-      result: SourceEventIdsResultSchema,
-    },
-  },
-});
+const ledgerContractSchema = ledgerContractMaterializations.history.current;
 
 const ledgerContractDefinition = withMaterializations(
   ledgerContractShape,
