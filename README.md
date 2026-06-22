@@ -283,6 +283,39 @@ Sledge validates that materialization histories start at version 1, versions
 are unique positive integers, versions have no gaps, and later operations only
 reference schema objects available at that point in the chain.
 
+When helper code needs named types outside inline callbacks, derive them from
+the materialization value instead of restating table shapes:
+
+```ts
+import type {
+  MaterializationDatabaseFor,
+  MaterializationImplementationRegistrationFor,
+  MaterializationMigrationDatabaseFor,
+  MaterializationReadDatabaseFor,
+  MaterializationSchemaFor,
+  MaterializationWriteDatabaseFor,
+} from "@torkbot/sledge/ledger";
+
+type AppSchema = MaterializationSchemaFor<typeof materializations>;
+type AppReadDb = MaterializationReadDatabaseFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+type AppWriteDb = MaterializationWriteDatabaseFor<typeof materializations>;
+type AppDb = MaterializationDatabaseFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+type AppMigrationDb = MaterializationMigrationDatabaseFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+type AppImplementations = MaterializationImplementationRegistrationFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+```
+
 Attach materializations to the ledger shape with `withMaterializations(...)`:
 
 ```ts

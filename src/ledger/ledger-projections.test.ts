@@ -13,8 +13,12 @@ import type {
   EventEnvelope,
   EventRef,
   LedgerIndexerContext,
-  MaterializationImplementationRegistration,
-  MaterializationMigrationDatabase,
+  MaterializationDatabaseFor,
+  MaterializationImplementationRegistrationFor,
+  MaterializationMigrationDatabaseFor,
+  MaterializationReadDatabaseFor,
+  MaterializationSchemaFor,
+  MaterializationWriteDatabaseFor,
   ProjectionEventScanBuilder,
   QuerySchema,
   RegisteredLedgerModel,
@@ -131,10 +135,9 @@ const implementations = {
         .executeTakeFirst();
     },
   },
-} satisfies MaterializationImplementationRegistration<
-  typeof schema,
-  typeof materializations.indexers,
-  typeof materializations.queries
+} satisfies MaterializationImplementationRegistrationFor<
+  typeof materializations,
+  typeof shape.shape.events
 >;
 
 const registeredModelWithoutHandlers = definedModel.register({
@@ -3913,6 +3916,14 @@ test("materialization migrations derive schema and record typed operations", () 
 
   assert.equal(historyV2.namespace, "plan");
   assert.equal(historyV2.currentVersion, 2);
+  const firstMigrationVersion: 1 = historyV2.migrations[0].version;
+  const secondMigrationVersion: 2 = historyV2.migrations[1].version;
+
+  // @ts-expect-error generated histories carry the exact version tuple.
+  historyV2.migrations[2];
+  void firstMigrationVersion;
+  void secondMigrationVersion;
+
   assert.deepEqual(historyV2.current.metadata.tables.users, {
     columns: {
       email: {
@@ -4259,8 +4270,8 @@ test("materialization data migrations can scan typed ledger events", async () =>
       yield event;
     },
   };
-  const migrationDb: MaterializationMigrationDatabase<
-    typeof migrationSchema,
+  const migrationDb: MaterializationMigrationDatabaseFor<
+    typeof migrationMaterializations,
     typeof shape.shape.events
   > = {
     deleteFrom: () => {
@@ -4636,7 +4647,52 @@ async function assertLedgerProjectionTypes(): Promise<void> {
       },
     });
   const typedHistory = typedMaterializations.history;
-  const typedSchema = typedHistory.current;
+  const typedSchema: MaterializationSchemaFor<typeof typedMaterializations> =
+    typedHistory.current;
+
+  const useGeneratedReadDb = (
+    db: MaterializationReadDatabaseFor<
+      typeof typedMaterializations,
+      typeof shape.shape.events
+    >,
+  ) => {
+    db.selectFrom("users").select(["email"]);
+    db.scanEvents("user.created");
+
+    // @ts-expect-error generated read databases cannot mutate tables.
+    db.updateTable("users");
+    // @ts-expect-error generated read databases only expose generated tables.
+    db.selectFrom("sessions");
+  };
+
+  const useGeneratedWriteDb = (
+    db: MaterializationWriteDatabaseFor<typeof typedMaterializations>,
+  ) => {
+    db.updateTable("users").set({ email: "alice@example.com" });
+
+    // @ts-expect-error generated write databases do not expose reads.
+    db.selectFrom("users");
+    // @ts-expect-error generated write databases only expose generated tables.
+    db.insertInto("sessions");
+  };
+
+  const useGeneratedDb = (
+    db: MaterializationDatabaseFor<
+      typeof typedMaterializations,
+      typeof shape.shape.events
+    >,
+  ) => {
+    db.insertInto("users");
+    db.selectFrom("users");
+    db.readEvent(createEventRef("user.created", 1));
+
+    // @ts-expect-error generated databases only expose generated tables.
+    db.selectFrom("sessions");
+  };
+
+  void useGeneratedReadDb;
+  void useGeneratedWriteDb;
+  void useGeneratedDb;
 
   const invalidMigrationBuilder = defineMaterialization(shape, {
     namespace: "invalid-migration-types",
@@ -5163,10 +5219,56 @@ async function assertLedgerProjectionTypes(): Promise<void> {
         return null;
       },
     },
-  } satisfies MaterializationImplementationRegistration<
-    typeof typedSchema,
-    typeof typedMaterializations.indexers,
-    typeof typedMaterializations.queries,
+  } satisfies MaterializationImplementationRegistrationFor<
+    typeof typedMaterializations,
+    typeof shape.shape.events
+  >;
+
+  const uniqueEmailMaterializations = defineMaterialization(shape, {
+    namespace: "unique-email-types",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .version(2, "add email uniqueness", (s) =>
+      s.createUniqueIndex("usersByEmail", "users", ["email"]),
+    )
+    .define({
+      indexers: {
+        upsertByEmail: {
+          sourceEvent: "user.created",
+          input: Type.Object({}),
+        },
+      },
+      queries: {},
+    });
+  const uniqueEmailImplementations = {
+    indexers: {
+      upsertByEmail: async ({ db, event }) => {
+        await db
+          .insertInto("users")
+          .values({
+            userId: "u_123",
+            email: "alice@example.com",
+            source: event.ref,
+          })
+          .onConflict(["email"])
+          .doUpdateSet({
+            source: event.ref,
+          })
+          .execute();
+      },
+    },
+  } satisfies MaterializationImplementationRegistrationFor<
+    typeof uniqueEmailMaterializations,
     typeof shape.shape.events
   >;
 
@@ -5261,15 +5363,14 @@ async function assertLedgerProjectionTypes(): Promise<void> {
         return [];
       },
     },
-  } satisfies MaterializationImplementationRegistration<
-    typeof schema,
-    typeof typedSignalMaterializations.indexers,
-    typeof typedSignalMaterializations.queries,
+  } satisfies MaterializationImplementationRegistrationFor<
+    typeof typedSignalMaterializations,
     typeof typedSignalShape.shape.events,
     typeof typedSignalShape.shape.signals
   >;
 
   void typedImplementations;
+  void uniqueEmailImplementations;
   void typedSignalImplementations;
 }
 

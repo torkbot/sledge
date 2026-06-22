@@ -9,6 +9,7 @@ import {
   createProjectionImplementations,
   type AnyProjectionSchema,
   type ProjectionAccess,
+  type ProjectionDatabase,
   type ProjectionImplementationRegistration,
   type ProjectionIndexerDefinitions,
   type ProjectionIndexerSchemas,
@@ -17,7 +18,9 @@ import {
   type ProjectionEventScanBuilder,
   type ProjectionQueryDefinitions,
   type ProjectionQuerySchemas,
+  type ProjectionReadDatabase,
   type ProjectionUpdateRow,
+  type ProjectionWriteDatabase,
   type ProjectionWriteResult,
 } from "./projection-access.ts";
 import {
@@ -1121,8 +1124,7 @@ export type MaterializationMigrationChain<
 export type MaterializationDefinitionBuilder<
   TCurrentSchema extends AnyMaterializationSchema,
   TEvents extends Record<string, TSchema>,
-  TMigrations extends readonly MaterializationMigration[] =
-    readonly MaterializationMigration[],
+  TMigrations extends readonly MaterializationMigration[] = readonly [],
 > = {
   version<
     const TVersion extends number,
@@ -1142,7 +1144,7 @@ export type MaterializationDefinitionBuilder<
   ): MaterializationDefinitionBuilder<
     MaterializationSchemaWithVersion<TNextSchema, TVersion>,
     TEvents,
-    readonly MaterializationMigration[]
+    readonly [...TMigrations, MaterializationMigration<TVersion, TDescription>]
   >;
   define<
     const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
@@ -1188,6 +1190,102 @@ export type Materializations<
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
 };
+
+export type MaterializationHistoryFor<TMaterializations> =
+  TMaterializations extends Materializations<
+    infer THistory,
+    ProjectionIndexerDefinitions<string>,
+    ProjectionQueryDefinitions
+  >
+    ? THistory
+    : never;
+
+export type MaterializationSchemaFor<TMaterializations> =
+  MaterializationHistoryFor<TMaterializations> extends MaterializationHistory<
+    infer TCurrentSchema,
+    readonly MaterializationMigration[]
+  >
+    ? TCurrentSchema
+    : never;
+
+export type MaterializationIndexerDefinitionsFor<TMaterializations> =
+  TMaterializations extends Materializations<
+    AnyMaterializationHistory,
+    infer TIndexerDefinitions,
+    ProjectionQueryDefinitions
+  >
+    ? TIndexerDefinitions
+    : never;
+
+export type MaterializationQueryDefinitionsFor<TMaterializations> =
+  TMaterializations extends Materializations<
+    AnyMaterializationHistory,
+    ProjectionIndexerDefinitions<string>,
+    infer TQueryDefinitions
+  >
+    ? TQueryDefinitions
+    : never;
+
+export type MaterializationReadDatabaseFor<
+  TMaterializations,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
+> =
+  MaterializationSchemaFor<TMaterializations> extends AnyMaterializationSchema
+    ? ProjectionReadDatabase<
+        MaterializationSchemaFor<TMaterializations>,
+        TEvents,
+        TSignals
+      >
+    : never;
+
+export type MaterializationWriteDatabaseFor<TMaterializations> =
+  MaterializationSchemaFor<TMaterializations> extends AnyMaterializationSchema
+    ? ProjectionWriteDatabase<MaterializationSchemaFor<TMaterializations>>
+    : never;
+
+export type MaterializationDatabaseFor<
+  TMaterializations,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
+> =
+  MaterializationSchemaFor<TMaterializations> extends AnyMaterializationSchema
+    ? ProjectionDatabase<
+        MaterializationSchemaFor<TMaterializations>,
+        TEvents,
+        TSignals
+      >
+    : never;
+
+export type MaterializationMigrationDatabaseFor<
+  TMaterializations,
+  TEvents extends Record<string, TSchema>,
+> =
+  MaterializationSchemaFor<TMaterializations> extends AnyMaterializationSchema
+    ? MaterializationMigrationDatabase<
+        MaterializationSchemaFor<TMaterializations>,
+        TEvents
+      >
+    : never;
+
+export type MaterializationImplementationRegistrationFor<
+  TMaterializations,
+  TEvents extends Record<string, TSchema> = Record<string, TSchema>,
+  TSignals extends Record<string, TSchema> = {},
+> =
+  TMaterializations extends Materializations<
+    infer THistory,
+    infer TIndexerDefinitions,
+    infer TQueryDefinitions
+  >
+    ? MaterializationImplementationRegistration<
+        THistory["current"],
+        TIndexerDefinitions,
+        TQueryDefinitions,
+        TEvents,
+        TSignals
+      >
+    : never;
 
 export type MaterializationImplementationRegistration<
   TMaterializationSchema extends AnyMaterializationSchema,
@@ -1445,15 +1543,15 @@ function createMaterializationDefinitionBuilder<
         description,
         operations: state.operations as MaterializationMigrationOperations,
         version,
-      } as MaterializationMigration;
+      } as MaterializationMigration<typeof version, typeof description>;
 
       return createMaterializationDefinitionBuilder({
         current,
         events: input.events,
-        migrations: [
-          ...input.migrations,
-          migration,
-        ] as readonly MaterializationMigration[],
+        migrations: [...input.migrations, migration] as readonly [
+          ...TMigrations,
+          MaterializationMigration<typeof version, typeof description>,
+        ],
       });
     },
     define: (definition) => {

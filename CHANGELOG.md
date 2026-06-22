@@ -17,6 +17,12 @@
   create table, add column, create index, create unique index, add foreign key,
   and data migration operations are recorded as data instead of `from` / `to`
   callbacks.
+- Preserve materialization migration version tuples in generated history types
+  and add `MaterializationSchemaFor`, `MaterializationReadDatabaseFor`,
+  `MaterializationWriteDatabaseFor`, `MaterializationDatabaseFor`,
+  `MaterializationMigrationDatabaseFor`, and
+  `MaterializationImplementationRegistrationFor` helper types so downstream
+  helpers can derive database facades from the authoritative migration chain.
 - Bind materialization histories to the ledger shape so migration data
   callbacks can use typed semantic `readEvent(...)`, `readEvents(...)`, and
   `scanEvents(...)` handles during backfills without seeing the internal
