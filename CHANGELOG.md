@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Include `causationEventId` in projection indexer event context so indexers can
+  enforce causal ownership without re-reading the source event.
+
+## 0.11.0 - 2026-07-27
+
 - Add `LedgerWorkers.waitForIdle({ signal })` for deterministic,
   cancellation-aware waiting until no nonterminal or executing work remains.
 - Make event-stream and worker-idle waits stop promptly when their signal

@@ -3297,6 +3297,8 @@ test("projection access scans semantic signals without exposing events table", a
 });
 
 test("projection facade supports TorkBot-style surface operation materialization", async () => {
+  let completedCausationEventId: number | null = null;
+
   const SurfaceOperationRequestedSchema = Type.Object({
     operationKey: Type.String(),
     requestedAtMs: Type.Number(),
@@ -3387,6 +3389,8 @@ test("projection facade supports TorkBot-style surface operation materialization
   ).register({
     indexers: {
       recordCompleted: async ({ input, event, db }) => {
+        completedCausationEventId = event.causationEventId;
+
         await db
           .updateTable("surfaceOperations")
           .set({
@@ -3618,6 +3622,7 @@ test("projection facade supports TorkBot-style surface operation materialization
   });
   await recordCompleted(completedFake.scope, completedInput, completedContext);
 
+  assert.equal(completedCausationEventId, 101);
   assert.deepEqual(completedFake.calls[0], {
     method: "run",
     params: [102, 1_100, null, null, null, "op_1"],
