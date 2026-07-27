@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - 2026-07-27
 
 - Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /
   `bindLedgerModel` construction path with
