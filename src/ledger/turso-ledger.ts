@@ -8,11 +8,17 @@ import {
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import type {
-  BoundLedgerModel,
+  RegisteredLedgerModel,
   Ledger,
   LedgerTiming,
   QuerySchema,
 } from "./ledger.ts";
+import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -24,15 +30,21 @@ type CreateTursoLedgerInput<
   TQueries extends Record<string, AnyQueryDef>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly databaseUrl: string;
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly timing: LedgerTiming;
 };
@@ -44,6 +56,9 @@ export async function createTursoLedger<
   const TQueries extends Record<string, AnyQueryDef> = {},
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(
   input: CreateTursoLedgerInput<
     TEvents,
@@ -51,7 +66,10 @@ export async function createTursoLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >,
 ): Promise<Ledger<TEvents, TQueries, TSignals>> {
   const sharedInput: CreateDatabaseLedgerInput<
@@ -60,10 +78,14 @@ export async function createTursoLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   > = {
     storage: await createTursoStorageRuntime(input.databaseUrl),
-    boundModel: input.boundModel,
+    model: input.model,
+    projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
     timing: input.timing,
   };
 
@@ -76,6 +98,13 @@ export async function createTursoStorageRuntime(
   validateDatabaseUrl(databaseUrl);
 
   const writer = await connect(databaseUrl);
+  try {
+    await enableForeignKeys(writer);
+  } catch (error: unknown) {
+    await writer.close();
+    throw error;
+  }
+
   const writerStorage = wrapTursoPromiseDatabase(writer);
   const activeReads = new Set<Promise<void>>();
   let closed = false;
@@ -86,7 +115,15 @@ export async function createTursoStorageRuntime(
       throw new Error("storage runtime is closed");
     }
 
-    return await connect(databaseUrl);
+    const database = await connect(databaseUrl);
+
+    try {
+      await enableForeignKeys(database);
+      return database;
+    } catch (error: unknown) {
+      await database.close();
+      throw error;
+    }
   };
 
   const closeConnection = async (database: Database): Promise<void> => {
@@ -231,4 +268,8 @@ function wrapTursoPromiseDatabase(database: Database): StorageDatabase {
       };
     },
   };
+}
+
+async function enableForeignKeys(database: Database): Promise<void> {
+  await database.exec("PRAGMA foreign_keys = ON");
 }

@@ -2,6 +2,150 @@
 
 ## Unreleased
 
+- Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /
+  `bindLedgerModel` construction path with
+  `defineLedgerShape(...)`, migration-derived
+  `defineMaterialization(...)`, `withMaterializations(...)`, and
+  `.register(...)`.
+- Breaking: storage adapters now receive a registered `model` instead of a
+  `boundModel`.
+- Add v2 materialization APIs: `@torkbot/sledge/ledger` records typed
+  table-local columns, indexes, semantic event references, second-phase
+  foreign-key metadata, schema namespace/version metadata, and materialization
+  migration history metadata.
+- Add a typed materialization migration DSL for ordered schema-change history:
+  create table, add column, create index, create unique index, add foreign key,
+  and data migration operations are recorded as data instead of `from` / `to`
+  callbacks.
+- Preserve materialization migration version tuples in generated history types
+  and add `MaterializationSchemaFor`, `MaterializationReadDatabaseFor`,
+  `MaterializationWriteDatabaseFor`, `MaterializationDatabaseFor`,
+  `MaterializationMigrationDatabaseFor`, and
+  `MaterializationImplementationRegistrationFor` helper types so downstream
+  helpers can derive database facades from the authoritative migration chain.
+- Bind materialization histories to the ledger shape so migration data
+  callbacks can use typed semantic `readEvent(...)`, `readEvents(...)`, and
+  `scanEvents(...)` handles during backfills without seeing the internal
+  `events` table.
+- Run materialization history hygiene during ledger startup: track applied
+  namespace versions, create fresh namespaces by replaying the ordered
+  migration history, replay data migration steps, and apply supported
+  incremental DDL without exposing raw SQL.
+- Re-read materialization namespace versions after acquiring the migration lock
+  so concurrent runtimes do not replay data migrations from stale version
+  observations.
+- Create indexes declared on tables introduced by incremental materialization
+  migrations so upgraded namespaces match fresh namespaces.
+- Preserve same-migration foreign keys on tables introduced by incremental
+  materialization migrations while still rejecting SQLite foreign-key additions
+  to pre-existing tables.
+- Run data migration callbacks against the replayed materialization schema
+  state for that migration step instead of exposing future tables/indexes from
+  the final schema.
+- Prune live-only signals that do not materialize durable signal work instead
+  of retaining observer-only rows forever.
+- Split materialization contracts from implementations. Materialization
+  migrations derive the current schema and `.define(...)` attaches plain-object
+  indexer/query contracts, while `.register(...)` supplies typed indexer/query
+  implementations.
+- Add ledger-owned event refs on event envelopes so projection access callbacks
+  can write semantic event references without exposing the internal events
+  table.
+- Expand the typed materialization facade toward TorkBot coverage: indexers can
+  read projection state, update rows, delete rows, inspect affected-row counts,
+  use ordered/limited range queries, and hydrate semantic `EventRef` values
+  without receiving raw SQL or the internal `events` table.
+- Declare `kysely` as the internal SQL compiler substrate for the v2
+  materialization facade while keeping public indexer/query callbacks on
+  Sledge-owned handles.
+- Route materialization facade execution through an internal statement compiler
+  boundary and add a non-public Kysely-backed lowerer without changing the
+  public indexer/query API.
+- Use the Kysely-backed SQLite statement compiler from the SQLite storage
+  adapters while keeping Kysely out of the public callback surfaces.
+- Add typed integer `add(...)` write expressions so counters and retry attempts
+  can be incremented without raw SQL.
+- Add typed `decrementIfPositive(...)` integer write expressions for bounded
+  grant/use counters without raw `CASE` SQL.
+- Add typed event scan payload predicates and event-id ordering so callbacks
+  can query semantic event history without reaching for `json_extract(...)`.
+- Add typed `scanSignals(...)` reads for retained signal history using the same
+  payload filtering facade and internal Kysely-backed compiler path.
+- Add typed `eventIdBounds()` on event and signal scans for low/high watermark
+  queries without raw `MIN(event_id)` / `MAX(event_id)` SQL.
+- Add typed `latestEventRefsByPayload(...)` on event and signal scans for
+  grouped latest-ref queries without raw JSON extraction or `GROUP BY` SQL.
+- Add typed batch insert values so data migrations and indexers can write many
+  projection rows in one statement without raw `INSERT ... VALUES` SQL.
+- Add typed composite projection joins so multi-column relationships can be
+  queried without raw `ON a = b AND c = d` SQL.
+- Make that statement compiler an explicit adapter-supplied internal dependency
+  for projection implementation factories and materialization table/index DDL,
+  removing the register-time SQLite compiler assumption.
+- Add typed `whereAny([...])` disjunction groups to projection read, update,
+  and delete builders so common OR predicates do not require raw SQL.
+- Add typed `innerJoin(...).selectFrom(...)` projection reads for
+  association-table lookups without exposing raw SQL or storage handles.
+- Add typed `leftJoin(...).selectFrom(...)` projection reads for optional
+  related rows, with selected joined-table columns exposed as nullable.
+- Add typed `whereNotExists(...)` projection anti-join predicates for
+  unassociated-row lookups without exposing raw subqueries.
+- Add typed projection aggregate reads with `count(...)`, `countNotNull(...)`,
+  `min(...)`, and `max(...)` aliases for summary queries without exposing raw
+  SQL.
+- Add batched semantic event-ref hydration with `readEvents(...)` so queries
+  can avoid event-table N+1 reads without receiving the internal events table.
+- Add semantic `scanEvents(eventName)` reads so backfills and queries can stream
+  typed event history without receiving the internal events table.
+- Add typed `orderByList(...)` projection reads for application-defined
+  priority ordering without exposing raw `CASE` SQL.
+- Add typed `orderByNulls(...)` projection reads for explicit nullable-column
+  ordering without exposing raw `CASE` SQL.
+- Add typed `unionFrom(...)` / `unionValue(...)` / `unionAll(...)`
+  projection reads for prioritized candidate streams without exposing raw
+  `UNION` SQL.
+- Serialize boolean `unionValue(...)` literals for SQLite and decode nullable
+  union aliases using merged nullability across all arms.
+- Track `executeExpectingOne()` affected-row assertions as pending projection
+  writes so unawaited assertion failures still fail the indexer/data scope.
+- Reject non-serializable JSON projection values at the facade boundary before
+  storage adapters receive bind parameters.
+- Preserve materialization definition types through ledger construction and
+  adapter inputs so event handlers can only call indexers for their source
+  event.
+- Reject out-of-order materialization histories and histories whose replayed
+  table shape does not match the current materialization schema.
+- Reject materialization histories whose replayed indexes, unique keys, or
+  foreign keys do not match the current materialization schema, including
+  operations ordered before their referenced tables or columns exist.
+- Reject non-positive event reference IDs when projection access serializes or
+  decodes event-ref columns.
+- Ensure declared materialization tables and indexes during ledger startup from
+  the typed materialization migration history instead of requiring callers to
+  run raw SQL setup.
+- Remove the low-level `@torkbot/sledge/database-ledger-engine` package export
+  and hide generated raw-scope implementations behind an internal attachment
+  that is not part of the public registered-model type.
+- Export `createEventRef(...)` from `@torkbot/sledge/ledger` and reject invalid
+  event-ref IDs at construction time.
+- Harden materialization/projection validation for migration-order data steps,
+  data steps before declared keys/relations, foreign-key target keys, duplicate
+  index names, ledger-reserved object names, SQLite-internal object names,
+  case-only duplicate tables/columns, unsafe integer union literals, null
+  predicate values, unsupported same-table joins, and late projection writes
+  after indexer completion.
+- Reject projection table/index names that would collide under SQLite's
+  identifier rules or share SQLite's table/index namespace, enable SQLite
+  foreign-key enforcement on adapter connections, and preserve JSON `null`
+  values in JSON projection columns.
+- Preserve JSON objects that look like projection-expression metadata during
+  update/upsert serialization, and chunk batched semantic event reads below
+  SQLite bind-variable limits.
+- Preserve JSON `null` values in JSON equality/`whereIn` predicates and reject
+  non-null `addColumn` migration steps until the migration DSL supports
+  defaults or two-phase constraints.
+- Compile write `max(...)` expressions null-safely so nullable operands do not
+  overwrite an existing non-null value with SQL `NULL`.
 - Reject SQLite URI `databaseUrl` values before opening adapter connections.
   This prevents shared-memory URI strings such as
   `file:sledge?mode=memory&cache=shared` from being treated as literal

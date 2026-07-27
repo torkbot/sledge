@@ -1,92 +1,133 @@
 # @torkbot/sledge
 
-A SQLite-backed event and work engine for building durable, restart-safe workflows.
+A SQLite-backed event and work engine for building durable, restart-safe
+workflows.
 
-If you need to reliably turn events into background work (without losing consistency during crashes/retries), this package gives you the core runtime.
+Sledge stores events and durable work, runs event handlers transactionally, and
+lets applications define typed materialization tables without handing raw SQL
+handles to indexer and query callbacks.
 
-## Who this is for
+## What You Get
 
-Use `@torkbot/sledge` when you want:
+- Durable event append with producer idempotency through `dedupeKey`
+- Event -> materialization -> work in one transaction
+- Typed materialization schema, event refs, indexers, and queries
+- Durable queue work with leases, retries, dead-letter outcomes, and restart
+  recovery
+- Durable event streams through `tailEvents(...)` and `resumeEvents(...)`
+- Process-local live signals for short-lived follow-up work
 
-- durable event append + background work orchestration,
-- retries and restart recovery by default,
-- strong runtime validation at I/O boundaries,
-- a small API surface you can adapt to your own schema and storage layout.
-
-## What you get
-
-- **Event log** (`events` table)
-- **Durable work queue** (`work` table)
-- **Transactional flow:** append event -> project -> materialize work in one transaction
-- **Lease-based execution** for queue handlers
-- **Idempotent producer retries** via `dedupeKey`
-- **Signals** for short-lived work created inside queue handlers
-
-## Example use-cases
-
-- **Webhook ingestion** with producer idempotency (`dedupeKey`) and reliable downstream processing
-- **Notification pipelines** (email/push/slack) with retries and dead-letter outcomes
-- **Long-running tool/API jobs** that survive worker restarts
-- **Outbox-style orchestration** without split-brain between writes and job enqueue
-- **Client-side materialization** (browser/mobile/worker) by tailing events and resuming with an opaque cursor
-
----
-
-## Quick start (copy/paste)
+## Quick Start
 
 ```ts
 import { Type } from "typebox";
 
-import {
-  bindLedgerModel,
-  defineLedgerModel,
-  registerLedgerModel,
-} from "@torkbot/sledge/ledger";
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
+import {
+  defineLedgerShape,
+  defineMaterialization,
+  withMaterializations,
+} from "@torkbot/sledge/ledger";
 import {
   NodeRuntimeScheduler,
   SystemRuntimeClock,
 } from "@torkbot/sledge/runtime/node-runtime";
 
-// Sledge schemas should describe JSON-compatible values. TypeBox codecs that
-// transform between distinct runtime and storage domains are not supported.
-const definedModel = defineLedgerModel({
+const databaseUrl = "./app.sqlite";
+
+const ledgerShape = defineLedgerShape({
   events: {
     "user.created": Type.Object({
       userId: Type.String(),
       email: Type.String(),
     }),
   },
-
   queues: {
     "welcome-email.send": Type.Object({
       userId: Type.String(),
       email: Type.String(),
     }),
   },
+  signals: {},
+  signalQueues: {},
+});
 
-  indexers: {
-    upsertUser: Type.Object({
-      userId: Type.String(),
-      email: Type.String(),
-    }),
-  },
-
-  queries: {
-    userById: {
-      params: Type.Object({ userId: Type.String() }),
-      result: Type.Union([
-        Type.Null(),
-        Type.Object({
+const materializations = defineMaterialization(ledgerShape, {
+  namespace: "app",
+})
+  .version(1, "create app tables", (s) =>
+    s.createTable("users", (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          email: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+    ),
+  )
+  .define({
+    indexers: {
+      upsertUser: {
+        sourceEvent: "user.created",
+        input: Type.Object({
           userId: Type.String(),
           email: Type.String(),
         }),
-      ]),
+      },
+    },
+    queries: {
+      userById: {
+        params: Type.Object({ userId: Type.String() }),
+        result: Type.Union([
+          Type.Null(),
+          Type.Object({
+            userId: Type.String(),
+            email: Type.String(),
+          }),
+        ]),
+      },
+    },
+  });
+
+const definedModel = withMaterializations(ledgerShape, materializations);
+
+const model = definedModel.register({
+  indexers: {
+    upsertUser: async ({ input, event, db }) => {
+      await db
+        .insertInto("users")
+        .values({
+          userId: input.userId,
+          email: input.email,
+          source: event.ref,
+        })
+        .onConflict(["userId"])
+        .doUpdateSet({
+          email: input.email,
+          source: event.ref,
+        })
+        .execute();
     },
   },
-});
+  queries: {
+    userById: async ({ params, db }) => {
+      const row = await db
+        .selectFrom("users")
+        .select(["userId", "email"])
+        .where("userId", "=", params.userId)
+        .executeTakeFirst();
 
-const registeredModel = registerLedgerModel(definedModel, {
+      if (row === null) {
+        return null;
+      }
+
+      return {
+        userId: row.userId,
+        email: row.email,
+      };
+    },
+  },
   events: {
     "user.created": async ({ event, actions }) => {
       await actions.index("upsertUser", {
@@ -106,109 +147,274 @@ const registeredModel = registerLedgerModel(definedModel, {
   },
   queues: {
     "welcome-email.send": async ({ work }) => {
-      // call provider here
       console.log("sending welcome email", work.payload.email);
     },
   },
 });
 
-const clock = new SystemRuntimeClock();
-const scheduler = new NodeRuntimeScheduler();
+await using ledger = createBetterSqliteLedger({
+  databaseUrl,
+  model,
+  timing: {
+    clock: new SystemRuntimeClock(),
+  },
+});
 
-{
-  await using ledger = createBetterSqliteLedger({
-    databaseUrl: "./app.sqlite",
-    boundModel: bindLedgerModel(registeredModel, {
-      indexers: {
-        upsertUser: async (scope, input) => {
-          // Write to your own projection table(s)
-          await scope
-            .prepare(
-              `INSERT INTO users (user_id, email)
-               VALUES (?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET email = excluded.email`,
-            )
-            .run(input.userId, input.email);
-        },
-      },
-      queries: {
-        userById: async (scope, params) => {
-          // Read from your own projection table(s)
-          const row = await scope
-            .prepare(
-              `SELECT user_id, email
-               FROM users
-               WHERE user_id = ?`,
-            )
-            .get(params.userId);
+await using workers = await ledger.startWorkers({
+  scheduler: new NodeRuntimeScheduler(),
+});
 
-          if (row === undefined) {
-            return null;
-          }
+await ledger.emit("user.created", {
+  userId: "u_123",
+  email: "alice@example.com",
+});
 
-          return {
-            userId: row.user_id,
-            email: row.email,
-          };
-        },
-      },
-    }),
-    timing: {
-      clock,
-    },
-  });
-
-  await using workers = await ledger.startWorkers({
-    scheduler,
-  });
-
-  const event = await ledger.emit("user.created", {
-    userId: "u_123",
-    email: "alice@example.com",
-  });
-
-  console.log(event.eventId);
-}
-
-db.close();
+const user = await ledger.query("userById", { userId: "u_123" });
+console.log(user);
 ```
 
----
+## Lifecycle
 
-## How to think about the API
+### 1. Define the Ledger Shape
 
-### 1) `defineLedgerModel(...)`
-
-You define contracts, not implementation details:
+`defineLedgerShape(...)` defines durable boundary contracts with TypeBox:
 
 - `events`: facts appended to the event stream
-- `signals`: short-lived records emitted from queue handlers
 - `queues`: durable work payloads
-- `signalQueues`: work payloads materialized from signals
-- `indexers`: projection write contracts
-- `queries`: projection read contracts
+- `signals`: process-local, short-lived records emitted by queue handlers
+- `signalQueues`: retryable work materialized from signals
 
-### 2) `registerLedgerModel(...)`
+All four fields are explicit. Use `{}` when a shape has no contracts in that
+category.
 
-You attach orchestration handlers keyed by event/signal/queue names.
+### 2. Define Materializations From Migrations
 
-Event handlers can `index`, `enqueue`, and `query`.
+Call `defineMaterialization(ledgerShape, { namespace })` to define one
+materialization namespace. The table schema is the outcome of the ordered
+version chain; there is no separate current-schema DDL to keep in sync.
 
-### 3) `bindLedgerModel(...)`
+Each `.version(...)` callback receives a typed migration chain. Operations
+append metadata and advance the schema type visible to later operations:
 
-You provide concrete implementations for indexers and queries. Sledge passes a
-storage scope as the first argument and the typed input/params as the second
-argument.
+```ts
+const materializations = defineMaterialization(ledgerShape, {
+  namespace: "app",
+})
+  .version(1, "create users", (s) =>
+    s.createTable("users", (t) =>
+      t
+        .columns({
+          userId: t.text().notNull(),
+          source: t.eventRef("user.created").notNull(),
+        })
+        .primaryKey(["userId"]),
+    ),
+  )
+  .version(2, "add user email", (s) =>
+    s
+      .addColumn("users", "email", (t) => t.text())
+      .createIndex("usersByEmail", "users", ["email"])
+      .data("backfill user email", async ({ db }) => {
+        const events = await db.scanEvents("user.created").execute();
 
-Query implementations are projection reads. They are not serialized behind
-ledger mutations, so a long-running query cannot block unrelated durable writes.
-Keep query implementations bounded to read-side state; avoid application
-orchestration, attachment/network/model I/O, and re-entering ledger-backed write
-paths from inside a query.
+        for (const event of events) {
+          await db
+            .updateTable("users")
+            .set({ email: event.payload.email })
+            .where("userId", "=", event.payload.userId)
+            .execute();
+        }
+      }),
+  )
+  .define({
+    indexers: {
+      upsertUser: {
+        sourceEvent: "user.created",
+        input: Type.Object({ userId: Type.String() }),
+      },
+    },
+    queries: {
+      userById: {
+        params: Type.Object({ userId: Type.String() }),
+        result: Type.Null(),
+      },
+    },
+  });
+```
 
-### 4) `create*Ledger(...)`
+Semantic event refs are first-class columns and must point at real ledger
+events:
 
-You choose a backend adapter and open the durable ledger:
+```ts
+source: t.eventRef("user.created").notNull();
+```
+
+Foreign keys are migration operations. Because operations advance the carried
+schema type, the relation builder sees tables created earlier in the chain:
+
+```ts
+.version(1, "create session tables", (s) =>
+  s
+    .createTable("users", (t) =>
+      t.columns({ userId: t.text().notNull() }).primaryKey(["userId"]),
+    )
+    .createTable("sessions", (t) =>
+      t
+        .columns({
+          sessionId: t.text().notNull(),
+          userId: t.text().notNull(),
+        })
+        .primaryKey(["sessionId"]),
+    )
+    .addForeignKey("sessionUser", (r) =>
+      r.foreignKey("sessions", ["userId"]).references("users", ["userId"]),
+    ),
+)
+```
+
+Data migration steps are typed against the schema state at that point in the
+chain. They can also read or scan typed ledger events with `readEvent(...)`,
+`readEvents(...)`, and `scanEvents(...)` without seeing the internal `events`
+table. Data migrations receive a Sledge-owned typed database facade, not a raw
+SQL handle, so executors can inject tenancy and storage-specific behavior
+before operations reach the database.
+
+Sledge validates that materialization histories start at version 1, versions
+are unique positive integers, versions have no gaps, and later operations only
+reference schema objects available at that point in the chain.
+
+When helper code needs named types outside inline callbacks, derive them from
+the materialization value instead of restating table shapes:
+
+```ts
+import type {
+  MaterializationDatabaseFor,
+  MaterializationImplementationRegistrationFor,
+  MaterializationMigrationDatabaseFor,
+  MaterializationReadDatabaseFor,
+  MaterializationSchemaFor,
+  MaterializationWriteDatabaseFor,
+} from "@torkbot/sledge/ledger";
+
+type AppSchema = MaterializationSchemaFor<typeof materializations>;
+type AppReadDb = MaterializationReadDatabaseFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+type AppWriteDb = MaterializationWriteDatabaseFor<typeof materializations>;
+type AppDb = MaterializationDatabaseFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+type AppMigrationDb = MaterializationMigrationDatabaseFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+type AppImplementations = MaterializationImplementationRegistrationFor<
+  typeof materializations,
+  typeof ledgerShape.shape.events
+>;
+```
+
+Attach materializations to the ledger shape with `withMaterializations(...)`:
+
+```ts
+const definedModel = withMaterializations(ledgerShape, materializations);
+```
+
+Ledgers without materialization tables can skip this step and call
+`defineLedgerShape(...).register(...)` directly.
+
+### 3. Register Orchestration
+
+Call `definedModel.register(...)` to attach indexer implementations, query
+implementations, event handlers, queue handlers, signal handlers, and
+signal-queue handlers.
+
+Indexer and query implementations receive sledge-owned facades:
+
+- indexers can `selectFrom(...)`, `readEvent(ref)`, `insertInto(...)`,
+  `updateTable(...)`, and `deleteFrom(...)`
+- queries can `selectFrom(...)` and `readEvent(ref)`, but cannot mutate
+  materialization tables
+- reads support typed predicates, null predicates, typed `whereAny([...])`
+  disjunction groups, typed single-column and composite
+  `innerJoin(...).selectFrom(...)` table joins, typed single-column and
+  composite `leftJoin(...).selectFrom(...)` optional-row joins, typed
+  `whereNotExists(...)` anti-joins, typed aggregate reads with `count(...)`,
+  `countNotNull(...)`, `min(...)`, and `max(...)`, `orderBy(...)`, explicit
+  nullable-column `orderByNulls(...)`, domain-specific `orderByList(...)`
+  value ordering, `limit(...)`,
+  `execute()`, `executeTakeFirst()`, and `stream()`
+- reads can compose typed candidate streams with `unionFrom(...)`,
+  `unionValue(...)`, and `unionAll(...)` without exposing raw SQL
+- reads can stream historical events with `scanEvents(eventName)` and retained
+  signals with `scanSignals(signalName)`, filter by typed top-level scalar
+  payload fields, choose event-id ordering, read event-id bounds, and group
+  latest semantic event refs by string payload keys without exposing the
+  internal `events` table
+- writes return affected-row metadata and support typed integer `add(...)`,
+  bounded `decrementIfPositive(...)`, `MAX(...)`, `COALESCE(...)`, and upsert
+  `excluded` expressions without raw SQL
+- inserts can bind one typed row or an array of typed rows, including conflict
+  handling, so migration backfills can batch projection writes without raw SQL
+
+Semantic event refs can be hydrated one at a time with `readEvent(ref)` or in
+batches with `readEvents(refs)`. Batch reads preserve the input order and avoid
+one storage round trip per row:
+
+```ts
+const events = await db.readEvents(rows.map((row) => row.source));
+```
+
+Application-defined row priority can be expressed without raw `CASE` SQL:
+
+```ts
+const docs = await db
+  .selectFrom("profileDocs")
+  .select(["docId", "version", "content"])
+  .orderByList("docId", ["SOUL", "IDENTITY", "USER"])
+  .execute();
+```
+
+Aggregate reads return a single typed object keyed by the declared aliases:
+
+```ts
+const summary = await db
+  .selectFrom("toolCalls")
+  .aggregate()
+  .count("totalToolCallCount")
+  .countNotNull("completedToolCallCount", "resultMessageJson")
+  .min("firstToolCallAtMs", "createdAtMs")
+  .max("latestToolCallAtMs", "createdAtMs")
+  .where("runId", "=", params.runId)
+  .execute();
+```
+
+They do not receive a raw storage handle. Event handlers can `index`, `enqueue`,
+and `query`.
+
+The low-level database engine and storage scope are internal implementation
+details, not package exports.
+
+Registration returns the model passed to a storage adapter. There is no
+separate bind step.
+
+### 4. Run Database Hygiene
+
+Opening a ledger creates Sledge's internal tables and ensures the declared
+materialization tables and indexes exist from the migration-derived current
+schema. Startup records applied namespace versions and runs pending migration
+steps through Sledge-owned typed facades. A fresh namespace creates the current
+schema in one pass, then replays data migration steps. Existing namespaces
+apply supported incremental DDL and data steps. SQLite cannot add foreign-key
+constraints incrementally, so
+`addForeignKey(...)` migrations are rejected after a namespace has already been
+created.
+
+### 5. Open a Runtime
+
+Use one adapter to open the ledger:
 
 - `createBetterSqliteLedger(...)`
 - `createTursoLedger(...)`
@@ -222,59 +428,43 @@ them as SQLite URI filenames consistently. Pass a normal filesystem path for
 local SQLite. The `better-sqlite3` adapter verifies that the opened database
 actually enters WAL journal mode and rejects databases that cannot.
 
-Sledge assumes a single process owns writes to a ledger database. Its
-multi-connection support is for Sledge-managed read/write scopes inside that
-runtime, not for competing writer processes. Cross-process consumers should use
-durable event streams (`tailEvents` / `resumeEvents`) and work inspection APIs.
-`onSignal(...)` is a live, process-local notification hook; signals are
-transient and are not a durable distributed pub/sub channel.
+## Runtime API
 
-The runtime exposes:
+The opened ledger exposes:
 
-- `emit(eventName, payload, options?)`: append an event and return its durable envelope
-- `query(queryName, params)`: run a model query implementation
-- `cancelWork({ ref, reason? })`: durably mark non-terminal keyed work as cancelled
-- `queryWork({ workId })`: inspect one durable work item by storage id
-- `listWork({ queueName?, sourceEventId?, states?, limit? })`: inspect durable work items
-- `tailEvents({ last, signal })`: read recent durable events and follow new ones
-- `resumeEvents({ cursor, signal })`: continue an event stream from an opaque cursor
-- `onSignal(signalName, observer)`: subscribe to live process-local signal notifications
-- `startWorkers(options)`: start queue dispatch for this ledger handle
-- `close()`: close the ledger runtime and the database connections owned by it
+- `emit(eventName, payload, options?)`
+- `query(queryName, params)`
+- `cancelWork({ ref, reason? })`
+- `queryWork({ workId })`
+- `listWork({ queueName?, sourceEventId?, states?, limit? })`
+- `tailEvents({ last, signal })`
+- `resumeEvents({ cursor, signal })`
+- `onSignal(signalName, observer)`
+- `startWorkers(options)`
+- `close()`
 
-Opening a ledger is passive: it initializes storage and can emit, query, tail,
-resume, and observe signals, but it does not claim or process queue work.
+Opening a ledger is passive. It initializes storage and can emit, query, tail,
+resume, and observe signals, but it does not claim or process queue work until
+`startWorkers(...)` is called.
 
-Sledge manages read and write scopes internally. Ambient `ledger.query(...)`
-calls receive an ambient read scope. Event projection `actions.query(...)` and
-`actions.index(...)` receive the same transaction-local scope as the event
-append and work materialization transaction.
+## Work and Retries
 
-Start workers explicitly in the process that owns queue execution:
+Queue and signal queue handlers implicitly ack on normal return.
 
-```ts
-await using workers = await ledger.startWorkers({
-  scheduler: new NodeRuntimeScheduler(),
-  leaseMs: 1_000,
-  defaultRetryDelayMs: 1_000,
-  maxInFlight: 16,
-  terminalWorkRetentionMs: 7 * 24 * 60 * 60 * 1_000,
-});
-```
+- Return or resolve: ack
+- Throw: retry using the default retry delay
+- `control.retry(error, { retryAtMs? })`: explicit retry timing
+- `control.deadLetter(error)`: terminal durable queue failure
 
----
+Handlers receive a lease with an `AbortSignal`; long-running handlers should
+stop when that signal aborts during shutdown or restart.
 
-## Work inspection and cancellation
+## Work Inspection and Cancellation
 
-Sledge stores durable work rows for queued, leased, delayed-retry, dead-lettered,
-and cancelled work. Successful work is deleted when it acks. Terminal retained
-work (`dead` and `cancelled`) is pruned when workers start according to
-`terminalWorkRetentionMs`.
+Sledge stores durable work rows for queued, leased, delayed-retry,
+dead-lettered, and cancelled work. Successful work is deleted when it acks.
 
-Event and signal handlers can assign a `workKey` when they enqueue work. Sledge
-combines that key with the source event id, queue name, and signal flag into a
-stable `WorkRef`. Use refs for cancellation; `workId` remains a storage-local
-inspection id.
+Use `workKey` when enqueueing work to get a durable `WorkRef` for cancellation:
 
 ```ts
 actions.enqueue(
@@ -283,212 +473,52 @@ actions.enqueue(
   { workKey: `welcome-email:${event.payload.userId}` },
 );
 
-const currentWork = await ledger.listWork({
+const work = await ledger.listWork({
   states: ["pending", "delayed", "leased"],
   limit: 100,
 });
 
-const target = currentWork.find((work) => work.ref !== null);
+const target = work.find((item) => item.ref !== null);
 
 if (target?.ref === undefined || target.ref === null) {
   throw new Error("no keyed work to cancel");
 }
 
-const result = await ledger.cancelWork({
+await ledger.cancelWork({
   ref: target.ref,
   reason: "user requested cancellation",
 });
-
-if (result.status === "cancelled") {
-  console.log(result.work.state); // "cancelled"
-}
 ```
 
-Cancellation is terminal. Once `cancelWork(...)` succeeds for a non-terminal
-work item, Sledge will not dispatch that work again, including after process
-restart. If the work is currently leased by this ledger's active worker handle,
-Sledge also aborts that lease's `AbortSignal` as a live-delivery fast path.
+Cancellation is terminal. Cancelled work will not dispatch again, including
+after process restart.
 
-`queryWork(...)` and `listWork(...)` read only committed work state; they do not
-expose rows staged by in-flight event materialization that may later roll back.
+## Event Streams
 
-## Handler behavior
-
-Queue and signal queue handlers implicitly ack on normal return.
-
-- Return (or resolve) => ack
-- Throw => retry using default retry delay
-- Use `control.retry(error, { retryAtMs? })` for explicit retry timing
-- Durable queue handlers may call `control.deadLetter(error)`
-- Signal queue handlers do not support dead-letter
-
-## Signals
-
-Use a signal when a handler needs to create short-lived follow-up work.
-
-For example, a response handler might need to publish a “response started” notice. If the process crashes before the notice is published, sledge should retry it. After it is published, the notice does not need to stay in event history.
-
-Signals are only emitted from normal queue handlers with `actions.emitSignal(...)`. A signal can create `signalQueues`, but it cannot write indexes.
+Use durable event streams for external materialization:
 
 ```ts
-const definedModel = defineLedgerModel({
-  events: {
-    "response.requested": Type.Object({
-      responseId: Type.String(),
-    }),
-  },
-  signals: {
-    "response.notice": Type.Object({
-      responseId: Type.String(),
-      message: Type.String(),
-    }),
-  },
-  queues: {
-    "response.generate": Type.Object({
-      responseId: Type.String(),
-    }),
-  },
-  signalQueues: {
-    "response.notice.publish": Type.Object({
-      responseId: Type.String(),
-      message: Type.String(),
-    }),
-  },
-  indexers: {},
-  queries: {},
-});
-
-const model = registerLedgerModel(definedModel, {
-  events: {
-    "response.requested": ({ event, actions }) => {
-      actions.enqueue("response.generate", {
-        responseId: event.payload.responseId,
-      });
-    },
-  },
-  queues: {
-    "response.generate": async ({ work, actions }) => {
-      actions.emitSignal("response.notice", {
-        responseId: work.payload.responseId,
-        message: "response started",
-      });
-    },
-  },
-  signals: {
-    "response.notice": ({ event, actions }) => {
-      actions.enqueueSignal("response.notice.publish", {
-        responseId: event.payload.responseId,
-        message: event.payload.message,
-      });
-    },
-  },
-  signalQueues: {
-    "response.notice.publish": async ({ work }) => {
-      await notifier.publish(work.payload);
-    },
-  },
-});
-```
-
-Sledge keeps a signal while its work is pending or retrying. When the work acks, sledge deletes the signal and the completed signal work in the same transaction. `dedupeKey` values are shared across durable events and signals, so they must be globally unique while any matching row exists.
-
-You can also watch signals live:
-
-```ts
-using notices = ledger.onSignal("response.notice", (signal) => {
-  socket.send(signal.payload.message);
-});
-```
-
-This is a live notification only. It does not have a cursor, and sledge does not retry observer callbacks. For work that must be retried before cleanup, use a `signalQueue`.
-
-## Dedupe and idempotency
-
-Use `dedupeKey` in `emit(...)` for producer retries. `emit(...)` returns the
-winning durable event envelope. With a duplicate key, the existing event envelope
-is returned and downstream materialization is not replayed.
-
-```ts
-const event = await ledger.emit(
-  "user.created",
-  { userId: "u_123", email: "alice@example.com" },
-  { dedupeKey: "provider-event:abc-123" },
-);
-
-console.log(event.eventId);
-```
-
-Same key => same durable event winner, no duplicate downstream materialization.
-
-## Event consumers (tail + resume)
-
-You can materialize ledger events outside the process (for example, to browser state) with two APIs:
-
-- `tailEvents({ last, signal })`: `tail -f -n <last>` semantics
-- `resumeEvents({ cursor, signal })`: continue from a previously persisted opaque cursor
-
-```ts
-const controller = new AbortController();
-
 for await (const item of ledger.tailEvents({
   last: 100,
-  signal: controller.signal,
+  signal: abortController.signal,
 })) {
-  const event = item.event;
-  const cursor = item.cursor;
-
-  // apply event to external read model
-  // persist cursor for reconnect/resume
+  await applyEvent(item.event);
+  await saveCursor(item.cursor);
 }
-
-// Later (e.g. reconnect):
-const resumeController = new AbortController();
 
 for await (const item of ledger.resumeEvents({
-  cursor: persistedCursor,
-  signal: resumeController.signal,
+  cursor: savedCursor,
+  signal: abortController.signal,
 })) {
-  // continue exactly after persisted cursor
+  await applyEvent(item.event);
 }
 ```
 
-Cursor values are opaque by contract. Persist and reuse them as-is.
+Cursor values are opaque. Persist and reuse them as-is.
 
-## Long-running handlers
-
-Long-running handlers are automatically lease-renewed for the full handler duration.
-
-Use `lease.signal` for cooperative cancellation on shutdown/restart:
-
-```ts
-register: {
-  queues: {
-    "some.queue": async ({ lease }) => {
-      while (!lease.signal.aborted) {
-        // long-running async work
-        break;
-      }
-    },
-  },
-};
-```
-
-## Runtime tuning knobs
-
-Available options when starting workers:
-
-- `leaseMs`
-- `defaultRetryDelayMs`
-- `maxInFlight`
-
-Start simple; tune only when you observe contention/throughput issues.
-
----
-
-## Package exports
+## Package Exports
 
 - `@torkbot/sledge/ledger`
-- `@torkbot/sledge/database-ledger-engine`
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`
 - `@torkbot/sledge/runtime/contracts`
@@ -504,11 +534,12 @@ node --run build
 node --run lint
 ```
 
-## Publishing notes
+## Publishing Notes
 
-- The package is published as compiled JavaScript in `dist/` (with `.d.ts` types).
+- The package is published as compiled JavaScript in `dist/` with `.d.ts`
+  types.
 - Source remains strict TypeScript in `src/`.
 - `prepublishOnly` runs `node --run build` automatically.
-- Publishing uses GitHub Actions OIDC trusted publishing (`.github/workflows/release.yml`), so no long-lived npm token is required.
-- Configure npm trusted publishing for `@torkbot/sledge` to trust this repository/workflow before first publish.
-- Node version is pinned via `engines.node` because runtime code uses explicit resource management (`using` / `await using`).
+- Publishing uses GitHub Actions OIDC trusted publishing.
+- Node version is pinned via `engines.node` because runtime code uses explicit
+  resource management (`using` / `await using`).

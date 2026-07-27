@@ -17,10 +17,6 @@
       "types": "./dist/ledger/ledger.d.ts",
       "default": "./dist/ledger/ledger.js"
     },
-    "./database-ledger-engine": {
-      "types": "./dist/ledger/database-ledger-engine.d.ts",
-      "default": "./dist/ledger/database-ledger-engine.js"
-    },
     "./better-sqlite3-ledger": {
       "types": "./dist/ledger/better-sqlite3-ledger.d.ts",
       "default": "./dist/ledger/better-sqlite3-ledger.js"
@@ -58,6 +54,7 @@
   "dependencies": {
     "@tursodatabase/database": "^0.5.1",
     "better-sqlite3": "^12.6.2",
+    "kysely": "^0.29.2",
     "sqids": "0.3.0",
     "typebox": "^1.1.33"
   },

@@ -19,35 +19,48 @@ import {
   type StorageStatement,
 } from "./database-ledger-engine.ts";
 import {
-  bindLedgerModel,
-  defineLedgerModel as defineStaticLedgerModel,
-  registerLedgerModel,
-  type BoundLedgerModel,
+  attachLedgerImplementationFactory,
   type LedgerImplementations,
+} from "./internal-storage.ts";
+import {
+  type RegisteredLedgerModel,
+  type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
-  type RegisteredLedgerModel,
 } from "./ledger.ts";
+import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
+import { defineProjectionSchema } from "./projections.ts";
 import { createTursoStorageRuntime } from "./turso-ledger.ts";
 
-type LegacyRegisteredLedgerModel<
+const projectionCompiler = createSqliteProjectionStatementCompiler();
+
+type EngineFixtureModel<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, TSchema> = {},
   TQueries extends Record<string, QuerySchema<TSchema, TSchema>> = {},
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
-> = RegisteredLedgerModel<
-  TEvents,
-  TQueues,
-  TIndexers,
-  TQueries,
-  TSignals,
-  TSignalQueues
-> & {
-  bind(
-    implementations: LedgerImplementations<TIndexers, TQueries>,
-  ): BoundLedgerModel<
+> = {
+  readonly model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+  readonly register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+  withImplementations(
+    implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
+  ): RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -57,7 +70,7 @@ type LegacyRegisteredLedgerModel<
   >;
 };
 
-function defineLedgerModel<
+function defineEngineFixtureModel<
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
   const TIndexers extends Record<string, TSchema> = {},
@@ -79,7 +92,7 @@ function defineLedgerModel<
     TSignals,
     TSignalQueues
   >;
-}): LegacyRegisteredLedgerModel<
+}): EngineFixtureModel<
   TEvents,
   TQueues,
   TIndexers,
@@ -87,20 +100,47 @@ function defineLedgerModel<
   TSignals,
   TSignalQueues
 > {
-  const definedModel = defineStaticLedgerModel({
+  const model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  > = {
     events: input.events,
-    signals: input.signals,
+    signals: input.signals ?? ({} as TSignals),
     queues: input.queues,
-    signalQueues: input.signalQueues,
-    indexers: input.indexers,
-    queries: input.queries,
-  });
-  const registeredModel = registerLedgerModel(definedModel, input.register);
+    signalQueues: input.signalQueues ?? ({} as TSignalQueues),
+    indexers: input.indexers ?? ({} as TIndexers),
+    queries: input.queries ?? ({} as TQueries),
+  };
+  const projections = defineProjectionSchema({});
 
   return {
-    ...registeredModel,
-    bind(implementations) {
-      return bindLedgerModel(registeredModel, implementations);
+    model,
+    register: input.register,
+    withImplementations(implementations) {
+      // Engine tests exercise custom storage hooks that the public v2
+      // construction path deliberately no longer exposes.
+      const registeredModel = {
+        materializationHistory: null,
+        model,
+        projections,
+        register: input.register,
+      } as unknown as RegisteredLedgerModel<
+        TEvents,
+        TQueues,
+        TIndexers,
+        TQueries,
+        TSignals,
+        TSignalQueues
+      >;
+
+      return attachLedgerImplementationFactory(
+        registeredModel,
+        () => implementations,
+      );
     },
   };
 }
@@ -304,6 +344,34 @@ test("storage runtimes reject in-memory database URLs", async () => {
   );
 });
 
+test("turso runtime enables foreign key enforcement on every connection", async () => {
+  const databaseUrl = createTempDatabasePath();
+  const storage = await createTursoStorageRuntime(databaseUrl);
+
+  try {
+    assert.equal(
+      await storage.write(async (database) => {
+        return await readForeignKeyPragma(database);
+      }),
+      1,
+    );
+    assert.equal(
+      await storage.read(async (database) => {
+        return await readForeignKeyPragma(database);
+      }),
+      1,
+    );
+  } finally {
+    await storage.close();
+    await rm(databaseUrl, {
+      force: true,
+    });
+    await rm(`${databaseUrl}-wal`, {
+      force: true,
+    });
+  }
+});
+
 test("storage runtimes reject SQLite URI database URLs", async () => {
   assert.throws(
     () => createBetterSqliteStorageRuntime("file:ledger.sqlite?mode=rwc"),
@@ -371,6 +439,18 @@ test("better-sqlite runtime close waits for in-flight reads", async () => {
     });
   }
 });
+
+async function readForeignKeyPragma(
+  database: StorageDatabase,
+): Promise<unknown> {
+  const row = await database.prepare("PRAGMA foreign_keys").get();
+
+  if (row === undefined) {
+    throw new Error("PRAGMA foreign_keys did not return a row");
+  }
+
+  return row.foreign_keys;
+}
 
 test("turso runtime close waits for in-flight reads", async () => {
   const databaseUrl = createTempDatabasePath();
@@ -441,7 +521,7 @@ test("ledger queries do not block external write transactions", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -459,8 +539,9 @@ test("ledger queries do not block external write transactions", async () => {
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(serializedStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         slow: async () => {
@@ -527,7 +608,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -540,8 +621,9 @@ test("dispatch scheduling reads do not block event writes", async () => {
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(serializedStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -572,7 +654,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
   const database = new Database(databaseUrl);
   let observedEvents = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -597,8 +679,9 @@ test("event-handler queries remain reentrant inside append transactions", async 
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         eventCount: async () => {
@@ -629,7 +712,7 @@ test("event-handler query actions expire after handler completion", async () => 
     | ((params: Record<string, never>) => Promise<{ count: number }>)
     | null = null;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -655,8 +738,9 @@ test("event-handler query actions expire after handler completion", async () => 
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(wrapBetterSqliteDatabase(database)),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         eventCount: async () => {
@@ -729,7 +813,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "thing.recorded": Type.Object({
         id: Type.Number(),
@@ -753,8 +837,9 @@ test("unawaited event-handler queries settle before rollback", async () => {
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(serializedStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         slow: async () => {
@@ -797,7 +882,7 @@ test("ledger construction and emit do not start queue workers", async () => {
   const database = new Database(databaseUrl);
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -832,7 +917,7 @@ test("ledger construction and emit do not start queue workers", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -895,7 +980,7 @@ test("closing workers during a pending claim releases the claimed work", async (
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -920,8 +1005,9 @@ test("closing workers during a pending claim releases the claimed work", async (
   });
 
   await using ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(blockingStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -962,7 +1048,7 @@ test("idle workers discover work materialized by another ledger handle", async (
   const database = new Database(databaseUrl);
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -998,7 +1084,7 @@ test("idle workers discover work materialized by another ledger handle", async (
   try {
     await using workerLedger = createBetterSqliteLedger({
       databaseUrl,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -1009,7 +1095,7 @@ test("idle workers discover work materialized by another ledger handle", async (
 
     await using emitterLedger = createBetterSqliteLedger({
       databaseUrl,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -1067,7 +1153,7 @@ test("ledger close waits for startup before closing storage", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {},
     queues: {},
     indexers: {},
@@ -1077,8 +1163,9 @@ test("ledger close waits for startup before closing storage", async () => {
 
   try {
     await using ledger = createDatabaseLedger({
+      projectionCompiler,
       storage,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -1120,7 +1207,7 @@ test("ledger close closes storage after startup failure", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {},
     queues: {},
     indexers: {},
@@ -1129,8 +1216,9 @@ test("ledger close closes storage after startup failure", async () => {
   });
 
   const ledger = createDatabaseLedger({
+    projectionCompiler,
     storage,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1188,7 +1276,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
     },
   };
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1213,8 +1301,9 @@ test("ledger close reports dispatch loop claim failures", async () => {
   });
 
   const ledger = createDatabaseLedger({
+    projectionCompiler,
     storage: singleConnectionStorageRuntime(failingStorage),
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1252,7 +1341,7 @@ test("startWorkers rejects while workers are already running", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1270,7 +1359,7 @@ test("startWorkers rejects while workers are already running", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1296,7 +1385,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1325,7 +1414,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1367,7 +1456,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1411,7 +1500,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1460,9 +1549,12 @@ test("deduped emit does not replay projections or materialization", async () => 
   let projected = 0;
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+      "message.updated": Type.Object({
         id: Type.Number(),
       }),
     },
@@ -1500,7 +1592,7 @@ test("deduped emit does not replay projections or materialization", async () => 
   try {
     await using ledger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {
           trackProjection: async () => {
             projected += 1;
@@ -1516,7 +1608,7 @@ test("deduped emit does not replay projections or materialization", async () => 
       scheduler: runtime.scheduler,
     });
 
-    await ledger.emit(
+    const first = await ledger.emit(
       "message.received",
       {
         id: 42,
@@ -1526,14 +1618,33 @@ test("deduped emit does not replay projections or materialization", async () => 
       },
     );
 
-    await ledger.emit(
+    const second = await ledger.emit(
       "message.received",
       {
-        id: 42,
+        id: 43,
       },
       {
         dedupeKey: "message:42",
       },
+    );
+
+    assert.equal(second.eventId, first.eventId);
+    assert.deepEqual(second.payload, {
+      id: 42,
+    });
+
+    await assert.rejects(
+      async () =>
+        await ledger.emit(
+          "message.updated",
+          {
+            id: 42,
+          },
+          {
+            dedupeKey: "message:42",
+          },
+        ),
+      /dedupe key message:42 already belongs to event message\.received/,
     );
 
     await waitFor(runtime, () => processed === 1);
@@ -1552,7 +1663,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
   const database = new Database(databaseUrl);
   let enabled = false;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -1590,7 +1701,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {
         "config.enabled": async () => enabled,
@@ -1653,7 +1764,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
     releaseSignal = resolve;
   });
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "response.generate": Type.Object({
         id: Type.Number(),
@@ -1722,7 +1833,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1808,8 +1919,9 @@ test("queue handlers publish signals immediately before handler completion", asy
 
   const gate = Promise.withResolvers<void>();
   let observerCount = 0;
+  let observedSignalEventId: number | null = null;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "response.generate": Type.Object({
         id: Type.Number(),
@@ -1852,7 +1964,7 @@ test("queue handlers publish signals immediately before handler completion", asy
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1864,17 +1976,37 @@ test("queue handlers publish signals immediately before handler completion", asy
     scheduler: runtime.scheduler,
   });
 
-  const subscription = ledger.onSignal("response.delta", () => {
+  const subscription = ledger.onSignal("response.delta", (signal) => {
     observerCount += 1;
+    observedSignalEventId = signal.eventId;
   });
 
   await ledger.emit("response.generate", { id: 1 });
   await waitFor(runtime, () => observerCount === 1);
 
+  if (observedSignalEventId === null) {
+    assert.fail("expected observed signal event id");
+  }
+
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
+    ),
+    0,
+  );
+
   gate.resolve();
   await waitFor(
     runtime,
     () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
+  );
+  assert.equal(
+    readCount(
+      database,
+      `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
+    ),
+    0,
   );
 
   subscription[Symbol.dispose]();
@@ -1887,7 +2019,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
 
   let attempts = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "response.generate": Type.Object({
         id: Type.Number(),
@@ -1952,7 +2084,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -1996,7 +2128,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
 });
 
 function createBusyTestModel() {
-  return defineLedgerModel({
+  return defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2022,7 +2154,7 @@ test("emit fails fast when busy retries are disabled", async () => {
 
   const ledger = createBetterSqliteLedger({
     databaseUrl: databasePath,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2080,7 +2212,7 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
 
   let materializerStarted = false;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2103,7 +2235,7 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2155,7 +2287,7 @@ test("tailEvents does not expose rolled back events from a shared read/write sco
 
   let materializerStarted = false;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2178,10 +2310,11 @@ test("tailEvents does not expose rolled back events from a shared read/write sco
 
   try {
     await using ledger = createDatabaseLedger({
+      projectionCompiler,
       storage: singleConnectionStorageRuntime(
         wrapBetterSqliteDatabase(database),
       ),
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2230,7 +2363,7 @@ test("tailEvents yields last N events then follows new events", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2244,7 +2377,7 @@ test("tailEvents yields last N events then follows new events", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2308,7 +2441,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
   const firstDatabase = new Database(databasePath);
   const secondDatabase = new Database(databasePath);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2323,7 +2456,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
   try {
     await using firstLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2334,7 +2467,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
 
     await using secondLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2384,7 +2517,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
   const firstDatabase = new Database(databasePath);
   const secondDatabase = new Database(databasePath);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2399,7 +2532,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
   try {
     await using firstLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2410,7 +2543,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
 
     await using secondLedger = createBetterSqliteLedger({
       databaseUrl: databasePath,
-      boundModel: model.bind({
+      model: model.withImplementations({
         indexers: {},
         queries: {},
       }),
@@ -2461,7 +2594,7 @@ test("resumeEvents continues from opaque cursor", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2475,7 +2608,7 @@ test("resumeEvents continues from opaque cursor", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2555,7 +2688,7 @@ test("tail iterator return stops stream without external abort", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "message.received": Type.Object({
         id: Type.Number(),
@@ -2569,7 +2702,7 @@ test("tail iterator return stops stream without external abort", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2607,7 +2740,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
   const database = new Database(databaseUrl);
   let processed = 0;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2642,7 +2775,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2696,7 +2829,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
     readonly workKey: string;
   } | null = null;
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2753,7 +2886,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2790,7 +2923,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         mode: Type.Union([Type.Literal("cancel"), Type.Literal("dead")]),
@@ -2825,7 +2958,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({
+    model: model.withImplementations({
       indexers: {},
       queries: {},
     }),
@@ -2874,7 +3007,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2898,7 +3031,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -2927,7 +3060,7 @@ test("listWork applies state filters before limit", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -2957,7 +3090,7 @@ test("listWork applies state filters before limit", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -2981,7 +3114,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
   const handlerStarted = Promise.withResolvers<void>();
   const releaseHandler = Promise.withResolvers<void>();
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({
         id: Type.Number(),
@@ -3009,7 +3142,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -3060,7 +3193,7 @@ test("work key migration adds column before creating ref index", async () => {
     );
   `);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({ id: Type.Number() }),
     },
@@ -3072,7 +3205,7 @@ test("work key migration adds column before creating ref index", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 
@@ -3092,7 +3225,7 @@ test("enqueue rejects empty work keys", async () => {
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
 
-  const model = defineLedgerModel({
+  const model = defineEngineFixtureModel({
     events: {
       "job.requested": Type.Object({ id: Type.Number() }),
     },
@@ -3112,7 +3245,7 @@ test("enqueue rejects empty work keys", async () => {
 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
-    boundModel: model.bind({ indexers: {}, queries: {} }),
+    model: model.withImplementations({ indexers: {}, queries: {} }),
     timing: { clock: runtime.clock },
   });
 

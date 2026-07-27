@@ -3,16 +3,22 @@ import type { TSchema } from "typebox";
 
 import type {
   Ledger,
-  BoundLedgerModel,
+  RegisteredLedgerModel,
   LedgerTiming,
   QuerySchema,
 } from "./ledger.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 import {
   createDatabaseLedger,
   type CreateDatabaseLedgerInput,
   type StorageDatabase,
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
+import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
@@ -28,15 +34,21 @@ type CreateBetterSqliteLedgerInput<
   TQueries extends Record<string, AnyQueryDef>,
   TSignals extends Record<string, TSchema> = {},
   TSignalQueues extends Record<string, TSchema> = {},
+  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  TQueryDefinitions extends ProjectionQueryDefinitions = {},
 > = {
   readonly databaseUrl: string;
-  readonly boundModel: BoundLedgerModel<
+  readonly model: RegisteredLedgerModel<
     TEvents,
     TQueues,
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >;
   readonly timing: LedgerTiming;
 };
@@ -48,6 +60,9 @@ export function createBetterSqliteLedger<
   const TQueries extends Record<string, AnyQueryDef>,
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(
   input: CreateBetterSqliteLedgerInput<
     TEvents,
@@ -55,7 +70,10 @@ export function createBetterSqliteLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   >,
 ): Ledger<TEvents, TQueries, TSignals> {
   const sharedInput: CreateDatabaseLedgerInput<
@@ -64,10 +82,14 @@ export function createBetterSqliteLedger<
     TIndexers,
     TQueries,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
   > = {
     storage: createBetterSqliteStorageRuntime(input.databaseUrl),
-    boundModel: input.boundModel,
+    model: input.model,
+    projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
     timing: input.timing,
   };
 
@@ -80,15 +102,20 @@ export function createBetterSqliteStorageRuntime(
   validateDatabaseUrl(databaseUrl);
 
   const writer = new Database(databaseUrl, connectionOptions);
-  const journalMode = writer.pragma("journal_mode = WAL", {
-    simple: true,
-  });
+  try {
+    enableForeignKeys(writer);
+    const journalMode = writer.pragma("journal_mode = WAL", {
+      simple: true,
+    });
 
-  if (journalMode !== "wal") {
+    if (journalMode !== "wal") {
+      throw new Error(
+        `databaseUrl must support WAL journal mode, received ${String(journalMode)}`,
+      );
+    }
+  } catch (error: unknown) {
     writer.close();
-    throw new Error(
-      `databaseUrl must support WAL journal mode, received ${String(journalMode)}`,
-    );
+    throw error;
   }
 
   const writerStorage = wrapBetterSqliteDatabase(writer);
@@ -101,7 +128,15 @@ export function createBetterSqliteStorageRuntime(
       throw new Error("storage runtime is closed");
     }
 
-    return new Database(databaseUrl, connectionOptions);
+    const database = new Database(databaseUrl, connectionOptions);
+
+    try {
+      enableForeignKeys(database);
+      return database;
+    } catch (error: unknown) {
+      database.close();
+      throw error;
+    }
   };
 
   const closeConnection = (database: Database.Database): void => {
@@ -248,4 +283,17 @@ function wrapBetterSqliteDatabase(
       };
     },
   };
+}
+
+function enableForeignKeys(database: Database.Database): void {
+  database.pragma("foreign_keys = ON");
+  const enabled = database.pragma("foreign_keys", {
+    simple: true,
+  });
+
+  if (enabled !== 1) {
+    throw new Error(
+      `database connection must enable foreign key enforcement, received ${String(enabled)}`,
+    );
+  }
 }
