@@ -6,6 +6,10 @@ on:
       - published
   workflow_dispatch:
     inputs:
+      release_version:
+        description: Version to publish, normally derived from the GitHub release tag
+        type: string
+        required: true
       publish:
         description: Publish to npm via GitHub OIDC trusted publishing
         type: boolean
@@ -14,6 +18,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  SLEDGE_RELEASE_VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_version }}
 
 jobs:
   verify:
@@ -35,6 +42,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate package version
+        run: npm version "${SLEDGE_RELEASE_VERSION#v}" --no-git-tag-version
+
       - name: Lint
         run: npm run lint
 
@@ -46,30 +56,6 @@ jobs:
 
       - name: Build
         run: npm run build
-
-      - name: Validate release tag matches package version
-        if: github.event_name == 'release'
-        run: |
-          node <<'EOF'
-          const fs = require('node:fs');
-          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const tag = process.env.RELEASE_TAG || '';
-          const normalizedTag = tag.startsWith('v') ? tag.slice(1) : tag;
-
-          if (!tag) {
-            throw new Error('Missing release tag from workflow context');
-          }
-
-          if (pkg.version !== normalizedTag) {
-            throw new Error(
-              `Release tag ${tag} does not match package.json version ${pkg.version}`,
-            );
-          }
-
-          console.log(`Validated release tag ${tag} against package.json version ${pkg.version}`);
-          EOF
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
 
   publish:
     name: Publish to npm
@@ -95,6 +81,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Generate package version
+        run: npm version "${SLEDGE_RELEASE_VERSION#v}" --no-git-tag-version
 
       - name: Build package
         run: npm run build
