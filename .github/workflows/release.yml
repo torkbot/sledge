@@ -54,11 +54,9 @@ jobs:
           const numericIdentifier = String.raw`(?:0|[1-9]\d*)`;
           const nonNumericIdentifier = String.raw`\d*[A-Za-z-][0-9A-Za-z-]*`;
           const prereleaseIdentifier = `(?:${numericIdentifier}|${nonNumericIdentifier})`;
-          const buildIdentifier = String.raw`[0-9A-Za-z-]+`;
           const semver = new RegExp(
             `${numericIdentifier}\\.${numericIdentifier}\\.${numericIdentifier}` +
-              `(?:-${prereleaseIdentifier}(?:\\.${prereleaseIdentifier})*)?` +
-              `(?:\\+${buildIdentifier}(?:\\.${buildIdentifier})*)?`,
+              `(?:-${prereleaseIdentifier}(?:\\.${prereleaseIdentifier})*)?`,
           );
 
           if (semver.exec(version)?.[0] !== version) {
