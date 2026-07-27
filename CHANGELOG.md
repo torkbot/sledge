@@ -4,6 +4,8 @@
 
 - Add `LedgerWorkers.waitForIdle({ signal })` for deterministic,
   cancellation-aware waiting until no nonterminal or executing work remains.
+- Make event-stream and worker-idle waits stop promptly when their signal
+  aborts, even while an underlying storage read continues settling safely.
 
 ## 0.10.0 - 2026-07-27
 

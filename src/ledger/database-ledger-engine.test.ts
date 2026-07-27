@@ -251,6 +251,35 @@ function createTempDatabasePath(): string {
   return join(tmpdir(), `sledge-${randomUUID()}.sqlite`);
 }
 
+function createImmediateJobTestModel(queueHandler: () => void | Promise<void>) {
+  return defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", {
+            id: event.payload.id,
+          });
+        },
+      },
+      queues: {
+        "job.run": queueHandler,
+      },
+    },
+  });
+}
+
 function singleConnectionStorageRuntime(
   database: StorageDatabase,
 ): StorageRuntime {
@@ -1244,7 +1273,7 @@ test("ledger close closes storage after startup failure", async () => {
   assert.equal(closeCalled, true);
 });
 
-test("ledger close reports dispatch loop claim failures", async () => {
+test("worker failures preserve arbitrary rejection reasons", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
@@ -1267,7 +1296,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
           run: statement.run,
           all: statement.all,
           get: async () => {
-            throw new Error("claim failed");
+            throw null;
           },
         };
       }
@@ -1276,29 +1305,7 @@ test("ledger close reports dispatch loop claim failures", async () => {
     },
   };
 
-  const model = defineEngineFixtureModel({
-    events: {
-      "job.requested": Type.Object({
-        id: Type.Number(),
-      }),
-    },
-    queues: {
-      "job.run": Type.Object({
-        id: Type.Number(),
-      }),
-    },
-    indexers: {},
-    queries: {},
-    register: {
-      events: {
-        "job.requested": ({ event, actions }) => {
-          actions.enqueue("job.run", {
-            id: event.payload.id,
-          });
-        },
-      },
-    },
-  });
+  const model = createImmediateJobTestModel(() => undefined);
 
   const ledger = createDatabaseLedger({
     projectionCompiler,
@@ -1318,12 +1325,14 @@ test("ledger close reports dispatch loop claim failures", async () => {
   });
   await runtime.flush();
 
-  await assert.rejects(
-    workers.waitForIdle({
+  try {
+    await workers.waitForIdle({
       signal: new AbortController().signal,
-    }),
-    /claim failed/,
-  );
+    });
+    assert.fail("expected waitForIdle to reject");
+  } catch (error: unknown) {
+    assert.equal(error, null);
+  }
 
   await assert.rejects(
     async () => {
@@ -1333,14 +1342,107 @@ test("ledger close reports dispatch loop claim failures", async () => {
       assert.ok(error instanceof AggregateError);
       assert.equal(error.message, "failed to close ledger workers");
       assert.equal(error.errors.length, 1);
-
-      const failure = error.errors[0];
-      assert.ok(failure instanceof Error);
-      assert.equal(failure.message, "claim failed");
+      assert.equal(error.errors[0], null);
 
       return true;
     },
   );
+});
+
+test("worker supervision reports work-processing failures", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const storage = createBetterSqliteStorageRuntime(databaseUrl);
+  let ackFailed = false;
+
+  const failingStorage: StorageRuntime = {
+    read: async (run) => await storage.read(run),
+    write: async (run) => {
+      return await storage.write(async (database) => {
+        const failingDatabase: StorageDatabase = {
+          exec: database.exec,
+          prepare: (sql): StorageStatement => {
+            const statement = database.prepare(sql);
+
+            if (
+              !ackFailed &&
+              sql.includes("DELETE FROM work") &&
+              sql.includes("lease_id = ?")
+            ) {
+              return {
+                get: statement.get,
+                all: statement.all,
+                run: async () => {
+                  ackFailed = true;
+                  throw new Error("ack failed");
+                },
+              };
+            }
+
+            return statement;
+          },
+        };
+
+        return await run(failingDatabase);
+      });
+    },
+    close: async () => await storage.close(),
+  };
+
+  const model = createImmediateJobTestModel(() => undefined);
+
+  const ledger = createDatabaseLedger({
+    projectionCompiler,
+    storage: failingStorage,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    await ledger.emit("job.requested", { id: 1 });
+    const workers = await ledger.startWorkers({
+      scheduler: runtime.scheduler,
+    });
+    const waiting = workers.waitForIdle({
+      signal: new AbortController().signal,
+    });
+
+    await waitFor(runtime, () => ackFailed);
+    await assert.rejects(waiting, /ack failed/);
+
+    await assert.rejects(ledger.close(), (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "failed to close ledger workers");
+      assert.equal(error.errors.length, 1);
+
+      const failure = error.errors[0];
+      assert.ok(failure instanceof Error);
+      assert.equal(failure.message, "ack failed");
+
+      return true;
+    });
+
+    const inspector = new Database(databaseUrl);
+
+    try {
+      assert.equal(
+        readCount(
+          inspector,
+          "SELECT COUNT(*) AS total FROM work WHERE lease_id IS NULL",
+        ),
+        1,
+      );
+    } finally {
+      inspector.close();
+    }
+  } finally {
+    await storage.close();
+  }
 });
 
 test("startWorkers rejects while workers are already running", async () => {
@@ -1556,6 +1658,90 @@ test("waitForIdle waits for work and supports cancellation", async () => {
   abortedWaitController.abort(reason);
 
   await assert.rejects(abortedWait, (error: unknown) => error === reason);
+});
+
+test("waitForIdle aborts while its durable-state read is still pending", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+  const storage = wrapBetterSqliteDatabase(database);
+  const idleReadStarted = Promise.withResolvers<void>();
+  const releaseIdleRead = Promise.withResolvers<void>();
+  const idleReadFinished = Promise.withResolvers<void>();
+
+  const blockingStorage: StorageDatabase = {
+    exec: storage.exec,
+    prepare: (sql): StorageStatement => {
+      const statement = storage.prepare(sql);
+
+      if (
+        sql.includes("FROM work") &&
+        sql.includes("cancelled = 0") &&
+        !sql.includes("lease_id")
+      ) {
+        return {
+          run: statement.run,
+          all: statement.all,
+          get: async () => {
+            idleReadStarted.resolve();
+            await releaseIdleRead.promise;
+
+            try {
+              throw new Error("late idle read failure");
+            } finally {
+              idleReadFinished.resolve();
+            }
+          },
+        };
+      }
+
+      return statement;
+    },
+  };
+
+  const model = defineEngineFixtureModel({
+    events: {},
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+
+  const ledger = createDatabaseLedger({
+    projectionCompiler,
+    storage: singleConnectionStorageRuntime(blockingStorage),
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    const workers = await ledger.startWorkers({
+      scheduler: runtime.scheduler,
+    });
+    const waitController = new AbortController();
+    const waiting = workers.waitForIdle({
+      signal: waitController.signal,
+    });
+
+    await idleReadStarted.promise;
+
+    const reason = new Error("stop waiting");
+    waitController.abort(reason);
+
+    await assert.rejects(waiting, (error: unknown) => error === reason);
+
+    releaseIdleRead.resolve();
+    await idleReadFinished.promise;
+    await workers.close();
+    await ledger.close();
+  } finally {
+    database.close();
+  }
 });
 
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
@@ -2247,6 +2433,80 @@ function createBusyTestModel() {
     register: {},
   });
 }
+
+test("event consumers abort while a storage read is still pending", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+  const storage = wrapBetterSqliteDatabase(database);
+  const eventReadStarted = Promise.withResolvers<void>();
+  const releaseEventRead = Promise.withResolvers<void>();
+  const eventReadFinished = Promise.withResolvers<void>();
+
+  const blockingStorage: StorageDatabase = {
+    exec: storage.exec,
+    prepare: (sql): StorageStatement => {
+      const statement = storage.prepare(sql);
+
+      if (sql.includes("FROM events") && sql.includes("event_id > ?")) {
+        return {
+          run: statement.run,
+          get: statement.get,
+          all: async (...params) => {
+            eventReadStarted.resolve();
+            await releaseEventRead.promise;
+
+            try {
+              return await statement.all(...params);
+            } finally {
+              eventReadFinished.resolve();
+            }
+          },
+        };
+      }
+
+      return statement;
+    },
+  };
+
+  const model = createBusyTestModel();
+  const ledger = createDatabaseLedger({
+    projectionCompiler,
+    storage: singleConnectionStorageRuntime(blockingStorage),
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    await ledger.listWork();
+
+    const abortController = new AbortController();
+    const iterator = ledger
+      .tailEvents({
+        last: 0,
+        signal: abortController.signal,
+      })
+      [Symbol.asyncIterator]();
+    const next = iterator.next();
+
+    await eventReadStarted.promise;
+    abortController.abort();
+
+    assert.equal(await settlesWithin(next, 20), true);
+    assert.equal((await next).done, true);
+
+    releaseEventRead.resolve();
+    await eventReadFinished.promise;
+    await ledger.close();
+  } finally {
+    database.close();
+  }
+});
 
 test("emit fails fast when busy retries are disabled", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
