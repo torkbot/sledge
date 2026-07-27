@@ -1744,6 +1744,117 @@ test("waitForIdle aborts while its durable-state read is still pending", async (
   }
 });
 
+test("waitForIdle exits a pending durable-state read when workers close or fail", async (t) => {
+  for (const transition of ["close", "failure"] as const) {
+    await t.test(transition, async () => {
+      const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+      const databaseUrl = createTempDatabasePath();
+      const database = new Database(databaseUrl);
+      const storage = wrapBetterSqliteDatabase(database);
+      const idleReadStarted = Promise.withResolvers<void>();
+      const releaseIdleRead = Promise.withResolvers<void>();
+      const idleReadFinished = Promise.withResolvers<void>();
+      const workerFailure = new Error("worker failed");
+
+      const blockingStorage: StorageDatabase = {
+        exec: storage.exec,
+        prepare: (sql): StorageStatement => {
+          const statement = storage.prepare(sql);
+
+          if (
+            sql.includes("FROM work") &&
+            sql.includes("cancelled = 0") &&
+            !sql.includes("lease_id")
+          ) {
+            return {
+              run: statement.run,
+              all: statement.all,
+              get: async () => {
+                idleReadStarted.resolve();
+                await releaseIdleRead.promise;
+
+                try {
+                  throw new Error("late idle read failure");
+                } finally {
+                  idleReadFinished.resolve();
+                }
+              },
+            };
+          }
+
+          if (
+            transition === "failure" &&
+            sql.includes("SELECT work_id") &&
+            sql.includes("available_at_ms <= ?")
+          ) {
+            return {
+              run: statement.run,
+              all: statement.all,
+              get: async () => {
+                throw workerFailure;
+              },
+            };
+          }
+
+          return statement;
+        },
+      };
+
+      const model = createImmediateJobTestModel(() => undefined);
+      const ledger = createDatabaseLedger({
+        projectionCompiler,
+        storage: singleConnectionStorageRuntime(blockingStorage),
+        model: model.withImplementations({
+          indexers: {},
+          queries: {},
+        }),
+        timing: {
+          clock: runtime.clock,
+        },
+      });
+
+      try {
+        const workers = await ledger.startWorkers({
+          scheduler: runtime.scheduler,
+        });
+        const waiting = workers.waitForIdle({
+          signal: new AbortController().signal,
+        });
+
+        await idleReadStarted.promise;
+
+        if (transition === "close") {
+          const closing = workers.close();
+
+          await assert.rejects(
+            waiting,
+            /ledger workers closed while waiting to become idle/,
+          );
+          await closing;
+        } else {
+          await ledger.emit("job.requested", { id: 1 });
+          await runtime.flush();
+
+          await assert.rejects(
+            waiting,
+            (error: unknown) => error === workerFailure,
+          );
+          await assert.rejects(
+            workers.close(),
+            (error: unknown) => error === workerFailure,
+          );
+        }
+
+        releaseIdleRead.resolve();
+        await idleReadFinished.promise;
+        await ledger.close();
+      } finally {
+        database.close();
+      }
+    });
+  }
+});
+
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();

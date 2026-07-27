@@ -524,6 +524,12 @@ function openDatabaseLedgerEngine<
      */
     readonly stateChanges: ChangeSignal;
     /**
+     * Interrupts idle-wait operations when this worker closes or fails. Storage
+     * operations remain safely observed because their drivers may not support
+     * physical cancellation.
+     */
+    readonly lifecycleAbortController: AbortController;
+    /**
      * Set once this worker handle has begun shutdown. Dispatching and new
      * scheduling bail out when true.
      */
@@ -1941,17 +1947,23 @@ function openDatabaseLedgerEngine<
     worker: WorkerRuntimeState,
     signal: AbortSignal,
   ): Promise<void> {
+    const waitSignal = AbortSignal.any([
+      signal,
+      worker.lifecycleAbortController.signal,
+    ]);
+
     while (true) {
       assertWorkerWaitActive(worker, signal);
 
       const observedState = worker.stateChanges.snapshot();
       const durableWorkResult = await raceWithSignal(
         hasNonterminalWork(),
-        signal,
+        waitSignal,
       );
 
       if (durableWorkResult.status === "aborted") {
-        throw signal.reason;
+        assertWorkerWaitActive(worker, signal);
+        throw waitSignal.reason;
       }
 
       assertWorkerWaitActive(worker, signal);
@@ -1969,7 +1981,7 @@ function openDatabaseLedgerEngine<
         return;
       }
 
-      await worker.stateChanges.waitForChange(observedState, signal);
+      await worker.stateChanges.waitForChange(observedState, waitSignal);
     }
   }
 
@@ -2328,6 +2340,7 @@ function openDatabaseLedgerEngine<
     };
     worker.scheduledDispatch?.cancel();
     worker.scheduledDispatch = null;
+    worker.lifecycleAbortController.abort(reason);
     worker.stateChanges.notify();
   }
 
@@ -2903,6 +2916,7 @@ function openDatabaseLedgerEngine<
     }
 
     worker.closed = true;
+    worker.lifecycleAbortController.abort(new Error(reason));
     worker.stateChanges.notify();
 
     if (activeWorker === worker) {
@@ -3422,6 +3436,7 @@ function openDatabaseLedgerEngine<
         leaseExpiryTasks: new Map(),
         leaseHeartbeatTasks: new Map(),
         stateChanges: new ChangeSignal(),
+        lifecycleAbortController: new AbortController(),
         closed: false,
         dispatchLoopActive: false,
         dispatchLoopQueued: false,
