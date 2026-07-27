@@ -1313,10 +1313,17 @@ test("ledger close reports dispatch loop claim failures", async () => {
   });
 
   await ledger.emit("job.requested", { id: 1 });
-  await ledger.startWorkers({
+  const workers = await ledger.startWorkers({
     scheduler: runtime.scheduler,
   });
   await runtime.flush();
+
+  await assert.rejects(
+    workers.waitForIdle({
+      signal: new AbortController().signal,
+    }),
+    /claim failed/,
+  );
 
   await assert.rejects(
     async () => {
@@ -1449,6 +1456,106 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
       }),
     /maxInFlight must be a positive integer/,
   );
+});
+
+test("waitForIdle waits for work and supports cancellation", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const releaseHandler = Promise.withResolvers<void>();
+  let handlerStarted = false;
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({
+        id: Type.Number(),
+        delayMs: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            { availableAtMs: runtime.nowMs() + event.payload.delayMs },
+          );
+        },
+      },
+      queues: {
+        "job.run": async () => {
+          handlerStarted = true;
+          await releaseHandler.promise;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  const waitController = new AbortController();
+
+  await workers.waitForIdle({
+    signal: waitController.signal,
+  });
+
+  await ledger.emit("job.requested", {
+    id: 1,
+    delayMs: 100,
+  });
+
+  let idle = false;
+  const waiting = workers
+    .waitForIdle({
+      signal: waitController.signal,
+    })
+    .then(() => {
+      idle = true;
+    });
+
+  await runtime.advanceByMs(99);
+  assert.equal(idle, false);
+
+  await runtime.advanceByMs(1);
+  await waitFor(runtime, () => handlerStarted);
+  assert.equal(idle, false);
+
+  releaseHandler.resolve();
+  await waitFor(runtime, () => idle);
+  await waiting;
+
+  await ledger.emit("job.requested", {
+    id: 2,
+    delayMs: 10_000,
+  });
+
+  const abortedWaitController = new AbortController();
+  const abortedWait = workers.waitForIdle({
+    signal: abortedWaitController.signal,
+  });
+  const reason = new Error("stop waiting");
+
+  abortedWaitController.abort(reason);
+
+  await assert.rejects(abortedWait, (error: unknown) => error === reason);
 });
 
 test("ledger enforces maxInFlight dispatch concurrency", async () => {
@@ -2987,10 +3094,21 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
     terminalWorkRetentionMs: 10,
   });
 
-  await waitFor(runtime, async () => {
-    const states = (await ledger.listWork()).map((item) => item.state);
-    return states.includes("cancelled") && states.includes("dead");
-  });
+  let idle = false;
+  const waiting = workers
+    .waitForIdle({
+      signal: new AbortController().signal,
+    })
+    .then(() => {
+      idle = true;
+    });
+
+  await waitFor(runtime, () => idle);
+  await waiting;
+
+  const states = (await ledger.listWork()).map((item) => item.state);
+  assert.ok(states.includes("cancelled"));
+  assert.ok(states.includes("dead"));
 
   await runtime.advanceByMs(11);
   await workers.close();

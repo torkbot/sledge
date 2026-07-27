@@ -447,6 +447,13 @@ Opening a ledger is passive. It initializes storage and can emit, query, tail,
 resume, and observe signals, but it does not claim or process queue work until
 `startWorkers(...)` is called.
 
+The handle returned by `startWorkers(...)` exposes
+`waitForIdle({ signal })`. It resolves once no pending, delayed, leased, or
+executing work remains. Retained dead and cancelled work does not prevent idle.
+The result describes one instant; later emissions can make the workers active
+again. The wait rejects if its signal aborts or the worker runtime closes or
+fails.
+
 ## Work and Retries
 
 Queue and signal queue handlers implicitly ack on normal return.

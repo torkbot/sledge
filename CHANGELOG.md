@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add `LedgerWorkers.waitForIdle({ signal })` for deterministic,
+  cancellation-aware waiting until no nonterminal or executing work remains.
+
 ## 0.10.0 - 2026-07-27
 
 - Breaking: replace the old `defineLedgerModel` / `registerLedgerModel` /

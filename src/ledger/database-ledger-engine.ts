@@ -515,6 +515,15 @@ function openDatabaseLedgerEngine<
      */
     readonly leaseHeartbeatTasks: Map<string, { cancel(): void }>;
     /**
+     * Monotonic generation used to close the race between checking durable
+     * work and subscribing to worker-runtime state changes.
+     */
+    activitySequence: number;
+    /**
+     * One-shot wakeups for callers waiting on a worker state transition.
+     */
+    readonly activityWaiters: Set<() => void>;
+    /**
      * Set once this worker handle has begun shutdown. Dispatching and new
      * scheduling bail out when true.
      */
@@ -1905,6 +1914,138 @@ function openDatabaseLedgerEngine<
     }
   }
 
+  function notifyWorkerActivity(worker: WorkerRuntimeState): void {
+    worker.activitySequence += 1;
+
+    const waiters = [...worker.activityWaiters.values()];
+    worker.activityWaiters.clear();
+
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  async function waitForWorkerActivity(input: {
+    readonly worker: WorkerRuntimeState;
+    readonly signal: AbortSignal;
+    readonly observedActivitySequence: number;
+  }): Promise<void> {
+    if (
+      input.signal.aborted ||
+      closed ||
+      input.worker.closed ||
+      input.worker.dispatchLoopFailure !== null
+    ) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+
+      const onActivity = () => {
+        finish();
+      };
+
+      const onAbort = () => {
+        finish();
+      };
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        input.worker.activityWaiters.delete(onActivity);
+        input.signal.removeEventListener("abort", onAbort);
+        resolve();
+      };
+
+      input.signal.addEventListener("abort", onAbort, {
+        once: true,
+      });
+      input.worker.activityWaiters.add(onActivity);
+
+      if (
+        input.signal.aborted ||
+        closed ||
+        input.worker.closed ||
+        input.worker.dispatchLoopFailure !== null ||
+        input.worker.activitySequence !== input.observedActivitySequence
+      ) {
+        finish();
+      }
+    });
+  }
+
+  function assertWorkerWaitActive(
+    worker: WorkerRuntimeState,
+    signal: AbortSignal,
+  ): void {
+    signal.throwIfAborted();
+
+    if (closed) {
+      throw new Error("ledger closed while waiting for workers to become idle");
+    }
+
+    if (worker.closed) {
+      throw new Error("ledger workers closed while waiting to become idle");
+    }
+
+    if (worker.dispatchLoopFailure !== null) {
+      throw worker.dispatchLoopFailure;
+    }
+  }
+
+  async function hasNonterminalWork(): Promise<boolean> {
+    const row = await storage.read(async (database) => {
+      return await database
+        .prepare(
+          `SELECT work_id
+           FROM work
+           WHERE dead = 0
+             AND cancelled = 0
+           LIMIT 1`,
+        )
+        .get();
+    });
+
+    return row !== undefined;
+  }
+
+  async function waitForWorkerIdle(
+    worker: WorkerRuntimeState,
+    signal: AbortSignal,
+  ): Promise<void> {
+    while (true) {
+      assertWorkerWaitActive(worker, signal);
+
+      const observedActivitySequence = worker.activitySequence;
+      const durableWorkRemains = await hasNonterminalWork();
+
+      assertWorkerWaitActive(worker, signal);
+
+      const runtimeIsActive =
+        worker.dispatchLoopActive ||
+        worker.dispatchLoopQueued ||
+        worker.inFlight.size > 0;
+
+      if (
+        !durableWorkRemains &&
+        !runtimeIsActive &&
+        worker.activitySequence === observedActivitySequence
+      ) {
+        return;
+      }
+
+      await waitForWorkerActivity({
+        worker,
+        signal,
+        observedActivitySequence,
+      });
+    }
+  }
+
   function notifySignalObservers(
     events: readonly EventEnvelope<TSignals, keyof TSignals>[],
   ): void {
@@ -2291,16 +2432,22 @@ function openDatabaseLedgerEngine<
     }
 
     if (worker.dispatchLoopActive) {
-      worker.dispatchLoopQueued = true;
+      if (!worker.dispatchLoopQueued) {
+        worker.dispatchLoopQueued = true;
+        notifyWorkerActivity(worker);
+      }
+
       return;
     }
 
     worker.dispatchLoopActive = true;
+    notifyWorkerActivity(worker);
 
     const dispatchLoopSettled = runDispatchLoop(worker)
       .catch((error: unknown) => {
         if (worker.dispatchLoopFailure === null) {
           worker.dispatchLoopFailure = error;
+          notifyWorkerActivity(worker);
         }
 
         throw error;
@@ -2308,6 +2455,7 @@ function openDatabaseLedgerEngine<
       .finally(() => {
         worker.dispatchLoopActive = false;
         worker.dispatchLoopSettled = null;
+        notifyWorkerActivity(worker);
 
         if (worker.dispatchLoopQueued && !closed && !worker.closed) {
           worker.dispatchLoopQueued = false;
@@ -2374,17 +2522,20 @@ function openDatabaseLedgerEngine<
                 claimed.leaseId,
               );
           });
+          notifyWorkerActivity(worker);
 
           continue;
         }
 
         const run = processClaimedWork(worker, claimed, handler).finally(() => {
           worker.inFlight.delete(run);
+          notifyWorkerActivity(worker);
           requestDispatchRun(worker);
         });
         handedOffToHandler = true;
 
         worker.inFlight.add(run);
+        notifyWorkerActivity(worker);
       } catch (error: unknown) {
         if (!handedOffToHandler) {
           try {
@@ -2605,6 +2756,7 @@ function openDatabaseLedgerEngine<
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
+            notifyWorkerActivity(worker);
             scheduleDispatchAt(worker, clock.nowMs());
           }
         },
@@ -2812,6 +2964,7 @@ function openDatabaseLedgerEngine<
         notifyEventWaiters();
       }
 
+      notifyWorkerActivity(worker);
       scheduleDispatchAt(worker, clock.nowMs());
     } finally {
       clearLeaseHeartbeat();
@@ -2830,6 +2983,8 @@ function openDatabaseLedgerEngine<
     }
 
     worker.closed = true;
+    notifyWorkerActivity(worker);
+
     if (activeWorker === worker) {
       activeWorker = null;
     }
@@ -2964,6 +3119,7 @@ function openDatabaseLedgerEngine<
         committedEventId = Math.max(committedEventId, result.envelope.eventId);
         notifyEventWaiters();
         if (activeWorker !== null) {
+          notifyWorkerActivity(activeWorker);
           scheduleDispatchAt(activeWorker, clock.nowMs());
         }
       }
@@ -3047,6 +3203,10 @@ function openDatabaseLedgerEngine<
       }
 
       const worker = activeWorker;
+
+      if (worker !== null) {
+        notifyWorkerActivity(worker);
+      }
 
       if (worker !== null && cancelledLeaseId !== null) {
         worker.leaseAbortControllers
@@ -3328,6 +3488,8 @@ function openDatabaseLedgerEngine<
         leaseAbortControllers: new Map(),
         leaseExpiryTasks: new Map(),
         leaseHeartbeatTasks: new Map(),
+        activitySequence: 0,
+        activityWaiters: new Set(),
         closed: false,
         dispatchLoopActive: false,
         dispatchLoopQueued: false,
@@ -3358,6 +3520,9 @@ function openDatabaseLedgerEngine<
       };
 
       return {
+        waitForIdle: async ({ signal }) => {
+          await waitForWorkerIdle(worker, signal);
+        },
         close: closeHandle,
         [Symbol.asyncDispose]: closeHandle,
       };
