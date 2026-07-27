@@ -79,6 +79,7 @@ export type AnyProjectionSchema = {
 export type ProjectionIndexerEvent<TEventName extends string> = {
   readonly eventName: TEventName;
   readonly eventId: number;
+  readonly causationEventId: number | null;
   readonly ref: EventRef<TEventName>;
 };
 
@@ -1712,6 +1713,7 @@ function createProjectionIndexerEvent(
   return {
     eventName,
     eventId: context.event.eventId,
+    causationEventId: context.event.causationEventId,
     ref: createEventRef(eventName, context.event.eventId),
   };
 }
