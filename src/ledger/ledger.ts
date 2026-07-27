@@ -582,6 +582,17 @@ export type LedgerWorkerOptions = {
 };
 
 export interface LedgerWorkers extends AsyncDisposable {
+  /**
+   * Resolves when this worker handle has no pending, delayed, leased, or
+   * executing work.
+   *
+   * Retained dead and cancelled work is terminal and does not prevent idle.
+   * The result describes one instant: work emitted after resolution can make
+   * the workers active again. The wait rejects if its signal aborts or this
+   * worker runtime closes or fails.
+   */
+  waitForIdle(input: { readonly signal: AbortSignal }): Promise<void>;
+
   close(): Promise<void>;
 }
 

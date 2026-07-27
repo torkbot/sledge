@@ -5,6 +5,7 @@ import { Type, type Static, type TSchema } from "typebox";
 import Sqids from "sqids";
 import { Value } from "typebox/value";
 
+import { ChangeSignal, raceWithSignal } from "../runtime/async-signals.ts";
 import { createEventRef } from "./event-ref.ts";
 import {
   readLedgerImplementations,
@@ -443,10 +444,9 @@ function openDatabaseLedgerEngine<
 
   let closed = false;
   let activeWorker: WorkerRuntimeState | null = null;
-  const eventWaiters = new Set<() => void>();
+  const eventChanges = new ChangeSignal();
   type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
-  let appendSequence = 0;
 
   type TransactionScope = {
     readonly query: <const TQueryName extends keyof TQueries>(
@@ -458,6 +458,10 @@ function openDatabaseLedgerEngine<
       input: Static<TIndexers[TIndexName]>,
       context: LedgerIndexerContext<TEvents>,
     ) => Promise<void>;
+  };
+
+  type WorkerFailure = {
+    readonly reason: unknown;
   };
 
   /**
@@ -515,6 +519,17 @@ function openDatabaseLedgerEngine<
      */
     readonly leaseHeartbeatTasks: Map<string, { cancel(): void }>;
     /**
+     * Wakes state consumers after worker execution or durable work changes.
+     * Callers still read authoritative runtime and storage state after waking.
+     */
+    readonly stateChanges: ChangeSignal;
+    /**
+     * Interrupts idle-wait operations when this worker closes or fails. Storage
+     * operations remain safely observed because their drivers may not support
+     * physical cancellation.
+     */
+    readonly lifecycleAbortController: AbortController;
+    /**
      * Set once this worker handle has begun shutdown. Dispatching and new
      * scheduling bail out when true.
      */
@@ -534,11 +549,10 @@ function openDatabaseLedgerEngine<
      */
     dispatchLoopSettled: Promise<void> | null;
     /**
-     * First dispatch loop failure observed for this worker. Dispatch runs are
-     * background tasks, so the error is retained until worker/ledger shutdown
-     * can report it to the caller.
+     * First background failure observed for this worker. The wrapper preserves
+     * arbitrary JavaScript rejection reasons, including null and undefined.
      */
-    dispatchLoopFailure: unknown | null;
+    failure: WorkerFailure | null;
     /**
      * Next scheduled dispatch wakeup for this handle, if any.
      */
@@ -1843,7 +1857,7 @@ function openDatabaseLedgerEngine<
     worker: WorkerRuntimeState,
     targetAtMs: number,
   ): void {
-    if (closed || worker.closed) {
+    if (closed || worker.closed || worker.failure !== null) {
       return;
     }
 
@@ -1894,14 +1908,80 @@ function openDatabaseLedgerEngine<
     scheduleDispatchAt(worker, Math.min(nextWorkAtMs, pollAtMs));
   }
 
-  function notifyEventWaiters(): void {
-    appendSequence += 1;
+  function assertWorkerWaitActive(
+    worker: WorkerRuntimeState,
+    signal: AbortSignal,
+  ): void {
+    signal.throwIfAborted();
 
-    const waiters = [...eventWaiters.values()];
-    eventWaiters.clear();
+    if (closed) {
+      throw new Error("ledger closed while waiting for workers to become idle");
+    }
 
-    for (const waiter of waiters) {
-      waiter();
+    if (worker.closed) {
+      throw new Error("ledger workers closed while waiting to become idle");
+    }
+
+    if (worker.failure !== null) {
+      throw worker.failure.reason;
+    }
+  }
+
+  async function hasNonterminalWork(): Promise<boolean> {
+    const row = await storage.read(async (database) => {
+      return await database
+        .prepare(
+          `SELECT work_id
+           FROM work
+           WHERE dead = 0
+             AND cancelled = 0
+           LIMIT 1`,
+        )
+        .get();
+    });
+
+    return row !== undefined;
+  }
+
+  async function waitForWorkerIdle(
+    worker: WorkerRuntimeState,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const waitSignal = AbortSignal.any([
+      signal,
+      worker.lifecycleAbortController.signal,
+    ]);
+
+    while (true) {
+      assertWorkerWaitActive(worker, signal);
+
+      const observedState = worker.stateChanges.snapshot();
+      const durableWorkResult = await raceWithSignal(
+        hasNonterminalWork(),
+        waitSignal,
+      );
+
+      if (durableWorkResult.status === "aborted") {
+        assertWorkerWaitActive(worker, signal);
+        throw waitSignal.reason;
+      }
+
+      assertWorkerWaitActive(worker, signal);
+
+      const runtimeIsActive =
+        worker.dispatchLoopActive ||
+        worker.dispatchLoopQueued ||
+        worker.inFlight.size > 0;
+
+      if (
+        !durableWorkResult.value &&
+        !runtimeIsActive &&
+        worker.stateChanges.snapshot() === observedState
+      ) {
+        return;
+      }
+
+      await worker.stateChanges.waitForChange(observedState, waitSignal);
     }
   }
 
@@ -1929,51 +2009,6 @@ function openDatabaseLedgerEngine<
         });
       }
     }
-  }
-
-  async function waitForEventAppend(input: {
-    readonly signal: AbortSignal;
-    readonly observedAppendSequence: number;
-  }): Promise<void> {
-    if (input.signal.aborted || closed) {
-      return;
-    }
-
-    await new Promise<void>((resolve) => {
-      let settled = false;
-
-      const onEvent = () => {
-        finish();
-      };
-
-      const onAbort = () => {
-        finish();
-      };
-
-      const finish = () => {
-        if (settled) {
-          return;
-        }
-
-        settled = true;
-        eventWaiters.delete(onEvent);
-        input.signal.removeEventListener("abort", onAbort);
-        resolve();
-      };
-
-      input.signal.addEventListener("abort", onAbort, {
-        once: true,
-      });
-      eventWaiters.add(onEvent);
-
-      if (
-        input.signal.aborted ||
-        closed ||
-        appendSequence !== input.observedAppendSequence
-      ) {
-        finish();
-      }
-    });
   }
 
   async function readEventsAfter(
@@ -2132,7 +2167,11 @@ function openDatabaseLedgerEngine<
     readonly afterEventId: number;
     readonly signal: AbortSignal;
   }): AsyncIterable<LedgerStreamEvent<TEvents>> {
-    await startup;
+    const startupResult = await raceWithSignal(startup, input.signal);
+
+    if (startupResult.status === "aborted") {
+      return;
+    }
 
     let currentAfterEventId = input.afterEventId;
     const readLimit = 256;
@@ -2142,8 +2181,17 @@ function openDatabaseLedgerEngine<
         return;
       }
 
-      const observedAppendSequence = appendSequence;
-      const events = await readEventsAfter(currentAfterEventId, readLimit);
+      const observedEvents = eventChanges.snapshot();
+      const readResult = await raceWithSignal(
+        readEventsAfter(currentAfterEventId, readLimit),
+        input.signal,
+      );
+
+      if (readResult.status === "aborted") {
+        return;
+      }
+
+      const events = readResult.value;
 
       if (events.length > 0) {
         for (const event of events) {
@@ -2162,10 +2210,7 @@ function openDatabaseLedgerEngine<
         continue;
       }
 
-      await waitForEventAppend({
-        signal: input.signal,
-        observedAppendSequence,
-      });
+      await eventChanges.waitForChange(observedEvents, input.signal);
     }
   }
 
@@ -2285,31 +2330,54 @@ function openDatabaseLedgerEngine<
     });
   }
 
+  function failWorker(worker: WorkerRuntimeState, reason: unknown): void {
+    if (worker.failure !== null) {
+      return;
+    }
+
+    worker.failure = {
+      reason,
+    };
+    worker.scheduledDispatch?.cancel();
+    worker.scheduledDispatch = null;
+    worker.lifecycleAbortController.abort(reason);
+    worker.stateChanges.notify();
+  }
+
   function requestDispatchRun(worker: WorkerRuntimeState): void {
-    if (closed || worker.closed) {
+    if (closed || worker.closed || worker.failure !== null) {
       return;
     }
 
     if (worker.dispatchLoopActive) {
-      worker.dispatchLoopQueued = true;
+      if (!worker.dispatchLoopQueued) {
+        worker.dispatchLoopQueued = true;
+        worker.stateChanges.notify();
+      }
+
       return;
     }
 
     worker.dispatchLoopActive = true;
+    worker.stateChanges.notify();
 
     const dispatchLoopSettled = runDispatchLoop(worker)
       .catch((error: unknown) => {
-        if (worker.dispatchLoopFailure === null) {
-          worker.dispatchLoopFailure = error;
-        }
+        failWorker(worker, error);
 
         throw error;
       })
       .finally(() => {
         worker.dispatchLoopActive = false;
         worker.dispatchLoopSettled = null;
+        worker.stateChanges.notify();
 
-        if (worker.dispatchLoopQueued && !closed && !worker.closed) {
+        if (
+          worker.dispatchLoopQueued &&
+          !closed &&
+          !worker.closed &&
+          worker.failure === null
+        ) {
           worker.dispatchLoopQueued = false;
           requestDispatchRun(worker);
         }
@@ -2322,13 +2390,14 @@ function openDatabaseLedgerEngine<
   async function runDispatchLoop(worker: WorkerRuntimeState): Promise<void> {
     await startup;
 
-    if (closed || worker.closed) {
+    if (closed || worker.closed || worker.failure !== null) {
       return;
     }
 
     while (
       !closed &&
       !worker.closed &&
+      worker.failure === null &&
       worker.inFlight.size < worker.maxInFlight
     ) {
       const claimed = await claimNextDueWork(worker);
@@ -2338,7 +2407,7 @@ function openDatabaseLedgerEngine<
         return;
       }
 
-      if (closed || worker.closed) {
+      if (closed || worker.closed || worker.failure !== null) {
         await releaseClaimedLease(claimed);
         return;
       }
@@ -2374,17 +2443,24 @@ function openDatabaseLedgerEngine<
                 claimed.leaseId,
               );
           });
+          worker.stateChanges.notify();
 
           continue;
         }
 
-        const run = processClaimedWork(worker, claimed, handler).finally(() => {
-          worker.inFlight.delete(run);
-          requestDispatchRun(worker);
-        });
+        const run = processClaimedWork(worker, claimed, handler)
+          .catch((error: unknown) => {
+            failWorker(worker, error);
+          })
+          .finally(() => {
+            worker.inFlight.delete(run);
+            worker.stateChanges.notify();
+            requestDispatchRun(worker);
+          });
         handedOffToHandler = true;
 
         worker.inFlight.add(run);
+        worker.stateChanges.notify();
       } catch (error: unknown) {
         if (!handedOffToHandler) {
           try {
@@ -2410,6 +2486,7 @@ function openDatabaseLedgerEngine<
     worker.leaseAbortControllers.set(claimed.leaseId, leaseAbortController);
 
     let currentLeaseExpiresAtMs = claimed.leaseExpiresAtMs;
+    let leaseSettled = false;
 
     const clearLeaseHeartbeat = (): void => {
       worker.leaseHeartbeatTasks.get(claimed.leaseId)?.cancel();
@@ -2605,6 +2682,7 @@ function openDatabaseLedgerEngine<
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
+            worker.stateChanges.notify();
             scheduleDispatchAt(worker, clock.nowMs());
           }
         },
@@ -2803,21 +2881,29 @@ function openDatabaseLedgerEngine<
           latestDurableEventId,
         };
       });
+      leaseSettled = true;
 
       if (emitted.durableEvents > 0) {
         committedEventId = Math.max(
           committedEventId,
           emitted.latestDurableEventId,
         );
-        notifyEventWaiters();
+        eventChanges.notify();
       }
 
+      worker.stateChanges.notify();
       scheduleDispatchAt(worker, clock.nowMs());
     } finally {
       clearLeaseHeartbeat();
       worker.leaseExpiryTasks.get(claimed.leaseId)?.cancel();
       worker.leaseExpiryTasks.delete(claimed.leaseId);
-      worker.leaseAbortControllers.delete(claimed.leaseId);
+
+      // A failed infrastructure operation leaves ownership registered so
+      // worker shutdown can release the durable lease before reporting the
+      // supervised failure.
+      if (leaseSettled) {
+        worker.leaseAbortControllers.delete(claimed.leaseId);
+      }
     }
   }
 
@@ -2830,6 +2916,9 @@ function openDatabaseLedgerEngine<
     }
 
     worker.closed = true;
+    worker.lifecycleAbortController.abort(new Error(reason));
+    worker.stateChanges.notify();
+
     if (activeWorker === worker) {
       activeWorker = null;
     }
@@ -2839,13 +2928,15 @@ function openDatabaseLedgerEngine<
 
     // Wait until claiming has quiesced so we can snapshot+abort the final set
     // of leases this worker owns.
-    let dispatchLoopFailure = worker.dispatchLoopFailure;
+    let observedFailure = worker.failure;
 
     try {
       await worker.dispatchLoopSettled;
     } catch (error: unknown) {
-      if (dispatchLoopFailure === null) {
-        dispatchLoopFailure = error;
+      if (observedFailure === null) {
+        observedFailure = {
+          reason: error,
+        };
       }
     }
 
@@ -2888,8 +2979,10 @@ function openDatabaseLedgerEngine<
       });
     }
 
-    if (dispatchLoopFailure !== null) {
-      throw dispatchLoopFailure;
+    const failure = worker.failure ?? observedFailure;
+
+    if (failure !== null) {
+      throw failure.reason;
     }
   }
 
@@ -2899,7 +2992,7 @@ function openDatabaseLedgerEngine<
     }
 
     closed = true;
-    notifyEventWaiters();
+    eventChanges.notify();
 
     const workerToClose = activeWorker;
     const closeResults =
@@ -2962,8 +3055,9 @@ function openDatabaseLedgerEngine<
 
       if (result.created) {
         committedEventId = Math.max(committedEventId, result.envelope.eventId);
-        notifyEventWaiters();
+        eventChanges.notify();
         if (activeWorker !== null) {
+          activeWorker.stateChanges.notify();
           scheduleDispatchAt(activeWorker, clock.nowMs());
         }
       }
@@ -3047,6 +3141,10 @@ function openDatabaseLedgerEngine<
       }
 
       const worker = activeWorker;
+
+      if (worker !== null) {
+        worker.stateChanges.notify();
+      }
 
       if (worker !== null && cancelledLeaseId !== null) {
         worker.leaseAbortControllers
@@ -3209,15 +3307,24 @@ function openDatabaseLedgerEngine<
         const iterate = async function* (): AsyncIterable<
           LedgerStreamEvent<TEvents>
         > {
-          await startup;
+          const startupResult = await raceWithSignal(startup, streamSignal);
 
-          if (streamSignal.aborted || closed) {
+          if (startupResult.status === "aborted" || closed) {
             return;
           }
 
           // Capture a follow boundary before reading backlog so we never skip
           // events appended during tail startup when `last` resolves to no rows.
-          const history = await readLastEvents(last);
+          const historyResult = await raceWithSignal(
+            readLastEvents(last),
+            streamSignal,
+          );
+
+          if (historyResult.status === "aborted" || closed) {
+            return;
+          }
+
+          const history = historyResult.value;
           let afterEventId = Math.max(
             readLatestEventId(),
             history.highWaterMark,
@@ -3328,11 +3435,13 @@ function openDatabaseLedgerEngine<
         leaseAbortControllers: new Map(),
         leaseExpiryTasks: new Map(),
         leaseHeartbeatTasks: new Map(),
+        stateChanges: new ChangeSignal(),
+        lifecycleAbortController: new AbortController(),
         closed: false,
         dispatchLoopActive: false,
         dispatchLoopQueued: false,
         dispatchLoopSettled: null,
-        dispatchLoopFailure: null,
+        failure: null,
         scheduledDispatch: null,
       };
 
@@ -3358,6 +3467,9 @@ function openDatabaseLedgerEngine<
       };
 
       return {
+        waitForIdle: async ({ signal }) => {
+          await waitForWorkerIdle(worker, signal);
+        },
         close: closeHandle,
         [Symbol.asyncDispose]: closeHandle,
       };
