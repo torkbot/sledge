@@ -348,11 +348,20 @@ function createLedgerContractFacade<
     readonly [registeredLedgerContractsBrand]: {
       readonly events: Readonly<Record<string, object>>;
       readonly queries: Readonly<Record<string, object>>;
+      readonly queues: Readonly<Record<string, object>>;
       readonly signals: Readonly<Record<string, object>>;
+      readonly signalQueues: Readonly<Record<string, object>>;
     };
+    readonly [composedLedgerModulesBrand]: readonly {
+      readonly [registeredLedgerContractsBrand]: {
+        readonly queues: Readonly<Record<string, object>>;
+        readonly signalQueues: Readonly<Record<string, object>>;
+      };
+    }[];
   },
 ): object {
   const contracts = model[registeredLedgerContractsBrand];
+  const workQueueNames = createWorkQueueNameMaps(model);
 
   return new Proxy(ledger, {
     get: (target, property, receiver) => {
@@ -376,6 +385,145 @@ function createLedgerContractFacade<
           );
 
           return createContractEnvelope(event, token);
+        };
+      }
+
+      if (property === "cancelWork") {
+        return async (input: CancelWorkInput) => {
+          const queueNames = input.ref.signal
+            ? workQueueNames.signalQueues
+            : workQueueNames.queues;
+          const physicalNames =
+            queueNames.localToPhysical.get(input.ref.queueName) ?? [];
+
+          if (physicalNames.length === 0) {
+            if (input.ref.queueName.length === 0) {
+              return await target.cancelWork(input);
+            }
+
+            await target.cancelWork({
+              ...input,
+              ref: {
+                ...input.ref,
+                queueName: unavailablePhysicalQueueName,
+              },
+            });
+
+            return {
+              status: "not_found",
+              ref: input.ref,
+            } satisfies CancelWorkResult;
+          }
+
+          let physicalName = physicalNames[0];
+
+          if (physicalNames.length > 1) {
+            // Module-local queue names may overlap. Resolve a durable ref by
+            // its remaining identity fields and fail closed if it is still
+            // ambiguous instead of cancelling work from the wrong module.
+            const candidates = (
+              await Promise.all(
+                physicalNames.map(async (candidateName) => {
+                  return await target.listWork({
+                    limit: Number.MAX_SAFE_INTEGER,
+                    queueName: candidateName,
+                    sourceEventId: input.ref.sourceEventId,
+                  });
+                }),
+              )
+            )
+              .flat()
+              .filter((work) => {
+                return (
+                  work.ref?.workKey === input.ref.workKey &&
+                  work.signal === input.ref.signal
+                );
+              });
+
+            if (candidates.length === 0) {
+              return {
+                status: "not_found",
+                ref: input.ref,
+              } satisfies CancelWorkResult;
+            }
+
+            if (candidates.length > 1) {
+              throw new Error(
+                `work ref queue name ${input.ref.queueName} is ambiguous across composed ledger modules`,
+              );
+            }
+
+            physicalName = candidates[0]?.queueName;
+          }
+
+          if (physicalName === undefined) {
+            throw new Error(
+              `missing physical queue name for ${input.ref.queueName}`,
+            );
+          }
+
+          const result = await target.cancelWork({
+            ...input,
+            ref: {
+              ...input.ref,
+              queueName: physicalName,
+            },
+          });
+
+          return localizeCancelWorkResult(result, workQueueNames);
+        };
+      }
+
+      if (property === "queryWork") {
+        return async (input: QueryWorkInput) => {
+          const work = await target.queryWork(input);
+          return work === null
+            ? null
+            : localizeWorkSnapshot(work, workQueueNames);
+        };
+      }
+
+      if (property === "listWork") {
+        return async (input: ListWorkInput = {}) => {
+          if (input.queueName === undefined) {
+            const work = await target.listWork(input);
+            return work.map((item) =>
+              localizeWorkSnapshot(item, workQueueNames),
+            );
+          }
+
+          const physicalNames = [
+            ...(workQueueNames.queues.localToPhysical.get(input.queueName) ??
+              []),
+            ...(workQueueNames.signalQueues.localToPhysical.get(
+              input.queueName,
+            ) ?? []),
+          ];
+
+          if (physicalNames.length === 0) {
+            return await target.listWork({
+              ...input,
+              queueName: unavailablePhysicalQueueName,
+            });
+          }
+
+          const limit = input.limit ?? 100;
+          const work = (
+            await Promise.all(
+              physicalNames.map(async (physicalName) => {
+                return await target.listWork({
+                  ...input,
+                  limit,
+                  queueName: physicalName,
+                });
+              }),
+            )
+          )
+            .flat()
+            .sort((left, right) => left.workId - right.workId)
+            .slice(0, limit);
+
+          return work.map((item) => localizeWorkSnapshot(item, workQueueNames));
         };
       }
 
@@ -442,6 +590,144 @@ function createLedgerContractFacade<
       return Reflect.get(target, property, receiver) as unknown;
     },
   });
+}
+
+type WorkQueueNameMap = {
+  readonly localToPhysical: ReadonlyMap<string, readonly string[]>;
+  readonly physicalToLocal: ReadonlyMap<string, string>;
+};
+
+type WorkQueueNameMaps = {
+  readonly queues: WorkQueueNameMap;
+  readonly signalQueues: WorkQueueNameMap;
+};
+
+const unavailablePhysicalQueueName = "\u0000";
+
+function createWorkQueueNameMaps(model: {
+  readonly [registeredLedgerContractsBrand]: {
+    readonly queues: Readonly<Record<string, object>>;
+    readonly signalQueues: Readonly<Record<string, object>>;
+  };
+  readonly [composedLedgerModulesBrand]: readonly {
+    readonly [registeredLedgerContractsBrand]: {
+      readonly queues: Readonly<Record<string, object>>;
+      readonly signalQueues: Readonly<Record<string, object>>;
+    };
+  }[];
+}): WorkQueueNameMaps {
+  const rootContracts = model[registeredLedgerContractsBrand];
+  const queues = createWorkQueueNameMap(
+    model,
+    "queue",
+    rootContracts.queues,
+    "queues",
+  );
+  const signalQueues = createWorkQueueNameMap(
+    model,
+    "signal queue",
+    rootContracts.signalQueues,
+    "signalQueues",
+  );
+
+  return {
+    queues,
+    signalQueues,
+  };
+}
+
+function createWorkQueueNameMap(
+  model: {
+    readonly [composedLedgerModulesBrand]: readonly {
+      readonly [registeredLedgerContractsBrand]: {
+        readonly queues: Readonly<Record<string, object>>;
+        readonly signalQueues: Readonly<Record<string, object>>;
+      };
+    }[];
+  },
+  kind: string,
+  rootContracts: Readonly<Record<string, object>>,
+  key: "queues" | "signalQueues",
+): WorkQueueNameMap {
+  const localToPhysical = new Map<string, string[]>();
+  const physicalToLocal = new Map<string, string>();
+
+  for (const module of model[composedLedgerModulesBrand]) {
+    const moduleContracts = module[registeredLedgerContractsBrand][key];
+
+    for (const [localName, token] of Object.entries(moduleContracts)) {
+      const physicalName = findPhysicalContractName(rootContracts, token, kind);
+      const physicalNames = localToPhysical.get(localName) ?? [];
+
+      physicalNames.push(physicalName);
+      localToPhysical.set(localName, physicalNames);
+      physicalToLocal.set(physicalName, localName);
+    }
+  }
+
+  return {
+    localToPhysical,
+    physicalToLocal,
+  };
+}
+
+function localizeCancelWorkResult(
+  result: CancelWorkResult,
+  names: WorkQueueNameMaps,
+): CancelWorkResult {
+  switch (result.status) {
+    case "cancelled":
+      return {
+        status: "cancelled",
+        work: localizeWorkSnapshot(result.work, names),
+      };
+    case "already_terminal":
+      return {
+        status: "already_terminal",
+        ref: localizeWorkRef(result.ref, names),
+        work: localizeWorkSnapshot(result.work, names),
+      };
+    case "not_found":
+      return {
+        status: "not_found",
+        ref: localizeWorkRef(result.ref, names),
+      };
+  }
+}
+
+function localizeWorkSnapshot(
+  work: WorkSnapshot,
+  names: WorkQueueNameMaps,
+): WorkSnapshot {
+  const queueName = localizeStoredQueueName(work.queueName, work.signal, names);
+
+  return {
+    ...work,
+    queueName,
+    ref: work.ref === null ? null : localizeWorkRef(work.ref, names),
+  };
+}
+
+function localizeWorkRef(ref: WorkRef, names: WorkQueueNameMaps): WorkRef {
+  return {
+    ...ref,
+    queueName: localizeStoredQueueName(ref.queueName, ref.signal, names),
+  };
+}
+
+function localizeStoredQueueName(
+  physicalName: string,
+  signal: boolean,
+  names: WorkQueueNameMaps,
+): string {
+  const queueNames = signal ? names.signalQueues : names.queues;
+  const localName = queueNames.physicalToLocal.get(physicalName);
+
+  if (localName === undefined) {
+    throw new Error(`unknown persisted queue ${physicalName}`);
+  }
+
+  return localName;
 }
 
 function createContractEnvelope(

@@ -1408,14 +1408,14 @@ export function createProjectionAccess<
   const queries: Record<string, AnyQuerySchema> = {};
 
   for (const [indexerName, definition] of Object.entries(input.indexers)) {
-    indexers[indexerName] = definition.input;
+    defineProjectionRecordEntry(indexers, indexerName, definition.input);
   }
 
   for (const [queryName, definition] of Object.entries(input.queries)) {
-    queries[queryName] = {
+    defineProjectionRecordEntry(queries, queryName, {
       params: definition.params,
       result: definition.result,
-    };
+    });
   }
 
   return {
@@ -1433,6 +1433,19 @@ export function createProjectionAccess<
     TQueryDefinitions,
     TOwnedQueryDefinitions
   >;
+}
+
+function defineProjectionRecordEntry<TValue>(
+  record: Record<string, TValue>,
+  name: string,
+  value: TValue,
+): void {
+  Object.defineProperty(record, name, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
 }
 
 export type ProjectionImplementationRegistration<
@@ -5128,6 +5141,10 @@ async function readProjectionEvents<
           eventSchema,
           "event",
           group.eventName,
+          statementCompiler.resolveStorageStreamName({
+            eventName: group.eventName,
+            streamKind: "event",
+          }),
           row,
         ) as AnyProjectionEventEnvelope<TEvents>;
         eventsByRef.set(
@@ -5178,7 +5195,16 @@ async function scanProjectionEvents<
   const rows = await scope.prepare(sql.text).all(...sql.params);
 
   return rows.map((row) => {
-    return decodeProjectionEventRow(eventSchema, streamKind, eventName, row);
+    return decodeProjectionEventRow(
+      eventSchema,
+      streamKind,
+      eventName,
+      statementCompiler.resolveStorageStreamName({
+        eventName,
+        streamKind,
+      }),
+      row,
+    );
   });
 }
 
@@ -5353,13 +5379,14 @@ function decodeProjectionEventRow<
   eventSchema: TEventSchema,
   streamKind: ProjectionCompilerEventStreamKind,
   eventName: TEventName,
+  storageEventName: string,
   row: LedgerStorageRow,
 ): EventEnvelope<Record<TEventName, TEventSchema>, TEventName> {
   const decodedRow = Value.Decode(ProjectionEventRowSchema, row);
 
-  if (decodedRow.event_name !== eventName) {
+  if (decodedRow.event_name !== storageEventName) {
     throw new Error(
-      `projection ${streamKind} expected ${eventName} but storage returned ${decodedRow.event_name}`,
+      `projection ${streamKind} expected stored stream ${storageEventName} but storage returned ${decodedRow.event_name}`,
     );
   }
 

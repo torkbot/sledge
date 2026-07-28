@@ -4112,7 +4112,7 @@ function createEventTokens<
   for (const [localName, definition] of Object.entries(definitions)) {
     if (isLedgerContractToken(definition)) {
       const metadata = readLedgerContractToken(definition, "event");
-      tokens[localName] = definition as AnyEventToken;
+      defineRecordEntry(tokens, localName, definition as AnyEventToken);
 
       if (metadata.kind !== "event") {
         throw new Error(`${localName} must reference an event token`);
@@ -4121,12 +4121,16 @@ function createEventTokens<
       continue;
     }
 
-    tokens[localName] = createSchemaToken(
-      moduleId,
-      "event",
+    defineRecordEntry(
+      tokens,
       localName,
-      definition,
-    ) as AnyEventToken;
+      createSchemaToken(
+        moduleId,
+        "event",
+        localName,
+        definition,
+      ) as AnyEventToken,
+    );
   }
 
   return tokens as EventTokensFor<TModuleId, TDefinitions>;
@@ -4138,9 +4142,13 @@ function readEventSchemas<TDefinitions extends Record<string, EventDefinition>>(
   const schemas: Record<string, TSchema> = {};
 
   for (const [localName, definition] of Object.entries(definitions)) {
-    schemas[localName] = isLedgerContractToken(definition)
-      ? readLedgerContractToken(definition, "event").schema
-      : definition;
+    defineRecordEntry(
+      schemas,
+      localName,
+      isLedgerContractToken(definition)
+        ? readLedgerContractToken(definition, "event").schema
+        : definition,
+    );
   }
 
   return schemas as EventSchemasFor<TDefinitions>;
@@ -4154,14 +4162,14 @@ function normalizeQueryDefinitions<TDefinitions extends LedgerQueryDefinitions>(
   for (const [localName, definition] of Object.entries(definitions)) {
     if (isLedgerContractToken(definition)) {
       const metadata = readLedgerContractToken(definition, "query");
-      normalized[localName] = {
+      defineRecordEntry(normalized, localName, {
         params: metadata.params,
         result: metadata.result,
-      };
+      });
       continue;
     }
 
-    normalized[localName] = definition as AnyQuerySchema;
+    defineRecordEntry(normalized, localName, definition as AnyQuerySchema);
   }
 
   return normalized as NormalizedQueryDefinitions<TDefinitions>;
@@ -4174,7 +4182,7 @@ function readOwnedQueryDefinitions<TDefinitions extends LedgerQueryDefinitions>(
 
   for (const [localName, definition] of Object.entries(definitions)) {
     if (!isLedgerContractToken(definition)) {
-      owned[localName] = definition as AnyQuerySchema;
+      defineRecordEntry(owned, localName, definition as AnyQuerySchema);
     }
   }
 
@@ -4193,7 +4201,7 @@ function createQueryTokens<
   for (const [localName, definition] of Object.entries(definitions)) {
     if (isLedgerContractToken(definition)) {
       readLedgerContractToken(definition, "query");
-      tokens[localName] = definition as AnyQueryToken;
+      defineRecordEntry(tokens, localName, definition as AnyQueryToken);
       continue;
     }
 
@@ -4207,7 +4215,7 @@ function createQueryTokens<
       physicalName: createPhysicalName(moduleId, "query", localName),
       result: queryDefinition.result,
     });
-    tokens[localName] = token as AnyQueryToken;
+    defineRecordEntry(tokens, localName, token as AnyQueryToken);
   }
 
   return tokens as QueryTokensFor<TModuleId, TDefinitions>;
@@ -4228,10 +4236,14 @@ function createSchemaTokens<
   > = {};
 
   for (const [localName, schema] of Object.entries(schemas)) {
-    tokens[localName] = createSchemaToken(moduleId, kind, localName, schema) as
-      | AnyQueueToken
-      | AnySignalToken
-      | AnySignalQueueToken;
+    defineRecordEntry(
+      tokens,
+      localName,
+      createSchemaToken(moduleId, kind, localName, schema) as
+        | AnyQueueToken
+        | AnySignalToken
+        | AnySignalQueueToken,
+    );
   }
 
   return tokens as TokensForSchemas<TModuleId, TSchemas, TKind>;
@@ -4252,6 +4264,19 @@ function createSchemaToken(
     schema,
   });
   return token;
+}
+
+function defineRecordEntry<TValue>(
+  record: Record<string, TValue>,
+  name: string,
+  value: TValue,
+): void {
+  Object.defineProperty(record, name, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
 }
 
 function isLedgerContractToken(value: unknown): value is object {
@@ -4424,6 +4449,11 @@ function createModuleProjectionStatementCompiler(
   };
 
   return {
+    resolveStorageStreamName: ({ eventName, streamKind }) =>
+      compiler.resolveStorageStreamName({
+        eventName: physicalStreamName(streamKind, eventName),
+        streamKind,
+      }),
     compileAddColumn: (statement) => compiler.compileAddColumn(statement),
     compileAggregate: (statement) =>
       compiler.compileAggregate(

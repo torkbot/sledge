@@ -79,6 +79,7 @@ export function createKyselyProjectionStatementCompiler(
   input: KyselyProjectionStatementCompilerInput,
 ): ProjectionStatementCompiler {
   return {
+    resolveStorageStreamName: ({ eventName }) => eventName,
     compileAddColumn: (statement) =>
       compileAddColumnStatement(input, statement),
     compileAggregate: (statement) =>

@@ -379,25 +379,7 @@ export function createLedgerContractHarnessLedger(
       }
 
       if (property === "cancelWork") {
-        return (input: {
-          readonly reason?: string;
-          readonly ref: {
-            readonly queueName: string;
-            readonly signal: boolean;
-            readonly sourceEventId: number;
-            readonly workKey: string;
-          };
-        }) => {
-          const kind = input.ref.signal ? "signal_queue" : "queue";
-
-          return runtime.cancelWork({
-            ...input,
-            ref: {
-              ...input.ref,
-              queueName: `sledge::ledger.contract::${kind}::${input.ref.queueName}`,
-            },
-          });
-        };
+        return runtime.cancelWork.bind(runtime);
       }
 
       if (property === "query") {
@@ -410,21 +392,7 @@ export function createLedgerContractHarnessLedger(
       }
 
       if (property === "listWork") {
-        return (input?: {
-          readonly limit?: number;
-          readonly queueName?: string;
-          readonly sourceEventId?: number;
-          readonly states?: readonly string[];
-        }) => {
-          if (input?.queueName === undefined) {
-            return runtime.listWork(input);
-          }
-
-          return runtime.listWork({
-            ...input,
-            queueName: `sledge::ledger.contract::queue::${input.queueName}`,
-          });
-        };
+        return runtime.listWork.bind(runtime);
       }
 
       if (property === "onSignal") {

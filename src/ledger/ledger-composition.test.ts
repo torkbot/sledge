@@ -13,6 +13,7 @@ import {
 } from "./better-sqlite3-ledger.ts";
 import {
   composeLedgerModels,
+  createEventRef,
   defineLedgerShape,
   defineMaterialization,
   withMaterializations,
@@ -94,6 +95,16 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const source = sourceDefinition.register({
         indexers: {
           store: async ({ input, db }) => {
+            const eventRef = createEventRef("created", input.eventId);
+            const event = await db.readEvent(eventRef);
+            const [batchEvent] = await db.readEvents([eventRef]);
+            const scannedEvents = await db.scanEvents("created").execute();
+
+            assert.equal(event?.eventName, "created");
+            assert.equal(batchEvent?.eventName, "created");
+            assert.equal(scannedEvents.at(-1)?.eventName, "created");
+            assert.equal(scannedEvents.at(-1)?.eventId, input.eventId);
+
             await db
               .insertInto("records")
               .values({
@@ -117,9 +128,15 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             await actions.index("store", {
               eventId: event.eventId,
             });
-            actions.enqueue("deliver", {
-              eventId: event.eventId,
-            });
+            actions.enqueue(
+              "deliver",
+              {
+                eventId: event.eventId,
+              },
+              {
+                workKey: "source",
+              },
+            );
             const count = await actions.query("count", {});
             contributions.push(`source:${count}`);
           },
@@ -270,9 +287,15 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             const sourceCount = await actions.query("sourceCount", {});
             const laterCount = await actions.query("laterCount", {});
             contributions.push(`consumer:${sourceCount}:${laterCount}`);
-            actions.enqueue("deliver", {
-              eventId: event.eventId,
-            });
+            actions.enqueue(
+              "deliver",
+              {
+                eventId: event.eventId,
+              },
+              {
+                workKey: "consumer",
+              },
+            );
             await actions.index("store", {
               eventId: event.eventId,
             });
@@ -373,6 +396,61 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           await ledger.query(consumerDefinition.queries.ownCount, {}),
           1,
         );
+
+        const work = await ledger.listWork({
+          queueName: "deliver",
+        });
+
+        assert.equal(work.length, 2);
+        assert.deepEqual(
+          work.map((item) => item.queueName),
+          ["deliver", "deliver"],
+        );
+        assert.deepEqual(
+          work.map((item) => item.ref?.queueName),
+          ["deliver", "deliver"],
+        );
+
+        const sourceWork = work.find((item) => item.ref?.workKey === "source");
+
+        if (sourceWork?.ref === null || sourceWork === undefined) {
+          throw new Error("expected source work ref");
+        }
+
+        assert.equal(
+          (await ledger.queryWork({ workId: sourceWork.workId }))?.queueName,
+          "deliver",
+        );
+        assert.deepEqual(
+          await ledger.listWork({
+            queueName: "sledge::contract.source::queue::deliver",
+          }),
+          [],
+        );
+        assert.equal(
+          (
+            await ledger.cancelWork({
+              ref: {
+                ...sourceWork.ref,
+                queueName: "sledge::contract.source::queue::deliver",
+              },
+            })
+          ).status,
+          "not_found",
+        );
+        const cancellation = await ledger.cancelWork({
+          ref: sourceWork.ref,
+          reason: "contract cancellation",
+        });
+
+        assert.equal(cancellation.status, "cancelled");
+
+        if (cancellation.status !== "cancelled") {
+          throw new Error("expected cancelled work");
+        }
+
+        assert.equal(cancellation.work.queueName, "deliver");
+        assert.equal(cancellation.work.ref?.queueName, "deliver");
 
         rejectAppend = true;
         await assert.rejects(
@@ -774,6 +852,70 @@ test("unused queue and signal definitions may be omitted", () => {
   assert.deepEqual(shape.shape.signals, {});
   assert.deepEqual(shape.shape.signalQueues, {});
   assert.doesNotThrow(() => composeLedgerModels(shape.register({})));
+});
+
+test("contract maps preserve names inherited by Object.prototype", () => {
+  const inheritedName = "__proto__" as const;
+  const shape = defineLedgerShape({
+    moduleId: "contract.prototype-name",
+    events: {
+      [inheritedName]: Type.Object({}),
+    },
+    queues: {
+      [inheritedName]: Type.Object({}),
+    },
+    signals: {
+      [inheritedName]: Type.Object({}),
+    },
+    signalQueues: {
+      [inheritedName]: Type.Object({}),
+    },
+  });
+  const materializations = defineMaterialization(shape, {
+    namespace: "state",
+  })
+    .version(1, "create state", (s) =>
+      s.createTable("state", (t) =>
+        t
+          .columns({
+            id: t.text().notNull(),
+          })
+          .primaryKey(["id"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        [inheritedName]: {
+          params: CountQueryParamsSchema,
+          result: CountQueryResultSchema,
+        },
+      },
+    });
+  const definition = withMaterializations(shape, materializations);
+
+  assert.equal(Object.hasOwn(shape.events, inheritedName), true);
+  assert.equal(Object.hasOwn(shape.signals, inheritedName), true);
+  assert.equal(Object.hasOwn(shape.shape.events, inheritedName), true);
+  assert.equal(Object.hasOwn(shape.shape.queues, inheritedName), true);
+  assert.equal(Object.hasOwn(shape.shape.signals, inheritedName), true);
+  assert.equal(Object.hasOwn(shape.shape.signalQueues, inheritedName), true);
+  assert.equal(Object.hasOwn(definition.queries, inheritedName), true);
+  assert.doesNotThrow(() =>
+    composeLedgerModels(
+      definition.register({
+        queries: {
+          [inheritedName]: () => 0,
+        },
+        queues: {
+          [inheritedName]: () => {},
+        },
+        signalQueues: {
+          [inheritedName]: () => {},
+        },
+      }),
+    ),
+  );
 });
 
 function errorTreeIncludesMessage(error: unknown, message: string): boolean {
