@@ -14,6 +14,7 @@ import {
   readLedgerImplementations,
   registeredLedgerContractsBrand,
   registeredLedgerRuntimeBrand,
+  storageRuntimeIdentityBrand,
   type LedgerStorageRow,
   type LedgerStorageScope,
   type LedgerStorageStatement,
@@ -170,6 +171,7 @@ type RuntimeMaterializationState = {
 };
 
 type RuntimeMaterializationModule = RuntimeMaterializationState & {
+  readonly moduleId: string;
   readonly [registeredLedgerContractsBrand]?: object;
   readonly [registeredLedgerRuntimeBrand]?: RuntimeMaterializationState;
 };
@@ -182,17 +184,21 @@ const storageLayoutVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
-const StorageLayoutVersionRowSchema = Type.Object({
+const StorageLayoutRowSchema = Type.Object({
+  module_ids_json: Type.String(),
   version: Type.Number(),
 });
-let databaseInitializationTail: Promise<void> = Promise.resolve();
+const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
+const databaseInitializationTails = new Map<string, Promise<void>>();
 
 async function serializeDatabaseInitialization<T>(
+  databaseIdentity: string,
   run: () => Promise<T>,
 ): Promise<T> {
-  const previous = databaseInitializationTail;
+  const previous =
+    databaseInitializationTails.get(databaseIdentity) ?? Promise.resolve();
   const gate = Promise.withResolvers<void>();
-  databaseInitializationTail = gate.promise;
+  databaseInitializationTails.set(databaseIdentity, gate.promise);
 
   await previous;
 
@@ -200,6 +206,10 @@ async function serializeDatabaseInitialization<T>(
     return await run();
   } finally {
     gate.resolve();
+
+    if (databaseInitializationTails.get(databaseIdentity) === gate.promise) {
+      databaseInitializationTails.delete(databaseIdentity);
+    }
   }
 }
 
@@ -208,6 +218,8 @@ export type StorageStatement = LedgerStorageStatement;
 export type StorageDatabase = LedgerStorageScope;
 
 export interface StorageRuntime {
+  readonly [storageRuntimeIdentityBrand]: string;
+
   read<T>(run: (scope: LedgerStorageScope) => Promise<T>): Promise<T>;
 
   write<T>(run: (scope: LedgerStorageScope) => Promise<T>): Promise<T>;
@@ -950,6 +962,11 @@ function openDatabaseLedgerEngine<
     statementCompiler: input.projectionCompiler,
   });
   const registration = registeredRuntime.register;
+  const rootModule = input.model as unknown as RuntimeMaterializationModule & {
+    readonly [composedLedgerModulesBrand]?: readonly RuntimeMaterializationModule[];
+  };
+  const modules = rootModule[composedLedgerModulesBrand] ?? [rootModule];
+  const moduleIds = modules.map((module) => module.moduleId);
 
   let closed = false;
   let activeWorker: WorkerRuntimeState | null = null;
@@ -1078,12 +1095,14 @@ function openDatabaseLedgerEngine<
     // The SQLite drivers fail fast when concurrent handles overlap startup DDL.
     // Serialize only the one-time initialization path; normal ledger reads and
     // writes remain concurrent after each handle has started.
-    await serializeDatabaseInitialization(async () => {
-      await storage.write(async (database) => {
-        await ensureStorageLayout(database);
-      });
-      await storage.write(async (database) => {
-        await database.exec(`
+    await serializeDatabaseInitialization(
+      storage[storageRuntimeIdentityBrand],
+      async () => {
+        await storage.write(async (database) => {
+          await ensureStorageLayout(database, moduleIds);
+        });
+        await storage.write(async (database) => {
+          await database.exec(`
       CREATE TABLE IF NOT EXISTS events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts_ms INTEGER NOT NULL,
@@ -1119,19 +1138,19 @@ function openDatabaseLedgerEngine<
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
     `);
-      });
+        });
 
-      await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn("work", "work_ref", "TEXT");
-      await ensureColumn("work", "work_key", "TEXT");
-      await ensureColumn("work", "partition_key", "TEXT");
-      await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
-      await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
-      await ensureColumn("work", "cancel_reason", "TEXT");
-      await ensureColumn("work", "terminal_at_ms", "INTEGER");
-      await storage.write(async (database) => {
-        await database.exec(`
+        await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("work", "work_ref", "TEXT");
+        await ensureColumn("work", "work_key", "TEXT");
+        await ensureColumn("work", "partition_key", "TEXT");
+        await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
+        await ensureColumn("work", "cancel_reason", "TEXT");
+        await ensureColumn("work", "terminal_at_ms", "INTEGER");
+        await storage.write(async (database) => {
+          await database.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_key
           ON work(source_event_id, signal, queue_name, work_key)
           WHERE work_key IS NOT NULL;
@@ -1146,46 +1165,41 @@ function openDatabaseLedgerEngine<
             AND dead = 0
             AND cancelled = 0;
       `);
-      });
-      const rootModule =
-        input.model as unknown as RuntimeMaterializationModule & {
-          readonly [composedLedgerModulesBrand]?: readonly RuntimeMaterializationModule[];
-        };
-      const modules = rootModule[composedLedgerModulesBrand] ?? [rootModule];
-
-      for (const module of modules) {
-        const moduleRuntime = module[registeredLedgerRuntimeBrand] ?? module;
-        let context: MaterializationRuntimeContext;
-
-        if (module[registeredLedgerContractsBrand] === undefined) {
-          context = {
-            compiler: input.projectionCompiler,
-            events: moduleRuntime.model.events,
-            projections: moduleRuntime.projections,
-            signals: moduleRuntime.model.signals,
-          };
-        } else {
-          const schemas = readLedgerProjectionSchemas(module);
-          context = {
-            compiler: readLedgerProjectionCompiler(
-              module,
-              input.projectionCompiler,
-            ),
-            events: schemas.events,
-            projections: moduleRuntime.projections,
-            signals: schemas.signals,
-          };
-        }
-
-        await storage.write(async (database) => {
-          await ensureMaterializationHygiene(
-            database,
-            moduleRuntime.materializationHistory,
-            context,
-          );
         });
-      }
-    });
+        for (const module of modules) {
+          const moduleRuntime = module[registeredLedgerRuntimeBrand] ?? module;
+          let context: MaterializationRuntimeContext;
+
+          if (module[registeredLedgerContractsBrand] === undefined) {
+            context = {
+              compiler: input.projectionCompiler,
+              events: moduleRuntime.model.events,
+              projections: moduleRuntime.projections,
+              signals: moduleRuntime.model.signals,
+            };
+          } else {
+            const schemas = readLedgerProjectionSchemas(module);
+            context = {
+              compiler: readLedgerProjectionCompiler(
+                module,
+                input.projectionCompiler,
+              ),
+              events: schemas.events,
+              projections: moduleRuntime.projections,
+              signals: schemas.signals,
+            };
+          }
+
+          await storage.write(async (database) => {
+            await ensureMaterializationHygiene(
+              database,
+              moduleRuntime.materializationHistory,
+              context,
+            );
+          });
+        }
+      },
+    );
     committedEventId = await storage.read(async (database) => {
       return await readStoredLatestEventId(database);
     });
@@ -1292,7 +1306,7 @@ function openDatabaseLedgerEngine<
   }
 
   function decodeWorkRef(ref: unknown): WorkRef {
-    return decodeValue(WorkRefSchema, ref);
+    return decodeValue(WorkRefSchema, ref) as WorkRef;
   }
 
   async function readWorkSnapshotByRef(
@@ -1341,7 +1355,10 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  async function ensureStorageLayout(database: StorageDatabase): Promise<void> {
+  async function ensureStorageLayout(
+    database: StorageDatabase,
+    moduleIds: readonly string[],
+  ): Promise<void> {
     await database.exec("BEGIN IMMEDIATE");
 
     try {
@@ -1374,16 +1391,23 @@ function openDatabaseLedgerEngine<
         await database.exec(`
           CREATE TABLE ${storageLayoutTableName} (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            version INTEGER NOT NULL
+            version INTEGER NOT NULL,
+            module_ids_json TEXT NOT NULL
           );
-
-          INSERT INTO ${storageLayoutTableName} (singleton, version)
-          VALUES (1, ${storageLayoutVersion});
         `);
+        await database
+          .prepare(
+            `INSERT INTO ${storageLayoutTableName} (
+               singleton,
+               version,
+               module_ids_json
+             ) VALUES (1, ?, ?)`,
+          )
+          .run(storageLayoutVersion, JSON.stringify(moduleIds));
       } else {
         const row = await database
           .prepare(
-            `SELECT version
+            `SELECT version, module_ids_json
              FROM ${storageLayoutTableName}
              WHERE singleton = 1`,
           )
@@ -1393,11 +1417,30 @@ function openDatabaseLedgerEngine<
           throw new Error("Sledge storage layout marker is missing");
         }
 
-        const decoded = Value.Decode(StorageLayoutVersionRowSchema, row);
+        const decoded = Value.Decode(StorageLayoutRowSchema, row);
 
         if (decoded.version !== storageLayoutVersion) {
           throw new Error(
             `unsupported Sledge storage layout version ${decoded.version}`,
+          );
+        }
+
+        const storedModuleIds = decodeValue(
+          ComposedModuleIdsSchema,
+          parseJson<unknown>(
+            decoded.module_ids_json,
+            "composed ledger root identity",
+          ),
+        );
+
+        if (
+          storedModuleIds.length !== moduleIds.length ||
+          storedModuleIds.some(
+            (moduleId, index) => moduleId !== moduleIds[index],
+          )
+        ) {
+          throw new Error(
+            `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
           );
         }
       }
@@ -2184,7 +2227,7 @@ function openDatabaseLedgerEngine<
 
         if (existingRow.event_name !== eventInput.eventName) {
           throw new Error(
-            `dedupe key ${eventInput.dedupeKey} already belongs to event ${existingRow.event_name}`,
+            `dedupe key ${eventInput.dedupeKey} already belongs to another event contract`,
           );
         }
 

@@ -17,6 +17,7 @@ import {
 } from "./database-ledger-engine.ts";
 import {
   attachLedgerImplementationFactory,
+  storageRuntimeIdentityBrand,
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
@@ -161,6 +162,7 @@ function defineEngineFixtureModel<
       // Engine tests exercise custom storage hooks that the public v2
       // construction path deliberately no longer exposes.
       const registeredModel = {
+        moduleId: "engine.fixture",
         materializationHistory: null,
         model,
         projections,
@@ -321,6 +323,7 @@ function singleConnectionStorageRuntime(
   database: StorageDatabase,
 ): StorageRuntime {
   return {
+    [storageRuntimeIdentityBrand]: `single-connection-test:${randomUUID()}`,
     read: async (run) => await run(database),
     write: async (run) => await run(database),
     close: async () => undefined,
@@ -1208,6 +1211,7 @@ test("ledger close waits for startup before closing storage", async () => {
   let closeCalled = false;
 
   const storage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]: databaseUrl,
     read: async (run) => await run(storageDatabase),
     write: async (run) => {
       startupEntered.resolve();
@@ -1257,11 +1261,84 @@ test("ledger close waits for startup before closing storage", async () => {
   }
 });
 
+test("ledger startup initialization is isolated per database", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const firstDatabaseUrl = createTempDatabasePath();
+  const secondDatabaseUrl = createTempDatabasePath();
+  const firstStorageRuntime =
+    createBetterSqliteStorageRuntime(firstDatabaseUrl);
+  const secondStorageRuntime =
+    createBetterSqliteStorageRuntime(secondDatabaseUrl);
+  const firstStartupEntered = Promise.withResolvers<void>();
+  const allowFirstStartup = Promise.withResolvers<void>();
+  let firstWrite = true;
+  const firstStorage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]:
+      firstStorageRuntime[storageRuntimeIdentityBrand],
+    read: async (run) => await firstStorageRuntime.read(run),
+    write: async (run) => {
+      return await firstStorageRuntime.write(async (database) => {
+        if (firstWrite) {
+          firstWrite = false;
+          firstStartupEntered.resolve();
+          await allowFirstStartup.promise;
+        }
+
+        return await run(database);
+      });
+    },
+    close: async () => await firstStorageRuntime.close(),
+  };
+  const model = defineEngineFixtureModel({
+    events: {},
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+  const firstLedger = createDatabaseLedger({
+    projectionCompiler,
+    storage: firstStorage,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const secondLedger = createDatabaseLedger({
+    projectionCompiler,
+    storage: secondStorageRuntime,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    await firstStartupEntered.promise;
+
+    const secondStartup = secondLedger.listWork();
+    assert.equal(await settlesWithin(secondStartup, 50), true);
+    assert.deepEqual(await secondStartup, []);
+  } finally {
+    allowFirstStartup.resolve();
+    await Promise.allSettled([firstLedger.close(), secondLedger.close()]);
+    await rm(firstDatabaseUrl, { force: true });
+    await rm(secondDatabaseUrl, { force: true });
+  }
+});
+
 test("ledger close closes storage after startup failure", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   let closeCalled = false;
 
   const storage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]: `startup-failure-test:${randomUUID()}`,
     read: async () => {
       throw new Error("unexpected read");
     },
@@ -1393,6 +1470,7 @@ test("worker supervision reports work-processing failures", async () => {
   let ackFailed = false;
 
   const failingStorage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]: storage[storageRuntimeIdentityBrand],
     read: async (run) => await storage.read(run),
     write: async (run) => {
       return await storage.write(async (database) => {
@@ -2085,7 +2163,7 @@ test("deduped emit does not replay projections or materialization", async () => 
             dedupeKey: "message:42",
           },
         ),
-      /dedupe key message:42 already belongs to event message\.received/,
+      /dedupe key message:42 already belongs to another event contract/,
     );
 
     await waitFor(runtime, () => processed === 1);
@@ -3680,11 +3758,12 @@ test("work metadata migration adds columns before creating indexes", async () =>
   database.exec(`
     CREATE TABLE sledge_storage_layout (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      version INTEGER NOT NULL
+      version INTEGER NOT NULL,
+      module_ids_json TEXT NOT NULL
     );
 
-    INSERT INTO sledge_storage_layout (singleton, version)
-    VALUES (1, 1);
+    INSERT INTO sledge_storage_layout (singleton, version, module_ids_json)
+    VALUES (1, 1, '["engine.fixture"]');
 
     CREATE TABLE events (
       event_id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+
 import Database from "better-sqlite3";
 
 import type {
@@ -13,6 +15,7 @@ import {
   type StorageDatabase,
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
+import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 
 const connectionOptions = {
@@ -90,6 +93,7 @@ export function createBetterSqliteStorageRuntime(
   };
 
   return {
+    [storageRuntimeIdentityBrand]: realpathSync(databaseUrl),
     read: async (run) => {
       if (closed) {
         throw new Error("storage runtime is closed");

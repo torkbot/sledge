@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+
 import { connect, type Database } from "@tursodatabase/database";
 
 import {
@@ -13,6 +15,7 @@ import type {
   Ledger,
   LedgerTiming,
 } from "./ledger.ts";
+import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 
 type CreateTursoLedgerInput<TModel extends AnyComposedLedgerModel> = {
@@ -79,6 +82,7 @@ export async function createTursoStorageRuntime(
   };
 
   return {
+    [storageRuntimeIdentityBrand]: realpathSync(databaseUrl),
     read: async (run) => {
       if (closed) {
         throw new Error("storage runtime is closed");

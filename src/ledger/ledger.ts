@@ -80,6 +80,7 @@ const physicalNameSeparator = "::";
 const reservedMaterializationSqliteObjectNames = [
   "events",
   "idx_work_due",
+  "idx_work_key",
   "idx_work_partition_order",
   "idx_work_ref",
   "sledge_materialization_versions",
@@ -745,7 +746,10 @@ export type WorkCancellationSnapshot = {
  * Opaque durable identity for keyed work. Persist and round-trip this value;
  * its representation is owned by Sledge.
  */
-export type WorkRef = string;
+declare const workRefBrand: unique symbol;
+export type WorkRef = string & {
+  readonly [workRefBrand]: true;
+};
 
 export type WorkSnapshot = {
   readonly workId: number;

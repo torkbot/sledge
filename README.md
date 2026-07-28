@@ -463,6 +463,12 @@ Module identity namespaces projection tables, projection indexes, durable
 queues, and materialization histories in SQLite, so independently defined
 modules can use the same local names without physical collisions.
 
+The first open records the composed root's ordered module ids. Every later
+runtime opening that database must supply the exact same modules in the same
+composition order. Sledge rejects mismatched roots before schema mutation or
+work dispatch so rolling processes cannot apply different handler
+contributions to one logical ledger.
+
 Composable models use a new canonical storage layout. Opening a database
 created by a pre-composition Sledge release fails before any schema mutation.
 Reset the database before adopting this API; this release intentionally does

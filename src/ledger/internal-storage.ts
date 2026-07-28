@@ -21,6 +21,9 @@ export const composedLedgerModulesBrand: unique symbol = Symbol(
 export const registeredLedgerRuntimeBrand: unique symbol = Symbol(
   "sledge.registeredLedgerRuntime",
 );
+export const storageRuntimeIdentityBrand: unique symbol = Symbol(
+  "sledge.storageRuntimeIdentity",
+);
 
 export type LedgerStorageRow = Record<string, unknown>;
 

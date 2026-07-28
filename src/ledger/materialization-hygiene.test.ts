@@ -1,12 +1,14 @@
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Type } from "typebox";
 
-import type {
-  LedgerStorageRow,
-  LedgerStorageScope,
-  LedgerStorageStatement,
+import {
+  storageRuntimeIdentityBrand,
+  type LedgerStorageRow,
+  type LedgerStorageScope,
+  type LedgerStorageStatement,
 } from "./internal-storage.ts";
 import {
   defineLedgerShape,
@@ -627,6 +629,7 @@ function createMaterializationHygieneStorage(input?: {
     calls,
     runtime: {
       close: async () => {},
+      [storageRuntimeIdentityBrand]: `materialization-hygiene:${randomUUID()}`,
       read: async (run) => await run(scope),
       write: async (run) => await run(scope),
     },

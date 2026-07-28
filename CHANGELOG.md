@@ -16,6 +16,8 @@
   contracts without duplicating persisted events or query implementations.
 - Execute event contributions deterministically in root composition order
   inside one atomic append transaction.
+- Persist the composed root's ordered module ids and reject runtimes whose
+  module set or contribution order does not match the database owner.
 - Namespace projection tables and indexes, durable queues, and materialization
   histories by module identity so independently defined modules can safely
   reuse local names.

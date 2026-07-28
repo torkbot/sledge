@@ -12,6 +12,7 @@ import {
   createBetterSqliteStorageRuntime,
 } from "./better-sqlite3-ledger.ts";
 import {
+  type AnyComposedLedgerModel,
   composeLedgerModels,
   createEventRef,
   defineLedgerShape,
@@ -35,6 +36,12 @@ const RecordIndexerInputSchema = Type.Object({
 });
 const CountQueryParamsSchema = Type.Object({});
 const CountQueryResultSchema = Type.Number();
+
+if (false) {
+  // @ts-expect-error Work refs are produced by Sledge, not application strings.
+  const invalidWorkRef: WorkRef = "work:v1:application-value";
+  void invalidWorkRef;
+}
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
   test(`${driver} composes modules into one atomic ledger`, async () => {
@@ -600,12 +607,14 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           assert.deepEqual(
             await database
               .prepare(
-                `SELECT version
+                `SELECT version, module_ids_json
                  FROM sledge_storage_layout
                  WHERE singleton = 1`,
               )
               .get(),
             {
+              module_ids_json:
+                '["contract.source","contract.consumer","contract.later","contract.failure"]',
               version: 1,
             },
           );
@@ -693,6 +702,115 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         assert.deepEqual(names, ["events", "sqlite_sequence"]);
       } finally {
         inspection.close();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test(`${driver} rejects a different composed root for an existing database`, async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), `sledge-root-identity-${driver}-`),
+    );
+    const databaseUrl = join(directory, "ledger.sqlite");
+    const first = defineLedgerShape({
+      moduleId: "contract.root-first",
+      events: {},
+    }).register({});
+    const second = defineLedgerShape({
+      moduleId: "contract.root-second",
+      events: {},
+    }).register({});
+    const openLedger = async (model: AnyComposedLedgerModel) => {
+      if (driver === "better-sqlite3") {
+        return createBetterSqliteLedger({
+          databaseUrl,
+          model,
+          timing,
+        });
+      }
+
+      return await createTursoLedger({
+        databaseUrl,
+        model,
+        timing,
+      });
+    };
+
+    try {
+      const owningLedger = await openLedger(composeLedgerModels(first, second));
+      await owningLedger.listWork();
+      await owningLedger.close();
+
+      for (const mismatchedModel of [
+        composeLedgerModels(second, first),
+        composeLedgerModels(first),
+      ]) {
+        const mismatchedLedger = await openLedger(mismatchedModel);
+
+        await assert.rejects(mismatchedLedger.close(), (error: unknown) => {
+          return errorTreeIncludesMessage(
+            error,
+            "database belongs to composed ledger root",
+          );
+        });
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test(`${driver} keeps physical event names out of dedupe conflicts`, async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), `sledge-dedupe-identity-${driver}-`),
+    );
+    const databaseUrl = join(directory, "ledger.sqlite");
+    const first = defineLedgerShape({
+      moduleId: "contract.dedupe-first",
+      events: {
+        created: Type.Object({}),
+      },
+    });
+    const second = defineLedgerShape({
+      moduleId: "contract.dedupe-second",
+      events: {
+        updated: Type.Object({}),
+      },
+    });
+    const model = composeLedgerModels(first.register({}), second.register({}));
+    const openLedger = async () => {
+      if (driver === "better-sqlite3") {
+        return createBetterSqliteLedger({
+          databaseUrl,
+          model,
+          timing,
+        });
+      }
+
+      return await createTursoLedger({
+        databaseUrl,
+        model,
+        timing,
+      });
+    };
+
+    try {
+      const ledger = await openLedger();
+
+      try {
+        await ledger.emit(first.events.created, {}, { dedupeKey: "shared" });
+        await assert.rejects(
+          ledger.emit(second.events.updated, {}, { dedupeKey: "shared" }),
+          (error: unknown) => {
+            assert.equal(errorTreeIncludesMessage(error, "sledge::"), false);
+            return errorTreeIncludesMessage(
+              error,
+              "dedupe key shared already belongs to another event contract",
+            );
+          },
+        );
+      } finally {
+        await ledger.close();
       }
     } finally {
       await rm(directory, { force: true, recursive: true });

@@ -10,6 +10,7 @@ import type {
 import type {
   LedgerCursor,
   MaterializationImplementationRegistration,
+  WorkRef,
 } from "./ledger.ts";
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
 import {
@@ -1263,7 +1264,7 @@ export function runLedgerContractSuite(input: {
       await withHarness(input.create, async (harness) => {
         await assert.rejects(
           harness.ledger.cancelWork({
-            ref: "controlled-work.run",
+            ref: "controlled-work.run" as WorkRef,
           }),
         );
       });
