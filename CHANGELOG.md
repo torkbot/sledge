@@ -14,6 +14,9 @@
   so cancellation never depends on public queue or module names.
 - Allow modules to alias another composed module's exact event and query
   contracts without duplicating persisted events or query implementations.
+- Expose each registered module's event, query, and signal tokens so module
+  factories can return one capability-bearing value for reuse and root
+  composition.
 - Execute event contributions deterministically in root composition order
   inside one atomic append transaction.
 - Persist the composed root's ordered module ids and reject runtimes whose
