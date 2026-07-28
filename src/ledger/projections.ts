@@ -13,11 +13,16 @@ declare const projectionTableUniqueKeysBrand: unique symbol;
 const reservedProjectionTableNames = new Set([
   "events",
   "idx_work_due",
+  "idx_work_partition_order",
   "idx_work_ref",
   "sledge_materialization_versions",
   "work",
 ]);
-const reservedProjectionIndexNames = new Set(["idx_work_due", "idx_work_ref"]);
+const reservedProjectionIndexNames = new Set([
+  "idx_work_due",
+  "idx_work_partition_order",
+  "idx_work_ref",
+]);
 const sqliteInternalNamePrefix = "sqlite_";
 
 export type ProjectionColumnKind =

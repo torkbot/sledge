@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `partitionKey` enqueue semantics for strict per-queue FIFO execution
+  across retries, lease recovery, restarts, and competing worker runtimes while
+  preserving concurrency across partitions.
 - Include `causationEventId` in projection indexer event context so indexers can
   enforce causal ownership without re-reading the source event.
 

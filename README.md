@@ -449,10 +449,10 @@ resume, and observe signals, but it does not claim or process queue work until
 
 The handle returned by `startWorkers(...)` exposes
 `waitForIdle({ signal })`. It resolves once no pending, delayed, leased, or
-executing work remains. Retained dead and cancelled work does not prevent idle.
-The result describes one instant; later emissions can make the workers active
-again. The wait rejects if its signal aborts or the worker runtime closes or
-fails.
+executing work remains, including work blocked behind a partition head.
+Retained dead and cancelled work does not prevent idle. The result describes
+one instant; later emissions can make the workers active again. The wait rejects
+if its signal aborts or the worker runtime closes or fails.
 
 ## Work and Retries
 
@@ -465,6 +465,31 @@ Queue and signal queue handlers implicitly ack on normal return.
 
 Handlers receive a lease with an `AbortSignal`; long-running handlers should
 stop when that signal aborts during shutdown or restart.
+
+### Partitioned Work
+
+Use `partitionKey` when work belongs to an ordered logical stream:
+
+```ts
+actions.enqueue(
+  "agent-lane.wake",
+  { laneId: event.payload.laneId },
+  { partitionKey: event.payload.laneId },
+);
+```
+
+For one queue, work with the same non-empty partition key executes one item at
+a time in enqueue order. A delayed or retrying head blocks later items in that
+partition, including across lease recovery, process restarts, and competing
+worker runtimes. Dead-lettering or cancelling the head releases its successor.
+Different partitions can execute concurrently, and work without a
+`partitionKey` retains the existing unconstrained scheduling behavior.
+
+Partitions do not coalesce work. Each enqueue remains a durable work item, so a
+handler may treat a redundant wake as a no-op. Sledge stores no separate
+partition registry: the key exists only on nonterminal work, successful work is
+deleted, and terminal retained work releases the key. Reusing a key after all
+of its work becomes terminal starts a fresh stream.
 
 ## Work Inspection and Cancellation
 
