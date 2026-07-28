@@ -37,10 +37,99 @@ const RecordIndexerInputSchema = Type.Object({
 const CountQueryParamsSchema = Type.Object({});
 const CountQueryResultSchema = Type.Number();
 
+function defineGenericSourceModule<const TModuleId extends string>(
+  moduleId: TModuleId,
+) {
+  const shape = defineLedgerShape({
+    moduleId,
+    events: {
+      created: Type.Object({
+        id: Type.String(),
+      }),
+    },
+  });
+  const materialization = defineMaterialization(shape, {
+    namespace: "state",
+  })
+    .version(1, "initialize generic source state", (schema) => schema)
+    .define({
+      indexers: {},
+      queries: {
+        byId: {
+          params: Type.Object({
+            id: Type.String(),
+          }),
+          result: Type.Object({
+            id: Type.String(),
+          }),
+        },
+      },
+    });
+
+  return withMaterializations(shape, materialization).register({
+    queries: {
+      byId: async ({ params }) => {
+        return params;
+      },
+    },
+  });
+}
+
+function defineGenericConsumerModule<
+  const TModuleId extends string,
+  const TSourceModuleId extends string,
+>(input: {
+  readonly moduleId: TModuleId;
+  readonly source: ReturnType<
+    typeof defineGenericSourceModule<TSourceModuleId>
+  >;
+}) {
+  const shape = defineLedgerShape({
+    moduleId: input.moduleId,
+    events: {
+      sourceCreated: input.source.events.created,
+    },
+  });
+  const materialization = defineMaterialization(shape, {
+    namespace: "state",
+  })
+    .version(1, "initialize generic consumer state", (schema) => schema)
+    .define({
+      indexers: {},
+      queries: {
+        sourceById: input.source.queries.byId,
+      },
+    });
+
+  return withMaterializations(shape, materialization).register({
+    events: {
+      sourceCreated: async ({ event, actions }) => {
+        const source = await actions.query("sourceById", {
+          id: event.payload.id,
+        });
+
+        source.id satisfies string;
+      },
+    },
+  });
+}
+
 if (false) {
   // @ts-expect-error Work refs are produced by Sledge, not application strings.
   const invalidWorkRef: WorkRef = "work:v1:application-value";
   void invalidWorkRef;
+
+  const genericSource = defineGenericSourceModule("contract.generic-source");
+  const genericConsumer = defineGenericConsumerModule({
+    moduleId: "contract.generic-consumer",
+    source: genericSource,
+  });
+
+  genericConsumer.events
+    .sourceCreated satisfies typeof genericSource.events.created;
+  genericConsumer.queries
+    .sourceById satisfies typeof genericSource.queries.byId;
+  composeLedgerModels(genericSource, genericConsumer);
 }
 
 for (const driver of ["better-sqlite3", "turso"] as const) {

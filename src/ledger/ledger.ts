@@ -261,7 +261,11 @@ type PrivateSchemaDefinitions<TDefinitions> = {
 };
 
 type EventSchemaFor<TDefinition> =
-  TDefinition extends EventToken<string, string, infer TSchemaToInfer>
+  TDefinition extends EventToken<
+    infer _TModuleId,
+    infer _TName,
+    infer TSchemaToInfer
+  >
     ? TSchemaToInfer
     : TDefinition extends TSchema
       ? TDefinition
@@ -275,7 +279,11 @@ type EventTokensFor<
   TModuleId extends string,
   TDefinitions extends Record<string, EventDefinition>,
 > = {
-  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends AnyEventToken
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends EventToken<
+    infer _TReferencedModuleId,
+    infer _TReferencedName,
+    infer _TReferencedSchema
+  >
     ? TDefinitions[TName]
     : EventToken<
         TModuleId,
@@ -347,8 +355,8 @@ type LedgerQueryDefinitions = Readonly<
 
 type QuerySchemaForDefinition<TDefinition> =
   TDefinition extends QueryToken<
-    string,
-    string,
+    infer _TModuleId,
+    infer _TName,
     infer TParamsSchema,
     infer TResultSchema
   >
@@ -364,7 +372,12 @@ type NormalizedQueryDefinitions<TDefinitions extends LedgerQueryDefinitions> = {
 };
 
 type OwnedQueryDefinitions<TDefinitions extends LedgerQueryDefinitions> = {
-  readonly [TName in keyof TDefinitions as TDefinitions[TName] extends AnyQueryToken
+  readonly [TName in keyof TDefinitions as TDefinitions[TName] extends QueryToken<
+    infer _TModuleId,
+    infer _TName,
+    infer _TParamsSchema,
+    infer _TResultSchema
+  >
     ? never
     : TName]: TDefinitions[TName] extends AnyQuerySchema
     ? TDefinitions[TName]
@@ -375,7 +388,12 @@ type QueryTokensFor<
   TModuleId extends string,
   TDefinitions extends LedgerQueryDefinitions,
 > = {
-  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends AnyQueryToken
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends QueryToken<
+    infer _TReferencedModuleId,
+    infer _TReferencedName,
+    infer _TReferencedParamsSchema,
+    infer _TReferencedResultSchema
+  >
     ? TDefinitions[TName]
     : TDefinitions[TName] extends QuerySchema<
           infer TParamsSchema,

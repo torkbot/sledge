@@ -420,6 +420,8 @@ Registered modules retain the exact event, query, and signal token maps created
 during definition. A module factory can therefore return its registered module
 directly: consumers use its public tokens as capabilities, while the
 composition root passes the same value to `composeLedgerModels(...)`.
+Generic module factories preserve those aliased event payload and query types
+without widening the referenced module's identity.
 
 Modules can reuse an event contract by supplying another module's event token
 as the definition value. The alias is a code-level name for the exact same
