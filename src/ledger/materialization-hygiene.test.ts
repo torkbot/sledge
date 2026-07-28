@@ -595,6 +595,7 @@ function createStorageStatement(
           "work_id",
           "queue_name",
           "work_key",
+          "partition_key",
           "payload_json",
           "source_event_id",
           "signal",

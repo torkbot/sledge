@@ -58,6 +58,7 @@ const materializationMigrationChainStateBrand: unique symbol = Symbol(
 const reservedMaterializationSqliteObjectNames = [
   "events",
   "idx_work_due",
+  "idx_work_partition_order",
   "idx_work_ref",
   "sledge_materialization_versions",
   "work",
@@ -131,6 +132,12 @@ export type EmitOptions = {
  */
 export type EnqueueOptions = {
   readonly availableAtMs?: number;
+  /**
+   * Serializes work in enqueue order with other work for the same queue and
+   * partition. The partition remains blocked while its head is delayed,
+   * leased, or retrying.
+   */
+  readonly partitionKey?: string;
   readonly workKey?: string;
 };
 
@@ -584,7 +591,7 @@ export type LedgerWorkerOptions = {
 export interface LedgerWorkers extends AsyncDisposable {
   /**
    * Resolves when this worker handle has no pending, delayed, leased, or
-   * executing work.
+   * executing work, including work blocked behind a partition head.
    *
    * Retained dead and cancelled work is terminal and does not prevent idle.
    * The result describes one instant: work emitted after resolution can make

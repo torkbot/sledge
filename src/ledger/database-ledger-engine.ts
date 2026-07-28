@@ -320,6 +320,8 @@ const WorkIdRowSchema = Type.Object({
   work_id: Type.Number(),
 });
 
+const PartitionKeySchema = Type.String({ minLength: 1 });
+
 const WorkSnapshotRowSchema = Type.Object({
   work_id: Type.Number(),
   queue_name: Type.String(),
@@ -582,6 +584,7 @@ function openDatabaseLedgerEngine<
         work_id INTEGER PRIMARY KEY AUTOINCREMENT,
         queue_name TEXT NOT NULL,
         work_key TEXT,
+        partition_key TEXT,
         payload_json TEXT NOT NULL,
         source_event_id INTEGER NOT NULL,
         signal INTEGER NOT NULL DEFAULT 0,
@@ -606,6 +609,7 @@ function openDatabaseLedgerEngine<
     await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "work_key", "TEXT");
+    await ensureColumn("work", "partition_key", "TEXT");
     await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
     await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
     await ensureColumn("work", "cancel_reason", "TEXT");
@@ -615,6 +619,12 @@ function openDatabaseLedgerEngine<
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
           ON work(source_event_id, signal, queue_name, work_key)
           WHERE work_key IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_work_partition_order
+          ON work(signal, queue_name, partition_key, work_id)
+          WHERE partition_key IS NOT NULL
+            AND dead = 0
+            AND cancelled = 0;
       `);
     });
     await storage.write(async (database) => {
@@ -726,6 +736,10 @@ function openDatabaseLedgerEngine<
     if (workKey.length === 0) {
       throw new Error("workKey must be non-empty");
     }
+  }
+
+  function validatePartitionKey(partitionKey: string): void {
+    decodeValue(PartitionKeySchema, partitionKey);
   }
 
   function validateWorkRef(ref: WorkRef): void {
@@ -1534,6 +1548,7 @@ function openDatabaseLedgerEngine<
     const queued: {
       queueName: string;
       workKey: string | null;
+      partitionKey: string | null;
       payload: unknown;
       availableAtMs: number;
     }[] = [];
@@ -1607,9 +1622,14 @@ function openDatabaseLedgerEngine<
                 validateWorkKey(options.workKey);
               }
 
+              if (options?.partitionKey !== undefined) {
+                validatePartitionKey(options.partitionKey);
+              }
+
               queued.push({
                 queueName: String(queueName),
                 workKey: options?.workKey ?? null,
+                partitionKey: options?.partitionKey ?? null,
                 payload: decodedQueuePayload,
                 availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
               });
@@ -1646,6 +1666,7 @@ function openDatabaseLedgerEngine<
           `INSERT INTO work (
               queue_name,
               work_key,
+              partition_key,
               payload_json,
               source_event_id,
               signal,
@@ -1656,11 +1677,12 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
           work.queueName,
           work.workKey,
+          work.partitionKey,
           JSON.stringify(work.payload),
           eventId,
           work.availableAtMs,
@@ -1761,6 +1783,7 @@ function openDatabaseLedgerEngine<
     const queued: {
       queueName: string;
       workKey: string | null;
+      partitionKey: string | null;
       payload: unknown;
       availableAtMs: number;
     }[] = [];
@@ -1783,9 +1806,14 @@ function openDatabaseLedgerEngine<
               validateWorkKey(options.workKey);
             }
 
+            if (options?.partitionKey !== undefined) {
+              validatePartitionKey(options.partitionKey);
+            }
+
             queued.push({
               queueName: String(queueName),
               workKey: options?.workKey ?? null,
+              partitionKey: options?.partitionKey ?? null,
               payload: decodedQueuePayload,
               availableAtMs: options?.availableAtMs ?? signalInput.nowMs,
             });
@@ -1800,6 +1828,7 @@ function openDatabaseLedgerEngine<
           `INSERT INTO work (
               queue_name,
               work_key,
+              partition_key,
               payload_json,
               source_event_id,
               signal,
@@ -1810,11 +1839,12 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
           work.queueName,
           work.workKey,
+          work.partitionKey,
           JSON.stringify(work.payload),
           eventId,
           work.availableAtMs,
@@ -1888,12 +1918,25 @@ function openDatabaseLedgerEngine<
     const row = await storage.read(async (database) => {
       return await database
         .prepare(
-          `SELECT available_at_ms
-           FROM work
-           WHERE dead = 0
-             AND cancelled = 0
-             AND lease_id IS NULL
-           ORDER BY available_at_ms ASC
+          `SELECT candidate.available_at_ms
+           FROM work AS candidate
+           WHERE candidate.dead = 0
+             AND candidate.cancelled = 0
+             AND candidate.lease_id IS NULL
+             AND (
+               candidate.partition_key IS NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM work AS predecessor
+                 WHERE predecessor.dead = 0
+                   AND predecessor.cancelled = 0
+                   AND predecessor.signal = candidate.signal
+                   AND predecessor.queue_name = candidate.queue_name
+                   AND predecessor.partition_key = candidate.partition_key
+                   AND predecessor.work_id < candidate.work_id
+               )
+             )
+           ORDER BY candidate.available_at_ms ASC
            LIMIT 1`,
         )
         .get();
@@ -2222,13 +2265,26 @@ function openDatabaseLedgerEngine<
 
       const candidate = await database
         .prepare(
-          `SELECT work_id
-           FROM work
-           WHERE dead = 0
-             AND cancelled = 0
-             AND lease_id IS NULL
-             AND available_at_ms <= ?
-           ORDER BY work_id ASC
+          `SELECT candidate.work_id
+           FROM work AS candidate
+           WHERE candidate.dead = 0
+             AND candidate.cancelled = 0
+             AND candidate.lease_id IS NULL
+             AND candidate.available_at_ms <= ?
+             AND (
+               candidate.partition_key IS NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM work AS predecessor
+                 WHERE predecessor.dead = 0
+                   AND predecessor.cancelled = 0
+                   AND predecessor.signal = candidate.signal
+                   AND predecessor.queue_name = candidate.queue_name
+                   AND predecessor.partition_key = candidate.partition_key
+                   AND predecessor.work_id < candidate.work_id
+               )
+             )
+           ORDER BY candidate.work_id ASC
            LIMIT 1`,
         )
         .get(nowMs);
@@ -2431,6 +2487,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   partition_key = NULL,
                    last_error = ?,
                    terminal_at_ms = ?
                  WHERE work_id = ?
@@ -2861,6 +2918,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   partition_key = NULL,
                    last_error = ?,
                    terminal_at_ms = ?
                  WHERE work_id = ?
@@ -3103,6 +3161,7 @@ function openDatabaseLedgerEngine<
                lease_id = NULL,
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
+               partition_key = NULL,
                last_error = ?
              WHERE source_event_id = ?
                AND signal = ?
@@ -3144,6 +3203,7 @@ function openDatabaseLedgerEngine<
 
       if (worker !== null) {
         worker.stateChanges.notify();
+        scheduleDispatchAt(worker, nowMs);
       }
 
       if (worker !== null && cancelledLeaseId !== null) {

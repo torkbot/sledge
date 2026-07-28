@@ -616,7 +616,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
       await storage.exec(sql);
     },
     prepare: (sql) => {
-      if (sql.includes("SELECT available_at_ms")) {
+      if (sql.includes("SELECT candidate.available_at_ms")) {
         return {
           run: async () => {
             return { changes: 0, lastInsertRowid: 0 };
@@ -989,7 +989,7 @@ test("closing workers during a pending claim releases the claimed work", async (
 
       if (
         !blockedClaim &&
-        sql.includes("SELECT work_id") &&
+        sql.includes("SELECT candidate.work_id") &&
         sql.includes("available_at_ms <= ?")
       ) {
         blockedClaim = true;
@@ -1287,7 +1287,7 @@ test("worker failures preserve arbitrary rejection reasons", async () => {
 
       if (
         !failedClaim &&
-        sql.includes("SELECT work_id") &&
+        sql.includes("SELECT candidate.work_id") &&
         sql.includes("available_at_ms <= ?")
       ) {
         failedClaim = true;
@@ -1784,7 +1784,7 @@ test("waitForIdle exits a pending durable-state read when workers close or fail"
 
           if (
             transition === "failure" &&
-            sql.includes("SELECT work_id") &&
+            sql.includes("SELECT candidate.work_id") &&
             sql.includes("available_at_ms <= ?")
           ) {
             return {
@@ -3646,7 +3646,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
   await assert.rejects(async () => await emitPromise, /rollback append/);
 });
 
-test("work key migration adds column before creating ref index", async () => {
+test("work metadata migration adds columns before creating indexes", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
@@ -3701,12 +3701,20 @@ test("work key migration adds column before creating ref index", async () => {
   await ledger.emit("job.requested", { id: 1 });
 
   const columns = database.prepare("PRAGMA table_info(work)").all();
-  assert.equal(
-    columns.some((row) => {
-      return (row as { readonly name?: unknown }).name === "work_key";
-    }),
-    true,
-  );
+  const columnNames = columns.map((row) => {
+    return (row as { readonly name?: unknown }).name;
+  });
+
+  assert.ok(columnNames.includes("work_key"));
+  assert.ok(columnNames.includes("partition_key"));
+
+  const indexes = database.prepare("PRAGMA index_list(work)").all();
+  const indexNames = indexes.map((row) => {
+    return (row as { readonly name?: unknown }).name;
+  });
+
+  assert.ok(indexNames.includes("idx_work_ref"));
+  assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 
 test("enqueue rejects empty work keys", async () => {
