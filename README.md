@@ -578,6 +578,12 @@ await ledger.cancelWork({
 });
 ```
 
+`WorkRef` is an opaque string generated and persisted by Sledge. Store and
+round-trip the value exactly as returned; do not construct or parse it. Queue
+and module identity remain private to the runtime, so work from different
+modules remains independently addressable even when the modules use the same
+local queue name and `workKey`.
+
 Cancellation is terminal. Cancelled work will not dispatch again, including
 after process restart.
 

@@ -3337,12 +3337,6 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
   const database = new Database(databaseUrl);
   const observedAbort = Promise.withResolvers<void>();
   let workId = 0;
-  let workRef: {
-    readonly sourceEventId: number;
-    readonly signal: boolean;
-    readonly queueName: string;
-    readonly workKey: string;
-  } | null = null;
 
   const model = defineEngineFixtureModel({
     events: {
@@ -3372,12 +3366,6 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
       queues: {
         "job.run": async ({ work, lease }) => {
           workId = work.workId;
-          workRef = {
-            sourceEventId: work.sourceEventId,
-            signal: false,
-            queueName: String(work.queueName),
-            workKey: `job:${work.payload.id}`,
-          };
 
           if (lease.signal.aborted) {
             observedAbort.resolve();
@@ -3416,13 +3404,14 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
 
   await ledger.emit("job.requested", { id: 1 });
   await waitFor(runtime, () => workId !== 0);
+  const leasedWork = await ledger.queryWork({ workId });
 
-  if (workRef === null) {
+  if (leasedWork?.ref === null || leasedWork === null) {
     assert.fail("expected work ref");
   }
 
   const cancelled = await ledger.cancelWork({
-    ref: workRef,
+    ref: leasedWork.ref,
     reason: "stop now",
   });
 
@@ -3750,6 +3739,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
     return (row as { readonly name?: unknown }).name;
   });
 
+  assert.ok(columnNames.includes("work_ref"));
   assert.ok(columnNames.includes("work_key"));
   assert.ok(columnNames.includes("partition_key"));
 
@@ -3759,6 +3749,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
   });
 
   assert.ok(indexNames.includes("idx_work_ref"));
+  assert.ok(indexNames.includes("idx_work_key"));
   assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 

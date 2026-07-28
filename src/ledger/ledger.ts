@@ -741,12 +741,11 @@ export type WorkCancellationSnapshot = {
   readonly reason: string | null;
 };
 
-export type WorkRef = {
-  readonly sourceEventId: number;
-  readonly signal: boolean;
-  readonly queueName: string;
-  readonly workKey: string;
-};
+/**
+ * Opaque durable identity for keyed work. Persist and round-trip this value;
+ * its representation is owned by Sledge.
+ */
+export type WorkRef = string;
 
 export type WorkSnapshot = {
   readonly workId: number;

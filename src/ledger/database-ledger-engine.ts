@@ -390,86 +390,7 @@ function createLedgerContractFacade<
 
       if (property === "cancelWork") {
         return async (input: CancelWorkInput) => {
-          const queueNames = input.ref.signal
-            ? workQueueNames.signalQueues
-            : workQueueNames.queues;
-          const physicalNames =
-            queueNames.localToPhysical.get(input.ref.queueName) ?? [];
-
-          if (physicalNames.length === 0) {
-            if (input.ref.queueName.length === 0) {
-              return await target.cancelWork(input);
-            }
-
-            await target.cancelWork({
-              ...input,
-              ref: {
-                ...input.ref,
-                queueName: unavailablePhysicalQueueName,
-              },
-            });
-
-            return {
-              status: "not_found",
-              ref: input.ref,
-            } satisfies CancelWorkResult;
-          }
-
-          let physicalName = physicalNames[0];
-
-          if (physicalNames.length > 1) {
-            // Module-local queue names may overlap. Resolve a durable ref by
-            // its remaining identity fields and fail closed if it is still
-            // ambiguous instead of cancelling work from the wrong module.
-            const candidates = (
-              await Promise.all(
-                physicalNames.map(async (candidateName) => {
-                  return await target.listWork({
-                    limit: Number.MAX_SAFE_INTEGER,
-                    queueName: candidateName,
-                    sourceEventId: input.ref.sourceEventId,
-                  });
-                }),
-              )
-            )
-              .flat()
-              .filter((work) => {
-                return (
-                  work.ref?.workKey === input.ref.workKey &&
-                  work.signal === input.ref.signal
-                );
-              });
-
-            if (candidates.length === 0) {
-              return {
-                status: "not_found",
-                ref: input.ref,
-              } satisfies CancelWorkResult;
-            }
-
-            if (candidates.length > 1) {
-              throw new Error(
-                `work ref queue name ${input.ref.queueName} is ambiguous across composed ledger modules`,
-              );
-            }
-
-            physicalName = candidates[0]?.queueName;
-          }
-
-          if (physicalName === undefined) {
-            throw new Error(
-              `missing physical queue name for ${input.ref.queueName}`,
-            );
-          }
-
-          const result = await target.cancelWork({
-            ...input,
-            ref: {
-              ...input.ref,
-              queueName: physicalName,
-            },
-          });
-
+          const result = await target.cancelWork(input);
           return localizeCancelWorkResult(result, workQueueNames);
         };
       }
@@ -684,13 +605,13 @@ function localizeCancelWorkResult(
     case "already_terminal":
       return {
         status: "already_terminal",
-        ref: localizeWorkRef(result.ref, names),
+        ref: result.ref,
         work: localizeWorkSnapshot(result.work, names),
       };
     case "not_found":
       return {
         status: "not_found",
-        ref: localizeWorkRef(result.ref, names),
+        ref: result.ref,
       };
   }
 }
@@ -704,14 +625,7 @@ function localizeWorkSnapshot(
   return {
     ...work,
     queueName,
-    ref: work.ref === null ? null : localizeWorkRef(work.ref, names),
-  };
-}
-
-function localizeWorkRef(ref: WorkRef, names: WorkQueueNameMaps): WorkRef {
-  return {
-    ...ref,
-    queueName: localizeStoredQueueName(ref.queueName, ref.signal, names),
+    ref: work.ref,
   };
 }
 
@@ -905,9 +819,14 @@ const WorkIdRowSchema = Type.Object({
 });
 
 const PartitionKeySchema = Type.String({ minLength: 1 });
+const WorkRefSchema = Type.String({
+  pattern:
+    "^work:v1:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+});
 
 const WorkSnapshotRowSchema = Type.Object({
   work_id: Type.Number(),
+  work_ref: Type.Union([Type.Null(), Type.String()]),
   queue_name: Type.String(),
   source_event_id: Type.Number(),
   signal: Type.Number(),
@@ -918,7 +837,6 @@ const WorkSnapshotRowSchema = Type.Object({
   lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
   lease_expires_at_ms: Type.Union([Type.Null(), Type.Number()]),
   last_error: Type.Union([Type.Null(), Type.String()]),
-  work_key: Type.Union([Type.Null(), Type.String()]),
   cancelled: Type.Number(),
   cancel_requested_at_ms: Type.Union([Type.Null(), Type.Number()]),
   cancel_reason: Type.Union([Type.Null(), Type.String()]),
@@ -1178,6 +1096,7 @@ function openDatabaseLedgerEngine<
 
       CREATE TABLE IF NOT EXISTS work (
         work_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_ref TEXT,
         queue_name TEXT NOT NULL,
         work_key TEXT,
         partition_key TEXT,
@@ -1204,6 +1123,7 @@ function openDatabaseLedgerEngine<
 
       await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
       await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+      await ensureColumn("work", "work_ref", "TEXT");
       await ensureColumn("work", "work_key", "TEXT");
       await ensureColumn("work", "partition_key", "TEXT");
       await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
@@ -1212,9 +1132,13 @@ function openDatabaseLedgerEngine<
       await ensureColumn("work", "terminal_at_ms", "INTEGER");
       await storage.write(async (database) => {
         await database.exec(`
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_key
           ON work(source_event_id, signal, queue_name, work_key)
           WHERE work_key IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
+          ON work(work_ref)
+          WHERE work_ref IS NOT NULL;
 
         CREATE INDEX IF NOT EXISTS idx_work_partition_order
           ON work(signal, queue_name, partition_key, work_id)
@@ -1304,15 +1228,7 @@ function openDatabaseLedgerEngine<
 
     return {
       workId: decoded.work_id,
-      ref:
-        decoded.work_key === null
-          ? null
-          : {
-              sourceEventId: decoded.source_event_id,
-              signal: decoded.signal !== 0,
-              queueName: decoded.queue_name,
-              workKey: decoded.work_key,
-            },
+      ref: decoded.work_ref === null ? null : decodeWorkRef(decoded.work_ref),
       queueName: decoded.queue_name,
       sourceEventId: decoded.source_event_id,
       attempt: decoded.attempt,
@@ -1339,6 +1255,7 @@ function openDatabaseLedgerEngine<
       .prepare(
         `SELECT
            work_id,
+           work_ref,
            queue_name,
            source_event_id,
            signal,
@@ -1349,7 +1266,6 @@ function openDatabaseLedgerEngine<
            lease_acquired_at_ms,
            lease_expires_at_ms,
            last_error,
-           work_key,
            cancelled,
            cancel_requested_at_ms,
            cancel_reason
@@ -1371,18 +1287,12 @@ function openDatabaseLedgerEngine<
     decodeValue(PartitionKeySchema, partitionKey);
   }
 
-  function validateWorkRef(ref: WorkRef): void {
-    if (!Number.isInteger(ref.sourceEventId) || ref.sourceEventId <= 0) {
-      throw new Error(
-        `sourceEventId must be a positive integer, received ${ref.sourceEventId}`,
-      );
-    }
+  function createWorkRef(): WorkRef {
+    return decodeWorkRef(`work:v1:${randomUUID()}`);
+  }
 
-    if (ref.queueName.length === 0) {
-      throw new Error("queueName must be non-empty");
-    }
-
-    validateWorkKey(ref.workKey);
+  function decodeWorkRef(ref: unknown): WorkRef {
+    return decodeValue(WorkRefSchema, ref);
   }
 
   async function readWorkSnapshotByRef(
@@ -1393,6 +1303,7 @@ function openDatabaseLedgerEngine<
       .prepare(
         `SELECT
            work_id,
+           work_ref,
            queue_name,
            source_event_id,
            signal,
@@ -1403,17 +1314,13 @@ function openDatabaseLedgerEngine<
            lease_acquired_at_ms,
            lease_expires_at_ms,
            last_error,
-           work_key,
            cancelled,
            cancel_requested_at_ms,
            cancel_reason
          FROM work
-         WHERE source_event_id = ?
-           AND signal = ?
-           AND queue_name = ?
-           AND work_key = ?`,
+         WHERE work_ref = ?`,
       )
-      .get(ref.sourceEventId, ref.signal ? 1 : 0, ref.queueName, ref.workKey);
+      .get(ref);
 
     return row === undefined ? null : workSnapshotFromRow(row);
   }
@@ -2428,6 +2335,7 @@ function openDatabaseLedgerEngine<
       await database
         .prepare(
           `INSERT INTO work (
+              work_ref,
               queue_name,
               work_key,
               partition_key,
@@ -2441,9 +2349,10 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
+          work.workKey === null ? null : createWorkRef(),
           work.queueName,
           work.workKey,
           work.partitionKey,
@@ -2590,6 +2499,7 @@ function openDatabaseLedgerEngine<
       await database
         .prepare(
           `INSERT INTO work (
+              work_ref,
               queue_name,
               work_key,
               partition_key,
@@ -2603,9 +2513,10 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
+          work.workKey === null ? null : createWorkRef(),
           work.queueName,
           work.workKey,
           work.partitionKey,
@@ -3892,12 +3803,12 @@ function openDatabaseLedgerEngine<
     },
     cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
       await startup;
-      validateWorkRef(input.ref);
+      const ref = decodeWorkRef(input.ref);
 
       const nowMs = clock.nowMs();
       let cancelledLeaseId: string | null = null;
       const work = await runInTransaction(async (database) => {
-        const existing = await readWorkSnapshotByRef(database, input.ref);
+        const existing = await readWorkSnapshotByRef(database, ref);
 
         if (existing === null) {
           return null;
@@ -3927,10 +3838,7 @@ function openDatabaseLedgerEngine<
                lease_expires_at_ms = NULL,
                partition_key = NULL,
                last_error = ?
-             WHERE source_event_id = ?
-               AND signal = ?
-               AND queue_name = ?
-               AND work_key = ?
+             WHERE work_ref = ?
                AND dead = 0
                AND cancelled = 0`,
           )
@@ -3939,26 +3847,23 @@ function openDatabaseLedgerEngine<
             input.reason ?? null,
             nowMs,
             input.reason ?? "work cancelled",
-            input.ref.sourceEventId,
-            input.ref.signal ? 1 : 0,
-            input.ref.queueName,
-            input.ref.workKey,
+            ref,
           );
 
-        return await readWorkSnapshotByRef(database, input.ref);
+        return await readWorkSnapshotByRef(database, ref);
       });
 
       if (work === null) {
         return {
           status: "not_found",
-          ref: input.ref,
+          ref,
         };
       }
 
       if (work.state === "dead") {
         return {
           status: "already_terminal",
-          ref: input.ref,
+          ref,
           work,
         };
       }
@@ -4065,6 +3970,7 @@ function openDatabaseLedgerEngine<
             .prepare(
               `SELECT
                  work_id,
+                 work_ref,
                  queue_name,
                  source_event_id,
                  signal,
@@ -4075,7 +3981,6 @@ function openDatabaseLedgerEngine<
                  lease_acquired_at_ms,
                  lease_expires_at_ms,
                  last_error,
-                 work_key,
                  cancelled,
                  cancel_requested_at_ms,
                  cancel_reason

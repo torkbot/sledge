@@ -329,12 +329,7 @@ export function createLedgerContractHarnessLedger(
   const runtime = ledger as {
     cancelWork(input: {
       readonly reason?: string;
-      readonly ref: {
-        readonly queueName: string;
-        readonly signal: boolean;
-        readonly sourceEventId: number;
-        readonly workKey: string;
-      };
+      readonly ref: string;
     }): Promise<unknown>;
     emit(
       event: object,
@@ -1110,16 +1105,22 @@ export function runLedgerContractSuite(input: {
           );
           const successor = harness.prepareControlledWork("lease-tail");
 
-          await harness.ledger.emit("controlled-work.requested", {
-            availableAtMs: null,
-            workKey: "lease-head",
-            partitionKey: "lease-lane",
-          });
-          await harness.ledger.emit("controlled-work.requested", {
-            availableAtMs: null,
-            workKey: "lease-tail",
-            partitionKey: "lease-lane",
-          });
+          const headEvent = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              workKey: "lease-head",
+              partitionKey: "lease-lane",
+            },
+          );
+          const successorEvent = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              workKey: "lease-tail",
+              partitionKey: "lease-lane",
+            },
+          );
           await harness.flush();
           await staleAttempt.entered;
 
@@ -1142,10 +1143,10 @@ export function runLedgerContractSuite(input: {
             states: ["leased", "pending"],
           });
           const recoveredHead = activeWork.find(
-            (work) => work.ref?.workKey === "lease-head",
+            (work) => work.sourceEventId === headEvent.eventId,
           );
           const blockedSuccessor = activeWork.find(
-            (work) => work.ref?.workKey === "lease-tail",
+            (work) => work.sourceEventId === successorEvent.eventId,
           );
 
           assert.equal(recoveredHead?.attempt, 2);
@@ -1233,14 +1234,16 @@ export function runLedgerContractSuite(input: {
             partitionKey: "cancel-lane",
           });
           await harness.flush();
+          const [headWork] = await harness.ledger.listWork({
+            sourceEventId: head.eventId,
+          });
+
+          if (headWork?.ref === null || headWork === undefined) {
+            throw new Error("expected delayed partition head ref");
+          }
 
           const cancelled = await harness.ledger.cancelWork({
-            ref: {
-              sourceEventId: head.eventId,
-              signal: false,
-              queueName: "controlled-work.run",
-              workKey: "cancel-head",
-            },
+            ref: headWork.ref,
           });
 
           assert.equal(cancelled.status, "cancelled");
@@ -1255,6 +1258,16 @@ export function runLedgerContractSuite(input: {
         });
       },
     );
+
+    await t.test("malformed work refs are rejected", async () => {
+      await withHarness(input.create, async (harness) => {
+        await assert.rejects(
+          harness.ledger.cancelWork({
+            ref: "controlled-work.run",
+          }),
+        );
+      });
+    });
 
     await t.test(
       "a partition retry survives restart and blocks its successor",
@@ -1485,22 +1498,28 @@ export function runLedgerContractSuite(input: {
 
         await harness.ledger.listWork();
         assert.equal(idleResolved, false);
+        const work = await harness.ledger.listWork();
+        const headWork = work.find(
+          (item) => item.sourceEventId === head.eventId,
+        );
+        const successorWork = work.find(
+          (item) => item.sourceEventId === successor.eventId,
+        );
+
+        if (
+          headWork?.ref === null ||
+          headWork === undefined ||
+          successorWork?.ref === null ||
+          successorWork === undefined
+        ) {
+          throw new Error("expected partition work refs");
+        }
 
         await harness.ledger.cancelWork({
-          ref: {
-            sourceEventId: successor.eventId,
-            signal: false,
-            queueName: "controlled-work.run",
-            workKey: "idle-tail",
-          },
+          ref: successorWork.ref,
         });
         await harness.ledger.cancelWork({
-          ref: {
-            sourceEventId: head.eventId,
-            signal: false,
-            queueName: "controlled-work.run",
-            workKey: "idle-head",
-          },
+          ref: headWork.ref,
         });
 
         await idle;

@@ -16,6 +16,7 @@ import {
   createEventRef,
   defineLedgerShape,
   defineMaterialization,
+  type WorkRef,
   withMaterializations,
 } from "./ledger.ts";
 import {
@@ -42,6 +43,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     );
     const databaseUrl = join(directory, "ledger.sqlite");
     const contributions: string[] = [];
+    let remainingWorkRef: WorkRef | null = null;
     let rejectAppend = false;
     let phase = "define models";
 
@@ -134,7 +136,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
                 eventId: event.eventId,
               },
               {
-                workKey: "source",
+                workKey: "delivery",
               },
             );
             const count = await actions.query("count", {});
@@ -293,7 +295,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
                 eventId: event.eventId,
               },
               {
-                workKey: "consumer",
+                workKey: "delivery",
               },
             );
             await actions.index("store", {
@@ -406,19 +408,22 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           work.map((item) => item.queueName),
           ["deliver", "deliver"],
         );
-        assert.deepEqual(
-          work.map((item) => item.ref?.queueName),
-          ["deliver", "deliver"],
-        );
+        const [firstWork, secondWork] = work;
 
-        const sourceWork = work.find((item) => item.ref?.workKey === "source");
-
-        if (sourceWork?.ref === null || sourceWork === undefined) {
-          throw new Error("expected source work ref");
+        if (
+          firstWork?.ref === null ||
+          firstWork === undefined ||
+          secondWork?.ref === null ||
+          secondWork === undefined
+        ) {
+          throw new Error("expected durable work refs");
         }
 
+        assert.equal(typeof firstWork.ref, "string");
+        assert.equal(typeof secondWork.ref, "string");
+        assert.notEqual(firstWork.ref, secondWork.ref);
         assert.equal(
-          (await ledger.queryWork({ workId: sourceWork.workId }))?.queueName,
+          (await ledger.queryWork({ workId: firstWork.workId }))?.queueName,
           "deliver",
         );
         assert.deepEqual(
@@ -427,19 +432,8 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           }),
           [],
         );
-        assert.equal(
-          (
-            await ledger.cancelWork({
-              ref: {
-                ...sourceWork.ref,
-                queueName: "sledge::contract.source::queue::deliver",
-              },
-            })
-          ).status,
-          "not_found",
-        );
         const cancellation = await ledger.cancelWork({
-          ref: sourceWork.ref,
+          ref: firstWork.ref,
           reason: "contract cancellation",
         });
 
@@ -450,7 +444,12 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         }
 
         assert.equal(cancellation.work.queueName, "deliver");
-        assert.equal(cancellation.work.ref?.queueName, "deliver");
+        assert.equal(cancellation.work.ref, firstWork.ref);
+        assert.deepEqual(
+          (await ledger.listWork()).map((item) => item.state),
+          ["cancelled", "pending"],
+        );
+        remainingWorkRef = secondWork.ref;
 
         rejectAppend = true;
         await assert.rejects(
@@ -494,6 +493,21 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         assert.equal(
           await ledger.query(consumerDefinition.queries.ownCount, {}),
           1,
+        );
+
+        if (remainingWorkRef === null) {
+          throw new Error("expected remaining work ref");
+        }
+
+        const cancellation = await ledger.cancelWork({
+          ref: remainingWorkRef,
+          reason: "contract cancellation after restart",
+        });
+
+        assert.equal(cancellation.status, "cancelled");
+        assert.deepEqual(
+          (await ledger.listWork()).map((item) => item.state),
+          ["cancelled", "cancelled"],
         );
       } finally {
         phase = "close second ledger";

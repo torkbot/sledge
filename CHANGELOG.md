@@ -9,6 +9,9 @@
   omitted; omitted categories are exact empty definitions.
 - Breaking: storage adapters now accept only a composed root model; remove the
   uncomposed `createLedger(...)` and `LedgerEngineFactory` public seam.
+- Breaking: make `WorkRef` an opaque Sledge-generated string instead of a
+  caller-constructible queue tuple. Keyed work persists its own stable identity,
+  so cancellation never depends on public queue or module names.
 - Allow modules to alias another composed module's exact event and query
   contracts without duplicating persisted events or query implementations.
 - Execute event contributions deterministically in root composition order
