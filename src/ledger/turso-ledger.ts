@@ -1,95 +1,43 @@
 import { connect, type Database } from "@tursodatabase/database";
-import type { TSchema } from "typebox";
 
 import {
-  createDatabaseLedger,
-  type CreateDatabaseLedgerInput,
+  createComposedDatabaseLedger,
   type StorageDatabase,
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import type {
-  RegisteredLedgerModel,
+  AnyComposedLedgerModel,
+  ComposedLedgerEventTokens,
+  ComposedLedgerQueryTokens,
+  ComposedLedgerSignalTokens,
   Ledger,
   LedgerTiming,
-  QuerySchema,
 } from "./ledger.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
-import type {
-  AnyProjectionSchema,
-  ProjectionIndexerDefinitions,
-  ProjectionQueryDefinitions,
-} from "./projection-access.ts";
 
-type AnyIndexerDef = TSchema;
-type AnyQueryDef = QuerySchema<TSchema, TSchema>;
-
-type CreateTursoLedgerInput<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TIndexers extends Record<string, AnyIndexerDef>,
-  TQueries extends Record<string, AnyQueryDef>,
-  TSignals extends Record<string, TSchema> = {},
-  TSignalQueues extends Record<string, TSchema> = {},
-  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
-  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
-  TQueryDefinitions extends ProjectionQueryDefinitions = {},
-> = {
+type CreateTursoLedgerInput<TModel extends AnyComposedLedgerModel> = {
   readonly databaseUrl: string;
-  readonly model: RegisteredLedgerModel<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  >;
+  readonly model: TModel;
   readonly timing: LedgerTiming;
 };
 
 export async function createTursoLedger<
-  const TEvents extends Record<string, TSchema>,
-  const TQueues extends Record<string, TSchema>,
-  const TIndexers extends Record<string, AnyIndexerDef> = {},
-  const TQueries extends Record<string, AnyQueryDef> = {},
-  const TSignals extends Record<string, TSchema> = {},
-  const TSignalQueues extends Record<string, TSchema> = {},
-  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
-  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
-  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
+  const TModel extends AnyComposedLedgerModel,
 >(
-  input: CreateTursoLedgerInput<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  >,
-): Promise<Ledger<TEvents, TQueries, TSignals>> {
-  const sharedInput: CreateDatabaseLedgerInput<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  > = {
+  input: CreateTursoLedgerInput<TModel>,
+): Promise<
+  Ledger<
+    ComposedLedgerEventTokens<TModel>,
+    ComposedLedgerQueryTokens<TModel>,
+    ComposedLedgerSignalTokens<TModel>
+  >
+> {
+  return createComposedDatabaseLedger({
     storage: await createTursoStorageRuntime(input.databaseUrl),
     model: input.model,
     projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
     timing: input.timing,
-  };
-
-  return createDatabaseLedger(sharedInput);
+  });
 }
 
 export async function createTursoStorageRuntime(

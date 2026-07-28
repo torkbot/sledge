@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Breaking: require every ledger shape to declare a stable `moduleId`, compose
+  registered modules explicitly with `composeLedgerModels(...)`, and use opaque
+  event, query, and signal tokens at runtime.
+- Breaking: storage adapters now accept only a composed root model; remove the
+  uncomposed `createLedger(...)` and `LedgerEngineFactory` public seam.
+- Allow modules to alias another composed module's exact event and query
+  contracts without duplicating persisted events or query implementations.
+- Execute event contributions deterministically in root composition order
+  inside one atomic append transaction.
+- Namespace projection tables and indexes, durable queues, and materialization
+  histories by module identity so independently defined modules can safely
+  reuse local names.
+- Adopt a new canonical composable storage layout. Databases created by
+  pre-composition releases are rejected before mutation and must be reset;
+  there is no legacy migration or compatibility mode.
+
 ## 0.13.0 - 2026-07-27
 
 - Add `partitionKey` enqueue semantics for strict per-queue FIFO execution

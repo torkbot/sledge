@@ -6,6 +6,21 @@ import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 const registeredLedgerImplementationFactoryBrand: unique symbol = Symbol(
   "sledge.registeredLedgerImplementationFactory",
 );
+const registeredLedgerProjectionCompilerFactoryBrand: unique symbol = Symbol(
+  "sledge.registeredLedgerProjectionCompilerFactory",
+);
+const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
+  "sledge.registeredLedgerProjectionSchemas",
+);
+export const registeredLedgerContractsBrand: unique symbol = Symbol(
+  "sledge.registeredLedgerContracts",
+);
+export const composedLedgerModulesBrand: unique symbol = Symbol(
+  "sledge.composedLedgerModules",
+);
+export const registeredLedgerRuntimeBrand: unique symbol = Symbol(
+  "sledge.registeredLedgerRuntime",
+);
 
 export type LedgerStorageRow = Record<string, unknown>;
 
@@ -72,6 +87,19 @@ type RegisteredLedgerImplementationCarrier<
   >;
 };
 
+type RegisteredLedgerProjectionCompilerCarrier = {
+  readonly [registeredLedgerProjectionCompilerFactoryBrand]?: (
+    compiler: ProjectionStatementCompiler,
+  ) => ProjectionStatementCompiler;
+};
+
+type RegisteredLedgerProjectionSchemasCarrier = {
+  readonly [registeredLedgerProjectionSchemasBrand]?: {
+    readonly events: Readonly<Record<string, TSchema>>;
+    readonly signals: Readonly<Record<string, TSchema>>;
+  };
+};
+
 export function attachLedgerImplementationFactory<
   TModel extends object,
   TIndexers extends Record<string, TSchema>,
@@ -115,4 +143,67 @@ export function readLedgerImplementations<
   }
 
   return factory(input);
+}
+
+export function attachLedgerProjectionCompilerFactory<TModel extends object>(
+  model: TModel,
+  factory: (
+    compiler: ProjectionStatementCompiler,
+  ) => ProjectionStatementCompiler,
+): TModel {
+  Object.defineProperty(model, registeredLedgerProjectionCompilerFactoryBrand, {
+    configurable: false,
+    enumerable: false,
+    value: factory,
+    writable: false,
+  });
+
+  return model;
+}
+
+export function readLedgerProjectionCompiler(
+  model: object,
+  compiler: ProjectionStatementCompiler,
+): ProjectionStatementCompiler {
+  const carrier = model as RegisteredLedgerProjectionCompilerCarrier;
+  const factory = carrier[registeredLedgerProjectionCompilerFactoryBrand];
+
+  if (factory === undefined) {
+    throw new Error(
+      "registered ledger model is missing projection compiler factory",
+    );
+  }
+
+  return factory(compiler);
+}
+
+export function attachLedgerProjectionSchemas<TModel extends object>(
+  model: TModel,
+  schemas: {
+    readonly events: Readonly<Record<string, TSchema>>;
+    readonly signals: Readonly<Record<string, TSchema>>;
+  },
+): TModel {
+  Object.defineProperty(model, registeredLedgerProjectionSchemasBrand, {
+    configurable: false,
+    enumerable: false,
+    value: schemas,
+    writable: false,
+  });
+
+  return model;
+}
+
+export function readLedgerProjectionSchemas(model: object): {
+  readonly events: Readonly<Record<string, TSchema>>;
+  readonly signals: Readonly<Record<string, TSchema>>;
+} {
+  const carrier = model as RegisteredLedgerProjectionSchemasCarrier;
+  const schemas = carrier[registeredLedgerProjectionSchemasBrand];
+
+  if (schemas === undefined) {
+    throw new Error("registered ledger model is missing projection schemas");
+  }
+
+  return schemas;
 }

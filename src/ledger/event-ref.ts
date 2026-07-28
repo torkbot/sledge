@@ -1,6 +1,6 @@
 declare const eventRefBrand: unique symbol;
 
-export type EventRef<TEventName extends string> = {
+export type EventRef<TEventName extends string | object> = {
   readonly eventName: TEventName;
   readonly eventId: number;
   readonly [eventRefBrand]: {
@@ -8,7 +8,7 @@ export type EventRef<TEventName extends string> = {
   };
 };
 
-export function createEventRef<TEventName extends string>(
+export function createEventRef<TEventName extends string | object>(
   eventName: TEventName,
   eventId: number,
 ): EventRef<TEventName> {

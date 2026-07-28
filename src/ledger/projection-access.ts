@@ -1376,28 +1376,33 @@ export type ProjectionAccess<
   TQueries extends Record<string, AnyQuerySchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TOwnedQueryDefinitions extends ProjectionQueryDefinitions = TQueryDefinitions,
 > = {
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexers;
   readonly queries: TQueries;
   readonly indexerDefinitions: TIndexerDefinitions;
   readonly queryDefinitions: TQueryDefinitions;
+  readonly ownedQueryDefinitions: TOwnedQueryDefinitions;
 };
 
 export function createProjectionAccess<
   const TProjectionSchema extends AnyProjectionSchema,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   const TQueryDefinitions extends ProjectionQueryDefinitions,
+  const TOwnedQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
+  readonly ownedQueries: TOwnedQueryDefinitions;
 }): ProjectionAccess<
   TProjectionSchema,
   ProjectionIndexerSchemas<TIndexerDefinitions>,
   ProjectionQuerySchemas<TQueryDefinitions>,
   TIndexerDefinitions,
-  TQueryDefinitions
+  TQueryDefinitions,
+  TOwnedQueryDefinitions
 > {
   const indexers: Record<string, TSchema> = {};
   const queries: Record<string, AnyQuerySchema> = {};
@@ -1419,12 +1424,14 @@ export function createProjectionAccess<
     queries,
     indexerDefinitions: input.indexers,
     queryDefinitions: input.queries,
+    ownedQueryDefinitions: input.ownedQueries,
   } as ProjectionAccess<
     TProjectionSchema,
     ProjectionIndexerSchemas<TIndexerDefinitions>,
     ProjectionQuerySchemas<TQueryDefinitions>,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TOwnedQueryDefinitions
   >;
 }
 

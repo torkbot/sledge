@@ -8,10 +8,12 @@ import type {
   RuntimeScheduler,
 } from "../runtime/contracts.ts";
 import type {
-  Ledger,
+  LedgerCursor,
   MaterializationImplementationRegistration,
 } from "./ledger.ts";
+import type { DatabaseLedger } from "./database-ledger-engine.ts";
 import {
+  createEventRef,
   defineLedgerShape,
   defineMaterialization,
   withMaterializations,
@@ -102,6 +104,7 @@ export const CountQueryResultSchema = Type.Number();
 export const SourceEventIdsResultSchema = Type.Array(Type.Number());
 
 const ledgerContractShape = defineLedgerShape({
+  moduleId: "ledger.contract",
   events: {
     "message.received": MessageReceivedSchema,
     "decision.attempted": DecisionAttemptedSchema,
@@ -302,6 +305,213 @@ type LedgerContractQueries = typeof ledgerContractDefinition.model.queries;
 type LedgerContractSignals = typeof ledgerContractShape.shape.signals;
 type LedgerContractModel = ReturnType<typeof ledgerContractDefinition.register>;
 
+type LedgerContractTokenEnvelope = {
+  readonly causationEventId: number | null;
+  readonly dedupeKey: string | null;
+  readonly event: object;
+  readonly eventId: number;
+  readonly payload: unknown;
+  readonly tsMs: number;
+};
+
+type LedgerContractTokenStreamEvent = {
+  readonly cursor: LedgerCursor;
+  readonly event: LedgerContractTokenEnvelope;
+};
+
+export function createLedgerContractHarnessLedger(
+  ledger: object,
+): DatabaseLedger<
+  LedgerContractEvents,
+  LedgerContractQueries,
+  LedgerContractSignals
+> {
+  const runtime = ledger as {
+    cancelWork(input: {
+      readonly reason?: string;
+      readonly ref: {
+        readonly queueName: string;
+        readonly signal: boolean;
+        readonly sourceEventId: number;
+        readonly workKey: string;
+      };
+    }): Promise<unknown>;
+    emit(
+      event: object,
+      payload: unknown,
+      options?: { readonly dedupeKey?: string },
+    ): Promise<LedgerContractTokenEnvelope>;
+    listWork(input?: {
+      readonly limit?: number;
+      readonly queueName?: string;
+      readonly sourceEventId?: number;
+      readonly states?: readonly string[];
+    }): Promise<readonly unknown[]>;
+    query(query: object, params: unknown): Promise<unknown>;
+    onSignal(
+      signal: object,
+      observer: (signal: LedgerContractTokenEnvelope) => void | Promise<void>,
+    ): unknown;
+    tailEvents(input: {
+      readonly last: number;
+      readonly signal: AbortSignal;
+    }): AsyncIterable<LedgerContractTokenStreamEvent>;
+    resumeEvents(input: {
+      readonly cursor: LedgerCursor;
+      readonly signal: AbortSignal;
+    }): AsyncIterable<LedgerContractTokenStreamEvent>;
+  };
+
+  return new Proxy(ledger, {
+    get: (target, property, receiver) => {
+      if (property === "emit") {
+        return (
+          eventName: keyof LedgerContractEvents,
+          payload: unknown,
+          options?: { readonly dedupeKey?: string },
+        ) => {
+          return runtime.emit(
+            ledgerContractShape.events[eventName],
+            payload,
+            options,
+          );
+        };
+      }
+
+      if (property === "cancelWork") {
+        return (input: {
+          readonly reason?: string;
+          readonly ref: {
+            readonly queueName: string;
+            readonly signal: boolean;
+            readonly sourceEventId: number;
+            readonly workKey: string;
+          };
+        }) => {
+          const kind = input.ref.signal ? "signal_queue" : "queue";
+
+          return runtime.cancelWork({
+            ...input,
+            ref: {
+              ...input.ref,
+              queueName: `sledge::ledger.contract::${kind}::${input.ref.queueName}`,
+            },
+          });
+        };
+      }
+
+      if (property === "query") {
+        return (queryName: keyof LedgerContractQueries, params: unknown) => {
+          return runtime.query(
+            ledgerContractDefinition.queries[queryName],
+            params,
+          );
+        };
+      }
+
+      if (property === "listWork") {
+        return (input?: {
+          readonly limit?: number;
+          readonly queueName?: string;
+          readonly sourceEventId?: number;
+          readonly states?: readonly string[];
+        }) => {
+          if (input?.queueName === undefined) {
+            return runtime.listWork(input);
+          }
+
+          return runtime.listWork({
+            ...input,
+            queueName: `sledge::ledger.contract::queue::${input.queueName}`,
+          });
+        };
+      }
+
+      if (property === "onSignal") {
+        return (
+          signalName: keyof LedgerContractSignals,
+          observer: (signal: unknown) => void | Promise<void>,
+        ) => {
+          return runtime.onSignal(
+            ledgerContractShape.signals[signalName],
+            async (signal) => {
+              await observer(createLedgerContractEnvelope(signal, signalName));
+            },
+          );
+        };
+      }
+
+      if (property === "tailEvents" || property === "resumeEvents") {
+        return (streamInput: {
+          readonly last?: number;
+          readonly cursor?: LedgerCursor;
+          readonly signal: AbortSignal;
+        }) => {
+          const source =
+            property === "tailEvents"
+              ? runtime.tailEvents(
+                  streamInput as {
+                    readonly last: number;
+                    readonly signal: AbortSignal;
+                  },
+                )
+              : runtime.resumeEvents(
+                  streamInput as {
+                    readonly cursor: LedgerCursor;
+                    readonly signal: AbortSignal;
+                  },
+                );
+
+          return mapLedgerContractEventStream(source);
+        };
+      }
+
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  }) as DatabaseLedger<
+    LedgerContractEvents,
+    LedgerContractQueries,
+    LedgerContractSignals
+  >;
+}
+
+function createLedgerContractEnvelope(
+  envelope: LedgerContractTokenEnvelope,
+  eventName: string,
+): object {
+  return {
+    causationEventId: envelope.causationEventId,
+    dedupeKey: envelope.dedupeKey,
+    eventId: envelope.eventId,
+    eventName,
+    payload: envelope.payload,
+    ref: createEventRef(eventName, envelope.eventId),
+    tsMs: envelope.tsMs,
+  };
+}
+
+async function* mapLedgerContractEventStream(
+  source: AsyncIterable<LedgerContractTokenStreamEvent>,
+): AsyncIterable<{
+  readonly cursor: LedgerContractTokenStreamEvent["cursor"];
+  readonly event: object;
+}> {
+  for await (const item of source) {
+    const eventName = Object.entries(ledgerContractShape.events).find(
+      ([, token]) => token === item.event.event,
+    )?.[0];
+
+    if (eventName === undefined) {
+      throw new Error("ledger contract received an unknown event token");
+    }
+
+    yield {
+      cursor: item.cursor,
+      event: createLedgerContractEnvelope(item.event, eventName),
+    };
+  }
+}
+
 export type LedgerContractDecisionMode =
   | "ack"
   | "retry_once"
@@ -421,7 +631,7 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
 }
 
 export type LedgerContractHarness = {
-  readonly ledger: Ledger<
+  readonly ledger: DatabaseLedger<
     LedgerContractEvents,
     LedgerContractQueries,
     LedgerContractSignals

@@ -25,8 +25,17 @@ type StorageCall = {
   readonly sql: string;
 };
 
+function physicalName(
+  moduleId: string,
+  kind: "index" | "materialization" | "table",
+  name: string,
+): string {
+  return `sledge::${moduleId}::${kind}::${name}`;
+}
+
 test("database ledger startup applies materialization history hygiene", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.apply-history",
     events: {
       "user.created": Type.Object({
         email: Type.String(),
@@ -79,13 +88,14 @@ test("database ledger startup applies materialization history hygiene", async ()
 
   await ledger.close();
 
+  const usersTable = physicalName("hygiene.apply-history", "table", "users");
   const userTableStatements = storage.calls.filter((call) => {
-    return call.sql.includes('CREATE TABLE IF NOT EXISTS "users"');
+    return call.sql.includes(`CREATE TABLE IF NOT EXISTS "${usersTable}"`);
   });
   assert.equal(userTableStatements.length, 1);
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('INSERT INTO "users"');
+      return call.sql.includes(`INSERT INTO "${usersTable}"`);
     }),
     true,
   );
@@ -97,7 +107,7 @@ test("database ledger startup applies materialization history hygiene", async ()
   );
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('ALTER TABLE "users"');
+      return call.sql.includes(`ALTER TABLE "${usersTable}"`);
     }),
     false,
   );
@@ -105,6 +115,7 @@ test("database ledger startup applies materialization history hygiene", async ()
 
 test("database ledger startup replays fresh materializations in migration order", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.fresh-order",
     events: {},
     queues: {},
     signals: {},
@@ -155,12 +166,18 @@ test("database ledger startup replays fresh materializations in migration order"
 
   await ledger.close();
 
+  const usersTable = physicalName("hygiene.fresh-order", "table", "users");
+  const usersByEmailIndex = physicalName(
+    "hygiene.fresh-order",
+    "index",
+    "usersByEmail",
+  );
   const insertUserCallIndex = storage.calls.findIndex((call) => {
-    return call.sql.includes('INSERT INTO "users"');
+    return call.sql.includes(`INSERT INTO "${usersTable}"`);
   });
   const createEmailIndexCallIndex = storage.calls.findIndex((call) => {
     return call.sql.includes(
-      'CREATE UNIQUE INDEX IF NOT EXISTS "usersByEmail"',
+      `CREATE UNIQUE INDEX IF NOT EXISTS "${usersByEmailIndex}"`,
     );
   });
 
@@ -171,6 +188,7 @@ test("database ledger startup replays fresh materializations in migration order"
 
 test("database ledger startup re-reads materialization version under the migration lock", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.lock-reread",
     events: {
       "user.created": Type.Object({
         email: Type.String(),
@@ -233,13 +251,25 @@ test("database ledger startup re-reads materialization version under the migrati
   assert.equal(versionReads.length, 2);
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('CREATE TABLE IF NOT EXISTS "users"');
+      return call.sql.includes(
+        `CREATE TABLE IF NOT EXISTS "${physicalName(
+          "hygiene.lock-reread",
+          "table",
+          "users",
+        )}"`,
+      );
     }),
     false,
   );
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('INSERT INTO "users"');
+      return call.sql.includes(
+        `INSERT INTO "${physicalName(
+          "hygiene.lock-reread",
+          "table",
+          "users",
+        )}"`,
+      );
     }),
     false,
   );
@@ -253,6 +283,7 @@ test("database ledger startup re-reads materialization version under the migrati
 
 test("database ledger startup creates indexes for incremental create-table migrations", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.incremental-indexes",
     events: {},
     queues: {},
     signals: {},
@@ -304,19 +335,37 @@ test("database ledger startup creates indexes for incremental create-table migra
 
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('CREATE TABLE IF NOT EXISTS "users"');
+      return call.sql.includes(
+        `CREATE TABLE IF NOT EXISTS "${physicalName(
+          "hygiene.incremental-indexes",
+          "table",
+          "users",
+        )}"`,
+      );
     }),
     false,
   );
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('CREATE TABLE IF NOT EXISTS "sessions"');
+      return call.sql.includes(
+        `CREATE TABLE IF NOT EXISTS "${physicalName(
+          "hygiene.incremental-indexes",
+          "table",
+          "sessions",
+        )}"`,
+      );
     }),
     true,
   );
   assert.equal(
     storage.calls.some((call) => {
-      return call.sql.includes('CREATE INDEX IF NOT EXISTS "sessionsByUser"');
+      return call.sql.includes(
+        `CREATE INDEX IF NOT EXISTS "${physicalName(
+          "hygiene.incremental-indexes",
+          "index",
+          "sessionsByUser",
+        )}"`,
+      );
     }),
     true,
   );
@@ -334,6 +383,7 @@ test("database ledger startup creates indexes for incremental create-table migra
 
 test("database ledger startup preserves foreign keys for incrementally created tables", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.incremental-foreign-keys",
     events: {},
     queues: {},
     signals: {},
@@ -386,19 +436,32 @@ test("database ledger startup preserves foreign keys for incrementally created t
 
   await ledger.close();
 
+  const sessionsTable = physicalName(
+    "hygiene.incremental-foreign-keys",
+    "table",
+    "sessions",
+  );
+  const usersTable = physicalName(
+    "hygiene.incremental-foreign-keys",
+    "table",
+    "users",
+  );
   const createSessions = storage.calls.find((call) => {
-    return call.sql.includes('CREATE TABLE IF NOT EXISTS "sessions"');
+    return call.sql.includes(`CREATE TABLE IF NOT EXISTS "${sessionsTable}"`);
   });
 
   assert.ok(createSessions !== undefined);
   assert.match(
     createSessions.sql,
-    /CONSTRAINT "sessionUser" FOREIGN KEY \("userId"\) REFERENCES "users" \("userId"\) ON DELETE RESTRICT/,
+    new RegExp(
+      `CONSTRAINT "sessionUser" FOREIGN KEY \\("userId"\\) REFERENCES "${usersTable}" \\("userId"\\) ON DELETE RESTRICT`,
+    ),
   );
 });
 
 test("database ledger startup rejects foreign keys that depend on same-migration added columns", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.late-foreign-key-columns",
     events: {},
     queues: {},
     signals: {},
@@ -456,7 +519,11 @@ test("database ledger startup rejects foreign keys that depend on same-migration
     (error: unknown) => {
       return errorTreeIncludesMessage(
         error,
-        "materialization late-foreign-key-columns migration cannot add foreign key sessionUser incrementally on SQLite",
+        `materialization ${physicalName(
+          "hygiene.late-foreign-key-columns",
+          "materialization",
+          "late-foreign-key-columns",
+        )} migration cannot add foreign key sessionUser incrementally on SQLite`,
       );
     },
   );
@@ -470,6 +537,7 @@ test("database ledger startup rejects foreign keys that depend on same-migration
 
 test("database ledger startup runs data migrations against replayed schema state", async () => {
   const shape = defineLedgerShape({
+    moduleId: "hygiene.replayed-data",
     events: {},
     queues: {},
     signals: {},

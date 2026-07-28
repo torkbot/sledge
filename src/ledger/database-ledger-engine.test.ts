@@ -8,10 +8,7 @@ import test from "node:test";
 import { Type, type TSchema } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
-import {
-  createBetterSqliteLedger,
-  createBetterSqliteStorageRuntime,
-} from "./better-sqlite3-ledger.ts";
+import { createBetterSqliteStorageRuntime } from "./better-sqlite3-ledger.ts";
 import {
   createDatabaseLedger,
   type StorageDatabase,
@@ -23,16 +20,56 @@ import {
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
+  type LedgerTiming,
   type RegisteredLedgerModel,
   type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
 } from "./ledger.ts";
+import type { DatabaseLedger } from "./database-ledger-engine.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import { defineProjectionSchema } from "./projections.ts";
 import { createTursoStorageRuntime } from "./turso-ledger.ts";
 
 const projectionCompiler = createSqliteProjectionStatementCompiler();
+
+function createBetterSqliteLedger<
+  const TEvents extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema>,
+  const TIndexers extends Record<string, TSchema>,
+  const TQueries extends Record<string, QuerySchema<TSchema, TSchema>>,
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
+>(input: {
+  readonly databaseUrl: string;
+  readonly model: RegisteredLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
+  >;
+  readonly timing: LedgerTiming;
+}): DatabaseLedger<TEvents, TQueries, TSignals> {
+  return createDatabaseLedger({
+    storage: createBetterSqliteStorageRuntime(input.databaseUrl),
+    model: input.model,
+    projectionCompiler,
+    timing: input.timing,
+  });
+}
 
 type EngineFixtureModel<
   TEvents extends Record<string, TSchema>,
@@ -3652,6 +3689,14 @@ test("work metadata migration adds columns before creating indexes", async () =>
   const database = new Database(databaseUrl);
 
   database.exec(`
+    CREATE TABLE sledge_storage_layout (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      version INTEGER NOT NULL
+    );
+
+    INSERT INTO sledge_storage_layout (singleton, version)
+    VALUES (1, 1);
+
     CREATE TABLE events (
       event_id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts_ms INTEGER NOT NULL,
