@@ -17,6 +17,8 @@
 - Expose each registered module's event, query, and signal tokens so module
   factories can return one capability-bearing value for reuse and root
   composition.
+- Preserve aliased event payload and query parameter/result types when one
+  generic module factory consumes another generic module.
 - Execute event contributions deterministically in root composition order
   inside one atomic append transaction.
 - Persist the composed root's ordered module ids and reject runtimes whose
