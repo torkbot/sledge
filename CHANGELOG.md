@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Store `null` written to nullable JSON projection columns as SQL `NULL`, so
+  `whereNull(...)`, `whereNotNull(...)`, and nullable reads agree while
+  non-null JSON columns can still store the JSON literal `null`.
+- Reject ambiguous `null` predicates for nullable JSON columns and `null`
+  entries in nullable-column `orderByList(...)` values; use `whereNull(...)`
+  and `orderByNulls(...)` for SQL null semantics.
 - Breaking: require every ledger shape to declare a stable `moduleId`, compose
   registered modules explicitly with `composeLedgerModels(...)`, and use opaque
   event, query, and signal tokens at runtime.

@@ -104,6 +104,23 @@ export const CountQueryResultSchema = Type.Number();
 
 export const SourceEventIdsResultSchema = Type.Array(Type.Number());
 
+const JsonNullValuesQueryParamsSchema = Type.Object({
+  sourceEventId: Type.Number(),
+});
+
+const JsonNullValuesQueryResultSchema = Type.Union([
+  Type.Null(),
+  Type.Object({
+    nullableValue: Type.Union([
+      Type.Null(),
+      Type.Object({
+        value: Type.String(),
+      }),
+    ]),
+    requiredJsonNull: Type.Null(),
+  }),
+]);
+
 const ledgerContractShape = defineLedgerShape({
   moduleId: "ledger.contract",
   events: {
@@ -136,16 +153,26 @@ const ledgerContractMaterializations = defineMaterialization(
   },
 )
   .version(1, "create contract projection", (s) =>
-    s.createTable("contractProjection", (t) =>
-      t
-        .columns({
-          sourceEventId: t.integer().notNull(),
-          decisionAttempts: t.integer().notNull(),
-          dispatchCount: t.integer().notNull(),
-          plannedIntentEventId: t.integer(),
-        })
-        .primaryKey(["sourceEventId"]),
-    ),
+    s
+      .createTable("contractProjection", (t) =>
+        t
+          .columns({
+            sourceEventId: t.integer().notNull(),
+            decisionAttempts: t.integer().notNull(),
+            dispatchCount: t.integer().notNull(),
+            plannedIntentEventId: t.integer(),
+          })
+          .primaryKey(["sourceEventId"]),
+      )
+      .createTable("jsonNullProjection", (t) =>
+        t
+          .columns({
+            sourceEventId: t.integer().notNull(),
+            nullableValue: t.json<{ readonly value: string } | null>(),
+            requiredJsonNull: t.json<null>().notNull(),
+          })
+          .primaryKey(["sourceEventId"]),
+      ),
   )
   .define({
     indexers: {
@@ -155,6 +182,10 @@ const ledgerContractMaterializations = defineMaterialization(
       },
       upsertControlledObserved: {
         sourceEvent: "controlled-work.requested",
+        input: UpsertObservedIndexerInputSchema,
+      },
+      insertJsonNulls: {
+        sourceEvent: "message.received",
         input: UpsertObservedIndexerInputSchema,
       },
       incrementDecisionAttempts: {
@@ -182,6 +213,10 @@ const ledgerContractMaterializations = defineMaterialization(
       seenSourceEventIds: {
         params: SeenSourceEventIdsQueryParamsSchema,
         result: SourceEventIdsResultSchema,
+      },
+      jsonNullValues: {
+        params: JsonNullValuesQueryParamsSchema,
+        result: JsonNullValuesQueryResultSchema,
       },
     },
   });
@@ -219,6 +254,16 @@ const ledgerContractImplementations = {
         })
         .onConflict(["sourceEventId"])
         .doNothing()
+        .execute();
+    },
+    insertJsonNulls: async ({ input, db }) => {
+      await db
+        .insertInto("jsonNullProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          nullableValue: null,
+          requiredJsonNull: null,
+        })
         .execute();
     },
     incrementDecisionAttempts: async ({ input, db }) => {
@@ -293,6 +338,15 @@ const ledgerContractImplementations = {
         .execute();
 
       return rows.map((row) => row.sourceEventId).sort((a, b) => a - b);
+    },
+    jsonNullValues: async ({ params, db }) => {
+      return await db
+        .selectFrom("jsonNullProjection")
+        .select(["nullableValue", "requiredJsonNull"])
+        .where("sourceEventId", "=", params.sourceEventId)
+        .whereNull("nullableValue")
+        .whereNotNull("requiredJsonNull")
+        .executeTakeFirst();
     },
   },
 } satisfies MaterializationImplementationRegistration<
@@ -646,6 +700,9 @@ export function createLedgerContractModel(input: {
     events: {
       "message.received": async ({ event, actions }) => {
         await actions.index("upsertObserved", {
+          sourceEventId: event.eventId,
+        });
+        await actions.index("insertJsonNulls", {
           sourceEventId: event.eventId,
         });
 
@@ -1641,6 +1698,28 @@ export function runLedgerContractSuite(input: {
         assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
       });
     });
+
+    await t.test(
+      "nullable JSON null round trips through SQL null semantics",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const event = await harness.ledger.emit("message.received", {
+            type: "message.received",
+            text: "json null contract",
+          });
+
+          assert.deepEqual(
+            await harness.ledger.query("jsonNullValues", {
+              sourceEventId: event.eventId,
+            }),
+            {
+              nullableValue: null,
+              requiredJsonNull: null,
+            },
+          );
+        });
+      },
+    );
 
     await t.test("dedupe key prevents duplicate downstream work", async () => {
       await withHarness(input.create, async (harness) => {
