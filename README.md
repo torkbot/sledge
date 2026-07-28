@@ -166,12 +166,12 @@ await using workers = await ledger.startWorkers({
   scheduler: new NodeRuntimeScheduler(),
 });
 
-await ledger.emit(ledgerShape.events["user.created"], {
+await ledger.emit(usersModel.events["user.created"], {
   userId: "u_123",
   email: "alice@example.com",
 });
 
-const user = await ledger.query(definedModel.queries.userById, {
+const user = await ledger.query(usersModel.queries.userById, {
   userId: "u_123",
 });
 console.log(user);
@@ -416,6 +416,11 @@ Every runtime receives one explicitly composed root model:
 const model = composeLedgerModels(usersModel, auditModel, deliveryModel);
 ```
 
+Registered modules retain the exact event, query, and signal token maps created
+during definition. A module factory can therefore return its registered module
+directly: consumers use its public tokens as capabilities, while the
+composition root passes the same value to `composeLedgerModels(...)`.
+
 Modules can reuse an event contract by supplying another module's event token
 as the definition value. The alias is a code-level name for the exact same
 persisted event:
@@ -424,13 +429,13 @@ persisted event:
 const auditShape = defineLedgerShape({
   moduleId: "app.audit",
   events: {
-    userCreated: ledgerShape.events["user.created"],
+    userCreated: usersModel.events["user.created"],
   },
 });
 ```
 
 Query definitions work the same way: supplying
-`definedModel.queries.userById` in another module's materialization query
+`usersModel.queries.userById` in another module's materialization query
 definitions creates a local alias that routes to the owning module's query
 implementation. The consuming module does not implement that alias.
 

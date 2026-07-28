@@ -67,7 +67,11 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             eventId: Type.Number(),
           }),
         },
-        signals: {},
+        signals: {
+          progressed: Type.Object({
+            eventId: Type.Number(),
+          }),
+        },
         signalQueues: {},
       });
       const sourceMaterializations = defineMaterialization(sourceShape, {
@@ -152,10 +156,14 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         },
       });
 
+      assert.equal(source.events, sourceDefinition.events);
+      assert.equal(source.queries, sourceDefinition.queries);
+      assert.equal(source.signals, sourceDefinition.signals);
+
       const laterShape = defineLedgerShape({
         moduleId: "contract.later",
         events: {
-          sourceCreated: sourceShape.events.created,
+          sourceCreated: source.events.created,
         },
         queues: {},
         signals: {},
@@ -227,7 +235,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const consumerShape = defineLedgerShape({
         moduleId: "contract.consumer",
         events: {
-          sourceCreated: sourceShape.events.created,
+          sourceCreated: source.events.created,
         },
         queues: {
           deliver: Type.Object({
@@ -258,8 +266,8 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             },
           },
           queries: {
-            sourceCount: sourceDefinition.queries.count,
-            laterCount: laterDefinition.queries.count,
+            sourceCount: source.queries.count,
+            laterCount: later.queries.count,
             ownCount: {
               params: CountQueryParamsSchema,
               result: CountQueryResultSchema,
@@ -330,7 +338,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const failureShape = defineLedgerShape({
         moduleId: "contract.failure",
         events: {
-          sourceCreated: sourceShape.events.created,
+          sourceCreated: source.events.created,
         },
         queues: {},
         signals: {},
@@ -371,21 +379,15 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         phase = "append and query";
         assert.equal(Object.isFrozen(sourceShape.events.created), true);
         assert.deepEqual(Object.keys(sourceShape.events.created), []);
-        assert.equal(
-          consumerShape.events.sourceCreated,
-          sourceShape.events.created,
-        );
-        assert.equal(
-          consumerDefinition.queries.sourceCount,
-          sourceDefinition.queries.count,
-        );
+        assert.equal(consumer.events.sourceCreated, source.events.created);
+        assert.equal(consumer.queries.sourceCount, source.queries.count);
 
-        const event = await ledger.emit(sourceShape.events.created, {
+        const event = await ledger.emit(source.events.created, {
           id: "account-1",
         });
 
         assert.equal(event.eventId, 1);
-        assert.equal(event.event, sourceShape.events.created);
+        assert.equal(event.event, source.events.created);
         assert.deepEqual(contributions, [
           "source:1",
           "consumer:1:0",
@@ -393,18 +395,9 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           "later:1",
           "failure",
         ]);
-        assert.equal(
-          await ledger.query(consumerDefinition.queries.sourceCount, {}),
-          1,
-        );
-        assert.equal(
-          await ledger.query(consumerDefinition.queries.laterCount, {}),
-          1,
-        );
-        assert.equal(
-          await ledger.query(consumerDefinition.queries.ownCount, {}),
-          1,
-        );
+        assert.equal(await ledger.query(consumer.queries.sourceCount, {}), 1);
+        assert.equal(await ledger.query(consumer.queries.laterCount, {}), 1);
+        assert.equal(await ledger.query(consumer.queries.ownCount, {}), 1);
 
         const work = await ledger.listWork({
           queueName: "deliver",
@@ -460,17 +453,14 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 
         rejectAppend = true;
         await assert.rejects(
-          ledger.emit(sourceShape.events.created, {
+          ledger.emit(source.events.created, {
             id: "account-2",
           }),
           /reject append/,
         );
-        assert.equal(await ledger.query(sourceDefinition.queries.count, {}), 1);
-        assert.equal(await ledger.query(laterDefinition.queries.count, {}), 1);
-        assert.equal(
-          await ledger.query(consumerDefinition.queries.ownCount, {}),
-          1,
-        );
+        assert.equal(await ledger.query(source.queries.count, {}), 1);
+        assert.equal(await ledger.query(later.queries.count, {}), 1);
+        assert.equal(await ledger.query(consumer.queries.ownCount, {}), 1);
 
         const abortController = new AbortController();
         const iterator = ledger
@@ -484,7 +474,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         await iterator.return?.();
 
         assert.equal(persisted.done, false);
-        assert.equal(persisted.value.event.event, sourceShape.events.created);
+        assert.equal(persisted.value.event.event, source.events.created);
         assert.equal(persisted.value.event.eventId, 1);
       } finally {
         phase = "close first ledger";
@@ -495,12 +485,9 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       ledger = await openLedger();
       try {
         phase = "query after restart";
-        assert.equal(await ledger.query(sourceDefinition.queries.count, {}), 1);
-        assert.equal(await ledger.query(laterDefinition.queries.count, {}), 1);
-        assert.equal(
-          await ledger.query(consumerDefinition.queries.ownCount, {}),
-          1,
-        );
+        assert.equal(await ledger.query(source.queries.count, {}), 1);
+        assert.equal(await ledger.query(later.queries.count, {}), 1);
+        assert.equal(await ledger.query(consumer.queries.ownCount, {}), 1);
 
         if (remainingWorkRef === null) {
           throw new Error("expected remaining work ref");

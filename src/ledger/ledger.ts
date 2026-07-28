@@ -895,6 +895,9 @@ export type RegisteredLedgerModel<
 > = {
   readonly [registeredLedgerModelBrand]: true;
   readonly moduleId: TModuleId;
+  readonly events: TEventTokens;
+  readonly queries: TQueryTokens;
+  readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
   readonly [registeredLedgerContractsBrand]: {
     readonly events: TEventTokens;
     readonly queries: TQueryTokens;
@@ -1962,6 +1965,9 @@ export function withMaterializations<
 type RegisteredLedgerModelRuntime = {
   readonly [registeredLedgerModelBrand]: true;
   readonly moduleId: string;
+  readonly events: Readonly<Record<string, AnyEventToken>>;
+  readonly queries: Readonly<Record<string, AnyQueryToken>>;
+  readonly signals: Readonly<Record<string, AnySignalToken>>;
   readonly [registeredLedgerContractsBrand]: {
     readonly events: Readonly<Record<string, AnyEventToken>>;
     readonly queries: Readonly<Record<string, AnyQueryToken>>;
@@ -4687,6 +4693,9 @@ function createDefinedLedgerModel<
           register: physical.register as typeof register,
         },
         moduleId: input.moduleId,
+        events: input.contracts.events,
+        queries: input.contracts.queries,
+        signals: input.contracts.signals,
         materializationHistory: input.materializationHistory,
         model: localModel,
         projections: input.access.projections,
