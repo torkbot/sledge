@@ -5,6 +5,8 @@
 - Breaking: require every ledger shape to declare a stable `moduleId`, compose
   registered modules explicitly with `composeLedgerModels(...)`, and use opaque
   event, query, and signal tokens at runtime.
+- Allow unused `queues`, `signals`, and `signalQueues` shape categories to be
+  omitted; omitted categories are exact empty definitions.
 - Breaking: storage adapters now accept only a composed root model; remove the
   uncomposed `createLedger(...)` and `LedgerEngineFactory` public seam.
 - Allow modules to alias another composed module's exact event and query

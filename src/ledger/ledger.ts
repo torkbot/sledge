@@ -1785,15 +1785,15 @@ export type DefinedLedgerModel<
 export function defineLedgerShape<
   const TModuleId extends string,
   const TEventDefinitions extends Record<string, EventDefinition>,
-  const TQueues extends Record<string, TSchema>,
-  const TSignals extends Record<string, TSchema>,
-  const TSignalQueues extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema> = {},
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
 >(input: {
   readonly moduleId: TModuleId;
   readonly events: TEventDefinitions;
-  readonly queues: TQueues & PrivateSchemaDefinitions<TQueues>;
-  readonly signals: TSignals & PrivateSchemaDefinitions<TSignals>;
-  readonly signalQueues: TSignalQueues &
+  readonly queues?: TQueues & PrivateSchemaDefinitions<TQueues>;
+  readonly signals?: TSignals & PrivateSchemaDefinitions<TSignals>;
+  readonly signalQueues?: TSignalQueues &
     PrivateSchemaDefinitions<TSignalQueues>;
 }): DefinedLedgerShape<
   EventSchemasFor<TEventDefinitions>,
@@ -1804,16 +1804,23 @@ export function defineLedgerShape<
   EventTokensFor<TModuleId, TEventDefinitions>
 > {
   validateModuleId(input.moduleId);
-  validatePrivateSchemaDefinitions("queue", input.queues);
-  validatePrivateSchemaDefinitions("signal", input.signals);
-  validatePrivateSchemaDefinitions("signal queue", input.signalQueues);
+  const queueDefinitions = (input.queues ?? {}) as TQueues;
+  const signalDefinitions = (input.signals ?? {}) as TSignals;
+  const signalQueueDefinitions = (input.signalQueues ?? {}) as TSignalQueues;
+  validatePrivateSchemaDefinitions("queue", queueDefinitions);
+  validatePrivateSchemaDefinitions("signal", signalDefinitions);
+  validatePrivateSchemaDefinitions("signal queue", signalQueueDefinitions);
   const events = createEventTokens(input.moduleId, input.events);
-  const queues = createSchemaTokens(input.moduleId, "queue", input.queues);
-  const signals = createSchemaTokens(input.moduleId, "signal", input.signals);
+  const queues = createSchemaTokens(input.moduleId, "queue", queueDefinitions);
+  const signals = createSchemaTokens(
+    input.moduleId,
+    "signal",
+    signalDefinitions,
+  );
   const signalQueues = createSchemaTokens(
     input.moduleId,
     "signal_queue",
-    input.signalQueues,
+    signalQueueDefinitions,
   );
   const eventSchemas = readEventSchemas(input.events);
   const shape: LedgerShape<
@@ -1823,9 +1830,9 @@ export function defineLedgerShape<
     TSignalQueues
   > = {
     events: eventSchemas,
-    queues: input.queues,
-    signals: input.signals,
-    signalQueues: input.signalQueues,
+    queues: queueDefinitions,
+    signals: signalDefinitions,
+    signalQueues: signalQueueDefinitions,
   };
 
   return {

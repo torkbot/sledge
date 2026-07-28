@@ -50,8 +50,6 @@ const ledgerShape = defineLedgerShape({
       email: Type.String(),
     }),
   },
-  signals: {},
-  signalQueues: {},
 });
 
 const materializations = defineMaterialization(ledgerShape, {
@@ -191,9 +189,9 @@ boundary contracts with TypeBox:
 - `signals`: process-local, short-lived records emitted by queue handlers
 - `signalQueues`: retryable work materialized from signals
 
-All four fields are explicit. Use `{}` when a shape has no contracts in that
-category. Plain event definitions create contracts owned by that module and
-produce opaque event tokens such as
+`events` is required. Omit `queues`, `signals`, or `signalQueues` when the
+module does not define contracts in that category. Plain event definitions
+create contracts owned by that module and produce opaque event tokens such as
 `ledgerShape.events["user.created"]`. Runtime APIs accept these tokens instead
 of string names.
 
@@ -428,9 +426,6 @@ const auditShape = defineLedgerShape({
   events: {
     userCreated: ledgerShape.events["user.created"],
   },
-  queues: {},
-  signals: {},
-  signalQueues: {},
 });
 ```
 

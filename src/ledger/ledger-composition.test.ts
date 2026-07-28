@@ -762,6 +762,20 @@ test("composition requires unique module ids and exact contract owners", () => {
   }
 });
 
+test("unused queue and signal definitions may be omitted", () => {
+  const shape = defineLedgerShape({
+    moduleId: "contract.minimal",
+    events: {
+      created: Type.Object({}),
+    },
+  });
+
+  assert.deepEqual(shape.shape.queues, {});
+  assert.deepEqual(shape.shape.signals, {});
+  assert.deepEqual(shape.shape.signalQueues, {});
+  assert.doesNotThrow(() => composeLedgerModels(shape.register({})));
+});
+
 function errorTreeIncludesMessage(error: unknown, message: string): boolean {
   if (error instanceof Error && error.message.includes(message)) {
     return true;
