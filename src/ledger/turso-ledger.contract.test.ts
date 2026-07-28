@@ -7,13 +7,14 @@ import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { createTursoLedger } from "./turso-ledger.ts";
 import {
   createLedgerContractControlledWork,
+  createLedgerContractHarnessLedger,
   createLedgerContractModel,
   LedgerContractPausableScheduler,
   runLedgerContractSuite,
   type LedgerContractDecisionMode,
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
-import { type LedgerWorkers } from "./ledger.ts";
+import { composeLedgerModels, type LedgerWorkers } from "./ledger.ts";
 
 runLedgerContractSuite({
   suiteName: "turso ledger contract",
@@ -28,19 +29,22 @@ runLedgerContractSuite({
     const controlledWork = createLedgerContractControlledWork();
 
     const createRuntimeLedger = async () => {
-      return await createTursoLedger({
+      const model = createLedgerContractModel({
+        readDecisionMode: () => decisionMode,
+        readMaterializationFailureText: () => materializationFailureText,
+        nowMs: () => runtime.nowMs(),
+        runControlledWork: (workKey, attempt) =>
+          controlledWork.run(workKey, attempt),
+      });
+      const ledger = await createTursoLedger({
         databaseUrl,
-        model: createLedgerContractModel({
-          readDecisionMode: () => decisionMode,
-          readMaterializationFailureText: () => materializationFailureText,
-          nowMs: () => runtime.nowMs(),
-          runControlledWork: (workKey, attempt) =>
-            controlledWork.run(workKey, attempt),
-        }),
+        model: composeLedgerModels(model),
         timing: {
           clock: runtime.clock,
         },
       });
+
+      return createLedgerContractHarnessLedger(ledger);
     };
 
     let ledger = await createRuntimeLedger();

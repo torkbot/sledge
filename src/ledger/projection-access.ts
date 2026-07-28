@@ -1376,41 +1376,46 @@ export type ProjectionAccess<
   TQueries extends Record<string, AnyQuerySchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TOwnedQueryDefinitions extends ProjectionQueryDefinitions = TQueryDefinitions,
 > = {
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexers;
   readonly queries: TQueries;
   readonly indexerDefinitions: TIndexerDefinitions;
   readonly queryDefinitions: TQueryDefinitions;
+  readonly ownedQueryDefinitions: TOwnedQueryDefinitions;
 };
 
 export function createProjectionAccess<
   const TProjectionSchema extends AnyProjectionSchema,
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   const TQueryDefinitions extends ProjectionQueryDefinitions,
+  const TOwnedQueryDefinitions extends ProjectionQueryDefinitions,
 >(input: {
   readonly projections: TProjectionSchema;
   readonly indexers: TIndexerDefinitions;
   readonly queries: TQueryDefinitions;
+  readonly ownedQueries: TOwnedQueryDefinitions;
 }): ProjectionAccess<
   TProjectionSchema,
   ProjectionIndexerSchemas<TIndexerDefinitions>,
   ProjectionQuerySchemas<TQueryDefinitions>,
   TIndexerDefinitions,
-  TQueryDefinitions
+  TQueryDefinitions,
+  TOwnedQueryDefinitions
 > {
   const indexers: Record<string, TSchema> = {};
   const queries: Record<string, AnyQuerySchema> = {};
 
   for (const [indexerName, definition] of Object.entries(input.indexers)) {
-    indexers[indexerName] = definition.input;
+    defineProjectionRecordEntry(indexers, indexerName, definition.input);
   }
 
   for (const [queryName, definition] of Object.entries(input.queries)) {
-    queries[queryName] = {
+    defineProjectionRecordEntry(queries, queryName, {
       params: definition.params,
       result: definition.result,
-    };
+    });
   }
 
   return {
@@ -1419,13 +1424,28 @@ export function createProjectionAccess<
     queries,
     indexerDefinitions: input.indexers,
     queryDefinitions: input.queries,
+    ownedQueryDefinitions: input.ownedQueries,
   } as ProjectionAccess<
     TProjectionSchema,
     ProjectionIndexerSchemas<TIndexerDefinitions>,
     ProjectionQuerySchemas<TQueryDefinitions>,
     TIndexerDefinitions,
-    TQueryDefinitions
+    TQueryDefinitions,
+    TOwnedQueryDefinitions
   >;
+}
+
+function defineProjectionRecordEntry<TValue>(
+  record: Record<string, TValue>,
+  name: string,
+  value: TValue,
+): void {
+  Object.defineProperty(record, name, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
 }
 
 export type ProjectionImplementationRegistration<
@@ -5121,6 +5141,10 @@ async function readProjectionEvents<
           eventSchema,
           "event",
           group.eventName,
+          statementCompiler.resolveStorageStreamName({
+            eventName: group.eventName,
+            streamKind: "event",
+          }),
           row,
         ) as AnyProjectionEventEnvelope<TEvents>;
         eventsByRef.set(
@@ -5171,7 +5195,16 @@ async function scanProjectionEvents<
   const rows = await scope.prepare(sql.text).all(...sql.params);
 
   return rows.map((row) => {
-    return decodeProjectionEventRow(eventSchema, streamKind, eventName, row);
+    return decodeProjectionEventRow(
+      eventSchema,
+      streamKind,
+      eventName,
+      statementCompiler.resolveStorageStreamName({
+        eventName,
+        streamKind,
+      }),
+      row,
+    );
   });
 }
 
@@ -5346,13 +5379,14 @@ function decodeProjectionEventRow<
   eventSchema: TEventSchema,
   streamKind: ProjectionCompilerEventStreamKind,
   eventName: TEventName,
+  storageEventName: string,
   row: LedgerStorageRow,
 ): EventEnvelope<Record<TEventName, TEventSchema>, TEventName> {
   const decodedRow = Value.Decode(ProjectionEventRowSchema, row);
 
-  if (decodedRow.event_name !== eventName) {
+  if (decodedRow.event_name !== storageEventName) {
     throw new Error(
-      `projection ${streamKind} expected ${eventName} but storage returned ${decodedRow.event_name}`,
+      `projection ${streamKind} expected stored stream ${storageEventName} but storage returned ${decodedRow.event_name}`,
     );
   }
 

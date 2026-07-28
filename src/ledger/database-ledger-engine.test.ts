@@ -8,10 +8,7 @@ import test from "node:test";
 import { Type, type TSchema } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
-import {
-  createBetterSqliteLedger,
-  createBetterSqliteStorageRuntime,
-} from "./better-sqlite3-ledger.ts";
+import { createBetterSqliteStorageRuntime } from "./better-sqlite3-ledger.ts";
 import {
   createDatabaseLedger,
   type StorageDatabase,
@@ -20,19 +17,60 @@ import {
 } from "./database-ledger-engine.ts";
 import {
   attachLedgerImplementationFactory,
+  storageRuntimeIdentityBrand,
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
+  type LedgerTiming,
   type RegisteredLedgerModel,
   type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
 } from "./ledger.ts";
+import type { DatabaseLedger } from "./database-ledger-engine.ts";
+import type {
+  AnyProjectionSchema,
+  ProjectionIndexerDefinitions,
+  ProjectionQueryDefinitions,
+} from "./projection-access.ts";
 import { createSqliteProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import { defineProjectionSchema } from "./projections.ts";
 import { createTursoStorageRuntime } from "./turso-ledger.ts";
 
 const projectionCompiler = createSqliteProjectionStatementCompiler();
+
+function createBetterSqliteLedger<
+  const TEvents extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema>,
+  const TIndexers extends Record<string, TSchema>,
+  const TQueries extends Record<string, QuerySchema<TSchema, TSchema>>,
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
+  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
+  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
+  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
+>(input: {
+  readonly databaseUrl: string;
+  readonly model: RegisteredLedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TProjectionSchema,
+    TIndexerDefinitions,
+    TQueryDefinitions
+  >;
+  readonly timing: LedgerTiming;
+}): DatabaseLedger<TEvents, TQueries, TSignals> {
+  return createDatabaseLedger({
+    storage: createBetterSqliteStorageRuntime(input.databaseUrl),
+    model: input.model,
+    projectionCompiler,
+    timing: input.timing,
+  });
+}
 
 type EngineFixtureModel<
   TEvents extends Record<string, TSchema>,
@@ -124,6 +162,7 @@ function defineEngineFixtureModel<
       // Engine tests exercise custom storage hooks that the public v2
       // construction path deliberately no longer exposes.
       const registeredModel = {
+        moduleId: "engine.fixture",
         materializationHistory: null,
         model,
         projections,
@@ -284,6 +323,7 @@ function singleConnectionStorageRuntime(
   database: StorageDatabase,
 ): StorageRuntime {
   return {
+    [storageRuntimeIdentityBrand]: `single-connection-test:${randomUUID()}`,
     read: async (run) => await run(database),
     write: async (run) => await run(database),
     close: async () => undefined,
@@ -1171,6 +1211,7 @@ test("ledger close waits for startup before closing storage", async () => {
   let closeCalled = false;
 
   const storage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]: databaseUrl,
     read: async (run) => await run(storageDatabase),
     write: async (run) => {
       startupEntered.resolve();
@@ -1220,11 +1261,84 @@ test("ledger close waits for startup before closing storage", async () => {
   }
 });
 
+test("ledger startup initialization is isolated per database", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const firstDatabaseUrl = createTempDatabasePath();
+  const secondDatabaseUrl = createTempDatabasePath();
+  const firstStorageRuntime =
+    createBetterSqliteStorageRuntime(firstDatabaseUrl);
+  const secondStorageRuntime =
+    createBetterSqliteStorageRuntime(secondDatabaseUrl);
+  const firstStartupEntered = Promise.withResolvers<void>();
+  const allowFirstStartup = Promise.withResolvers<void>();
+  let firstWrite = true;
+  const firstStorage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]:
+      firstStorageRuntime[storageRuntimeIdentityBrand],
+    read: async (run) => await firstStorageRuntime.read(run),
+    write: async (run) => {
+      return await firstStorageRuntime.write(async (database) => {
+        if (firstWrite) {
+          firstWrite = false;
+          firstStartupEntered.resolve();
+          await allowFirstStartup.promise;
+        }
+
+        return await run(database);
+      });
+    },
+    close: async () => await firstStorageRuntime.close(),
+  };
+  const model = defineEngineFixtureModel({
+    events: {},
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  });
+  const firstLedger = createDatabaseLedger({
+    projectionCompiler,
+    storage: firstStorage,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const secondLedger = createDatabaseLedger({
+    projectionCompiler,
+    storage: secondStorageRuntime,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    await firstStartupEntered.promise;
+
+    const secondStartup = secondLedger.listWork();
+    assert.equal(await settlesWithin(secondStartup, 50), true);
+    assert.deepEqual(await secondStartup, []);
+  } finally {
+    allowFirstStartup.resolve();
+    await Promise.allSettled([firstLedger.close(), secondLedger.close()]);
+    await rm(firstDatabaseUrl, { force: true });
+    await rm(secondDatabaseUrl, { force: true });
+  }
+});
+
 test("ledger close closes storage after startup failure", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   let closeCalled = false;
 
   const storage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]: `startup-failure-test:${randomUUID()}`,
     read: async () => {
       throw new Error("unexpected read");
     },
@@ -1356,6 +1470,7 @@ test("worker supervision reports work-processing failures", async () => {
   let ackFailed = false;
 
   const failingStorage: StorageRuntime = {
+    [storageRuntimeIdentityBrand]: storage[storageRuntimeIdentityBrand],
     read: async (run) => await storage.read(run),
     write: async (run) => {
       return await storage.write(async (database) => {
@@ -2048,7 +2163,7 @@ test("deduped emit does not replay projections or materialization", async () => 
             dedupeKey: "message:42",
           },
         ),
-      /dedupe key message:42 already belongs to event message\.received/,
+      /dedupe key message:42 already belongs to another event contract/,
     );
 
     await waitFor(runtime, () => processed === 1);
@@ -3300,12 +3415,6 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
   const database = new Database(databaseUrl);
   const observedAbort = Promise.withResolvers<void>();
   let workId = 0;
-  let workRef: {
-    readonly sourceEventId: number;
-    readonly signal: boolean;
-    readonly queueName: string;
-    readonly workKey: string;
-  } | null = null;
 
   const model = defineEngineFixtureModel({
     events: {
@@ -3335,12 +3444,6 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
       queues: {
         "job.run": async ({ work, lease }) => {
           workId = work.workId;
-          workRef = {
-            sourceEventId: work.sourceEventId,
-            signal: false,
-            queueName: String(work.queueName),
-            workKey: `job:${work.payload.id}`,
-          };
 
           if (lease.signal.aborted) {
             observedAbort.resolve();
@@ -3379,13 +3482,14 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
 
   await ledger.emit("job.requested", { id: 1 });
   await waitFor(runtime, () => workId !== 0);
+  const leasedWork = await ledger.queryWork({ workId });
 
-  if (workRef === null) {
+  if (leasedWork?.ref === null || leasedWork === null) {
     assert.fail("expected work ref");
   }
 
   const cancelled = await ledger.cancelWork({
-    ref: workRef,
+    ref: leasedWork.ref,
     reason: "stop now",
   });
 
@@ -3652,6 +3756,15 @@ test("work metadata migration adds columns before creating indexes", async () =>
   const database = new Database(databaseUrl);
 
   database.exec(`
+    CREATE TABLE sledge_storage_layout (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      version INTEGER NOT NULL,
+      module_ids_json TEXT NOT NULL
+    );
+
+    INSERT INTO sledge_storage_layout (singleton, version, module_ids_json)
+    VALUES (1, 1, '["engine.fixture"]');
+
     CREATE TABLE events (
       event_id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts_ms INTEGER NOT NULL,
@@ -3705,6 +3818,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
     return (row as { readonly name?: unknown }).name;
   });
 
+  assert.ok(columnNames.includes("work_ref"));
   assert.ok(columnNames.includes("work_key"));
   assert.ok(columnNames.includes("partition_key"));
 
@@ -3714,6 +3828,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
   });
 
   assert.ok(indexNames.includes("idx_work_ref"));
+  assert.ok(indexNames.includes("idx_work_key"));
   assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 

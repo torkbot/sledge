@@ -8,21 +8,32 @@ import { Value } from "typebox/value";
 import { ChangeSignal, raceWithSignal } from "../runtime/async-signals.ts";
 import { createEventRef } from "./event-ref.ts";
 import {
+  composedLedgerModulesBrand,
+  readLedgerProjectionCompiler,
+  readLedgerProjectionSchemas,
   readLedgerImplementations,
+  registeredLedgerContractsBrand,
+  registeredLedgerRuntimeBrand,
+  storageRuntimeIdentityBrand,
   type LedgerStorageRow,
   type LedgerStorageScope,
   type LedgerStorageStatement,
 } from "./internal-storage.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
+  AnyComposedLedgerModel,
   AnyMaterializationHistory,
+  ComposedLedgerEventTokens,
+  ComposedLedgerQueryTokens,
+  ComposedLedgerSignalTokens,
   RegisteredLedgerModel,
+  EmitOptions,
   EventEnvelope,
   Ledger,
   LedgerCursor,
-  LedgerStreamEvent,
   LedgerTiming,
   LedgerIndexerContext,
+  ListWorkInput,
   LedgerWorkerOptions,
   LedgerWorkers,
   QuerySchema,
@@ -41,6 +52,8 @@ import type {
   WorkSnapshot,
   WorkState,
   MaterializationMigrationOperation,
+  QueryWorkInput,
+  SignalSubscription,
 } from "./ledger.ts";
 import type {
   AnyProjectionSchema,
@@ -56,6 +69,56 @@ import type {
 
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
+
+type DatabaseLedgerStreamEvent<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends keyof TEvents = keyof TEvents,
+> = {
+  readonly event: EventEnvelope<TEvents, TEventName>;
+  readonly cursor: LedgerCursor;
+};
+
+export interface DatabaseLedger<
+  TEvents extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQueryDef>,
+  TSignals extends Record<string, TSchema> = {},
+> extends AsyncDisposable {
+  emit<const TEventName extends keyof TEvents>(
+    eventName: TEventName,
+    event: Static<TEvents[TEventName]>,
+    options?: EmitOptions,
+  ): Promise<EventEnvelope<TEvents, TEventName>>;
+
+  query<const TQueryName extends keyof TQueries>(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<Static<TQueries[TQueryName]["result"]>>;
+
+  cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
+
+  queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
+
+  listWork(input?: ListWorkInput): Promise<readonly WorkSnapshot[]>;
+
+  onSignal<const TSignalName extends keyof TSignals>(
+    signalName: TSignalName,
+    observer: SignalObserverFunction<TSignals, TSignalName>,
+  ): SignalSubscription;
+
+  tailEvents(input: {
+    readonly last: number;
+    readonly signal: AbortSignal;
+  }): AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>;
+
+  resumeEvents(input: {
+    readonly cursor: LedgerCursor;
+    readonly signal: AbortSignal;
+  }): AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>;
+
+  startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
+
+  close(): Promise<void>;
+}
 
 type PersistedWorkLease = {
   readonly workId: number;
@@ -91,18 +154,72 @@ type MaterializationReplayState = {
   readonly tables: Map<string, ProjectionTableMetadata>;
 };
 
+type MaterializationRuntimeContext = {
+  readonly compiler: ProjectionStatementCompiler;
+  readonly events: Readonly<Record<string, TSchema>>;
+  readonly projections: AnyProjectionSchema;
+  readonly signals: Readonly<Record<string, TSchema>>;
+};
+
+type RuntimeMaterializationState = {
+  readonly materializationHistory: AnyMaterializationHistory | null;
+  readonly model: {
+    readonly events: Readonly<Record<string, TSchema>>;
+    readonly signals: Readonly<Record<string, TSchema>>;
+  };
+  readonly projections: AnyProjectionSchema;
+};
+
+type RuntimeMaterializationModule = RuntimeMaterializationState & {
+  readonly moduleId: string;
+  readonly [registeredLedgerContractsBrand]?: object;
+  readonly [registeredLedgerRuntimeBrand]?: RuntimeMaterializationState;
+};
+
 type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
+const storageLayoutTableName = "sledge_storage_layout";
+const storageLayoutVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
+const StorageLayoutRowSchema = Type.Object({
+  module_ids_json: Type.String(),
+  version: Type.Number(),
+});
+const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
+const databaseInitializationTails = new Map<string, Promise<void>>();
+
+async function serializeDatabaseInitialization<T>(
+  databaseIdentity: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const previous =
+    databaseInitializationTails.get(databaseIdentity) ?? Promise.resolve();
+  const gate = Promise.withResolvers<void>();
+  databaseInitializationTails.set(databaseIdentity, gate.promise);
+
+  await previous;
+
+  try {
+    return await run();
+  } finally {
+    gate.resolve();
+
+    if (databaseInitializationTails.get(databaseIdentity) === gate.promise) {
+      databaseInitializationTails.delete(databaseIdentity);
+    }
+  }
+}
 
 export type StorageStatement = LedgerStorageStatement;
 
 export type StorageDatabase = LedgerStorageScope;
 
 export interface StorageRuntime {
+  readonly [storageRuntimeIdentityBrand]: string;
+
   read<T>(run: (scope: LedgerStorageScope) => Promise<T>): Promise<T>;
 
   write<T>(run: (scope: LedgerStorageScope) => Promise<T>): Promise<T>;
@@ -195,13 +312,406 @@ export function createDatabaseLedger<
     TQueryDefinitions,
     TMaterializationHistory
   >,
-): Ledger<TEvents, TQueries, TSignals> {
+): DatabaseLedger<TEvents, TQueries, TSignals> {
   return openDatabaseLedgerEngine({
     model: input.model,
     projectionCompiler: input.projectionCompiler,
     timing: input.timing,
     storage: input.storage,
   });
+}
+
+export function createComposedDatabaseLedger<
+  const TModel extends AnyComposedLedgerModel,
+>(input: {
+  readonly storage: StorageRuntime;
+  readonly model: TModel;
+  readonly projectionCompiler: ProjectionStatementCompiler;
+  readonly timing: LedgerTiming;
+}): Ledger<
+  ComposedLedgerEventTokens<TModel>,
+  ComposedLedgerQueryTokens<TModel>,
+  ComposedLedgerSignalTokens<TModel>
+> {
+  const rawInput = input as unknown as CreateDatabaseLedgerInput<
+    Record<string, TSchema>,
+    Record<string, TSchema>,
+    Record<string, TSchema>,
+    Record<string, AnyQueryDef>,
+    Record<string, TSchema>,
+    Record<string, TSchema>
+  >;
+  const ledger = createDatabaseLedger(rawInput);
+
+  return createLedgerContractFacade(ledger, input.model) as unknown as Ledger<
+    ComposedLedgerEventTokens<TModel>,
+    ComposedLedgerQueryTokens<TModel>,
+    ComposedLedgerSignalTokens<TModel>
+  >;
+}
+
+function createLedgerContractFacade<
+  TEvents extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQueryDef>,
+  TSignals extends Record<string, TSchema>,
+>(
+  ledger: DatabaseLedger<TEvents, TQueries, TSignals>,
+  model: {
+    readonly [registeredLedgerContractsBrand]: {
+      readonly events: Readonly<Record<string, object>>;
+      readonly queries: Readonly<Record<string, object>>;
+      readonly queues: Readonly<Record<string, object>>;
+      readonly signals: Readonly<Record<string, object>>;
+      readonly signalQueues: Readonly<Record<string, object>>;
+    };
+    readonly [composedLedgerModulesBrand]: readonly {
+      readonly [registeredLedgerContractsBrand]: {
+        readonly queues: Readonly<Record<string, object>>;
+        readonly signalQueues: Readonly<Record<string, object>>;
+      };
+    }[];
+  },
+): object {
+  const contracts = model[registeredLedgerContractsBrand];
+  const workQueueNames = createWorkQueueNameMaps(model);
+
+  return new Proxy(ledger, {
+    get: (target, property, receiver) => {
+      if (property === "emit") {
+        return async (
+          token: object,
+          payload: unknown,
+          options?: {
+            readonly dedupeKey?: string;
+          },
+        ) => {
+          const physicalName = findPhysicalContractName(
+            contracts.events,
+            token,
+            "event",
+          );
+          const event = await target.emit(
+            physicalName as keyof TEvents,
+            payload as Static<TEvents[keyof TEvents]>,
+            options,
+          );
+
+          return createContractEnvelope(event, token);
+        };
+      }
+
+      if (property === "cancelWork") {
+        return async (input: CancelWorkInput) => {
+          const result = await target.cancelWork(input);
+          return localizeCancelWorkResult(result, workQueueNames);
+        };
+      }
+
+      if (property === "queryWork") {
+        return async (input: QueryWorkInput) => {
+          const work = await target.queryWork(input);
+          return work === null
+            ? null
+            : localizeWorkSnapshot(work, workQueueNames);
+        };
+      }
+
+      if (property === "listWork") {
+        return async (input: ListWorkInput = {}) => {
+          if (input.queueName === undefined) {
+            const work = await target.listWork(input);
+            return work.map((item) =>
+              localizeWorkSnapshot(item, workQueueNames),
+            );
+          }
+
+          const physicalNames = [
+            ...(workQueueNames.queues.localToPhysical.get(input.queueName) ??
+              []),
+            ...(workQueueNames.signalQueues.localToPhysical.get(
+              input.queueName,
+            ) ?? []),
+          ];
+
+          if (physicalNames.length === 0) {
+            return await target.listWork({
+              ...input,
+              queueName: unavailablePhysicalQueueName,
+            });
+          }
+
+          const limit = input.limit ?? 100;
+          const work = (
+            await Promise.all(
+              physicalNames.map(async (physicalName) => {
+                return await target.listWork({
+                  ...input,
+                  limit,
+                  queueName: physicalName,
+                });
+              }),
+            )
+          )
+            .flat()
+            .sort((left, right) => left.workId - right.workId)
+            .slice(0, limit);
+
+          return work.map((item) => localizeWorkSnapshot(item, workQueueNames));
+        };
+      }
+
+      if (property === "query") {
+        return async (token: object, params: unknown) => {
+          const physicalName = findPhysicalContractName(
+            contracts.queries,
+            token,
+            "query",
+          );
+
+          return await target.query(
+            physicalName as keyof TQueries,
+            params as Static<TQueries[keyof TQueries]["params"]>,
+          );
+        };
+      }
+
+      if (property === "onSignal") {
+        return (
+          token: object,
+          observer: (signal: object) => void | Promise<void>,
+        ) => {
+          const physicalName = findPhysicalContractName(
+            contracts.signals,
+            token,
+            "signal",
+          );
+
+          return target.onSignal(
+            physicalName as keyof TSignals,
+            async (signal) => {
+              await observer(createContractEnvelope(signal, token));
+            },
+          );
+        };
+      }
+
+      if (property === "tailEvents" || property === "resumeEvents") {
+        return (input: {
+          readonly last?: number;
+          readonly cursor?: LedgerCursor;
+          readonly signal: AbortSignal;
+        }) => {
+          const source =
+            property === "tailEvents"
+              ? target.tailEvents(
+                  input as {
+                    readonly last: number;
+                    readonly signal: AbortSignal;
+                  },
+                )
+              : target.resumeEvents(
+                  input as {
+                    readonly cursor: LedgerCursor;
+                    readonly signal: AbortSignal;
+                  },
+                );
+
+          return mapContractEventStream(source, contracts.events);
+        };
+      }
+
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  });
+}
+
+type WorkQueueNameMap = {
+  readonly localToPhysical: ReadonlyMap<string, readonly string[]>;
+  readonly physicalToLocal: ReadonlyMap<string, string>;
+};
+
+type WorkQueueNameMaps = {
+  readonly queues: WorkQueueNameMap;
+  readonly signalQueues: WorkQueueNameMap;
+};
+
+const unavailablePhysicalQueueName = "\u0000";
+
+function createWorkQueueNameMaps(model: {
+  readonly [registeredLedgerContractsBrand]: {
+    readonly queues: Readonly<Record<string, object>>;
+    readonly signalQueues: Readonly<Record<string, object>>;
+  };
+  readonly [composedLedgerModulesBrand]: readonly {
+    readonly [registeredLedgerContractsBrand]: {
+      readonly queues: Readonly<Record<string, object>>;
+      readonly signalQueues: Readonly<Record<string, object>>;
+    };
+  }[];
+}): WorkQueueNameMaps {
+  const rootContracts = model[registeredLedgerContractsBrand];
+  const queues = createWorkQueueNameMap(
+    model,
+    "queue",
+    rootContracts.queues,
+    "queues",
+  );
+  const signalQueues = createWorkQueueNameMap(
+    model,
+    "signal queue",
+    rootContracts.signalQueues,
+    "signalQueues",
+  );
+
+  return {
+    queues,
+    signalQueues,
+  };
+}
+
+function createWorkQueueNameMap(
+  model: {
+    readonly [composedLedgerModulesBrand]: readonly {
+      readonly [registeredLedgerContractsBrand]: {
+        readonly queues: Readonly<Record<string, object>>;
+        readonly signalQueues: Readonly<Record<string, object>>;
+      };
+    }[];
+  },
+  kind: string,
+  rootContracts: Readonly<Record<string, object>>,
+  key: "queues" | "signalQueues",
+): WorkQueueNameMap {
+  const localToPhysical = new Map<string, string[]>();
+  const physicalToLocal = new Map<string, string>();
+
+  for (const module of model[composedLedgerModulesBrand]) {
+    const moduleContracts = module[registeredLedgerContractsBrand][key];
+
+    for (const [localName, token] of Object.entries(moduleContracts)) {
+      const physicalName = findPhysicalContractName(rootContracts, token, kind);
+      const physicalNames = localToPhysical.get(localName) ?? [];
+
+      physicalNames.push(physicalName);
+      localToPhysical.set(localName, physicalNames);
+      physicalToLocal.set(physicalName, localName);
+    }
+  }
+
+  return {
+    localToPhysical,
+    physicalToLocal,
+  };
+}
+
+function localizeCancelWorkResult(
+  result: CancelWorkResult,
+  names: WorkQueueNameMaps,
+): CancelWorkResult {
+  switch (result.status) {
+    case "cancelled":
+      return {
+        status: "cancelled",
+        work: localizeWorkSnapshot(result.work, names),
+      };
+    case "already_terminal":
+      return {
+        status: "already_terminal",
+        ref: result.ref,
+        work: localizeWorkSnapshot(result.work, names),
+      };
+    case "not_found":
+      return {
+        status: "not_found",
+        ref: result.ref,
+      };
+  }
+}
+
+function localizeWorkSnapshot(
+  work: WorkSnapshot,
+  names: WorkQueueNameMaps,
+): WorkSnapshot {
+  const queueName = localizeStoredQueueName(work.queueName, work.signal, names);
+
+  return {
+    ...work,
+    queueName,
+    ref: work.ref,
+  };
+}
+
+function localizeStoredQueueName(
+  physicalName: string,
+  signal: boolean,
+  names: WorkQueueNameMaps,
+): string {
+  const queueNames = signal ? names.signalQueues : names.queues;
+  const localName = queueNames.physicalToLocal.get(physicalName);
+
+  if (localName === undefined) {
+    throw new Error(`unknown persisted queue ${physicalName}`);
+  }
+
+  return localName;
+}
+
+function createContractEnvelope(
+  event: {
+    readonly causationEventId: number | null;
+    readonly eventId: number;
+    readonly payload: unknown;
+    readonly tsMs: number;
+    readonly dedupeKey: string | null;
+  },
+  token: object,
+): object {
+  return {
+    eventId: event.eventId,
+    event: token,
+    payload: event.payload,
+    tsMs: event.tsMs,
+    ref: createEventRef(token, event.eventId),
+    causationEventId: event.causationEventId,
+    dedupeKey: event.dedupeKey,
+  };
+}
+
+async function* mapContractEventStream<TEvents extends Record<string, TSchema>>(
+  source: AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>,
+  contracts: Readonly<Record<string, object>>,
+): AsyncIterable<{
+  readonly event: object;
+  readonly cursor: LedgerCursor;
+}> {
+  for await (const item of source) {
+    const token = contracts[String(item.event.eventName)];
+
+    if (token === undefined) {
+      throw new Error(
+        `unknown persisted event ${String(item.event.eventName)}`,
+      );
+    }
+
+    yield {
+      event: createContractEnvelope(item.event, token),
+      cursor: item.cursor,
+    };
+  }
+}
+
+function findPhysicalContractName(
+  contracts: Readonly<Record<string, object>>,
+  token: object,
+  kind: string,
+): string {
+  for (const [physicalName, candidate] of Object.entries(contracts)) {
+    if (candidate === token) {
+      return physicalName;
+    }
+  }
+
+  throw new Error(`unknown ${kind} token`);
 }
 
 function parseJson<T>(value: string, context: string): T {
@@ -321,9 +831,14 @@ const WorkIdRowSchema = Type.Object({
 });
 
 const PartitionKeySchema = Type.String({ minLength: 1 });
+const WorkRefSchema = Type.String({
+  pattern:
+    "^work:v1:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+});
 
 const WorkSnapshotRowSchema = Type.Object({
   work_id: Type.Number(),
+  work_ref: Type.Union([Type.Null(), Type.String()]),
   queue_name: Type.String(),
   source_event_id: Type.Number(),
   signal: Type.Number(),
@@ -334,7 +849,6 @@ const WorkSnapshotRowSchema = Type.Object({
   lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
   lease_expires_at_ms: Type.Union([Type.Null(), Type.Number()]),
   last_error: Type.Union([Type.Null(), Type.String()]),
-  work_key: Type.Union([Type.Null(), Type.String()]),
   cancelled: Type.Number(),
   cancel_requested_at_ms: Type.Union([Type.Null(), Type.Number()]),
   cancel_reason: Type.Union([Type.Null(), Type.String()]),
@@ -431,10 +945,15 @@ function openDatabaseLedgerEngine<
     TQueryDefinitions,
     TMaterializationHistory
   >,
-): Ledger<TEvents, TQueries, TSignals> {
+): DatabaseLedger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
   const storage = input.storage;
-  const model = input.model.model;
+  const runtimeCarrier = input.model as typeof input.model & {
+    readonly [registeredLedgerRuntimeBrand]?: typeof input.model;
+  };
+  const registeredRuntime =
+    runtimeCarrier[registeredLedgerRuntimeBrand] ?? input.model;
+  const model = registeredRuntime.model;
   const implementations = readLedgerImplementations<
     TIndexers,
     TQueries,
@@ -442,7 +961,12 @@ function openDatabaseLedgerEngine<
   >(input.model, {
     statementCompiler: input.projectionCompiler,
   });
-  const registration = input.model.register;
+  const registration = registeredRuntime.register;
+  const rootModule = input.model as unknown as RuntimeMaterializationModule & {
+    readonly [composedLedgerModulesBrand]?: readonly RuntimeMaterializationModule[];
+  };
+  const modules = rootModule[composedLedgerModulesBrand] ?? [rootModule];
+  const moduleIds = modules.map((module) => module.moduleId);
 
   let closed = false;
   let activeWorker: WorkerRuntimeState | null = null;
@@ -568,8 +1092,17 @@ function openDatabaseLedgerEngine<
   let activeWriteTransactions = 0;
 
   const startup = (async () => {
-    await storage.write(async (database) => {
-      await database.exec(`
+    // The SQLite drivers fail fast when concurrent handles overlap startup DDL.
+    // Serialize only the one-time initialization path; normal ledger reads and
+    // writes remain concurrent after each handle has started.
+    await serializeDatabaseInitialization(
+      storage[storageRuntimeIdentityBrand],
+      async () => {
+        await storage.write(async (database) => {
+          await ensureStorageLayout(database, moduleIds);
+        });
+        await storage.write(async (database) => {
+          await database.exec(`
       CREATE TABLE IF NOT EXISTS events (
         event_id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts_ms INTEGER NOT NULL,
@@ -582,6 +1115,7 @@ function openDatabaseLedgerEngine<
 
       CREATE TABLE IF NOT EXISTS work (
         work_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_ref TEXT,
         queue_name TEXT NOT NULL,
         work_key TEXT,
         partition_key TEXT,
@@ -604,21 +1138,26 @@ function openDatabaseLedgerEngine<
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
     `);
-    });
+        });
 
-    await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
-    await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
-    await ensureColumn("work", "work_key", "TEXT");
-    await ensureColumn("work", "partition_key", "TEXT");
-    await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
-    await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
-    await ensureColumn("work", "cancel_reason", "TEXT");
-    await ensureColumn("work", "terminal_at_ms", "INTEGER");
-    await storage.write(async (database) => {
-      await database.exec(`
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
+        await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("work", "work_ref", "TEXT");
+        await ensureColumn("work", "work_key", "TEXT");
+        await ensureColumn("work", "partition_key", "TEXT");
+        await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
+        await ensureColumn("work", "cancel_reason", "TEXT");
+        await ensureColumn("work", "terminal_at_ms", "INTEGER");
+        await storage.write(async (database) => {
+          await database.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_key
           ON work(source_event_id, signal, queue_name, work_key)
           WHERE work_key IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
+          ON work(work_ref)
+          WHERE work_ref IS NOT NULL;
 
         CREATE INDEX IF NOT EXISTS idx_work_partition_order
           ON work(signal, queue_name, partition_key, work_id)
@@ -626,13 +1165,41 @@ function openDatabaseLedgerEngine<
             AND dead = 0
             AND cancelled = 0;
       `);
-    });
-    await storage.write(async (database) => {
-      await ensureMaterializationHygiene(
-        database,
-        input.model.materializationHistory,
-      );
-    });
+        });
+        for (const module of modules) {
+          const moduleRuntime = module[registeredLedgerRuntimeBrand] ?? module;
+          let context: MaterializationRuntimeContext;
+
+          if (module[registeredLedgerContractsBrand] === undefined) {
+            context = {
+              compiler: input.projectionCompiler,
+              events: moduleRuntime.model.events,
+              projections: moduleRuntime.projections,
+              signals: moduleRuntime.model.signals,
+            };
+          } else {
+            const schemas = readLedgerProjectionSchemas(module);
+            context = {
+              compiler: readLedgerProjectionCompiler(
+                module,
+                input.projectionCompiler,
+              ),
+              events: schemas.events,
+              projections: moduleRuntime.projections,
+              signals: schemas.signals,
+            };
+          }
+
+          await storage.write(async (database) => {
+            await ensureMaterializationHygiene(
+              database,
+              moduleRuntime.materializationHistory,
+              context,
+            );
+          });
+        }
+      },
+    );
     committedEventId = await storage.read(async (database) => {
       return await readStoredLatestEventId(database);
     });
@@ -675,15 +1242,7 @@ function openDatabaseLedgerEngine<
 
     return {
       workId: decoded.work_id,
-      ref:
-        decoded.work_key === null
-          ? null
-          : {
-              sourceEventId: decoded.source_event_id,
-              signal: decoded.signal !== 0,
-              queueName: decoded.queue_name,
-              workKey: decoded.work_key,
-            },
+      ref: decoded.work_ref === null ? null : decodeWorkRef(decoded.work_ref),
       queueName: decoded.queue_name,
       sourceEventId: decoded.source_event_id,
       attempt: decoded.attempt,
@@ -710,6 +1269,7 @@ function openDatabaseLedgerEngine<
       .prepare(
         `SELECT
            work_id,
+           work_ref,
            queue_name,
            source_event_id,
            signal,
@@ -720,7 +1280,6 @@ function openDatabaseLedgerEngine<
            lease_acquired_at_ms,
            lease_expires_at_ms,
            last_error,
-           work_key,
            cancelled,
            cancel_requested_at_ms,
            cancel_reason
@@ -742,18 +1301,12 @@ function openDatabaseLedgerEngine<
     decodeValue(PartitionKeySchema, partitionKey);
   }
 
-  function validateWorkRef(ref: WorkRef): void {
-    if (!Number.isInteger(ref.sourceEventId) || ref.sourceEventId <= 0) {
-      throw new Error(
-        `sourceEventId must be a positive integer, received ${ref.sourceEventId}`,
-      );
-    }
+  function createWorkRef(): WorkRef {
+    return decodeWorkRef(`work:v1:${randomUUID()}`);
+  }
 
-    if (ref.queueName.length === 0) {
-      throw new Error("queueName must be non-empty");
-    }
-
-    validateWorkKey(ref.workKey);
+  function decodeWorkRef(ref: unknown): WorkRef {
+    return decodeValue(WorkRefSchema, ref) as WorkRef;
   }
 
   async function readWorkSnapshotByRef(
@@ -764,6 +1317,7 @@ function openDatabaseLedgerEngine<
       .prepare(
         `SELECT
            work_id,
+           work_ref,
            queue_name,
            source_event_id,
            signal,
@@ -774,17 +1328,13 @@ function openDatabaseLedgerEngine<
            lease_acquired_at_ms,
            lease_expires_at_ms,
            last_error,
-           work_key,
            cancelled,
            cancel_requested_at_ms,
            cancel_reason
          FROM work
-         WHERE source_event_id = ?
-           AND signal = ?
-           AND queue_name = ?
-           AND work_key = ?`,
+         WHERE work_ref = ?`,
       )
-      .get(ref.sourceEventId, ref.signal ? 1 : 0, ref.queueName, ref.workKey);
+      .get(ref);
 
     return row === undefined ? null : workSnapshotFromRow(row);
   }
@@ -803,6 +1353,103 @@ function openDatabaseLedgerEngine<
         )
         .run(clock.nowMs() - retentionMs);
     });
+  }
+
+  async function ensureStorageLayout(
+    database: StorageDatabase,
+    moduleIds: readonly string[],
+  ): Promise<void> {
+    await database.exec("BEGIN IMMEDIATE");
+
+    try {
+      const layoutTable = await database
+        .prepare(
+          `SELECT name
+           FROM sqlite_schema
+           WHERE type = 'table'
+             AND name = ?`,
+        )
+        .get(storageLayoutTableName);
+
+      if (layoutTable === undefined) {
+        const legacyTable = await database
+          .prepare(
+            `SELECT name
+             FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN (?, ?, ?)
+             LIMIT 1`,
+          )
+          .get("events", "work", materializationVersionTableName);
+
+        if (legacyTable !== undefined) {
+          throw new Error(
+            "database uses the pre-composition Sledge storage layout; reset the database before opening it with composable ledger models",
+          );
+        }
+
+        await database.exec(`
+          CREATE TABLE ${storageLayoutTableName} (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            version INTEGER NOT NULL,
+            module_ids_json TEXT NOT NULL
+          );
+        `);
+        await database
+          .prepare(
+            `INSERT INTO ${storageLayoutTableName} (
+               singleton,
+               version,
+               module_ids_json
+             ) VALUES (1, ?, ?)`,
+          )
+          .run(storageLayoutVersion, JSON.stringify(moduleIds));
+      } else {
+        const row = await database
+          .prepare(
+            `SELECT version, module_ids_json
+             FROM ${storageLayoutTableName}
+             WHERE singleton = 1`,
+          )
+          .get();
+
+        if (row === undefined) {
+          throw new Error("Sledge storage layout marker is missing");
+        }
+
+        const decoded = Value.Decode(StorageLayoutRowSchema, row);
+
+        if (decoded.version !== storageLayoutVersion) {
+          throw new Error(
+            `unsupported Sledge storage layout version ${decoded.version}`,
+          );
+        }
+
+        const storedModuleIds = decodeValue(
+          ComposedModuleIdsSchema,
+          parseJson<unknown>(
+            decoded.module_ids_json,
+            "composed ledger root identity",
+          ),
+        );
+
+        if (
+          storedModuleIds.length !== moduleIds.length ||
+          storedModuleIds.some(
+            (moduleId, index) => moduleId !== moduleIds[index],
+          )
+        ) {
+          throw new Error(
+            `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
+          );
+        }
+      }
+
+      await database.exec("COMMIT");
+    } catch (error: unknown) {
+      await database.exec("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   }
 
   async function ensureColumn(
@@ -841,9 +1488,10 @@ function openDatabaseLedgerEngine<
   async function createProjectionSchema(
     database: StorageDatabase,
     metadata: ProjectionSchemaMetadata,
+    compiler: ProjectionStatementCompiler,
   ): Promise<void> {
     for (const table of Object.values(metadata.tables)) {
-      const sql = input.projectionCompiler.compileCreateTable({
+      const sql = compiler.compileCreateTable({
         metadata,
         table,
       });
@@ -852,7 +1500,7 @@ function openDatabaseLedgerEngine<
 
     for (const table of Object.values(metadata.tables)) {
       for (const index of table.indexes) {
-        const sql = input.projectionCompiler.compileCreateIndex({
+        const sql = compiler.compileCreateIndex({
           index,
           tableName: table.name,
         });
@@ -862,10 +1510,18 @@ function openDatabaseLedgerEngine<
   }
 
   async function ensureMaterializationHygiene<
-    const THistory extends AnyMaterializationHistory<TEvents> | null,
-  >(database: StorageDatabase, history: THistory): Promise<void> {
+    const THistory extends AnyMaterializationHistory | null,
+  >(
+    database: StorageDatabase,
+    history: THistory,
+    context: MaterializationRuntimeContext,
+  ): Promise<void> {
     if (history === null) {
-      await createProjectionSchema(database, input.model.projections.metadata);
+      await createProjectionSchema(
+        database,
+        context.projections.metadata,
+        context.compiler,
+      );
       return;
     }
 
@@ -926,6 +1582,7 @@ function openDatabaseLedgerEngine<
           history,
           migration,
           replayState,
+          context,
         );
         await recordMaterializationVersion(
           database,
@@ -986,12 +1643,13 @@ function openDatabaseLedgerEngine<
   }
 
   async function applyMaterializationMigration<
-    const THistory extends AnyMaterializationHistory<TEvents>,
+    const THistory extends AnyMaterializationHistory,
   >(
     database: StorageDatabase,
     history: THistory,
     migration: THistory["migrations"][number],
     replayState: MaterializationReplayState,
+    context: MaterializationRuntimeContext,
   ): Promise<void> {
     const relationsForCreatedTables =
       readMaterializationMigrationRelationsForCreatedTables(migration);
@@ -1003,12 +1661,13 @@ function openDatabaseLedgerEngine<
         operation,
         replayState,
         relationsForCreatedTables,
+        context,
       );
     }
   }
 
   async function applyMaterializationMigrationOperation<
-    const THistory extends AnyMaterializationHistory<TEvents>,
+    const THistory extends AnyMaterializationHistory,
   >(
     database: StorageDatabase,
     history: THistory,
@@ -1018,6 +1677,7 @@ function openDatabaseLedgerEngine<
       string,
       Readonly<Record<string, ProjectionForeignKeyMetadata>>
     >,
+    context: MaterializationRuntimeContext,
   ): Promise<void> {
     switch (operation.kind) {
       case "create_table":
@@ -1025,25 +1685,42 @@ function openDatabaseLedgerEngine<
           database,
           operation,
           relationsForCreatedTables.get(operation.tableName) ?? {},
+          context.compiler,
         );
-        await createMaterializationTableIndexes(database, operation);
+        await createMaterializationTableIndexes(
+          database,
+          operation,
+          context.compiler,
+        );
 
         replayState.tables.set(operation.tableName, operation.table);
         return;
       case "create_index":
-        await createMaterializationIndex(database, operation);
+        await createMaterializationIndex(
+          database,
+          operation,
+          replayState,
+          context.compiler,
+        );
 
         addMaterializationReplayIndex(replayState, operation);
         return;
       case "add_column":
-        await addMaterializationColumn(database, operation);
+        await addMaterializationColumn(
+          database,
+          operation,
+          replayState,
+          context.compiler,
+        );
 
         addMaterializationReplayColumn(replayState, operation);
         return;
       case "add_foreign_key":
-        const relations = relationsForCreatedTables.get(
+        const sourceTableName = findMaterializationTableName(
+          replayState,
           operation.foreignKey.fromTable,
         );
+        const relations = relationsForCreatedTables.get(sourceTableName);
 
         if (relations?.[operation.name] === undefined) {
           throw new Error(
@@ -1055,11 +1732,11 @@ function openDatabaseLedgerEngine<
         return;
       case "data":
         await runProjectionDatabaseScope({
-          events: model.events,
-          signals: model.signals,
+          events: context.events,
+          signals: context.signals,
           projections: createMaterializationReplaySchema(replayState),
           scope: database,
-          statementCompiler: input.projectionCompiler,
+          statementCompiler: context.compiler,
           run: async (db) => {
             await operation.run({
               db,
@@ -1181,6 +1858,21 @@ function openDatabaseLedgerEngine<
     };
   }
 
+  function findMaterializationTableName(
+    replayState: MaterializationReplayState,
+    physicalName: string,
+  ): string {
+    for (const [localName, table] of replayState.tables) {
+      if (table.name === physicalName) {
+        return localName;
+      }
+    }
+
+    throw new Error(
+      `materialization replay cannot find physical table ${physicalName}`,
+    );
+  }
+
   function readMaterializationMigrationRelationsForCreatedTables(migration: {
     readonly operations: readonly MaterializationMigrationOperation[];
   }): ReadonlyMap<
@@ -1205,14 +1897,14 @@ function openDatabaseLedgerEngine<
       }
 
       if (operation.kind === "add_foreign_key") {
-        const createdTable = openCreatedTables.get(
-          operation.foreignKey.fromTable,
+        const sourceEntry = [...openCreatedTables].find(
+          ([, table]) => table.name === operation.foreignKey.fromTable,
         );
-
-        if (createdTable === undefined) {
+        if (sourceEntry === undefined) {
           continue;
         }
 
+        const [sourceTableName, createdTable] = sourceEntry;
         const sourceColumnsExistInCreateTable =
           operation.foreignKey.fromColumns.every((columnName) => {
             return createdTable.columns[columnName] !== undefined;
@@ -1222,11 +1914,11 @@ function openDatabaseLedgerEngine<
           continue;
         }
 
-        let relations = relationsByTable.get(operation.foreignKey.fromTable);
+        let relations = relationsByTable.get(sourceTableName);
 
         if (relations === undefined) {
           relations = {};
-          relationsByTable.set(operation.foreignKey.fromTable, relations);
+          relationsByTable.set(sourceTableName, relations);
         }
 
         relations[operation.name] = operation.foreignKey;
@@ -1243,8 +1935,9 @@ function openDatabaseLedgerEngine<
       { kind: "create_table" }
     >,
     relations: Readonly<Record<string, ProjectionForeignKeyMetadata>>,
+    compiler: ProjectionStatementCompiler,
   ): Promise<void> {
-    const sql = input.projectionCompiler.compileCreateTable({
+    const sql = compiler.compileCreateTable({
       metadata: {
         relations,
         tables: {
@@ -1263,11 +1956,12 @@ function openDatabaseLedgerEngine<
       MaterializationMigrationOperation,
       { kind: "create_table" }
     >,
+    compiler: ProjectionStatementCompiler,
   ): Promise<void> {
     for (const index of operation.table.indexes) {
-      const sql = input.projectionCompiler.compileCreateIndex({
+      const sql = compiler.compileCreateIndex({
         index,
-        tableName: operation.tableName,
+        tableName: operation.table.name,
       });
       await database.exec(sql.text);
     }
@@ -1279,10 +1973,20 @@ function openDatabaseLedgerEngine<
       MaterializationMigrationOperation,
       { kind: "create_index" }
     >,
+    replayState: MaterializationReplayState,
+    compiler: ProjectionStatementCompiler,
   ): Promise<void> {
-    const sql = input.projectionCompiler.compileCreateIndex({
+    const table = replayState.tables.get(operation.tableName);
+
+    if (table === undefined) {
+      throw new Error(
+        `materialization migration cannot create index on unknown table ${operation.tableName}`,
+      );
+    }
+
+    const sql = compiler.compileCreateIndex({
       index: operation.index,
-      tableName: operation.tableName,
+      tableName: table.name,
     });
 
     await database.exec(sql.text);
@@ -1294,11 +1998,21 @@ function openDatabaseLedgerEngine<
       MaterializationMigrationOperation,
       { kind: "add_column" }
     >,
+    replayState: MaterializationReplayState,
+    compiler: ProjectionStatementCompiler,
   ): Promise<void> {
-    const sql = input.projectionCompiler.compileAddColumn({
+    const table = replayState.tables.get(operation.tableName);
+
+    if (table === undefined) {
+      throw new Error(
+        `materialization migration cannot add column to unknown table ${operation.tableName}`,
+      );
+    }
+
+    const sql = compiler.compileAddColumn({
       column: operation.column,
       columnName: operation.columnName,
-      tableName: operation.tableName,
+      tableName: table.name,
     });
 
     try {
@@ -1513,7 +2227,7 @@ function openDatabaseLedgerEngine<
 
         if (existingRow.event_name !== eventInput.eventName) {
           throw new Error(
-            `dedupe key ${eventInput.dedupeKey} already belongs to event ${existingRow.event_name}`,
+            `dedupe key ${eventInput.dedupeKey} already belongs to another event contract`,
           );
         }
 
@@ -1664,6 +2378,7 @@ function openDatabaseLedgerEngine<
       await database
         .prepare(
           `INSERT INTO work (
+              work_ref,
               queue_name,
               work_key,
               partition_key,
@@ -1677,9 +2392,10 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
+          work.workKey === null ? null : createWorkRef(),
           work.queueName,
           work.workKey,
           work.partitionKey,
@@ -1826,6 +2542,7 @@ function openDatabaseLedgerEngine<
       await database
         .prepare(
           `INSERT INTO work (
+              work_ref,
               queue_name,
               work_key,
               partition_key,
@@ -1839,9 +2556,10 @@ function openDatabaseLedgerEngine<
               lease_acquired_at_ms,
               lease_expires_at_ms,
               last_error
-            ) VALUES (?, ?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, 0, NULL, NULL, NULL, NULL)`,
         )
         .run(
+          work.workKey === null ? null : createWorkRef(),
           work.queueName,
           work.workKey,
           work.partitionKey,
@@ -2157,10 +2875,10 @@ function openDatabaseLedgerEngine<
   function createManagedStreamIterator(input: {
     createIterator(
       signal: AbortSignal,
-    ): AsyncIterator<LedgerStreamEvent<TEvents>>;
+    ): AsyncIterator<DatabaseLedgerStreamEvent<TEvents>>;
     externalSignal: AbortSignal;
     closeReason: string;
-  }): AsyncIterableIterator<LedgerStreamEvent<TEvents>> {
+  }): AsyncIterableIterator<DatabaseLedgerStreamEvent<TEvents>> {
     const localController = new AbortController();
     const streamSignal = AbortSignal.any([
       input.externalSignal,
@@ -2209,7 +2927,7 @@ function openDatabaseLedgerEngine<
   async function* streamEventsFromAfterEventId(input: {
     readonly afterEventId: number;
     readonly signal: AbortSignal;
-  }): AsyncIterable<LedgerStreamEvent<TEvents>> {
+  }): AsyncIterable<DatabaseLedgerStreamEvent<TEvents>> {
     const startupResult = await raceWithSignal(startup, input.signal);
 
     if (startupResult.status === "aborted") {
@@ -3096,7 +3814,7 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  const ledger: Ledger<TEvents, TQueries, TSignals> = {
+  const ledger: DatabaseLedger<TEvents, TQueries, TSignals> = {
     emit: async (eventName, event, options) => {
       await startup;
 
@@ -3128,12 +3846,12 @@ function openDatabaseLedgerEngine<
     },
     cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
       await startup;
-      validateWorkRef(input.ref);
+      const ref = decodeWorkRef(input.ref);
 
       const nowMs = clock.nowMs();
       let cancelledLeaseId: string | null = null;
       const work = await runInTransaction(async (database) => {
-        const existing = await readWorkSnapshotByRef(database, input.ref);
+        const existing = await readWorkSnapshotByRef(database, ref);
 
         if (existing === null) {
           return null;
@@ -3163,10 +3881,7 @@ function openDatabaseLedgerEngine<
                lease_expires_at_ms = NULL,
                partition_key = NULL,
                last_error = ?
-             WHERE source_event_id = ?
-               AND signal = ?
-               AND queue_name = ?
-               AND work_key = ?
+             WHERE work_ref = ?
                AND dead = 0
                AND cancelled = 0`,
           )
@@ -3175,26 +3890,23 @@ function openDatabaseLedgerEngine<
             input.reason ?? null,
             nowMs,
             input.reason ?? "work cancelled",
-            input.ref.sourceEventId,
-            input.ref.signal ? 1 : 0,
-            input.ref.queueName,
-            input.ref.workKey,
+            ref,
           );
 
-        return await readWorkSnapshotByRef(database, input.ref);
+        return await readWorkSnapshotByRef(database, ref);
       });
 
       if (work === null) {
         return {
           status: "not_found",
-          ref: input.ref,
+          ref,
         };
       }
 
       if (work.state === "dead") {
         return {
           status: "already_terminal",
-          ref: input.ref,
+          ref,
           work,
         };
       }
@@ -3301,6 +4013,7 @@ function openDatabaseLedgerEngine<
             .prepare(
               `SELECT
                  work_id,
+                 work_ref,
                  queue_name,
                  source_event_id,
                  signal,
@@ -3311,7 +4024,6 @@ function openDatabaseLedgerEngine<
                  lease_acquired_at_ms,
                  lease_expires_at_ms,
                  last_error,
-                 work_key,
                  cancelled,
                  cancel_requested_at_ms,
                  cancel_reason
@@ -3365,7 +4077,7 @@ function openDatabaseLedgerEngine<
 
       const createIterator = (streamSignal: AbortSignal) => {
         const iterate = async function* (): AsyncIterable<
-          LedgerStreamEvent<TEvents>
+          DatabaseLedgerStreamEvent<TEvents>
         > {
           const startupResult = await raceWithSignal(startup, streamSignal);
 
@@ -3413,7 +4125,9 @@ function openDatabaseLedgerEngine<
       };
 
       return {
-        [Symbol.asyncIterator](): AsyncIterator<LedgerStreamEvent<TEvents>> {
+        [Symbol.asyncIterator](): AsyncIterator<
+          DatabaseLedgerStreamEvent<TEvents>
+        > {
           return createManagedStreamIterator({
             createIterator,
             externalSignal: signal,
@@ -3426,7 +4140,9 @@ function openDatabaseLedgerEngine<
       const afterEventId = decodeCursor(cursor);
 
       return {
-        [Symbol.asyncIterator](): AsyncIterator<LedgerStreamEvent<TEvents>> {
+        [Symbol.asyncIterator](): AsyncIterator<
+          DatabaseLedgerStreamEvent<TEvents>
+        > {
           return createManagedStreamIterator({
             createIterator: (streamSignal) => {
               return streamEventsFromAfterEventId({

@@ -3,7 +3,15 @@ import type { Static, TSchema } from "typebox";
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import { createEventRef, type EventRef } from "./event-ref.ts";
 import type { LedgerImplementations } from "./internal-storage.ts";
-import { attachLedgerImplementationFactory } from "./internal-storage.ts";
+import {
+  attachLedgerImplementationFactory,
+  attachLedgerProjectionCompilerFactory,
+  attachLedgerProjectionSchemas,
+  composedLedgerModulesBrand,
+  readLedgerImplementations,
+  registeredLedgerContractsBrand,
+  registeredLedgerRuntimeBrand,
+} from "./internal-storage.ts";
 import {
   createProjectionAccess,
   createProjectionImplementations,
@@ -23,6 +31,7 @@ import {
   type ProjectionWriteDatabase,
   type ProjectionWriteResult,
 } from "./projection-access.ts";
+import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import {
   createProjectionRelationBuilder,
   defineProjectionSchemaForEvents,
@@ -52,15 +61,30 @@ import {
 const registeredLedgerModelBrand: unique symbol = Symbol(
   "sledge.registeredLedgerModel",
 );
+const composedLedgerModelBrand: unique symbol = Symbol(
+  "sledge.composedLedgerModel",
+);
 const materializationMigrationChainStateBrand: unique symbol = Symbol(
   "sledge.materializationMigrationChainState",
 );
+declare const eventTokenTypeBrand: unique symbol;
+declare const queryTokenTypeBrand: unique symbol;
+declare const queueTokenTypeBrand: unique symbol;
+declare const signalTokenTypeBrand: unique symbol;
+declare const signalQueueTokenTypeBrand: unique symbol;
+const ledgerContractTokenMetadata = new WeakMap<
+  object,
+  LedgerContractMetadata
+>();
+const physicalNameSeparator = "::";
 const reservedMaterializationSqliteObjectNames = [
   "events",
   "idx_work_due",
+  "idx_work_key",
   "idx_work_partition_order",
   "idx_work_ref",
   "sledge_materialization_versions",
+  "sledge_storage_layout",
   "work",
 ] as const;
 const sqliteInternalMaterializationNamePrefix = "sqlite_";
@@ -120,6 +144,169 @@ export type {
 export { createEventRef };
 export type { EventRef };
 
+export type EventToken<
+  TModuleId extends string = string,
+  TName extends string = string,
+  TPayloadSchema extends TSchema = TSchema,
+> = {
+  readonly [eventTokenTypeBrand]: {
+    readonly moduleId: TModuleId;
+    readonly name: TName;
+    readonly schema: TPayloadSchema;
+  };
+};
+
+export type QueryToken<
+  TModuleId extends string = string,
+  TName extends string = string,
+  TParamsSchema extends TSchema = TSchema,
+  TResultSchema extends TSchema = TSchema,
+> = {
+  readonly [queryTokenTypeBrand]: {
+    readonly moduleId: TModuleId;
+    readonly name: TName;
+    readonly params: TParamsSchema;
+    readonly result: TResultSchema;
+  };
+};
+
+type QueueToken<
+  TModuleId extends string = string,
+  TName extends string = string,
+  TPayloadSchema extends TSchema = TSchema,
+> = {
+  readonly [queueTokenTypeBrand]: {
+    readonly moduleId: TModuleId;
+    readonly name: TName;
+    readonly schema: TPayloadSchema;
+  };
+};
+
+export type SignalToken<
+  TModuleId extends string = string,
+  TName extends string = string,
+  TPayloadSchema extends TSchema = TSchema,
+> = {
+  readonly [signalTokenTypeBrand]: {
+    readonly moduleId: TModuleId;
+    readonly name: TName;
+    readonly schema: TPayloadSchema;
+  };
+};
+
+type SignalQueueToken<
+  TModuleId extends string = string,
+  TName extends string = string,
+  TPayloadSchema extends TSchema = TSchema,
+> = {
+  readonly [signalQueueTokenTypeBrand]: {
+    readonly moduleId: TModuleId;
+    readonly name: TName;
+    readonly schema: TPayloadSchema;
+  };
+};
+
+type AnyEventToken = EventToken<string, string, TSchema>;
+type AnyQueryToken = QueryToken<string, string, TSchema, TSchema>;
+type AnyQueueToken = QueueToken<string, string, TSchema>;
+type AnySignalToken = SignalToken<string, string, TSchema>;
+type AnySignalQueueToken = SignalQueueToken<string, string, TSchema>;
+
+type LedgerContractKind =
+  | "event"
+  | "index"
+  | "indexer"
+  | "materialization"
+  | "query"
+  | "queue"
+  | "signal"
+  | "signal_queue"
+  | "table";
+
+type SchemaLedgerContractMetadata<
+  TKind extends "event" | "queue" | "signal" | "signal_queue",
+> = {
+  readonly kind: TKind;
+  readonly moduleId: string;
+  readonly localName: string;
+  readonly physicalName: string;
+  readonly schema: TSchema;
+};
+
+type LedgerContractMetadata =
+  | SchemaLedgerContractMetadata<"event">
+  | SchemaLedgerContractMetadata<"queue">
+  | SchemaLedgerContractMetadata<"signal">
+  | SchemaLedgerContractMetadata<"signal_queue">
+  | {
+      readonly kind: "query";
+      readonly moduleId: string;
+      readonly localName: string;
+      readonly physicalName: string;
+      readonly params: TSchema;
+      readonly result: TSchema;
+    };
+
+type EventDefinition = TSchema | AnyEventToken;
+
+type PrivateSchemaDefinitions<TDefinitions> = {
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends
+    | AnyEventToken
+    | AnyQueryToken
+    | AnyQueueToken
+    | AnySignalToken
+    | AnySignalQueueToken
+    ? never
+    : TDefinitions[TName];
+};
+
+type EventSchemaFor<TDefinition> =
+  TDefinition extends EventToken<string, string, infer TSchemaToInfer>
+    ? TSchemaToInfer
+    : TDefinition extends TSchema
+      ? TDefinition
+      : never;
+
+type EventSchemasFor<TDefinitions extends Record<string, EventDefinition>> = {
+  readonly [TName in keyof TDefinitions]: EventSchemaFor<TDefinitions[TName]>;
+};
+
+type EventTokensFor<
+  TModuleId extends string,
+  TDefinitions extends Record<string, EventDefinition>,
+> = {
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends AnyEventToken
+    ? TDefinitions[TName]
+    : EventToken<
+        TModuleId,
+        Extract<TName, string>,
+        EventSchemaFor<TDefinitions[TName]>
+      >;
+};
+
+type EventTokensForSchemas<
+  TModuleId extends string,
+  TEvents extends Record<string, TSchema>,
+> = {
+  readonly [TEventName in keyof TEvents]: EventToken<
+    TModuleId,
+    Extract<TEventName, string>,
+    TEvents[TEventName]
+  >;
+};
+
+type TokensForSchemas<
+  TModuleId extends string,
+  TSchemas extends Record<string, TSchema>,
+  TKind extends "queue" | "signal" | "signal_queue",
+> = {
+  readonly [TName in keyof TSchemas]: TKind extends "queue"
+    ? QueueToken<TModuleId, Extract<TName, string>, TSchemas[TName]>
+    : TKind extends "signal"
+      ? SignalToken<TModuleId, Extract<TName, string>, TSchemas[TName]>
+      : SignalQueueToken<TModuleId, Extract<TName, string>, TSchemas[TName]>;
+};
+
 /**
  * Optional knobs for producer-side event emission.
  */
@@ -154,6 +341,55 @@ export type QuerySchema<
 
 type AnyQuerySchema = QuerySchema<TSchema, TSchema>;
 
+type LedgerQueryDefinitions = Readonly<
+  Record<string, AnyQuerySchema | AnyQueryToken>
+>;
+
+type QuerySchemaForDefinition<TDefinition> =
+  TDefinition extends QueryToken<
+    string,
+    string,
+    infer TParamsSchema,
+    infer TResultSchema
+  >
+    ? QuerySchema<TParamsSchema, TResultSchema>
+    : TDefinition extends AnyQuerySchema
+      ? TDefinition
+      : never;
+
+type NormalizedQueryDefinitions<TDefinitions extends LedgerQueryDefinitions> = {
+  readonly [TName in keyof TDefinitions]: QuerySchemaForDefinition<
+    TDefinitions[TName]
+  >;
+};
+
+type OwnedQueryDefinitions<TDefinitions extends LedgerQueryDefinitions> = {
+  readonly [TName in keyof TDefinitions as TDefinitions[TName] extends AnyQueryToken
+    ? never
+    : TName]: TDefinitions[TName] extends AnyQuerySchema
+    ? TDefinitions[TName]
+    : never;
+};
+
+type QueryTokensFor<
+  TModuleId extends string,
+  TDefinitions extends LedgerQueryDefinitions,
+> = {
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends AnyQueryToken
+    ? TDefinitions[TName]
+    : TDefinitions[TName] extends QuerySchema<
+          infer TParamsSchema,
+          infer TResultSchema
+        >
+      ? QueryToken<
+          TModuleId,
+          Extract<TName, string>,
+          TParamsSchema,
+          TResultSchema
+        >
+      : never;
+};
+
 /**
  * Index input schema keyed in model definitions.
  */
@@ -182,6 +418,43 @@ export type EventEnvelope<
   readonly causationEventId: number | null;
   readonly dedupeKey: string | null;
 };
+
+type EventTokenSchema<TToken> =
+  TToken extends EventToken<string, string, infer TSchemaToInfer>
+    ? TSchemaToInfer
+    : never;
+
+type QueryTokenParamsSchema<TToken> =
+  TToken extends QueryToken<string, string, infer TParamsSchema, TSchema>
+    ? TParamsSchema
+    : never;
+
+type QueryTokenResultSchema<TToken> =
+  TToken extends QueryToken<string, string, TSchema, infer TResultSchema>
+    ? TResultSchema
+    : never;
+
+type SignalTokenSchema<TToken> =
+  TToken extends SignalToken<string, string, infer TSchemaToInfer>
+    ? TSchemaToInfer
+    : never;
+
+type LedgerEnvelopeSchema<TContract> = TContract extends AnyEventToken
+  ? EventTokenSchema<TContract>
+  : TContract extends AnySignalToken
+    ? SignalTokenSchema<TContract>
+    : never;
+
+export type LedgerEventEnvelope<TEvent extends AnyEventToken | AnySignalToken> =
+  {
+    readonly eventId: number;
+    readonly event: TEvent;
+    readonly ref: EventRef<TEvent>;
+    readonly tsMs: number;
+    readonly payload: Static<LedgerEnvelopeSchema<TEvent>>;
+    readonly causationEventId: number | null;
+    readonly dedupeKey: string | null;
+  };
 
 export type LedgerIndexerContext<
   TEvents extends Record<string, TSchema> = Record<string, TSchema>,
@@ -447,18 +720,6 @@ export type RegisterFunction<
  */
 export type LedgerCursor = string;
 
-export type LedgerStreamEvent<
-  TEvents extends Record<string, TSchema>,
-  TEventName extends keyof TEvents = keyof TEvents,
-> = {
-  readonly event: EventEnvelope<TEvents, TEventName>;
-  /**
-   * Opaque resume token. Treat this as an implementation detail and persist it
-   * as-is for resume operations.
-   */
-  readonly cursor: LedgerCursor;
-};
-
 export interface SignalSubscription {
   [Symbol.dispose](): void;
 }
@@ -481,11 +742,13 @@ export type WorkCancellationSnapshot = {
   readonly reason: string | null;
 };
 
-export type WorkRef = {
-  readonly sourceEventId: number;
-  readonly signal: boolean;
-  readonly queueName: string;
-  readonly workKey: string;
+/**
+ * Opaque durable identity for keyed work. Persist and round-trip this value;
+ * its representation is owned by Sledge.
+ */
+declare const workRefBrand: unique symbol;
+export type WorkRef = string & {
+  readonly [workRefBrand]: true;
 };
 
 export type WorkSnapshot = {
@@ -533,21 +796,26 @@ export type ListWorkInput = {
   readonly limit?: number;
 };
 
-export interface Ledger<
-  TEvents extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema> = {},
-> extends AsyncDisposable {
-  emit<const TEventName extends keyof TEvents>(
-    eventName: TEventName,
-    event: Static<TEvents[TEventName]>,
-    options?: EmitOptions,
-  ): Promise<EventEnvelope<TEvents, TEventName>>;
+export type LedgerStreamEvent<TEvents extends AnyEventToken> = {
+  readonly event: LedgerEventEnvelope<TEvents>;
+  readonly cursor: LedgerCursor;
+};
 
-  query<const TQueryName extends keyof TQueries>(
-    queryName: TQueryName,
-    params: Static<TQueries[TQueryName]["params"]>,
-  ): Promise<Static<TQueries[TQueryName]["result"]>>;
+export interface Ledger<
+  TEvents extends AnyEventToken,
+  TQueries extends AnyQueryToken,
+  TSignals extends AnySignalToken = never,
+> extends AsyncDisposable {
+  emit<const TEvent extends TEvents>(
+    event: TEvent,
+    payload: Static<EventTokenSchema<TEvent>>,
+    options?: EmitOptions,
+  ): Promise<LedgerEventEnvelope<TEvent>>;
+
+  query<const TQuery extends TQueries>(
+    query: TQuery,
+    params: Static<QueryTokenParamsSchema<TQuery>>,
+  ): Promise<Static<QueryTokenResultSchema<TQuery>>>;
 
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
@@ -555,14 +823,9 @@ export interface Ledger<
 
   listWork(input?: ListWorkInput): Promise<readonly WorkSnapshot[]>;
 
-  /**
-   * Subscribe to live signal notifications emitted by this ledger runtime.
-   * Signals are process-local and transient; use durable event streams for
-   * cross-process consumption.
-   */
-  onSignal<const TSignalName extends keyof TSignals>(
-    signalName: TSignalName,
-    observer: SignalObserverFunction<TSignals, TSignalName>,
+  onSignal<const TSignal extends TSignals>(
+    signal: TSignal,
+    observer: (signal: LedgerEventEnvelope<TSignal>) => void | Promise<void>,
   ): SignalSubscription;
 
   tailEvents(input: {
@@ -622,8 +885,48 @@ export type RegisteredLedgerModel<
   TQueryDefinitions extends ProjectionQueryDefinitions = {},
   TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null =
     AnyMaterializationHistory<TEvents> | null,
+  TModuleId extends string = string,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  } = EventTokensForSchemas<TModuleId, TEvents>,
+  TQueryTokens extends {
+    readonly [TQueryName in keyof TQueries]: AnyQueryToken;
+  } = QueryTokensFor<TModuleId, TQueries>,
 > = {
   readonly [registeredLedgerModelBrand]: true;
+  readonly moduleId: TModuleId;
+  readonly [registeredLedgerContractsBrand]: {
+    readonly events: TEventTokens;
+    readonly queries: TQueryTokens;
+    readonly queues: TokensForSchemas<TModuleId, TQueues, "queue">;
+    readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
+    readonly signalQueues: TokensForSchemas<
+      TModuleId,
+      TSignalQueues,
+      "signal_queue"
+    >;
+  };
+  readonly [registeredLedgerRuntimeBrand]: {
+    readonly materializationHistory: TMaterializationHistory;
+    readonly model: LedgerModel<
+      TEvents,
+      TQueues,
+      TIndexers,
+      TQueries,
+      TSignals,
+      TSignalQueues
+    >;
+    readonly projections: TProjectionSchema;
+    readonly register: RegisterFunction<
+      TEvents,
+      TQueues,
+      TIndexers,
+      TQueries,
+      TSignals,
+      TSignalQueues,
+      TIndexerDefinitions
+    >;
+  };
   readonly model: LedgerModel<
     TEvents,
     TQueues,
@@ -1174,7 +1477,7 @@ export type MaterializationDefinitionBuilder<
   >;
   define<
     const TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
-    const TQueryDefinitions extends ProjectionQueryDefinitions,
+    const TQueryDefinitions extends LedgerQueryDefinitions,
   >(input: {
     readonly indexers: TIndexerDefinitions;
     readonly queries: TQueryDefinitions;
@@ -1210,7 +1513,7 @@ export type AnyMaterializationHistory<
 export type Materializations<
   THistory extends AnyMaterializationHistory,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
-  TQueryDefinitions extends ProjectionQueryDefinitions,
+  TQueryDefinitions extends LedgerQueryDefinitions,
 > = {
   readonly history: THistory;
   readonly indexers: TIndexerDefinitions;
@@ -1221,7 +1524,7 @@ export type MaterializationHistoryFor<TMaterializations> =
   TMaterializations extends Materializations<
     infer THistory,
     ProjectionIndexerDefinitions<string>,
-    ProjectionQueryDefinitions
+    LedgerQueryDefinitions
   >
     ? THistory
     : never;
@@ -1238,7 +1541,7 @@ export type MaterializationIndexerDefinitionsFor<TMaterializations> =
   TMaterializations extends Materializations<
     AnyMaterializationHistory,
     infer TIndexerDefinitions,
-    ProjectionQueryDefinitions
+    LedgerQueryDefinitions
   >
     ? TIndexerDefinitions
     : never;
@@ -1307,7 +1610,7 @@ export type MaterializationImplementationRegistrationFor<
     ? MaterializationImplementationRegistration<
         THistory["current"],
         TIndexerDefinitions,
-        TQueryDefinitions,
+        OwnedQueryDefinitions<TQueryDefinitions>,
         TEvents,
         TSignals
       >
@@ -1328,13 +1631,24 @@ export type MaterializationImplementationRegistration<
 >;
 
 export function defineMaterialization<
+  const TModuleId extends string,
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
   const TSignals extends Record<string, TSchema>,
   const TSignalQueues extends Record<string, TSchema>,
   const TNamespace extends string,
+  const TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
 >(
-  shape: DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
+  shape: DefinedLedgerShape<
+    TEvents,
+    TQueues,
+    TSignals,
+    TSignalQueues,
+    TModuleId,
+    TEventTokens
+  >,
   input: MaterializationDefinitionInput<TNamespace>,
 ): MaterializationDefinitionBuilder<
   MaterializationSchema<TNamespace, 0, {}, {}, Extract<keyof TEvents, string>>,
@@ -1368,7 +1682,14 @@ export type DefinedLedgerShape<
   TQueues extends Record<string, TSchema>,
   TSignals extends Record<string, TSchema>,
   TSignalQueues extends Record<string, TSchema>,
+  TModuleId extends string = string,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  } = EventTokensForSchemas<TModuleId, TEvents>,
 > = {
+  readonly moduleId: TModuleId;
+  readonly events: TEventTokens;
+  readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
   register(
     register: RegisterFunction<
@@ -1390,7 +1711,9 @@ export type DefinedLedgerShape<
     ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>,
     {},
     {},
-    null
+    null,
+    TModuleId,
+    TEventTokens
   >;
 };
 
@@ -1406,7 +1729,18 @@ export type DefinedLedgerModel<
   TQueryDefinitions extends ProjectionQueryDefinitions = {},
   TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null =
     AnyMaterializationHistory<TEvents> | null,
+  TModuleId extends string = string,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  } = EventTokensForSchemas<TModuleId, TEvents>,
+  TQueryTokens extends {
+    readonly [TQueryName in keyof TQueries]: AnyQueryToken;
+  } = QueryTokensFor<TModuleId, TQueries>,
 > = {
+  readonly moduleId: TModuleId;
+  readonly events: TEventTokens;
+  readonly queries: TQueryTokens;
+  readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
   readonly materializationHistory: TMaterializationHistory;
   readonly model: LedgerModel<
     TEvents,
@@ -1444,34 +1778,91 @@ export type DefinedLedgerModel<
     TProjectionSchema,
     TIndexerDefinitions,
     TQueryDefinitions,
-    TMaterializationHistory
+    TMaterializationHistory,
+    TModuleId,
+    TEventTokens,
+    TQueryTokens
   >;
 };
 
 export function defineLedgerShape<
-  const TEvents extends Record<string, TSchema>,
-  const TQueues extends Record<string, TSchema>,
-  const TSignals extends Record<string, TSchema>,
-  const TSignalQueues extends Record<string, TSchema>,
+  const TModuleId extends string,
+  const TEventDefinitions extends Record<string, EventDefinition>,
+  const TQueues extends Record<string, TSchema> = {},
+  const TSignals extends Record<string, TSchema> = {},
+  const TSignalQueues extends Record<string, TSchema> = {},
 >(input: {
-  readonly events: TEvents;
-  readonly queues: TQueues;
-  readonly signals: TSignals;
-  readonly signalQueues: TSignalQueues;
-}): DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues> {
-  const shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues> = {
-    events: input.events,
-    queues: input.queues,
-    signals: input.signals,
-    signalQueues: input.signalQueues,
+  readonly moduleId: TModuleId;
+  readonly events: TEventDefinitions;
+  readonly queues?: TQueues & PrivateSchemaDefinitions<TQueues>;
+  readonly signals?: TSignals & PrivateSchemaDefinitions<TSignals>;
+  readonly signalQueues?: TSignalQueues &
+    PrivateSchemaDefinitions<TSignalQueues>;
+}): DefinedLedgerShape<
+  EventSchemasFor<TEventDefinitions>,
+  TQueues,
+  TSignals,
+  TSignalQueues,
+  TModuleId,
+  EventTokensFor<TModuleId, TEventDefinitions>
+> {
+  validateModuleId(input.moduleId);
+  const queueDefinitions = (input.queues ?? {}) as TQueues;
+  const signalDefinitions = (input.signals ?? {}) as TSignals;
+  const signalQueueDefinitions = (input.signalQueues ?? {}) as TSignalQueues;
+  validatePrivateSchemaDefinitions("queue", queueDefinitions);
+  validatePrivateSchemaDefinitions("signal", signalDefinitions);
+  validatePrivateSchemaDefinitions("signal queue", signalQueueDefinitions);
+  const events = createEventTokens(input.moduleId, input.events);
+  const queues = createSchemaTokens(input.moduleId, "queue", queueDefinitions);
+  const signals = createSchemaTokens(
+    input.moduleId,
+    "signal",
+    signalDefinitions,
+  );
+  const signalQueues = createSchemaTokens(
+    input.moduleId,
+    "signal_queue",
+    signalQueueDefinitions,
+  );
+  const eventSchemas = readEventSchemas(input.events);
+  const shape: LedgerShape<
+    EventSchemasFor<TEventDefinitions>,
+    TQueues,
+    TSignals,
+    TSignalQueues
+  > = {
+    events: eventSchemas,
+    queues: queueDefinitions,
+    signals: signalDefinitions,
+    signalQueues: signalQueueDefinitions,
   };
 
   return {
+    moduleId: input.moduleId,
+    events,
+    signals,
     shape,
     register: (register) => {
       return createDefinedLedgerModel({
-        shape,
-        access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
+        moduleId: input.moduleId,
+        contracts: {
+          events,
+          queries: {},
+          queues,
+          signals,
+          signalQueues,
+        },
+        shape: shape as LedgerShape<
+          EventSchemasFor<TEventDefinitions>,
+          TQueues,
+          TSignals,
+          TSignalQueues
+        >,
+        access:
+          createEmptyProjectionAccess<
+            Extract<keyof TEventDefinitions, string>
+          >(),
         materializationHistory: null,
       }).register(register);
     },
@@ -1479,6 +1870,7 @@ export function defineLedgerShape<
 }
 
 export function withMaterializations<
+  const TModuleId extends string,
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
   const TSignals extends Record<string, TSchema>,
@@ -1487,9 +1879,19 @@ export function withMaterializations<
   const TIndexerDefinitions extends ProjectionIndexerDefinitions<
     Extract<keyof TEvents, string>
   >,
-  const TQueryDefinitions extends ProjectionQueryDefinitions,
+  const TQueryDefinitions extends LedgerQueryDefinitions,
+  const TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
 >(
-  shape: DefinedLedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
+  shape: DefinedLedgerShape<
+    TEvents,
+    TQueues,
+    TSignals,
+    TSignalQueues,
+    TModuleId,
+    TEventTokens
+  >,
   materializations: Materializations<
     THistory,
     TIndexerDefinitions,
@@ -1506,25 +1908,365 @@ export function withMaterializations<
   TQueues,
   THistory["current"],
   ProjectionIndexerSchemas<TIndexerDefinitions>,
-  ProjectionQuerySchemas<TQueryDefinitions>,
+  ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>>,
   TSignals,
   TSignalQueues,
   TIndexerDefinitions,
-  TQueryDefinitions,
-  THistory
+  OwnedQueryDefinitions<TQueryDefinitions>,
+  THistory,
+  TModuleId,
+  TEventTokens,
+  QueryTokensFor<TModuleId, TQueryDefinitions>
 > {
   validateMaterializationEvents(shape.shape, materializations);
+  const queryDefinitions = normalizeQueryDefinitions(materializations.queries);
+  const ownedQueryDefinitions = readOwnedQueryDefinitions(
+    materializations.queries,
+  );
+  const queryTokens = createQueryTokens(
+    shape.moduleId,
+    materializations.queries,
+  );
+  const queues = createSchemaTokens(
+    shape.moduleId,
+    "queue",
+    shape.shape.queues,
+  );
+  const signalQueues = createSchemaTokens(
+    shape.moduleId,
+    "signal_queue",
+    shape.shape.signalQueues,
+  );
   const access = createProjectionAccess({
     projections: materializations.history.current,
     indexers: materializations.indexers,
-    queries: materializations.queries,
+    queries: queryDefinitions,
+    ownedQueries: ownedQueryDefinitions,
   });
 
   return createDefinedLedgerModel({
+    moduleId: shape.moduleId,
+    contracts: {
+      events: shape.events,
+      queries: queryTokens,
+      queues,
+      signals: shape.signals,
+      signalQueues,
+    },
     shape: shape.shape,
     access,
     materializationHistory: materializations.history,
   });
+}
+
+type RegisteredLedgerModelRuntime = {
+  readonly [registeredLedgerModelBrand]: true;
+  readonly moduleId: string;
+  readonly [registeredLedgerContractsBrand]: {
+    readonly events: Readonly<Record<string, AnyEventToken>>;
+    readonly queries: Readonly<Record<string, AnyQueryToken>>;
+    readonly queues: Readonly<Record<string, AnyQueueToken>>;
+    readonly signals: Readonly<Record<string, AnySignalToken>>;
+    readonly signalQueues: Readonly<Record<string, AnySignalQueueToken>>;
+  };
+  readonly [registeredLedgerRuntimeBrand]: {
+    readonly materializationHistory: AnyMaterializationHistory | null;
+    readonly model: {
+      readonly events: Readonly<Record<string, TSchema>>;
+      readonly queues: Readonly<Record<string, TSchema>>;
+      readonly signals: Readonly<Record<string, TSchema>>;
+      readonly signalQueues: Readonly<Record<string, TSchema>>;
+      readonly indexers: Readonly<Record<string, TSchema>>;
+      readonly queries: Readonly<Record<string, AnyQuerySchema>>;
+    };
+    readonly projections: AnyProjectionSchema;
+    readonly register: object;
+  };
+  readonly model: {
+    readonly events: Readonly<Record<string, TSchema>>;
+    readonly queues: Readonly<Record<string, TSchema>>;
+    readonly signals: Readonly<Record<string, TSchema>>;
+    readonly signalQueues: Readonly<Record<string, TSchema>>;
+    readonly indexers: Readonly<Record<string, TSchema>>;
+    readonly queries: Readonly<Record<string, AnyQuerySchema>>;
+  };
+  readonly register: object;
+  readonly materializationHistory: AnyMaterializationHistory | null;
+  readonly projections: AnyProjectionSchema;
+};
+
+type ContractValues<TContracts extends Readonly<Record<string, object>>> =
+  TContracts[keyof TContracts];
+
+type ModuleEventTokens<TModule> = TModule extends RegisteredLedgerModelRuntime
+  ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["events"]>
+  : never;
+
+type ModuleSignalTokens<TModule> = TModule extends RegisteredLedgerModelRuntime
+  ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["signals"]>
+  : never;
+
+type ModuleQueryTokens<TModule> = TModule extends RegisteredLedgerModelRuntime
+  ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["queries"]>
+  : never;
+
+export type ComposedLedgerModel<
+  TModules extends readonly RegisteredLedgerModelRuntime[],
+> = {
+  readonly [composedLedgerModelBrand]: true;
+  readonly [composedLedgerModulesBrand]: TModules;
+  readonly [registeredLedgerContractsBrand]: RegisteredLedgerModelRuntime[typeof registeredLedgerContractsBrand];
+  readonly [registeredLedgerRuntimeBrand]: RegisteredLedgerModelRuntime[typeof registeredLedgerRuntimeBrand];
+};
+
+export type AnyComposedLedgerModel = ComposedLedgerModel<
+  readonly RegisteredLedgerModelRuntime[]
+>;
+
+export type ComposedLedgerEventTokens<TModel extends AnyComposedLedgerModel> =
+  ModuleEventTokens<TModel[typeof composedLedgerModulesBrand][number]>;
+
+export type ComposedLedgerSignalTokens<TModel extends AnyComposedLedgerModel> =
+  ModuleSignalTokens<TModel[typeof composedLedgerModulesBrand][number]>;
+
+export type ComposedLedgerQueryTokens<TModel extends AnyComposedLedgerModel> =
+  ModuleQueryTokens<TModel[typeof composedLedgerModulesBrand][number]>;
+
+export function composeLedgerModels<
+  const TFirst extends RegisteredLedgerModelRuntime,
+  const TRest extends readonly RegisteredLedgerModelRuntime[],
+>(
+  first: TFirst,
+  ...rest: TRest
+): ComposedLedgerModel<readonly [TFirst, ...TRest]> {
+  const modules: readonly [TFirst, ...TRest] = [first, ...rest];
+  const moduleIds = new Set<string>();
+
+  for (const module of modules) {
+    const normalizedModuleId = module.moduleId.toLowerCase();
+
+    if (moduleIds.has(normalizedModuleId)) {
+      throw new Error(`duplicate ledger module id ${module.moduleId}`);
+    }
+
+    moduleIds.add(normalizedModuleId);
+  }
+
+  for (const module of modules) {
+    const moduleContracts = module[registeredLedgerContractsBrand];
+
+    for (const token of Object.values(moduleContracts.events)) {
+      const metadata = readLedgerContractToken(token, "event");
+      const owner = modules.find(
+        (candidate) => candidate.moduleId === metadata.moduleId,
+      );
+
+      if (
+        owner === undefined ||
+        !Object.values(owner[registeredLedgerContractsBrand].events).includes(
+          token,
+        )
+      ) {
+        throw new Error(
+          `ledger module ${module.moduleId} references unavailable event ${metadata.moduleId}.${metadata.localName}`,
+        );
+      }
+    }
+
+    for (const token of Object.values(moduleContracts.queries)) {
+      const metadata = readLedgerContractToken(token, "query");
+      const owner = modules.find(
+        (candidate) => candidate.moduleId === metadata.moduleId,
+      );
+
+      if (
+        owner === undefined ||
+        !Object.values(owner[registeredLedgerContractsBrand].queries).includes(
+          token,
+        )
+      ) {
+        throw new Error(
+          `ledger module ${module.moduleId} references unavailable query ${metadata.moduleId}.${metadata.localName}`,
+        );
+      }
+    }
+  }
+
+  const model = {
+    events: mergeModelSchemas(modules, "events"),
+    queues: mergeModelSchemas(modules, "queues"),
+    signals: mergeModelSchemas(modules, "signals"),
+    signalQueues: mergeModelSchemas(modules, "signalQueues"),
+    indexers: mergeModelSchemas(modules, "indexers"),
+    queries: mergeModelSchemas(modules, "queries"),
+  };
+  const registration = {
+    events: mergeContributionHandlers(modules, "events"),
+    queues: mergeExclusiveHandlers(modules, "queues"),
+    signals: mergeContributionHandlers(modules, "signals"),
+    signalQueues: mergeExclusiveHandlers(modules, "signalQueues"),
+  };
+  const firstMaterializedRuntime = modules
+    .map((module) => module[registeredLedgerRuntimeBrand])
+    .find((runtime) => runtime.materializationHistory !== null);
+  const materializationHistory =
+    firstMaterializedRuntime?.materializationHistory ?? null;
+  const projections =
+    firstMaterializedRuntime?.projections ??
+    first[registeredLedgerRuntimeBrand].projections;
+  const contracts = mergeRootContracts(modules);
+  const runtime = {
+    materializationHistory,
+    model,
+    projections,
+    register: registration,
+  };
+  const composed = {
+    [composedLedgerModelBrand]: true,
+    [composedLedgerModulesBrand]: modules,
+    [registeredLedgerContractsBrand]: contracts,
+    [registeredLedgerRuntimeBrand]: runtime,
+  } as unknown as ComposedLedgerModel<readonly [TFirst, ...TRest]>;
+
+  return attachLedgerImplementationFactory(composed, (factory) => {
+    const indexers: Record<string, unknown> = {};
+    const queries: Record<string, unknown> = {};
+
+    for (const module of modules) {
+      const implementations = readLedgerImplementations(module, factory);
+      Object.assign(indexers, implementations.indexers);
+      Object.assign(queries, implementations.queries);
+    }
+
+    return {
+      indexers,
+      queries,
+    } as LedgerImplementations<
+      Record<string, TSchema>,
+      Record<string, AnyQuerySchema>,
+      Record<string, TSchema>
+    >;
+  });
+}
+
+function mergeModelSchemas(
+  modules: readonly RegisteredLedgerModelRuntime[],
+  key: keyof RegisteredLedgerModelRuntime[typeof registeredLedgerRuntimeBrand]["model"],
+): Record<string, TSchema | AnyQuerySchema> {
+  const merged: Record<string, TSchema | AnyQuerySchema> = {};
+
+  for (const module of modules) {
+    Object.assign(merged, module[registeredLedgerRuntimeBrand].model[key]);
+  }
+
+  return merged;
+}
+
+function mergeContributionHandlers(
+  modules: readonly RegisteredLedgerModelRuntime[],
+  key: "events" | "signals",
+): Readonly<Record<string, (input: unknown) => Promise<void>>> {
+  const contributions = new Map<
+    string,
+    readonly ((input: unknown) => void | Promise<void>)[]
+  >();
+
+  for (const module of modules) {
+    const handlers = (
+      module[registeredLedgerRuntimeBrand].register as RuntimeRegister
+    )[key] as
+      | Readonly<Record<string, (input: unknown) => void | Promise<void>>>
+      | undefined;
+
+    for (const [physicalName, handler] of Object.entries(handlers ?? {})) {
+      contributions.set(physicalName, [
+        ...(contributions.get(physicalName) ?? []),
+        handler,
+      ]);
+    }
+  }
+
+  return Object.fromEntries(
+    [...contributions].map(([physicalName, handlers]) => {
+      return [
+        physicalName,
+        async (input: unknown) => {
+          for (const handler of handlers) {
+            await handler(input);
+          }
+        },
+      ];
+    }),
+  );
+}
+
+function mergeExclusiveHandlers(
+  modules: readonly RegisteredLedgerModelRuntime[],
+  key: "queues" | "signalQueues",
+): Readonly<Record<string, (input: unknown) => void | Promise<void>>> {
+  const merged: Record<string, (input: unknown) => void | Promise<void>> = {};
+
+  for (const module of modules) {
+    const handlers = (
+      module[registeredLedgerRuntimeBrand].register as RuntimeRegister
+    )[key] as
+      | Readonly<Record<string, (input: unknown) => void | Promise<void>>>
+      | undefined;
+
+    for (const [physicalName, handler] of Object.entries(handlers ?? {})) {
+      if (merged[physicalName] !== undefined) {
+        throw new Error(`duplicate ${key} handler ${physicalName}`);
+      }
+
+      merged[physicalName] = handler;
+    }
+  }
+
+  return merged;
+}
+
+function mergeRootContracts(
+  modules: readonly RegisteredLedgerModelRuntime[],
+): RegisteredLedgerModelRuntime[typeof registeredLedgerContractsBrand] {
+  const events: Record<string, AnyEventToken> = {};
+  const queries: Record<string, AnyQueryToken> = {};
+  const queues: Record<string, AnyQueueToken> = {};
+  const signals: Record<string, AnySignalToken> = {};
+  const signalQueues: Record<string, AnySignalQueueToken> = {};
+
+  for (const module of modules) {
+    const moduleContracts = module[registeredLedgerContractsBrand];
+
+    for (const token of Object.values(moduleContracts.events)) {
+      events[readLedgerContractToken(token, "event").physicalName] = token;
+    }
+
+    for (const token of Object.values(moduleContracts.queues)) {
+      queues[readLedgerContractToken(token, "queue").physicalName] = token;
+    }
+
+    for (const token of Object.values(moduleContracts.queries)) {
+      queries[readLedgerContractToken(token, "query").physicalName] = token;
+    }
+
+    for (const token of Object.values(moduleContracts.signals)) {
+      signals[readLedgerContractToken(token, "signal").physicalName] = token;
+    }
+
+    for (const token of Object.values(moduleContracts.signalQueues)) {
+      signalQueues[
+        readLedgerContractToken(token, "signal_queue").physicalName
+      ] = token;
+    }
+  }
+
+  return {
+    events,
+    queries,
+    queues,
+    signals,
+    signalQueues,
+  };
 }
 
 type MaterializationMigrationChainState<
@@ -2653,7 +3395,7 @@ function validateMaterializationEvents<
   TSignalQueues extends Record<string, TSchema>,
   THistory extends AnyMaterializationHistory<TEvents>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
-  TQueryDefinitions extends ProjectionQueryDefinitions,
+  TQueryDefinitions extends LedgerQueryDefinitions,
 >(
   shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>,
   materializations: Materializations<
@@ -2754,10 +3496,1074 @@ function createEmptyProjectionAccess<
     queries: {},
     indexerDefinitions: {},
     queryDefinitions: {},
+    ownedQueryDefinitions: {},
   };
 }
 
+type RuntimeEventHandlerInput = {
+  readonly event: {
+    readonly eventId: number;
+    readonly ref: EventRef<string>;
+    readonly tsMs: number;
+    readonly eventName: string;
+    readonly payload: unknown;
+    readonly causationEventId: number | null;
+    readonly dedupeKey: string | null;
+  };
+  readonly actions: {
+    index(indexName: string, input: unknown): Promise<void>;
+    enqueue(
+      queueName: string,
+      payload: unknown,
+      options?: EnqueueOptions,
+    ): void;
+    query(queryName: string, params: unknown): Promise<unknown>;
+  };
+};
+
+type RuntimeSignalHandlerInput = {
+  readonly event: RuntimeEventHandlerInput["event"];
+  readonly actions: {
+    enqueueSignal(
+      queueName: string,
+      payload: unknown,
+      options?: EnqueueOptions,
+    ): void;
+  };
+};
+
+type RuntimeQueueHandlerInput = {
+  readonly work: {
+    readonly workId: number;
+    readonly queueName: string;
+    readonly payload: unknown;
+    readonly attempt: number;
+    readonly sourceEventId: number;
+  };
+  readonly lease: {
+    readonly workId: number;
+    readonly queueName: string;
+    readonly sourceEventId: number;
+    readonly attempt: number;
+    readonly leaseId: string;
+    readonly leaseAcquiredAtMs: number;
+    readonly leaseExpiresAtMs: number;
+    readonly signal: AbortSignal;
+  };
+  readonly actions: {
+    emit(eventName: string, event: unknown, options?: EmitOptions): void;
+    emitSignal(
+      signalName: string,
+      signal: unknown,
+      options?: EmitOptions,
+    ): Promise<void>;
+    query(queryName: string, params: unknown): Promise<unknown>;
+  };
+  readonly control: QueueHandlerControl;
+};
+
+type RuntimeSignalQueueHandlerInput = {
+  readonly work: RuntimeQueueHandlerInput["work"];
+  readonly lease: RuntimeQueueHandlerInput["lease"];
+  readonly actions: {
+    query(queryName: string, params: unknown): Promise<unknown>;
+  };
+  readonly control: SignalQueueHandlerControl;
+};
+
+type RuntimeRegister = {
+  readonly events?: Readonly<
+    Record<string, (input: RuntimeEventHandlerInput) => void | Promise<void>>
+  >;
+  readonly signals?: Readonly<
+    Record<string, (input: RuntimeSignalHandlerInput) => void | Promise<void>>
+  >;
+  readonly queues?: Readonly<
+    Record<string, (input: RuntimeQueueHandlerInput) => void | Promise<void>>
+  >;
+  readonly signalQueues?: Readonly<
+    Record<
+      string,
+      (input: RuntimeSignalQueueHandlerInput) => void | Promise<void>
+    >
+  >;
+  readonly indexers?: Readonly<Record<string, unknown>>;
+  readonly queries?: Readonly<Record<string, unknown>>;
+};
+
+function createPhysicalRegisteredModule<
+  TModuleId extends string,
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
+  TSignals extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+  TQueryTokens extends {
+    readonly [TQueryName in keyof TQueries]: AnyQueryToken;
+  },
+>(input: {
+  readonly moduleId: TModuleId;
+  readonly contracts: {
+    readonly events: TEventTokens;
+    readonly queries: TQueryTokens;
+    readonly queues: TokensForSchemas<TModuleId, TQueues, "queue">;
+    readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
+    readonly signalQueues: TokensForSchemas<
+      TModuleId,
+      TSignalQueues,
+      "signal_queue"
+    >;
+  };
+  readonly localModel: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+  readonly access: {
+    readonly indexers: TIndexers;
+    readonly queries: TQueries;
+  };
+  readonly register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TIndexerDefinitions
+  >;
+}): {
+  readonly model: LedgerModel<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues
+  >;
+  readonly register: RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TIndexerDefinitions
+  >;
+} {
+  const runtimeRegister = input.register as RuntimeRegister;
+  const model = {
+    events: createPhysicalSchemaMap(
+      input.contracts.events,
+      input.localModel.events,
+      "event",
+    ),
+    queues: createPhysicalSchemaMap(
+      input.contracts.queues,
+      input.localModel.queues,
+      "queue",
+    ),
+    signals: createPhysicalSchemaMap(
+      input.contracts.signals,
+      input.localModel.signals,
+      "signal",
+    ),
+    signalQueues: createPhysicalSchemaMap(
+      input.contracts.signalQueues,
+      input.localModel.signalQueues,
+      "signal_queue",
+    ),
+    indexers: createPrivatePhysicalSchemaMap(
+      input.moduleId,
+      "indexer",
+      input.access.indexers,
+    ),
+    queries: createPhysicalQuerySchemaMap(
+      input.contracts.queries,
+      input.access.queries,
+    ),
+  };
+  const events: Record<
+    string,
+    (input: RuntimeEventHandlerInput) => Promise<void>
+  > = {};
+
+  for (const [localName, handler] of Object.entries(
+    runtimeRegister.events ?? {},
+  )) {
+    const token = input.contracts.events[localName];
+
+    if (token === undefined) {
+      throw new Error(`unknown event registration ${localName}`);
+    }
+
+    const physicalName = readLedgerContractToken(token, "event").physicalName;
+    const previous = events[physicalName];
+    events[physicalName] = async (physicalInput) => {
+      if (previous !== undefined) {
+        await previous(physicalInput);
+      }
+
+      await runEventContribution(handler, localName, physicalInput, {
+        indexerName: (name) =>
+          createPhysicalName(input.moduleId, "indexer", name),
+        queryName: (name) =>
+          readTokenPhysicalName(input.contracts.queries[name], "query", name),
+        queueName: (name) =>
+          readTokenPhysicalName(input.contracts.queues[name], "queue", name),
+      });
+    };
+  }
+
+  const signals: Record<
+    string,
+    (input: RuntimeSignalHandlerInput) => void | Promise<void>
+  > = {};
+
+  for (const [localName, handler] of Object.entries(
+    runtimeRegister.signals ?? {},
+  )) {
+    const physicalName = readTokenPhysicalName(
+      input.contracts.signals[localName],
+      "signal",
+      localName,
+    );
+    signals[physicalName] = (physicalInput) => {
+      return handler({
+        event: localizeRuntimeEvent(physicalInput.event, localName),
+        actions: {
+          enqueueSignal: (queueName, payload, options) => {
+            physicalInput.actions.enqueueSignal(
+              readTokenPhysicalName(
+                input.contracts.signalQueues[queueName],
+                "signal_queue",
+                queueName,
+              ),
+              payload,
+              options,
+            );
+          },
+        },
+      });
+    };
+  }
+
+  const queues: Record<
+    string,
+    (input: RuntimeQueueHandlerInput) => void | Promise<void>
+  > = {};
+
+  for (const [localName, handler] of Object.entries(
+    runtimeRegister.queues ?? {},
+  )) {
+    const physicalName = readTokenPhysicalName(
+      input.contracts.queues[localName],
+      "queue",
+      localName,
+    );
+    queues[physicalName] = (physicalInput) => {
+      return handler({
+        ...physicalInput,
+        work: {
+          ...physicalInput.work,
+          queueName: localName,
+        },
+        lease: {
+          ...physicalInput.lease,
+          queueName: localName,
+        },
+        actions: {
+          emit: (eventName, event, options) => {
+            physicalInput.actions.emit(
+              readTokenPhysicalName(
+                input.contracts.events[eventName],
+                "event",
+                eventName,
+              ),
+              event,
+              options,
+            );
+          },
+          emitSignal: (signalName, signal, options) => {
+            return physicalInput.actions.emitSignal(
+              readTokenPhysicalName(
+                input.contracts.signals[signalName],
+                "signal",
+                signalName,
+              ),
+              signal,
+              options,
+            );
+          },
+          query: (queryName, params) => {
+            return physicalInput.actions.query(
+              readTokenPhysicalName(
+                input.contracts.queries[queryName],
+                "query",
+                queryName,
+              ),
+              params,
+            );
+          },
+        },
+      });
+    };
+  }
+
+  const signalQueues: Record<
+    string,
+    (input: RuntimeSignalQueueHandlerInput) => void | Promise<void>
+  > = {};
+
+  for (const [localName, handler] of Object.entries(
+    runtimeRegister.signalQueues ?? {},
+  )) {
+    const physicalName = readTokenPhysicalName(
+      input.contracts.signalQueues[localName],
+      "signal_queue",
+      localName,
+    );
+    signalQueues[physicalName] = (physicalInput) => {
+      return handler({
+        ...physicalInput,
+        work: {
+          ...physicalInput.work,
+          queueName: localName,
+        },
+        lease: {
+          ...physicalInput.lease,
+          queueName: localName,
+        },
+        actions: {
+          query: (queryName, params) => {
+            return physicalInput.actions.query(
+              readTokenPhysicalName(
+                input.contracts.queries[queryName],
+                "query",
+                queryName,
+              ),
+              params,
+            );
+          },
+        },
+      });
+    };
+  }
+
+  return {
+    model: model as LedgerModel<
+      TEvents,
+      TQueues,
+      TIndexers,
+      TQueries,
+      TSignals,
+      TSignalQueues
+    >,
+    register: {
+      events,
+      indexers: runtimeRegister.indexers,
+      queries: runtimeRegister.queries,
+      queues,
+      signals,
+      signalQueues,
+    } as RegisterFunction<
+      TEvents,
+      TQueues,
+      TIndexers,
+      TQueries,
+      TSignals,
+      TSignalQueues,
+      TIndexerDefinitions
+    >,
+  };
+}
+
+async function runEventContribution(
+  handler: (input: RuntimeEventHandlerInput) => void | Promise<void>,
+  localName: string,
+  physicalInput: RuntimeEventHandlerInput,
+  names: {
+    readonly indexerName: (name: string) => string;
+    readonly queryName: (name: string) => string;
+    readonly queueName: (name: string) => string;
+  },
+): Promise<void> {
+  const pendingActions = new Set<Promise<unknown>>();
+  let open = true;
+  const track = <T>(run: () => Promise<T>): Promise<T> => {
+    if (!open) {
+      return Promise.reject(
+        new Error("event actions are only valid during event handling"),
+      );
+    }
+
+    let tracked: Promise<T>;
+    tracked = run().finally(() => {
+      pendingActions.delete(tracked);
+    });
+    pendingActions.add(tracked);
+    return tracked;
+  };
+
+  await handler({
+    event: localizeRuntimeEvent(physicalInput.event, localName),
+    actions: {
+      index: (indexName, indexInput) => {
+        return track(async () => {
+          await physicalInput.actions.index(
+            names.indexerName(indexName),
+            indexInput,
+          );
+        });
+      },
+      enqueue: (queueName, payload, options) => {
+        if (!open) {
+          throw new Error("event actions are only valid during event handling");
+        }
+
+        physicalInput.actions.enqueue(
+          names.queueName(queueName),
+          payload,
+          options,
+        );
+      },
+      query: (queryName, params) => {
+        return track(async () => {
+          return await physicalInput.actions.query(
+            names.queryName(queryName),
+            params,
+          );
+        });
+      },
+    },
+  });
+
+  open = false;
+
+  if (pendingActions.size === 0) {
+    return;
+  }
+
+  await Promise.allSettled([...pendingActions]);
+  throw new Error("event actions must be awaited before the handler returns");
+}
+
+function localizeRuntimeEvent(
+  event: RuntimeEventHandlerInput["event"],
+  localName: string,
+): RuntimeEventHandlerInput["event"] {
+  return {
+    ...event,
+    eventName: localName,
+    ref: createEventRef(localName, event.eventId),
+  };
+}
+
+function createPhysicalSchemaMap(
+  tokens: Readonly<Record<string, object>>,
+  schemas: Readonly<Record<string, TSchema>>,
+  kind: "event" | "queue" | "signal" | "signal_queue",
+): Record<string, TSchema> {
+  const physical: Record<string, TSchema> = {};
+
+  for (const [localName, schema] of Object.entries(schemas)) {
+    const token = tokens[localName];
+    physical[readTokenPhysicalName(token, kind, localName)] = schema;
+  }
+
+  return physical;
+}
+
+function createPrivatePhysicalSchemaMap<TValue>(
+  moduleId: string,
+  kind: "indexer",
+  schemas: Readonly<Record<string, TValue>>,
+): Record<string, TValue> {
+  const physical: Record<string, TValue> = {};
+
+  for (const [localName, schema] of Object.entries(schemas)) {
+    physical[createPhysicalName(moduleId, kind, localName)] = schema;
+  }
+
+  return physical;
+}
+
+function createPhysicalQuerySchemaMap(
+  tokens: Readonly<Record<string, object>>,
+  schemas: Readonly<Record<string, AnyQuerySchema>>,
+): Record<string, AnyQuerySchema> {
+  const physical: Record<string, AnyQuerySchema> = {};
+
+  for (const [localName, schema] of Object.entries(schemas)) {
+    physical[readTokenPhysicalName(tokens[localName], "query", localName)] =
+      schema;
+  }
+
+  return physical;
+}
+
+function namespaceLedgerImplementations(
+  moduleId: string,
+  queryTokens: Readonly<Record<string, object>>,
+  indexerDefinitions: ProjectionIndexerDefinitions<string>,
+  implementations: LedgerImplementations<
+    Record<string, TSchema>,
+    Record<string, AnyQuerySchema>,
+    Record<string, TSchema>
+  >,
+): LedgerImplementations<
+  Record<string, TSchema>,
+  Record<string, AnyQuerySchema>,
+  Record<string, TSchema>
+> {
+  const indexers: Record<
+    string,
+    NonNullable<typeof implementations.indexers>[string]
+  > = {};
+  const queries: Record<
+    string,
+    NonNullable<typeof implementations.queries>[string]
+  > = {};
+
+  for (const [localName, implementation] of Object.entries(
+    implementations.indexers ?? {},
+  )) {
+    const definition = indexerDefinitions[localName];
+
+    if (definition === undefined) {
+      throw new Error(`unknown indexer implementation ${localName}`);
+    }
+
+    indexers[createPhysicalName(moduleId, "indexer", localName)] = (
+      scope,
+      indexInput,
+      context,
+    ) => {
+      return implementation(scope, indexInput, {
+        event: localizeRuntimeEvent(context.event, definition.sourceEvent),
+      });
+    };
+  }
+
+  for (const [localName, implementation] of Object.entries(
+    implementations.queries ?? {},
+  )) {
+    queries[readTokenPhysicalName(queryTokens[localName], "query", localName)] =
+      implementation;
+  }
+
+  return {
+    indexers,
+    queries,
+  };
+}
+
+function validateModuleId(moduleId: string): void {
+  validatePhysicalNamePart("ledger module id", moduleId);
+}
+
+function validatePrivateSchemaDefinitions(
+  kind: string,
+  definitions: Readonly<Record<string, unknown>>,
+): void {
+  for (const [name, definition] of Object.entries(definitions)) {
+    if (isLedgerContractToken(definition)) {
+      throw new Error(`${kind} ${name} must be defined by its owning module`);
+    }
+  }
+}
+
+function validatePhysicalNamePart(context: string, value: string): void {
+  if (value.length === 0) {
+    throw new Error(`${context} must not be empty`);
+  }
+
+  if (value.includes(physicalNameSeparator)) {
+    throw new Error(
+      `${context} must not contain reserved separator ${physicalNameSeparator}`,
+    );
+  }
+}
+
+function createPhysicalName(
+  moduleId: string,
+  kind: LedgerContractKind,
+  localName: string,
+): string {
+  validateModuleId(moduleId);
+  validatePhysicalNamePart(`${kind} name`, localName);
+  return `sledge${physicalNameSeparator}${moduleId}${physicalNameSeparator}${kind}${physicalNameSeparator}${localName}`;
+}
+
+function createEventTokens<
+  TModuleId extends string,
+  TDefinitions extends Record<string, EventDefinition>,
+>(
+  moduleId: TModuleId,
+  definitions: TDefinitions,
+): EventTokensFor<TModuleId, TDefinitions> {
+  const tokens: Record<string, AnyEventToken> = {};
+
+  for (const [localName, definition] of Object.entries(definitions)) {
+    if (isLedgerContractToken(definition)) {
+      const metadata = readLedgerContractToken(definition, "event");
+      defineRecordEntry(tokens, localName, definition as AnyEventToken);
+
+      if (metadata.kind !== "event") {
+        throw new Error(`${localName} must reference an event token`);
+      }
+
+      continue;
+    }
+
+    defineRecordEntry(
+      tokens,
+      localName,
+      createSchemaToken(
+        moduleId,
+        "event",
+        localName,
+        definition,
+      ) as AnyEventToken,
+    );
+  }
+
+  return tokens as EventTokensFor<TModuleId, TDefinitions>;
+}
+
+function readEventSchemas<TDefinitions extends Record<string, EventDefinition>>(
+  definitions: TDefinitions,
+): EventSchemasFor<TDefinitions> {
+  const schemas: Record<string, TSchema> = {};
+
+  for (const [localName, definition] of Object.entries(definitions)) {
+    defineRecordEntry(
+      schemas,
+      localName,
+      isLedgerContractToken(definition)
+        ? readLedgerContractToken(definition, "event").schema
+        : definition,
+    );
+  }
+
+  return schemas as EventSchemasFor<TDefinitions>;
+}
+
+function normalizeQueryDefinitions<TDefinitions extends LedgerQueryDefinitions>(
+  definitions: TDefinitions,
+): NormalizedQueryDefinitions<TDefinitions> {
+  const normalized: Record<string, AnyQuerySchema> = {};
+
+  for (const [localName, definition] of Object.entries(definitions)) {
+    if (isLedgerContractToken(definition)) {
+      const metadata = readLedgerContractToken(definition, "query");
+      defineRecordEntry(normalized, localName, {
+        params: metadata.params,
+        result: metadata.result,
+      });
+      continue;
+    }
+
+    defineRecordEntry(normalized, localName, definition as AnyQuerySchema);
+  }
+
+  return normalized as NormalizedQueryDefinitions<TDefinitions>;
+}
+
+function readOwnedQueryDefinitions<TDefinitions extends LedgerQueryDefinitions>(
+  definitions: TDefinitions,
+): OwnedQueryDefinitions<TDefinitions> {
+  const owned: Record<string, AnyQuerySchema> = {};
+
+  for (const [localName, definition] of Object.entries(definitions)) {
+    if (!isLedgerContractToken(definition)) {
+      defineRecordEntry(owned, localName, definition as AnyQuerySchema);
+    }
+  }
+
+  return owned as OwnedQueryDefinitions<TDefinitions>;
+}
+
+function createQueryTokens<
+  TModuleId extends string,
+  TDefinitions extends LedgerQueryDefinitions,
+>(
+  moduleId: TModuleId,
+  definitions: TDefinitions,
+): QueryTokensFor<TModuleId, TDefinitions> {
+  const tokens: Record<string, AnyQueryToken> = {};
+
+  for (const [localName, definition] of Object.entries(definitions)) {
+    if (isLedgerContractToken(definition)) {
+      readLedgerContractToken(definition, "query");
+      defineRecordEntry(tokens, localName, definition as AnyQueryToken);
+      continue;
+    }
+
+    const queryDefinition = definition as AnyQuerySchema;
+    const token = Object.freeze({});
+    ledgerContractTokenMetadata.set(token, {
+      kind: "query",
+      localName,
+      moduleId,
+      params: queryDefinition.params,
+      physicalName: createPhysicalName(moduleId, "query", localName),
+      result: queryDefinition.result,
+    });
+    defineRecordEntry(tokens, localName, token as AnyQueryToken);
+  }
+
+  return tokens as QueryTokensFor<TModuleId, TDefinitions>;
+}
+
+function createSchemaTokens<
+  TModuleId extends string,
+  TSchemas extends Record<string, TSchema>,
+  TKind extends "queue" | "signal" | "signal_queue",
+>(
+  moduleId: TModuleId,
+  kind: TKind,
+  schemas: TSchemas,
+): TokensForSchemas<TModuleId, TSchemas, TKind> {
+  const tokens: Record<
+    string,
+    AnyQueueToken | AnySignalToken | AnySignalQueueToken
+  > = {};
+
+  for (const [localName, schema] of Object.entries(schemas)) {
+    defineRecordEntry(
+      tokens,
+      localName,
+      createSchemaToken(moduleId, kind, localName, schema) as
+        | AnyQueueToken
+        | AnySignalToken
+        | AnySignalQueueToken,
+    );
+  }
+
+  return tokens as TokensForSchemas<TModuleId, TSchemas, TKind>;
+}
+
+function createSchemaToken(
+  moduleId: string,
+  kind: "event" | "queue" | "signal" | "signal_queue",
+  localName: string,
+  schema: TSchema,
+): object {
+  const token = Object.freeze({});
+  ledgerContractTokenMetadata.set(token, {
+    kind,
+    localName,
+    moduleId,
+    physicalName: createPhysicalName(moduleId, kind, localName),
+    schema,
+  });
+  return token;
+}
+
+function defineRecordEntry<TValue>(
+  record: Record<string, TValue>,
+  name: string,
+  value: TValue,
+): void {
+  Object.defineProperty(record, name, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function isLedgerContractToken(value: unknown): value is object {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    ledgerContractTokenMetadata.has(value)
+  );
+}
+
+function readLedgerContractToken<TKind extends LedgerContractMetadata["kind"]>(
+  token: object,
+  expectedKind: TKind,
+): Extract<LedgerContractMetadata, { readonly kind: TKind }> {
+  const metadata = ledgerContractTokenMetadata.get(token);
+
+  if (metadata === undefined || metadata.kind !== expectedKind) {
+    throw new Error(`expected Sledge ${expectedKind} token`);
+  }
+
+  return metadata as Extract<LedgerContractMetadata, { readonly kind: TKind }>;
+}
+
+function readTokenPhysicalName(
+  token: object | undefined,
+  expectedKind: LedgerContractMetadata["kind"],
+  localName: string,
+): string {
+  if (token === undefined) {
+    throw new Error(`unknown ${expectedKind}: ${localName}`);
+  }
+
+  return readLedgerContractToken(token, expectedKind).physicalName;
+}
+
+function namespaceProjectionSchema<
+  TProjectionSchema extends AnyProjectionSchema,
+>(moduleId: string, schema: TProjectionSchema): TProjectionSchema {
+  const tables: Record<string, ProjectionTableMetadata> = {};
+
+  for (const [localName, table] of Object.entries(schema.metadata.tables)) {
+    tables[localName] = namespaceProjectionTable(moduleId, localName, table);
+  }
+
+  const relations: Record<string, ProjectionForeignKeyMetadata> = {};
+
+  for (const [name, relation] of Object.entries(schema.metadata.relations)) {
+    relations[name] = namespaceProjectionForeignKey(moduleId, relation);
+  }
+
+  return {
+    ...schema,
+    metadata: {
+      relations,
+      tables,
+    },
+  } as TProjectionSchema;
+}
+
+function namespaceProjectionTable(
+  moduleId: string,
+  localName: string,
+  table: ProjectionTableMetadata,
+): ProjectionTableMetadata {
+  return {
+    ...table,
+    indexes: table.indexes.map((index) => {
+      return namespaceProjectionIndex(moduleId, index);
+    }),
+    name: createPhysicalName(moduleId, "table", localName),
+  };
+}
+
+function namespaceProjectionIndex(
+  moduleId: string,
+  index: ProjectionIndexMetadata,
+): ProjectionIndexMetadata {
+  return {
+    ...index,
+    name: createPhysicalName(moduleId, "index", index.name),
+  };
+}
+
+function namespaceProjectionForeignKey(
+  moduleId: string,
+  foreignKey: ProjectionForeignKeyMetadata,
+): ProjectionForeignKeyMetadata {
+  return {
+    ...foreignKey,
+    fromTable: createPhysicalName(moduleId, "table", foreignKey.fromTable),
+    toTable: createPhysicalName(moduleId, "table", foreignKey.toTable),
+  };
+}
+
+function namespaceMaterializationHistory<
+  THistory extends AnyMaterializationHistory,
+>(moduleId: string, history: THistory): THistory {
+  const namespace = createPhysicalName(
+    moduleId,
+    "materialization",
+    history.namespace,
+  );
+
+  return {
+    ...history,
+    current: {
+      ...namespaceProjectionSchema(moduleId, history.current),
+      namespace,
+    },
+    migrations: history.migrations.map((migration) => {
+      return {
+        ...migration,
+        operations: migration.operations.map((operation) => {
+          return namespaceMaterializationOperation(moduleId, operation);
+        }),
+      };
+    }),
+    namespace,
+  } as THistory;
+}
+
+function namespaceMaterializationOperation(
+  moduleId: string,
+  operation: MaterializationMigrationOperation,
+): MaterializationMigrationOperation {
+  switch (operation.kind) {
+    case "create_table":
+      return {
+        ...operation,
+        table: namespaceProjectionTable(
+          moduleId,
+          operation.tableName,
+          operation.table,
+        ),
+      };
+    case "create_index":
+      return {
+        ...operation,
+        index: namespaceProjectionIndex(moduleId, operation.index),
+      };
+    case "add_foreign_key":
+      return {
+        ...operation,
+        foreignKey: namespaceProjectionForeignKey(
+          moduleId,
+          operation.foreignKey,
+        ),
+      };
+    case "add_column":
+    case "data":
+      return operation;
+  }
+}
+
+function createModuleProjectionStatementCompiler(
+  compiler: ProjectionStatementCompiler,
+  moduleId: string,
+  contracts: {
+    readonly events: Readonly<Record<string, AnyEventToken>>;
+    readonly signals: Readonly<Record<string, AnySignalToken>>;
+  },
+): ProjectionStatementCompiler {
+  const physicalStreamName = (
+    streamKind: "event" | "signal",
+    localName: string,
+  ): string => {
+    const tokens =
+      streamKind === "event" ? contracts.events : contracts.signals;
+    return readTokenPhysicalName(tokens[localName], streamKind, localName);
+  };
+
+  return {
+    resolveStorageStreamName: ({ eventName, streamKind }) =>
+      compiler.resolveStorageStreamName({
+        eventName: physicalStreamName(streamKind, eventName),
+        streamKind,
+      }),
+    compileAddColumn: (statement) => compiler.compileAddColumn(statement),
+    compileAggregate: (statement) =>
+      compiler.compileAggregate(
+        namespaceProjectionStatementTables(moduleId, statement),
+      ),
+    compileCreateIndex: (statement) => compiler.compileCreateIndex(statement),
+    compileCreateTable: (statement) => compiler.compileCreateTable(statement),
+    compileDelete: (statement) =>
+      compiler.compileDelete(
+        namespaceProjectionStatementTables(moduleId, statement),
+      ),
+    compileEventRead: (statement) =>
+      compiler.compileEventRead({
+        ...statement,
+        eventName: physicalStreamName("event", statement.eventName),
+      }),
+    compileEventIdBounds: (statement) =>
+      compiler.compileEventIdBounds({
+        ...statement,
+        eventName: physicalStreamName(
+          statement.streamKind,
+          statement.eventName,
+        ),
+      }),
+    compileEventScan: (statement) =>
+      compiler.compileEventScan({
+        ...statement,
+        eventName: physicalStreamName(
+          statement.streamKind,
+          statement.eventName,
+        ),
+      }),
+    compileLatestEventRefsByPayload: (statement) =>
+      compiler.compileLatestEventRefsByPayload({
+        ...statement,
+        eventName: physicalStreamName(
+          statement.streamKind,
+          statement.eventName,
+        ),
+      }),
+    compileInsert: (statement) =>
+      compiler.compileInsert(
+        namespaceProjectionStatementTables(moduleId, statement),
+      ),
+    compileSelect: (statement) =>
+      compiler.compileSelect(
+        namespaceProjectionStatementTables(moduleId, statement),
+      ),
+    compileUnionSelect: (statement) =>
+      compiler.compileUnionSelect(
+        namespaceProjectionStatementTables(moduleId, statement),
+      ),
+    compileUpdate: (statement) =>
+      compiler.compileUpdate(
+        namespaceProjectionStatementTables(moduleId, statement),
+      ),
+  };
+}
+
+function namespaceProjectionStatementTables<T>(moduleId: string, value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      return namespaceProjectionStatementTables(moduleId, item);
+    }) as T;
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  const namespaced: Record<string, unknown> = {};
+
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "value" || key === "values") {
+      namespaced[key] = child;
+      continue;
+    }
+
+    if (
+      (key === "tableName" || key === "fromTableName") &&
+      typeof child === "string"
+    ) {
+      namespaced[key] = namespaceProjectionStatementTableName(moduleId, child);
+      continue;
+    }
+
+    namespaced[key] = namespaceProjectionStatementTables(moduleId, child);
+  }
+
+  return namespaced as T;
+}
+
+function namespaceProjectionStatementTableName(
+  moduleId: string,
+  tableName: string,
+): string {
+  const moduleTablePrefix = `sledge::${moduleId}::table::`;
+
+  if (tableName.startsWith(moduleTablePrefix)) {
+    return tableName;
+  }
+
+  return createPhysicalName(moduleId, "table", tableName);
+}
+
 function createDefinedLedgerModel<
+  TModuleId extends string,
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TProjectionSchema extends AnyProjectionSchema,
@@ -2767,8 +4573,27 @@ function createDefinedLedgerModel<
   TSignalQueues extends Record<string, TSchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
+  TAllQueryDefinitions extends ProjectionQueryDefinitions,
   TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+  TQueryTokens extends {
+    readonly [TQueryName in keyof TQueries]: AnyQueryToken;
+  },
 >(input: {
+  readonly moduleId: TModuleId;
+  readonly contracts: {
+    readonly events: TEventTokens;
+    readonly queries: TQueryTokens;
+    readonly queues: TokensForSchemas<TModuleId, TQueues, "queue">;
+    readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
+    readonly signalQueues: TokensForSchemas<
+      TModuleId,
+      TSignalQueues,
+      "signal_queue"
+    >;
+  };
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
   readonly materializationHistory: TMaterializationHistory;
   readonly access: ProjectionAccess<
@@ -2776,6 +4601,7 @@ function createDefinedLedgerModel<
     TIndexers,
     TQueries,
     TIndexerDefinitions,
+    TAllQueryDefinitions,
     TQueryDefinitions
   >;
 }): DefinedLedgerModel<
@@ -2788,9 +4614,12 @@ function createDefinedLedgerModel<
   TSignalQueues,
   TIndexerDefinitions,
   TQueryDefinitions,
-  TMaterializationHistory
+  TMaterializationHistory,
+  TModuleId,
+  TEventTokens,
+  TQueryTokens
 > {
-  const model: LedgerModel<
+  const localModel: LedgerModel<
     TEvents,
     TQueues,
     TIndexers,
@@ -2805,12 +4634,34 @@ function createDefinedLedgerModel<
     indexers: input.access.indexers,
     queries: input.access.queries,
   };
+  const physicalProjections = namespaceProjectionSchema(
+    input.moduleId,
+    input.access.projections,
+  );
+  const physicalMaterializationHistory =
+    input.materializationHistory === null
+      ? null
+      : namespaceMaterializationHistory(
+          input.moduleId,
+          input.materializationHistory,
+        );
 
   return {
+    moduleId: input.moduleId,
+    events: input.contracts.events,
+    queries: input.contracts.queries,
+    signals: input.contracts.signals,
     materializationHistory: input.materializationHistory,
-    model,
+    model: localModel,
     projections: input.access.projections,
     register: (register) => {
+      const physical = createPhysicalRegisteredModule({
+        access: input.access,
+        contracts: input.contracts,
+        localModel,
+        moduleId: input.moduleId,
+        register,
+      });
       const registeredModel: RegisteredLedgerModel<
         TEvents,
         TQueues,
@@ -2821,87 +4672,71 @@ function createDefinedLedgerModel<
         TProjectionSchema,
         TIndexerDefinitions,
         TQueryDefinitions,
-        TMaterializationHistory
+        TMaterializationHistory,
+        TModuleId,
+        TEventTokens,
+        TQueryTokens
       > = {
         [registeredLedgerModelBrand]: true,
+        [registeredLedgerContractsBrand]: input.contracts,
+        [registeredLedgerRuntimeBrand]: {
+          materializationHistory:
+            physicalMaterializationHistory as TMaterializationHistory,
+          model: physical.model,
+          projections: physicalProjections,
+          register: physical.register as typeof register,
+        },
+        moduleId: input.moduleId,
         materializationHistory: input.materializationHistory,
-        model,
+        model: localModel,
         projections: input.access.projections,
         register,
       };
 
-      return attachLedgerImplementationFactory(registeredModel, (factory) => {
-        return createProjectionImplementations({
+      const registeredWithSchemas = attachLedgerProjectionSchemas(
+        registeredModel,
+        {
           events: input.shape.events,
           signals: input.shape.signals,
-          statementCompiler: factory.statementCompiler,
-          projections: input.access.projections,
-          indexers: input.access.indexerDefinitions,
-          queries: input.access.queryDefinitions,
-          register,
-        }) as LedgerImplementations<TIndexers, TQueries, TEvents>;
-      });
+        },
+      );
+      const registeredWithCompiler = attachLedgerProjectionCompilerFactory(
+        registeredWithSchemas,
+        (compiler) => {
+          return createModuleProjectionStatementCompiler(
+            compiler,
+            input.moduleId,
+            input.contracts,
+          );
+        },
+      );
+
+      return attachLedgerImplementationFactory(
+        registeredWithCompiler,
+        (factory) => {
+          const statementCompiler = createModuleProjectionStatementCompiler(
+            factory.statementCompiler,
+            input.moduleId,
+            input.contracts,
+          );
+          const implementations = createProjectionImplementations({
+            events: input.shape.events,
+            signals: input.shape.signals,
+            statementCompiler,
+            projections: input.access.projections,
+            indexers: input.access.indexerDefinitions,
+            queries: input.access.ownedQueryDefinitions,
+            register,
+          }) as LedgerImplementations<TIndexers, TQueries, TEvents>;
+
+          return namespaceLedgerImplementations(
+            input.moduleId,
+            input.contracts.queries,
+            input.access.indexerDefinitions,
+            implementations,
+          ) as LedgerImplementations<TIndexers, TQueries, TEvents>;
+        },
+      );
     },
   };
-}
-
-/**
- * Backend runtime factory capability.
- */
-export interface LedgerEngineFactory {
-  openLedger<
-    TEvents extends Record<string, TSchema>,
-    TQueues extends Record<string, TSchema>,
-    TIndexers extends Record<string, TSchema>,
-    TQueries extends Record<string, AnyQuerySchema>,
-    TSignals extends Record<string, TSchema> = {},
-    TSignalQueues extends Record<string, TSchema> = {},
-    TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
-    TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
-    TQueryDefinitions extends ProjectionQueryDefinitions = {},
-  >(input: {
-    readonly model: RegisteredLedgerModel<
-      TEvents,
-      TQueues,
-      TIndexers,
-      TQueries,
-      TSignals,
-      TSignalQueues,
-      TProjectionSchema,
-      TIndexerDefinitions,
-      TQueryDefinitions
-    >;
-    readonly timing: LedgerTiming;
-  }): Ledger<TEvents, TQueries, TSignals>;
-}
-
-export function createLedger<
-  const TEvents extends Record<string, TSchema>,
-  const TQueues extends Record<string, TSchema>,
-  const TIndexers extends Record<string, TSchema>,
-  const TQueries extends Record<string, AnyQuerySchema>,
-  const TSignals extends Record<string, TSchema> = {},
-  const TSignalQueues extends Record<string, TSchema> = {},
-  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
-  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
-  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
->(input: {
-  readonly model: RegisteredLedgerModel<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  >;
-  readonly engineFactory: LedgerEngineFactory;
-  readonly timing: LedgerTiming;
-}): Ledger<TEvents, TQueries, TSignals> {
-  return input.engineFactory.openLedger({
-    model: input.model,
-    timing: input.timing,
-  });
 }

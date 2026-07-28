@@ -258,6 +258,10 @@ export type ProjectionCompilerCreateIndexStatement = {
 };
 
 export type ProjectionStatementCompiler = {
+  resolveStorageStreamName(input: {
+    readonly eventName: string;
+    readonly streamKind: ProjectionCompilerEventStreamKind;
+  }): string;
   compileAddColumn(
     statement: ProjectionCompilerAddColumnStatement,
   ): ProjectionCompiledSql;
@@ -303,6 +307,7 @@ const projectionEventPayloadFieldNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export function createSqliteProjectionStatementCompiler(): ProjectionStatementCompiler {
   return {
+    resolveStorageStreamName: ({ eventName }) => eventName,
     compileAddColumn: compileAddColumnStatement,
     compileAggregate: compileAggregateStatement,
     compileCreateIndex: compileCreateIndexStatement,

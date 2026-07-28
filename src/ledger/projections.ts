@@ -16,6 +16,7 @@ const reservedProjectionTableNames = new Set([
   "idx_work_partition_order",
   "idx_work_ref",
   "sledge_materialization_versions",
+  "sledge_storage_layout",
   "work",
 ]);
 const reservedProjectionIndexNames = new Set([

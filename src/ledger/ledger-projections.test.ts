@@ -52,6 +52,7 @@ const RunStreamFrameSchema = Type.Object({
 });
 
 const shape = defineLedgerShape({
+  moduleId: "projection.tests",
   events: {
     "user.created": UserCreatedSchema,
   },
@@ -379,9 +380,78 @@ function readTestLedgerImplementations<
   >,
   statementCompiler: ProjectionStatementCompiler = createSqliteProjectionStatementCompiler(),
 ): LedgerImplementations<TIndexers, TQueries, TEvents> {
-  return readLedgerImplementations<TIndexers, TQueries, TEvents>(model, {
-    statementCompiler,
+  const logicalStatementCompiler =
+    createLogicalTestStatementCompiler(statementCompiler);
+  const implementations = readLedgerImplementations<
+    TIndexers,
+    TQueries,
+    TEvents
+  >(model, {
+    statementCompiler: logicalStatementCompiler,
   });
+  const indexers: Record<string, unknown> = {};
+  const queries: Record<string, unknown> = {};
+  const indexerPrefix = `sledge::${model.moduleId}::indexer::`;
+  const queryPrefix = `sledge::${model.moduleId}::query::`;
+
+  for (const [name, implementation] of Object.entries(
+    implementations.indexers ?? {},
+  )) {
+    indexers[name.slice(indexerPrefix.length)] = implementation;
+  }
+
+  for (const [name, implementation] of Object.entries(
+    implementations.queries ?? {},
+  )) {
+    queries[name.slice(queryPrefix.length)] = implementation;
+  }
+
+  return {
+    indexers,
+    queries,
+  } as LedgerImplementations<TIndexers, TQueries, TEvents>;
+}
+
+function createLogicalTestStatementCompiler(
+  compiler: ProjectionStatementCompiler,
+): ProjectionStatementCompiler {
+  return new Proxy(compiler, {
+    get: (target, property, receiver) => {
+      const value = Reflect.get(target, property, receiver) as unknown;
+
+      if (typeof value !== "function") {
+        return value;
+      }
+
+      return (statement: unknown) => {
+        return Reflect.apply(value, target, [
+          localizeProjectionStatement(statement),
+        ]) as unknown;
+      };
+    },
+  });
+}
+
+function localizeProjectionStatement(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(/^sledge::[^:]+::(?:event|signal|table)::/, "");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(localizeProjectionStatement);
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+
+  const localized: Record<string, unknown> = {};
+
+  for (const [key, child] of Object.entries(value)) {
+    localized[key] = localizeProjectionStatement(child);
+  }
+
+  return localized;
 }
 
 async function settlesWithin<T>(
@@ -2727,7 +2797,7 @@ test("projection access rejects unsafe predicate and self-join shapes", async ()
   }, /nodes\.parentId predicate value cannot be null/);
   await assert.rejects(async () => {
     await selfAntiJoin(fake.scope, {});
-  }, /projection anti-join cannot target the same table nodes/);
+  }, /projection anti-join cannot target the same table (?:sledge::projection\.tests::table::)?nodes/);
   await assert.rejects(async () => {
     await selfJoin(fake.scope, {});
   }, /projection inner join cannot target the same table nodes/);
@@ -3152,6 +3222,7 @@ test("projection access hydrates semantic event references without exposing even
 
 test("projection access scans semantic signals without exposing events table", async () => {
   const signalShape = defineLedgerShape({
+    moduleId: "projection.signal-tests",
     events: {
       "user.created": UserCreatedSchema,
     },
@@ -3321,6 +3392,7 @@ test("projection facade supports TorkBot-style surface operation materialization
     "surface.operation.requested": SurfaceOperationRequestedSchema,
   };
   const surfaceShape = defineLedgerShape({
+    moduleId: "projection.surface-tests",
     events: surfaceEvents,
     queues: {},
     signals: {},
@@ -3775,13 +3847,16 @@ test("ledger projection construction feeds generated contracts and implementatio
     },
   });
 
-  assert.equal(registeredModel.model.events["user.created"], UserCreatedSchema);
   assert.equal(
-    registeredModel.model.indexers.upsertUser,
+    Object.values(registeredModel.model.events)[0],
+    UserCreatedSchema,
+  );
+  assert.equal(
+    Object.values(registeredModel.model.indexers)[0],
     definedModel.model.indexers.upsertUser,
   );
   assert.equal(
-    registeredModel.model.queries.userById,
+    Object.values(registeredModel.model.queries)[0],
     definedModel.model.queries.userById,
   );
   assert.equal(
@@ -3789,8 +3864,11 @@ test("ledger projection construction feeds generated contracts and implementatio
     "function",
   );
   assert.equal(definedModel.materializationHistory, history);
-  assert.equal(registeredModel.materializationHistory, history);
-  assert.equal(registeredModel.projections, definedModel.projections);
+  assert.equal(registeredModel.materializationHistory?.namespace, "test");
+  assert.equal(
+    registeredModel.projections.metadata.tables.users?.name,
+    "users",
+  );
 });
 
 test("ledger shape can register without projections", () => {
@@ -3802,7 +3880,10 @@ test("ledger shape can register without projections", () => {
     },
   });
 
-  assert.equal(registeredModel.model.events["user.created"], UserCreatedSchema);
+  assert.equal(
+    Object.values(registeredModel.model.events)[0],
+    UserCreatedSchema,
+  );
   assert.deepEqual(registeredModel.model.indexers, {});
   assert.deepEqual(registeredModel.model.queries, {});
   assert.equal(registeredModel.materializationHistory, null);
@@ -4621,6 +4702,7 @@ test("withMaterializations rejects unchecked indexer source events outside the l
 
 async function assertLedgerProjectionTypes(): Promise<void> {
   const multiEventShape = defineLedgerShape({
+    moduleId: "projection.source-event-tests",
     events: {
       "session.created": Type.Object({
         sessionId: Type.String(),
@@ -5410,6 +5492,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
   >;
 
   const typedSignalShape = defineLedgerShape({
+    moduleId: "projection.signal-type-tests",
     events: {
       "user.created": UserCreatedSchema,
     },

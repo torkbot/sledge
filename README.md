@@ -24,6 +24,7 @@ import { Type } from "typebox";
 
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
+  composeLedgerModels,
   defineLedgerShape,
   defineMaterialization,
   withMaterializations,
@@ -36,6 +37,7 @@ import {
 const databaseUrl = "./app.sqlite";
 
 const ledgerShape = defineLedgerShape({
+  moduleId: "app.users",
   events: {
     "user.created": Type.Object({
       userId: Type.String(),
@@ -48,8 +50,6 @@ const ledgerShape = defineLedgerShape({
       email: Type.String(),
     }),
   },
-  signals: {},
-  signalQueues: {},
 });
 
 const materializations = defineMaterialization(ledgerShape, {
@@ -92,7 +92,7 @@ const materializations = defineMaterialization(ledgerShape, {
 
 const definedModel = withMaterializations(ledgerShape, materializations);
 
-const model = definedModel.register({
+const usersModel = definedModel.register({
   indexers: {
     upsertUser: async ({ input, event, db }) => {
       await db
@@ -152,6 +152,8 @@ const model = definedModel.register({
   },
 });
 
+const model = composeLedgerModels(usersModel);
+
 await using ledger = createBetterSqliteLedger({
   databaseUrl,
   model,
@@ -164,12 +166,14 @@ await using workers = await ledger.startWorkers({
   scheduler: new NodeRuntimeScheduler(),
 });
 
-await ledger.emit("user.created", {
+await ledger.emit(ledgerShape.events["user.created"], {
   userId: "u_123",
   email: "alice@example.com",
 });
 
-const user = await ledger.query("userById", { userId: "u_123" });
+const user = await ledger.query(definedModel.queries.userById, {
+  userId: "u_123",
+});
 console.log(user);
 ```
 
@@ -177,15 +181,19 @@ console.log(user);
 
 ### 1. Define the Ledger Shape
 
-`defineLedgerShape(...)` defines durable boundary contracts with TypeBox:
+`defineLedgerShape(...)` requires a stable `moduleId` and defines durable
+boundary contracts with TypeBox:
 
 - `events`: facts appended to the event stream
 - `queues`: durable work payloads
 - `signals`: process-local, short-lived records emitted by queue handlers
 - `signalQueues`: retryable work materialized from signals
 
-All four fields are explicit. Use `{}` when a shape has no contracts in that
-category.
+`events` is required. Omit `queues`, `signals`, or `signalQueues` when the
+module does not define contracts in that category. Plain event definitions
+create contracts owned by that module and produce opaque event tokens such as
+`ledgerShape.events["user.created"]`. Runtime APIs accept these tokens instead
+of string names.
 
 ### 2. Define Materializations From Migrations
 
@@ -400,7 +408,46 @@ details, not package exports.
 Registration returns the model passed to a storage adapter. There is no
 separate bind step.
 
-### 4. Run Database Hygiene
+### 4. Compose the Root Model
+
+Every runtime receives one explicitly composed root model:
+
+```ts
+const model = composeLedgerModels(usersModel, auditModel, deliveryModel);
+```
+
+Modules can reuse an event contract by supplying another module's event token
+as the definition value. The alias is a code-level name for the exact same
+persisted event:
+
+```ts
+const auditShape = defineLedgerShape({
+  moduleId: "app.audit",
+  events: {
+    userCreated: ledgerShape.events["user.created"],
+  },
+});
+```
+
+Query definitions work the same way: supplying
+`definedModel.queries.userById` in another module's materialization query
+definitions creates a local alias that routes to the owning module's query
+implementation. The consuming module does not implement that alias.
+
+Event and query references establish contract availability, not execution
+order. For one append, Sledge runs contributions in
+`composeLedgerModels(...)` order, left to right, inside the existing atomic
+transaction. A query invoked during indexing sees committed state plus writes
+performed earlier in that append, but never writes from later contributions.
+Any failure rolls back the persisted event, projection writes, and queued work
+from every module.
+
+Indexer definitions, durable queue definitions, projection tables and indexes,
+and materialization histories remain owned by their defining module. Consumers
+reference source event tokens and define their own indexers or queues; queues
+and indexers cannot be aliased across modules.
+
+### 5. Run Database Hygiene
 
 Opening a ledger creates Sledge's internal tables and ensures the declared
 materialization tables and indexes exist from the migration-derived current
@@ -412,7 +459,22 @@ constraints incrementally, so
 `addForeignKey(...)` migrations are rejected after a namespace has already been
 created.
 
-### 5. Open a Runtime
+Module identity namespaces projection tables, projection indexes, durable
+queues, and materialization histories in SQLite, so independently defined
+modules can use the same local names without physical collisions.
+
+The first open records the composed root's ordered module ids. Every later
+runtime opening that database must supply the exact same modules in the same
+composition order. Sledge rejects mismatched roots before schema mutation or
+work dispatch so rolling processes cannot apply different handler
+contributions to one logical ledger.
+
+Composable models use a new canonical storage layout. Opening a database
+created by a pre-composition Sledge release fails before any schema mutation.
+Reset the database before adopting this API; this release intentionally does
+not include a legacy migration or compatibility mode.
+
+### 6. Open a Runtime
 
 Use one adapter to open the ledger:
 
@@ -432,14 +494,14 @@ actually enters WAL journal mode and rejects databases that cannot.
 
 The opened ledger exposes:
 
-- `emit(eventName, payload, options?)`
-- `query(queryName, params)`
+- `emit(eventToken, payload, options?)`
+- `query(queryToken, params)`
 - `cancelWork({ ref, reason? })`
 - `queryWork({ workId })`
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`
 - `tailEvents({ last, signal })`
 - `resumeEvents({ cursor, signal })`
-- `onSignal(signalName, observer)`
+- `onSignal(signalToken, observer)`
 - `startWorkers(options)`
 - `close()`
 
@@ -521,6 +583,12 @@ await ledger.cancelWork({
   reason: "user requested cancellation",
 });
 ```
+
+`WorkRef` is an opaque string generated and persisted by Sledge. Store and
+round-trip the value exactly as returned; do not construct or parse it. Queue
+and module identity remain private to the runtime, so work from different
+modules remains independently addressable even when the modules use the same
+local queue name and `workKey`.
 
 Cancellation is terminal. Cancelled work will not dispatch again, including
 after process restart.

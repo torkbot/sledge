@@ -1,99 +1,48 @@
+import { realpathSync } from "node:fs";
+
 import Database from "better-sqlite3";
-import type { TSchema } from "typebox";
 
 import type {
+  AnyComposedLedgerModel,
+  ComposedLedgerEventTokens,
+  ComposedLedgerQueryTokens,
+  ComposedLedgerSignalTokens,
   Ledger,
-  RegisteredLedgerModel,
   LedgerTiming,
-  QuerySchema,
 } from "./ledger.ts";
-import type {
-  AnyProjectionSchema,
-  ProjectionIndexerDefinitions,
-  ProjectionQueryDefinitions,
-} from "./projection-access.ts";
 import {
-  createDatabaseLedger,
-  type CreateDatabaseLedgerInput,
+  createComposedDatabaseLedger,
   type StorageDatabase,
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
+import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
-
-type AnyIndexerDef = TSchema;
-type AnyQueryDef = QuerySchema<TSchema, TSchema>;
 
 const connectionOptions = {
   timeout: 0,
 } satisfies Database.Options;
 
-type CreateBetterSqliteLedgerInput<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TIndexers extends Record<string, AnyIndexerDef>,
-  TQueries extends Record<string, AnyQueryDef>,
-  TSignals extends Record<string, TSchema> = {},
-  TSignalQueues extends Record<string, TSchema> = {},
-  TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
-  TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
-  TQueryDefinitions extends ProjectionQueryDefinitions = {},
-> = {
+type CreateBetterSqliteLedgerInput<TModel extends AnyComposedLedgerModel> = {
   readonly databaseUrl: string;
-  readonly model: RegisteredLedgerModel<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  >;
+  readonly model: TModel;
   readonly timing: LedgerTiming;
 };
 
 export function createBetterSqliteLedger<
-  const TEvents extends Record<string, TSchema>,
-  const TQueues extends Record<string, TSchema>,
-  const TIndexers extends Record<string, AnyIndexerDef>,
-  const TQueries extends Record<string, AnyQueryDef>,
-  const TSignals extends Record<string, TSchema> = {},
-  const TSignalQueues extends Record<string, TSchema> = {},
-  const TProjectionSchema extends AnyProjectionSchema = AnyProjectionSchema,
-  const TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
-  const TQueryDefinitions extends ProjectionQueryDefinitions = {},
+  const TModel extends AnyComposedLedgerModel,
 >(
-  input: CreateBetterSqliteLedgerInput<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  >,
-): Ledger<TEvents, TQueries, TSignals> {
-  const sharedInput: CreateDatabaseLedgerInput<
-    TEvents,
-    TQueues,
-    TIndexers,
-    TQueries,
-    TSignals,
-    TSignalQueues,
-    TProjectionSchema,
-    TIndexerDefinitions,
-    TQueryDefinitions
-  > = {
+  input: CreateBetterSqliteLedgerInput<TModel>,
+): Ledger<
+  ComposedLedgerEventTokens<TModel>,
+  ComposedLedgerQueryTokens<TModel>,
+  ComposedLedgerSignalTokens<TModel>
+> {
+  return createComposedDatabaseLedger({
     storage: createBetterSqliteStorageRuntime(input.databaseUrl),
     model: input.model,
     projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
     timing: input.timing,
-  };
-
-  return createDatabaseLedger(sharedInput);
+  });
 }
 
 export function createBetterSqliteStorageRuntime(
@@ -144,6 +93,7 @@ export function createBetterSqliteStorageRuntime(
   };
 
   return {
+    [storageRuntimeIdentityBrand]: realpathSync(databaseUrl),
     read: async (run) => {
       if (closed) {
         throw new Error("storage runtime is closed");
