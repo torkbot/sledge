@@ -180,7 +180,8 @@ type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
 const storageLayoutTableName = "sledge_storage_layout";
-const storageLayoutVersion = 1;
+const legacyJsonNullStorageLayoutVersion = 1;
+const storageLayoutVersion = 2;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
@@ -1098,9 +1099,11 @@ function openDatabaseLedgerEngine<
     await serializeDatabaseInitialization(
       storage[storageRuntimeIdentityBrand],
       async () => {
-        await storage.write(async (database) => {
-          await ensureStorageLayout(database, moduleIds);
-        });
+        const openedStorageLayoutVersion = await storage.write(
+          async (database) => {
+            return await ensureStorageLayout(database, moduleIds);
+          },
+        );
         await storage.write(async (database) => {
           await database.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -1166,6 +1169,8 @@ function openDatabaseLedgerEngine<
             AND cancelled = 0;
       `);
         });
+        const materializationContexts: MaterializationRuntimeContext[] = [];
+
         for (const module of modules) {
           const moduleRuntime = module[registeredLedgerRuntimeBrand] ?? module;
           let context: MaterializationRuntimeContext;
@@ -1190,12 +1195,20 @@ function openDatabaseLedgerEngine<
             };
           }
 
+          materializationContexts.push(context);
+
           await storage.write(async (database) => {
             await ensureMaterializationHygiene(
               database,
               moduleRuntime.materializationHistory,
               context,
             );
+          });
+        }
+
+        if (openedStorageLayoutVersion < storageLayoutVersion) {
+          await storage.write(async (database) => {
+            await migrateStorageLayout(database, materializationContexts);
           });
         }
       },
@@ -1358,7 +1371,7 @@ function openDatabaseLedgerEngine<
   async function ensureStorageLayout(
     database: StorageDatabase,
     moduleIds: readonly string[],
-  ): Promise<void> {
+  ): Promise<number> {
     await database.exec("BEGIN IMMEDIATE");
 
     try {
@@ -1404,6 +1417,10 @@ function openDatabaseLedgerEngine<
              ) VALUES (1, ?, ?)`,
           )
           .run(storageLayoutVersion, JSON.stringify(moduleIds));
+
+        await database.exec("COMMIT");
+
+        return storageLayoutVersion;
       } else {
         const row = await database
           .prepare(
@@ -1419,7 +1436,10 @@ function openDatabaseLedgerEngine<
 
         const decoded = Value.Decode(StorageLayoutRowSchema, row);
 
-        if (decoded.version !== storageLayoutVersion) {
+        if (
+          decoded.version !== legacyJsonNullStorageLayoutVersion &&
+          decoded.version !== storageLayoutVersion
+        ) {
           throw new Error(
             `unsupported Sledge storage layout version ${decoded.version}`,
           );
@@ -1443,12 +1463,106 @@ function openDatabaseLedgerEngine<
             `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
           );
         }
+
+        await database.exec("COMMIT");
+
+        return decoded.version;
+      }
+    } catch (error: unknown) {
+      await database.exec("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async function migrateStorageLayout(
+    database: StorageDatabase,
+    materializationContexts: readonly MaterializationRuntimeContext[],
+  ): Promise<void> {
+    await database.exec("BEGIN IMMEDIATE");
+
+    try {
+      const row = await database
+        .prepare(
+          `SELECT version, module_ids_json
+           FROM ${storageLayoutTableName}
+           WHERE singleton = 1`,
+        )
+        .get();
+
+      if (row === undefined) {
+        throw new Error("Sledge storage layout marker is missing");
       }
 
+      const decoded = Value.Decode(StorageLayoutRowSchema, row);
+
+      if (decoded.version === storageLayoutVersion) {
+        await database.exec("COMMIT");
+        return;
+      }
+
+      if (decoded.version !== legacyJsonNullStorageLayoutVersion) {
+        throw new Error(
+          `unsupported Sledge storage layout version ${decoded.version}`,
+        );
+      }
+
+      for (const context of materializationContexts) {
+        await normalizeLegacyNullableJsonNulls(database, context);
+      }
+
+      await database
+        .prepare(
+          `UPDATE ${storageLayoutTableName}
+           SET version = ?
+           WHERE singleton = 1`,
+        )
+        .run(storageLayoutVersion);
       await database.exec("COMMIT");
     } catch (error: unknown) {
       await database.exec("ROLLBACK").catch(() => undefined);
       throw error;
+    }
+  }
+
+  async function normalizeLegacyNullableJsonNulls(
+    database: StorageDatabase,
+    context: MaterializationRuntimeContext,
+  ): Promise<void> {
+    // Storage layout v1 encoded null in every JSON column as the text `null`.
+    // Nullable JSON now reserves JavaScript null for SQL NULL, so normalize the
+    // old representation once before marking the upgraded layout durable.
+    for (const table of Object.values(context.projections.metadata.tables)) {
+      for (const [columnName, column] of Object.entries(table.columns)) {
+        if (column.kind !== "json" || !column.nullable) {
+          continue;
+        }
+
+        const sql = context.compiler.compileUpdate({
+          assignments: [
+            {
+              columnName,
+              value: {
+                kind: "value",
+                value: null,
+              },
+            },
+          ],
+          tableName: table.name,
+          where: [
+            {
+              column: {
+                columnName,
+                tableName: null,
+              },
+              kind: "comparison",
+              operator: "=",
+              value: JSON.stringify(null),
+            },
+          ],
+        });
+
+        await database.prepare(sql.text).run(...sql.params);
+      }
     }
   }
 

@@ -691,7 +691,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             {
               module_ids_json:
                 '["contract.source","contract.consumer","contract.later","contract.failure"]',
-              version: 1,
+              version: 2,
             },
           );
         });
@@ -702,6 +702,216 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       throw new Error(`${driver} composition failed during ${phase}`, {
         cause: error,
       });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test(`${driver} migrates legacy nullable JSON nulls`, async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), `sledge-json-null-layout-${driver}-`),
+    );
+    const databaseUrl = join(directory, "ledger.sqlite");
+
+    try {
+      const shape = defineLedgerShape({
+        moduleId: "contract.json-null-layout",
+        events: {
+          created: Type.Object({
+            rowId: Type.Number(),
+          }),
+        },
+      });
+      const materializations = defineMaterialization(shape, {
+        namespace: "state",
+      })
+        .version(1, "create JSON null rows", (s) =>
+          s.createTable("rows", (t) =>
+            t
+              .columns({
+                rowId: t.integer().notNull(),
+                nullableValue: t.json<{ readonly value: string } | null>(),
+                requiredJsonNull: t.json<null>().notNull(),
+              })
+              .primaryKey(["rowId"]),
+          ),
+        )
+        .define({
+          indexers: {
+            store: {
+              sourceEvent: "created",
+              input: Type.Object({
+                rowId: Type.Number(),
+              }),
+            },
+          },
+          queries: {
+            nullValues: {
+              params: Type.Object({}),
+              result: Type.Array(
+                Type.Object({
+                  nullableValue: Type.Union([
+                    Type.Null(),
+                    Type.Object({
+                      value: Type.String(),
+                    }),
+                  ]),
+                  requiredJsonNull: Type.Null(),
+                }),
+              ),
+            },
+            nullableNotNullIds: {
+              params: Type.Object({}),
+              result: Type.Array(Type.Number()),
+            },
+          },
+        });
+      const module = withMaterializations(shape, materializations).register({
+        events: {
+          created: async ({ event, actions }) => {
+            await actions.index("store", {
+              rowId: event.payload.rowId,
+            });
+          },
+        },
+        indexers: {
+          store: async ({ input, db }) => {
+            await db
+              .insertInto("rows")
+              .values({
+                rowId: input.rowId,
+                nullableValue: null,
+                requiredJsonNull: null,
+              })
+              .execute();
+          },
+        },
+        queries: {
+          nullableNotNullIds: async ({ db }) => {
+            const rows = await db
+              .selectFrom("rows")
+              .select(["rowId"])
+              .whereNotNull("nullableValue")
+              .execute();
+
+            return rows.map((row) => row.rowId);
+          },
+          nullValues: async ({ db }) => {
+            const rows = await db
+              .selectFrom("rows")
+              .select(["nullableValue", "requiredJsonNull"])
+              .whereNull("nullableValue")
+              .whereNotNull("requiredJsonNull")
+              .execute();
+
+            return [...rows];
+          },
+        },
+      });
+      const model = composeLedgerModels(module);
+      const openLedger = async () => {
+        if (driver === "better-sqlite3") {
+          return createBetterSqliteLedger({
+            databaseUrl,
+            model,
+            timing,
+          });
+        }
+
+        return await createTursoLedger({
+          databaseUrl,
+          model,
+          timing,
+        });
+      };
+
+      const firstLedger = await openLedger();
+      await firstLedger.emit(module.events.created, {
+        rowId: 1,
+      });
+      await firstLedger.close();
+
+      const storage =
+        driver === "better-sqlite3"
+          ? createBetterSqliteStorageRuntime(databaseUrl)
+          : await createTursoStorageRuntime(databaseUrl);
+      try {
+        await storage.write(async (database) => {
+          await database
+            .prepare(
+              `UPDATE "sledge::contract.json-null-layout::table::rows"
+               SET "nullableValue" = ?
+               WHERE "rowId" = ?`,
+            )
+            .run(JSON.stringify(null), 1);
+          await database
+            .prepare(
+              `UPDATE sledge_storage_layout
+               SET version = 1
+               WHERE singleton = 1`,
+            )
+            .run();
+        });
+      } finally {
+        await storage.close();
+      }
+
+      const migratedLedger = await openLedger();
+      try {
+        assert.deepEqual(
+          await migratedLedger.query(module.queries.nullValues, {}),
+          [
+            {
+              nullableValue: null,
+              requiredJsonNull: null,
+            },
+          ],
+        );
+        assert.deepEqual(
+          await migratedLedger.query(module.queries.nullableNotNullIds, {}),
+          [],
+        );
+      } finally {
+        await migratedLedger.close();
+      }
+
+      const inspection =
+        driver === "better-sqlite3"
+          ? createBetterSqliteStorageRuntime(databaseUrl)
+          : await createTursoStorageRuntime(databaseUrl);
+      try {
+        await inspection.read(async (database) => {
+          assert.deepEqual(
+            await database
+              .prepare(
+                `SELECT
+                   typeof("nullableValue") AS nullable_type,
+                   typeof("requiredJsonNull") AS required_type
+                 FROM "sledge::contract.json-null-layout::table::rows"
+                 WHERE "rowId" = ?`,
+              )
+              .get(1),
+            {
+              nullable_type: "null",
+              required_type: "text",
+            },
+          );
+          assert.deepEqual(
+            await database
+              .prepare(
+                `SELECT version
+                 FROM sledge_storage_layout
+                 WHERE singleton = 1`,
+              )
+              .get(),
+            {
+              version: 2,
+            },
+          );
+        });
+      } finally {
+        await inspection.close();
+      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
