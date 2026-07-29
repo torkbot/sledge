@@ -691,7 +691,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             {
               module_ids_json:
                 '["contract.source","contract.consumer","contract.later","contract.failure"]',
-              version: 2,
+              version: 1,
             },
           );
         });
@@ -702,98 +702,6 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       throw new Error(`${driver} composition failed during ${phase}`, {
         cause: error,
       });
-    } finally {
-      await rm(directory, { force: true, recursive: true });
-    }
-  });
-
-  test(`${driver} rejects storage layout v1 before mutation`, async () => {
-    const directory = await mkdtemp(
-      join(tmpdir(), `sledge-v1-layout-${driver}-`),
-    );
-    const databaseUrl = join(directory, "ledger.sqlite");
-
-    try {
-      const database = new Database(databaseUrl);
-      database.exec(`
-        CREATE TABLE sledge_storage_layout (
-          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-          version INTEGER NOT NULL,
-          module_ids_json TEXT NOT NULL
-        );
-
-        INSERT INTO sledge_storage_layout (singleton, version, module_ids_json)
-        VALUES (1, 1, '["contract.layout"]');
-      `);
-      database.close();
-
-      const shape = defineLedgerShape({
-        moduleId: "contract.layout",
-        events: {
-          pinged: Type.Object({}),
-        },
-      });
-      const model = composeLedgerModels(shape.register({}));
-      const openLedger = async () => {
-        if (driver === "better-sqlite3") {
-          return createBetterSqliteLedger({
-            databaseUrl,
-            model,
-            timing,
-          });
-        }
-
-        return await createTursoLedger({
-          databaseUrl,
-          model,
-          timing,
-        });
-      };
-
-      const ledger = await openLedger();
-      await assert.rejects(
-        async () => {
-          await ledger.close();
-        },
-        (error: unknown) => {
-          return errorTreeIncludesMessage(
-            error,
-            "unsupported Sledge storage layout version 1; reset the database before opening it with version 2",
-          );
-        },
-      );
-
-      const inspection = new Database(databaseUrl, {
-        readonly: true,
-      });
-      try {
-        const names = inspection
-          .prepare(
-            `SELECT name
-             FROM sqlite_schema
-             WHERE type = 'table'
-             ORDER BY name`,
-          )
-          .all()
-          .map((row) => readStringColumn(row, "name"));
-
-        assert.deepEqual(names, ["sledge_storage_layout"]);
-        assert.deepEqual(
-          inspection
-            .prepare(
-              `SELECT version, module_ids_json
-               FROM sledge_storage_layout
-               WHERE singleton = 1`,
-            )
-            .get(),
-          {
-            module_ids_json: '["contract.layout"]',
-            version: 1,
-          },
-        );
-      } finally {
-        inspection.close();
-      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

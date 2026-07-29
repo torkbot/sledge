@@ -180,7 +180,7 @@ type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
 const storageLayoutTableName = "sledge_storage_layout";
-const storageLayoutVersion = 2;
+const storageLayoutVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
@@ -1421,7 +1421,7 @@ function openDatabaseLedgerEngine<
 
         if (decoded.version !== storageLayoutVersion) {
           throw new Error(
-            `unsupported Sledge storage layout version ${decoded.version}; reset the database before opening it with version ${storageLayoutVersion}`,
+            `unsupported Sledge storage layout version ${decoded.version}`,
           );
         }
 

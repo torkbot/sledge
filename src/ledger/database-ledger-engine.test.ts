@@ -3763,7 +3763,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
     );
 
     INSERT INTO sledge_storage_layout (singleton, version, module_ids_json)
-    VALUES (1, 2, '["engine.fixture"]');
+    VALUES (1, 1, '["engine.fixture"]');
 
     CREATE TABLE events (
       event_id INTEGER PRIMARY KEY AUTOINCREMENT,
