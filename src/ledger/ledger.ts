@@ -572,9 +572,50 @@ export type QueueHandlerRetryOptions = {
 };
 
 /**
+ * Raised when a queue operation exceeds its engine-scheduled timeout.
+ *
+ * The same error instance is used as the operation signal's abort reason and
+ * as the rejection from `withTimeout`.
+ */
+export class WorkOperationTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`work operation timed out after ${timeoutMs}ms`);
+    this.name = "WorkOperationTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+interface WorkHandlerControl {
+  /**
+   * Runs an asynchronous operation under a timeout scheduled by the active
+   * worker runtime.
+   *
+   * The operation receives a child of the active work lease signal. Timeout
+   * and lease cancellation both abort that exact signal before this promise
+   * rejects. A timeout does not choose a work disposition: an uncaught timeout
+   * follows normal thrown-handler retry semantics, while a handler may catch
+   * it and choose another outcome.
+   *
+   * `timeoutMs` must be a positive integer no greater than 2,147,483,647.
+   *
+   * Aborting cannot forcibly stop JavaScript. An operation that ignores its
+   * signal may continue after this promise rejects. This method is a timing
+   * primitive, not an execution sandbox: the operation retains access to
+   * anything its closure captures. Pass only the capabilities it should retain,
+   * and use application-level idempotency for external side effects.
+   */
+  withTimeout<TResult>(
+    timeoutMs: number,
+    operation: (signal: AbortSignal) => Promise<TResult>,
+  ): Promise<TResult>;
+}
+
+/**
  * Explicit queue control methods for non-default outcomes.
  */
-export interface QueueHandlerControl {
+export interface QueueHandlerControl extends WorkHandlerControl {
   retry(error: unknown, options?: QueueHandlerRetryOptions): never;
   deadLetter(error: unknown): never;
 }
@@ -582,7 +623,7 @@ export interface QueueHandlerControl {
 /**
  * Explicit signal queue control methods for non-default outcomes.
  */
-export interface SignalQueueHandlerControl {
+export interface SignalQueueHandlerControl extends WorkHandlerControl {
   retry(error: unknown, options?: QueueHandlerRetryOptions): never;
 }
 

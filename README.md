@@ -531,9 +531,51 @@ Queue and signal queue handlers implicitly ack on normal return.
 - Throw: retry using the default retry delay
 - `control.retry(error, { retryAtMs? })`: explicit retry timing
 - `control.deadLetter(error)`: terminal durable queue failure
+- `control.withTimeout(timeoutMs, operation)`: run an operation under a
+  worker-scheduled timeout
 
 Handlers receive a lease with an `AbortSignal`; long-running handlers should
 stop when that signal aborts during shutdown or restart.
+
+Use `control.withTimeout(...)` when one operation inside a handler needs a
+shorter lifetime than the work lease:
+
+```ts
+queues: {
+  "tools.execute": async ({ work, actions, control }) => {
+    try {
+      const result = await control.withTimeout(30_000, async (signal) => {
+        return await executeTool(work.payload, { signal });
+      });
+
+      actions.emit("tool.completed", result);
+    } catch (error: unknown) {
+      actions.emit("tool.failed", {
+        callId: work.payload.callId,
+        reason:
+          error instanceof WorkOperationTimeoutError
+            ? "timed_out"
+            : String(error),
+      });
+    }
+  },
+},
+```
+
+Sledge schedules the timeout through the worker's `RuntimeScheduler`. The
+operation receives one child signal that aborts before `withTimeout(...)`
+rejects, whether the timeout expires or the active lease is cancelled. Timeout
+rejections use `WorkOperationTimeoutError`; uncaught errors retain the normal
+retry behavior, while handlers may catch them and choose another outcome.
+Timeout durations must be positive integer milliseconds no greater than
+`2,147,483,647`.
+
+Timeout cancellation cannot forcibly stop JavaScript. An operation that ignores
+its signal may continue after the handler stops awaiting it.
+`control.withTimeout(...)` is a deterministic timing primitive, not an execution
+sandbox: the operation retains anything captured by its closure. Pass only the
+capabilities it should retain, propagate the signal, and use application-level
+idempotency for external side effects.
 
 ### Partitioned Work
 

@@ -5,6 +5,7 @@ import { Type, type Static, type TSchema } from "typebox";
 import Sqids from "sqids";
 import { Value } from "typebox/value";
 
+import type { RuntimeScheduler } from "../runtime/contracts.ts";
 import { ChangeSignal, raceWithSignal } from "../runtime/async-signals.ts";
 import { createEventRef } from "./event-ref.ts";
 import {
@@ -55,6 +56,7 @@ import type {
   QueryWorkInput,
   SignalSubscription,
 } from "./ledger.ts";
+import { WorkOperationTimeoutError } from "./ledger.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
@@ -747,6 +749,72 @@ class DeadLetterRequested {
 
   constructor(error: unknown) {
     this.error = describeUnknownError(error);
+  }
+}
+
+const maxRuntimeTimeoutMs = 2_147_483_647;
+
+async function runWorkOperationWithTimeout<TResult>(input: {
+  readonly leaseSignal: AbortSignal;
+  readonly operation: (signal: AbortSignal) => Promise<TResult>;
+  readonly scheduler: RuntimeScheduler;
+  readonly timeoutMs: number;
+}): Promise<TResult> {
+  if (
+    !Number.isInteger(input.timeoutMs) ||
+    input.timeoutMs <= 0 ||
+    input.timeoutMs > maxRuntimeTimeoutMs
+  ) {
+    throw new Error(
+      `timeoutMs must be a positive integer no greater than ${maxRuntimeTimeoutMs}, received ${input.timeoutMs}`,
+    );
+  }
+
+  input.leaseSignal.throwIfAborted();
+
+  const operationAbortController = new AbortController();
+  const abortForLease = (): void => {
+    operationAbortController.abort(input.leaseSignal.reason);
+  };
+
+  input.leaseSignal.addEventListener("abort", abortForLease, {
+    once: true,
+  });
+
+  try {
+    if (input.leaseSignal.aborted) {
+      abortForLease();
+    }
+
+    operationAbortController.signal.throwIfAborted();
+
+    const timeoutError = new WorkOperationTimeoutError(input.timeoutMs);
+    const timeoutTask = input.scheduler.scheduleOnce(input.timeoutMs, () => {
+      operationAbortController.abort(timeoutError);
+    });
+
+    try {
+      operationAbortController.signal.throwIfAborted();
+
+      const operation = Promise.resolve().then(async () => {
+        return await input.operation(operationAbortController.signal);
+      });
+      const result = await raceWithSignal(
+        operation,
+        operationAbortController.signal,
+      );
+
+      if (result.status === "completed") {
+        return result.value;
+      }
+
+      operationAbortController.signal.throwIfAborted();
+      throw new Error("work operation stopped without an abort reason");
+    } finally {
+      timeoutTask.cancel();
+    }
+  } finally {
+    input.leaseSignal.removeEventListener("abort", abortForLease);
   }
 }
 
@@ -3473,7 +3541,20 @@ function openDatabaseLedgerEngine<
         query: actions.query,
       };
 
+      const withTimeout = async <TResult>(
+        timeoutMs: number,
+        operation: (signal: AbortSignal) => Promise<TResult>,
+      ): Promise<TResult> => {
+        return await runWorkOperationWithTimeout({
+          leaseSignal: lease.signal,
+          operation,
+          scheduler: worker.scheduler,
+          timeoutMs,
+        });
+      };
+
       const queueControl: QueueHandlerControl = {
+        withTimeout,
         retry: (error, options) => {
           throw new RetryRequested(error, options?.retryAtMs);
         },
@@ -3483,6 +3564,7 @@ function openDatabaseLedgerEngine<
       };
 
       const signalQueueControl: SignalQueueHandlerControl = {
+        withTimeout,
         retry: (error, options) => {
           throw new RetryRequested(error, options?.retryAtMs);
         },
