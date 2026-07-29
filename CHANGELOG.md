@@ -4,8 +4,8 @@
 
 - Store `null` written to nullable JSON projection columns as SQL `NULL`, so
   `whereNull(...)`, `whereNotNull(...)`, and nullable reads agree while
-  non-null JSON columns can still store the JSON literal `null`. Existing
-  storage-layout-v1 databases normalize prior nullable JSON nulls on startup.
+  non-null JSON columns can still store the JSON literal `null`. Reset
+  storage-layout-v1 databases before opening them with this release.
 - Reject ambiguous `null` predicates for nullable JSON columns and `null`
   entries in nullable-column `orderByList(...)` values; use `whereNull(...)`
   and `orderByNulls(...)` for SQL null semantics.
