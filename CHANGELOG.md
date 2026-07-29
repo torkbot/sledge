@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-- Add deterministic `control.withTimeout(...)` operation deadlines to durable
-  and signal queue handlers, composing timeout and active-lease cancellation
-  through one handler-facing `AbortSignal` while preventing timed callbacks and
-  their async descendants from using captured queue actions.
+- Add two-phase external queue operations with deterministic engine timeouts.
+  External execution receives only its work and cancellation signal; after it
+  completes or fails, Sledge invokes its returned settlement with fresh ledger
+  actions while the lease remains active.
 - Store `null` written to nullable JSON projection columns as SQL `NULL`, so
   `whereNull(...)`, `whereNotNull(...)`, and nullable reads agree while
   non-null JSON columns can still store the JSON literal `null`.

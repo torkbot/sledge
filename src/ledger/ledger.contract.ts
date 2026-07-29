@@ -1,7 +1,6 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import type {
@@ -11,7 +10,6 @@ import type {
 import type {
   LedgerCursor,
   MaterializationImplementationRegistration,
-  QueueHandlerControl,
   WorkRef,
 } from "./ledger.ts";
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
@@ -19,7 +17,7 @@ import {
   createEventRef,
   defineLedgerShape,
   defineMaterialization,
-  WorkOperationTimeoutError,
+  QueueOperationTimeoutError,
   withMaterializations,
 } from "./ledger.ts";
 
@@ -62,15 +60,14 @@ const ControlledSignalWorkSchema = Type.Object({
 
 const TimedWorkSchema = Type.Object({
   workKey: Type.String(),
-  timeoutMs: Type.Number(),
 });
 
-const TimedWorkActionEventSchema = Type.Object({
-  origin: Type.Union([Type.Literal("inner"), Type.Literal("outer")]),
-  workKey: Type.String(),
-});
-
-const TimedWorkActionSignalSchema = Type.Object({
+const TimedWorkSettledSchema = Type.Object({
+  outcome: Type.Union([
+    Type.Literal("completed"),
+    Type.Literal("failed"),
+    Type.Literal("timed_out"),
+  ]),
   workKey: Type.String(),
 });
 
@@ -149,8 +146,7 @@ const ledgerContractShape = defineLedgerShape({
     "controlled-work.attempted": ControlledWorkAttemptedSchema,
     "controlled-signal-work.requested": ControlledSignalWorkSchema,
     "timed-work.requested": TimedWorkSchema,
-    "timed-signal-work.requested": TimedWorkSchema,
-    "timed-work.action": TimedWorkActionEventSchema,
+    "timed-work.settled": TimedWorkSettledSchema,
   },
   queues: {
     "evaluate.message": EvaluateMessageQueueSchema,
@@ -158,16 +154,12 @@ const ledgerContractShape = defineLedgerShape({
     "controlled-work.run": ControlledWorkQueueSchema,
     "controlled-signal-work.publish": ControlledSignalWorkSchema,
     "timed-work.run": TimedWorkSchema,
-    "timed-signal-work.publish": TimedWorkSchema,
   },
   signals: {
     "controlled-work.signalled": ControlledSignalWorkSchema,
-    "timed-work.signalled": TimedWorkSchema,
-    "timed-work.action-signalled": TimedWorkActionSignalSchema,
   },
   signalQueues: {
     "controlled-signal-work.run": ControlledWorkQueueSchema,
-    "timed-signal-work.run": TimedWorkSchema,
   },
 });
 
@@ -587,58 +579,32 @@ export type LedgerContractControlledWork = {
   releaseAll(): void;
 };
 
-export type LedgerContractTimedWorkSettlement =
-  | {
-      readonly status: "completed";
-      readonly value: string;
-    }
-  | {
-      readonly status: "rejected";
-      readonly error: unknown;
-      readonly operationWasInvoked: boolean;
-    };
-
-export type LedgerContractTimedWorkAction =
-  | "none"
-  | "emit"
-  | "emitSignal"
-  | "query";
-
-type LedgerContractTimedQueueAction = Exclude<
-  LedgerContractTimedWorkAction,
-  "none"
->;
+export type LedgerContractTimedWorkSettlement = {
+  readonly outcome: "completed" | "failed" | "timed_out";
+  readonly failure: unknown | null;
+};
 
 export type LedgerContractTimedWorkGate = {
   readonly entered: Promise<{
-    readonly leaseSignal: AbortSignal;
     readonly operationSignal: AbortSignal;
+    readonly inputKeys: readonly string[];
   }>;
-  readonly initialActionResult: Promise<unknown>;
-  readonly orphanActionResult: Promise<unknown>;
-  readonly detachedActionResult: Promise<unknown>;
-  readonly preExistingResourceActionResult: Promise<unknown>;
-  readonly outerActionsCompleted: Promise<void>;
-  readonly settled: Promise<LedgerContractTimedWorkSettlement>;
-  releaseDetachedAction(): void;
-  triggerPreExistingResourceAction(): void;
+  settlements(): readonly LedgerContractTimedWorkSettlement[];
   resolve(value: string): void;
   reject(error: unknown): void;
 };
 
 export type LedgerContractTimedWork = {
-  prepare(
+  prepare(workKey: string): LedgerContractTimedWorkGate;
+  execute(
     workKey: string,
-    action: LedgerContractTimedWorkAction,
-  ): LedgerContractTimedWorkGate;
-  run(
+    signal: AbortSignal,
+    inputKeys: readonly string[],
+  ): Promise<string>;
+  recordSettlement(
     workKey: string,
-    timeoutMs: number,
-    leaseSignal: AbortSignal,
-    control: Pick<QueueHandlerControl, "withTimeout">,
-    runAction: (action: LedgerContractTimedQueueAction) => Promise<void>,
-  ): Promise<LedgerContractTimedWorkAction>;
-  completeOuterActions(workKey: string): void;
+    settlement: LedgerContractTimedWorkSettlement,
+  ): void;
   releaseAll(): void;
 };
 
@@ -732,168 +698,63 @@ export function createLedgerContractTimedWork(): LedgerContractTimedWork {
   const gates = new Map<
     string,
     {
-      readonly action: LedgerContractTimedWorkAction;
-      readonly detachedActionRelease: PromiseWithResolvers<void>;
-      readonly detachedActionResult: PromiseWithResolvers<unknown>;
       readonly entered: PromiseWithResolvers<{
-        readonly leaseSignal: AbortSignal;
         readonly operationSignal: AbortSignal;
+        readonly inputKeys: readonly string[];
       }>;
-      readonly initialActionResult: PromiseWithResolvers<unknown>;
       readonly operation: PromiseWithResolvers<string>;
-      readonly orphanActionResult: PromiseWithResolvers<unknown>;
-      readonly outerActionsCompleted: PromiseWithResolvers<void>;
-      readonly preExistingResource: EventEmitter;
-      readonly preExistingResourceActionResult: PromiseWithResolvers<unknown>;
-      readonly settled: PromiseWithResolvers<LedgerContractTimedWorkSettlement>;
+      readonly settlements: LedgerContractTimedWorkSettlement[];
     }
   >();
 
-  const captureActionResult = async (
-    runAction: () => Promise<void>,
-  ): Promise<unknown> => {
-    try {
-      await runAction();
-
-      return new Error("timed queue action unexpectedly succeeded");
-    } catch (error: unknown) {
-      return error;
-    }
-  };
-
   return {
-    prepare: (workKey, action) => {
+    prepare: (workKey) => {
       if (gates.has(workKey)) {
         throw new Error(`timed work was already prepared: ${workKey}`);
       }
 
-      const detachedActionRelease = Promise.withResolvers<void>();
-      const detachedActionResult = Promise.withResolvers<unknown>();
       const entered = Promise.withResolvers<{
-        readonly leaseSignal: AbortSignal;
         readonly operationSignal: AbortSignal;
+        readonly inputKeys: readonly string[];
       }>();
-      const initialActionResult = Promise.withResolvers<unknown>();
       const operation = Promise.withResolvers<string>();
-      const orphanActionResult = Promise.withResolvers<unknown>();
-      const outerActionsCompleted = Promise.withResolvers<void>();
-      const preExistingResource = new EventEmitter();
-      const preExistingResourceActionResult = Promise.withResolvers<unknown>();
-      const settled =
-        Promise.withResolvers<LedgerContractTimedWorkSettlement>();
+      const settlements: LedgerContractTimedWorkSettlement[] = [];
 
       gates.set(workKey, {
-        action,
-        detachedActionRelease,
-        detachedActionResult,
         entered,
-        initialActionResult,
         operation,
-        orphanActionResult,
-        outerActionsCompleted,
-        preExistingResource,
-        preExistingResourceActionResult,
-        settled,
+        settlements,
       });
 
       return {
         entered: entered.promise,
-        initialActionResult: initialActionResult.promise,
-        orphanActionResult: orphanActionResult.promise,
-        detachedActionResult: detachedActionResult.promise,
-        preExistingResourceActionResult:
-          preExistingResourceActionResult.promise,
-        outerActionsCompleted: outerActionsCompleted.promise,
-        settled: settled.promise,
-        releaseDetachedAction: () => detachedActionRelease.resolve(),
-        triggerPreExistingResourceAction: () => {
-          preExistingResource.emit("action");
-        },
+        settlements: () => [...settlements],
         resolve: (value) => operation.resolve(value),
         reject: (error) => operation.reject(error),
       };
     },
-    run: async (workKey, timeoutMs, leaseSignal, control, runAction) => {
+    execute: async (workKey, signal, inputKeys) => {
       const gate = gates.get(workKey);
 
       if (gate === undefined) {
         throw new Error(`timed work was not prepared: ${workKey}`);
       }
 
-      let operationWasInvoked = false;
+      gate.entered.resolve({
+        operationSignal: signal,
+        inputKeys,
+      });
 
-      try {
-        const value = await control.withTimeout(timeoutMs, async (signal) => {
-          operationWasInvoked = true;
-          gate.entered.resolve({
-            leaseSignal,
-            operationSignal: signal,
-          });
-
-          const action = gate.action;
-
-          if (action !== "none") {
-            gate.preExistingResource.once("action", () => {
-              void (async () => {
-                gate.preExistingResourceActionResult.resolve(
-                  await captureActionResult(async () => {
-                    await runAction(action);
-                  }),
-                );
-              })();
-            });
-
-            gate.initialActionResult.resolve(
-              await captureActionResult(async () => {
-                await runAction(action);
-              }),
-            );
-
-            void (async () => {
-              await gate.detachedActionRelease.promise;
-              gate.detachedActionResult.resolve(
-                await captureActionResult(async () => {
-                  await runAction(action);
-                }),
-              );
-            })();
-          }
-
-          const value = await gate.operation.promise;
-
-          if (action !== "none") {
-            gate.orphanActionResult.resolve(
-              await captureActionResult(async () => {
-                await runAction(action);
-              }),
-            );
-          }
-
-          return value;
-        });
-
-        gate.settled.resolve({
-          status: "completed",
-          value,
-        });
-      } catch (error: unknown) {
-        gate.settled.resolve({
-          status: "rejected",
-          error,
-          operationWasInvoked,
-        });
-      }
-
-      return gate.action;
+      return await gate.operation.promise;
     },
-    completeOuterActions: (workKey) => {
+    recordSettlement: (workKey, settlement) => {
       const gate = gates.get(workKey);
 
       if (gate === undefined) {
         throw new Error(`timed work was not prepared: ${workKey}`);
       }
 
-      gate.outerActionsCompleted.resolve();
+      gate.settlements.push(settlement);
     },
     releaseAll: () => {
       for (const gate of gates.values()) {
@@ -931,10 +792,7 @@ export type LedgerContractHarness = {
     attempt: number,
     outcome: LedgerContractControlledWorkOutcome,
   ): LedgerContractControlledWorkGate;
-  prepareTimedWork(
-    workKey: string,
-    action: LedgerContractTimedWorkAction,
-  ): LedgerContractTimedWorkGate;
+  prepareTimedWork(workKey: string): LedgerContractTimedWorkGate;
   getStartedControlledWorkKeys(): readonly string[];
 
   getDecisionAttempts(sourceEventId: number): Promise<number>;
@@ -952,14 +810,15 @@ export function createLedgerContractModel(input: {
     workKey: string,
     attempt: number,
   ): Promise<LedgerContractControlledWorkOutcome>;
-  runTimedWork(
+  executeTimedWork(
     workKey: string,
-    timeoutMs: number,
-    leaseSignal: AbortSignal,
-    control: Pick<QueueHandlerControl, "withTimeout">,
-    runAction: (action: LedgerContractTimedQueueAction) => Promise<void>,
-  ): Promise<LedgerContractTimedWorkAction>;
-  completeTimedWorkOuterActions(workKey: string): void;
+    signal: AbortSignal,
+    inputKeys: readonly string[],
+  ): Promise<string>;
+  recordTimedWorkSettlement(
+    workKey: string,
+    settlement: LedgerContractTimedWorkSettlement,
+  ): void;
 }): LedgerContractModel {
   return ledgerContractDefinition.register({
     indexers: ledgerContractImplementations.indexers,
@@ -1051,12 +910,7 @@ export function createLedgerContractModel(input: {
           workKey: event.payload.workKey,
         });
       },
-      "timed-signal-work.requested": ({ event, actions }) => {
-        actions.enqueue("timed-signal-work.publish", event.payload, {
-          workKey: event.payload.workKey,
-        });
-      },
-      "timed-work.action": () => {},
+      "timed-work.settled": () => {},
     },
     queues: {
       "evaluate.message": async ({ work, lease, actions, control }) => {
@@ -1172,57 +1026,45 @@ export function createLedgerContractModel(input: {
           dedupeKey: `controlled-signal:${work.sourceEventId}`,
         });
       },
-      "timed-work.run": async ({ work, lease, actions, control }) => {
-        const action = await input.runTimedWork(
-          work.payload.workKey,
-          work.payload.timeoutMs,
-          lease.signal,
-          control,
-          async (requestedAction) => {
-            switch (requestedAction) {
-              case "emit":
-                actions.emit("timed-work.action", {
-                  origin: "inner",
-                  workKey: work.payload.workKey,
-                });
-                return;
-              case "emitSignal":
-                await actions.emitSignal("timed-work.action-signalled", {
-                  workKey: work.payload.workKey,
-                });
-                return;
-              case "query":
-                await actions.query("seenSourceEventIds", {});
-                return;
-            }
-          },
-        );
+      "timed-work.run": {
+        timeoutMs: 100,
+        execute: async (execution) => {
+          await input.executeTimedWork(
+            execution.work.payload.workKey,
+            execution.signal,
+            Object.keys(execution).sort(),
+          );
 
-        switch (action) {
-          case "none":
-            return;
-          case "emit":
-            actions.emit("timed-work.action", {
-              origin: "outer",
+          return ({ actions }) => {
+            const settlement: LedgerContractTimedWorkSettlement = {
+              outcome: "completed",
+              failure: null,
+            };
+
+            actions.emit("timed-work.settled", {
+              outcome: settlement.outcome,
+              workKey: execution.work.payload.workKey,
+            });
+            input.recordTimedWorkSettlement(
+              execution.work.payload.workKey,
+              settlement,
+            );
+          };
+        },
+        onFailure: ({ work, failure }) => {
+          return ({ actions }) => {
+            const settlement: LedgerContractTimedWorkSettlement = {
+              outcome: failure.kind === "timeout" ? "timed_out" : "failed",
+              failure: failure.error,
+            };
+
+            actions.emit("timed-work.settled", {
+              outcome: settlement.outcome,
               workKey: work.payload.workKey,
             });
-            break;
-          case "emitSignal":
-            await actions.emitSignal("timed-work.action-signalled", {
-              workKey: work.payload.workKey,
-            });
-            break;
-          case "query":
-            await actions.query("seenSourceEventIds", {});
-            break;
-        }
-
-        input.completeTimedWorkOuterActions(work.payload.workKey);
-      },
-      "timed-signal-work.publish": async ({ work, actions }) => {
-        await actions.emitSignal("timed-work.signalled", work.payload, {
-          dedupeKey: `timed-signal:${work.sourceEventId}`,
-        });
+            input.recordTimedWorkSettlement(work.payload.workKey, settlement);
+          };
+        },
       },
     },
     signals: {
@@ -1238,12 +1080,6 @@ export function createLedgerContractModel(input: {
           },
         );
       },
-      "timed-work.signalled": ({ event, actions }) => {
-        actions.enqueueSignal("timed-signal-work.run", event.payload, {
-          workKey: event.payload.workKey,
-        });
-      },
-      "timed-work.action-signalled": () => {},
     },
     signalQueues: {
       "controlled-signal-work.run": async ({ work, control }) => {
@@ -1262,36 +1098,6 @@ export function createLedgerContractModel(input: {
           case "dead_letter":
             throw new Error("controlled signal work cannot dead-letter");
         }
-      },
-      "timed-signal-work.run": async ({ work, lease, actions, control }) => {
-        const action = await input.runTimedWork(
-          work.payload.workKey,
-          work.payload.timeoutMs,
-          lease.signal,
-          control,
-          async (requestedAction) => {
-            if (requestedAction !== "query") {
-              throw new Error(
-                "signal queue timed action must use its query action",
-              );
-            }
-
-            await actions.query("seenSourceEventIds", {});
-          },
-        );
-
-        if (action === "none") {
-          return;
-        }
-
-        if (action !== "query") {
-          throw new Error(
-            "signal queue timed action must use its query action",
-          );
-        }
-
-        await actions.query("seenSourceEventIds", {});
-        input.completeTimedWorkOuterActions(work.payload.workKey);
       },
     },
   });
@@ -1398,69 +1204,40 @@ export function runLedgerContractSuite(input: {
 
     const emitTimedWork = async (
       harness: LedgerContractHarness,
-      kind: "durable" | "signal",
       workKey: string,
-      timeoutMs: number,
     ): Promise<void> => {
-      if (kind === "durable") {
-        await harness.ledger.emit("timed-work.requested", {
-          workKey,
-          timeoutMs,
-        });
-      } else {
-        await harness.ledger.emit("timed-signal-work.requested", {
-          workKey,
-          timeoutMs,
-        });
-      }
+      await harness.ledger.emit("timed-work.requested", {
+        workKey,
+      });
 
       await harness.flush();
     };
 
-    const assertTimedQueueActionUnavailable = (result: unknown): void => {
-      assert.ok(result instanceof Error);
-      assert.equal(
-        result.message,
-        "queue handler actions are unavailable outside their owning handler context",
-      );
-    };
-
-    const readLastEvents = async (
+    const readLatestEvent = async (
       harness: LedgerContractHarness,
-      last: number,
-    ): Promise<
-      readonly {
-        readonly eventName: string;
-        readonly payload: unknown;
-      }[]
-    > => {
+    ): Promise<{
+      readonly eventName: string;
+      readonly payload: unknown;
+    }> => {
       const abortController = new AbortController();
       const iterator = harness.ledger
         .tailEvents({
-          last,
+          last: 1,
           signal: abortController.signal,
         })
         [Symbol.asyncIterator]();
-      const events: {
-        readonly eventName: string;
-        readonly payload: unknown;
-      }[] = [];
 
       try {
-        for (let index = 0; index < last; index += 1) {
-          const item = await iterator.next();
+        const item = await iterator.next();
 
-          if (item.done) {
-            assert.fail(`expected ${String(last)} historical events`);
-          }
-
-          events.push({
-            eventName: item.value.event.eventName,
-            payload: item.value.event.payload,
-          });
+        if (item.done) {
+          assert.fail("expected one historical event");
         }
 
-        return events;
+        return {
+          eventName: String(item.value.event.eventName),
+          payload: item.value.event.payload,
+        };
       } finally {
         abortController.abort();
         await iterator.return?.();
@@ -1468,298 +1245,168 @@ export function runLedgerContractSuite(input: {
     };
 
     await t.test(
-      "withTimeout returns values and preserves operation failures",
+      "external queue operations settle completed and failed execution",
       async () => {
         await withHarness(input.create, async (harness) => {
-          const completed = harness.prepareTimedWork("timed-completed", "none");
+          const completed = harness.prepareTimedWork("timed-completed");
 
-          await emitTimedWork(harness, "durable", "timed-completed", 100);
+          await emitTimedWork(harness, "timed-completed");
           const completedEntry = await completed.entered;
           completed.resolve("completed value");
+          await harness.waitForIdle();
 
-          assert.deepEqual(await completed.settled, {
-            status: "completed",
-            value: "completed value",
-          });
-
-          await harness.advanceByMs(100);
+          assert.deepEqual(completedEntry.inputKeys, ["signal", "work"]);
           assert.equal(completedEntry.operationSignal.aborted, false);
+          assert.deepEqual(completed.settlements(), [
+            {
+              outcome: "completed",
+              failure: null,
+            },
+          ]);
+          assert.deepEqual(
+            Value.Decode(
+              TimedWorkSettledSchema,
+              (await readLatestEvent(harness)).payload,
+            ),
+            {
+              outcome: "completed",
+              workKey: "timed-completed",
+            },
+          );
 
-          const failed = harness.prepareTimedWork("timed-failed", "none");
+          const failed = harness.prepareTimedWork("timed-failed");
           const expectedError = new Error("operation failed");
 
-          await emitTimedWork(harness, "durable", "timed-failed", 100);
+          await emitTimedWork(harness, "timed-failed");
           const failedEntry = await failed.entered;
           failed.reject(expectedError);
+          await harness.waitForIdle();
 
-          assert.deepEqual(await failed.settled, {
-            status: "rejected",
-            error: expectedError,
-            operationWasInvoked: true,
-          });
           assert.equal(failedEntry.operationSignal.aborted, false);
-
-          await harness.waitForIdle();
-        });
-      },
-    );
-
-    for (const kind of ["durable", "signal"] as const) {
-      await t.test(
-        `withTimeout aborts the ${kind} queue operation signal before rejecting`,
-        async () => {
-          await withHarness(input.create, async (harness) => {
-            const workKey = `timed-${kind}-deadline`;
-            const gate = harness.prepareTimedWork(workKey, "none");
-
-            await emitTimedWork(harness, kind, workKey, 100);
-            const entered = await gate.entered;
-            let didSettle = false;
-            void gate.settled.then(() => {
-              didSettle = true;
-            });
-
-            await harness.advanceByMs(99);
-            assert.equal(entered.operationSignal.aborted, false);
-            assert.equal(didSettle, false);
-
-            await harness.advanceByMs(1);
-            const settled = await gate.settled;
-
-            assert.equal(settled.status, "rejected");
-
-            if (settled.status !== "rejected") {
-              assert.fail("expected timed work to reject");
-            }
-
-            assert.equal(settled.operationWasInvoked, true);
-            assert.equal(entered.operationSignal.aborted, true);
-            assert.ok(settled.error instanceof WorkOperationTimeoutError);
-            assert.equal(settled.error.timeoutMs, 100);
-            assert.equal(entered.operationSignal.reason, settled.error);
-            assert.equal(entered.leaseSignal.aborted, false);
-
-            await harness.waitForIdle();
-          });
-        },
-      );
-
-      await t.test(
-        `withTimeout preserves ${kind} queue lease cancellation`,
-        async () => {
-          await withHarness(input.create, async (harness) => {
-            const workKey = `timed-${kind}-cancelled`;
-            const queueName =
-              kind === "durable" ? "timed-work.run" : "timed-signal-work.run";
-            const gate = harness.prepareTimedWork(workKey, "none");
-
-            await emitTimedWork(harness, kind, workKey, 500);
-            const entered = await gate.entered;
-            const [work] = await harness.ledger.listWork({
-              queueName,
-              states: ["leased"],
-            });
-
-            if (work?.ref === null || work === undefined) {
-              throw new Error(`expected leased ${kind} timed work`);
-            }
-
-            const cancelled = await harness.ledger.cancelWork({
-              ref: work.ref,
-              reason: "contract cancellation",
-            });
-            assert.equal(cancelled.status, "cancelled");
-
-            const settled = await gate.settled;
-            assert.equal(settled.status, "rejected");
-
-            if (settled.status !== "rejected") {
-              assert.fail("expected cancelled timed work to reject");
-            }
-
-            assert.equal(settled.operationWasInvoked, true);
-            assert.equal(entered.operationSignal.aborted, true);
-            assert.equal(entered.leaseSignal.aborted, true);
-            assert.equal(
-              entered.operationSignal.reason,
-              entered.leaseSignal.reason,
-            );
-            assert.equal(entered.operationSignal.reason, settled.error);
-            assert.equal(
-              settled.error instanceof WorkOperationTimeoutError,
-              false,
-            );
-
-            await harness.advanceByMs(500);
-            assert.equal(
-              entered.operationSignal.reason,
-              entered.leaseSignal.reason,
-            );
-            await harness.waitForIdle();
-          });
-        },
-      );
-    }
-
-    await t.test(
-      "withTimeout rejects invalid durations without invoking the operation",
-      async () => {
-        await withHarness(input.create, async (harness) => {
-          for (const timeoutMs of [0, -1, 1.5, 2_147_483_648]) {
-            const workKey = `timed-invalid-${String(timeoutMs)}`;
-            const gate = harness.prepareTimedWork(workKey, "none");
-
-            await emitTimedWork(harness, "durable", workKey, timeoutMs);
-            const settled = await gate.settled;
-
-            assert.equal(settled.status, "rejected");
-
-            if (settled.status !== "rejected") {
-              assert.fail("expected invalid timeout to reject");
-            }
-
-            assert.equal(settled.operationWasInvoked, false);
-          }
-
-          await harness.waitForIdle();
-        });
-      },
-    );
-
-    await t.test(
-      "withTimeout fences durable queue actions while preserving outer actions",
-      async () => {
-        await withHarness(input.create, async (harness) => {
-          const observedSignalWorkKeys: string[] = [];
-          const subscription = harness.ledger.onSignal(
-            "timed-work.action-signalled",
-            (signal) => {
-              observedSignalWorkKeys.push(signal.payload.workKey);
+          assert.deepEqual(failed.settlements(), [
+            {
+              outcome: "failed",
+              failure: expectedError,
+            },
+          ]);
+          assert.deepEqual(
+            Value.Decode(
+              TimedWorkSettledSchema,
+              (await readLatestEvent(harness)).payload,
+            ),
+            {
+              outcome: "failed",
+              workKey: "timed-failed",
             },
           );
-
-          try {
-            for (const action of ["emit", "emitSignal", "query"] as const) {
-              const workKey = `timed-action-${action}`;
-              const gate = harness.prepareTimedWork(workKey, action);
-
-              await emitTimedWork(harness, "durable", workKey, 100);
-              await gate.entered;
-              assertTimedQueueActionUnavailable(await gate.initialActionResult);
-
-              await harness.advanceByMs(100);
-              const settlement = await gate.settled;
-              assert.equal(settlement.status, "rejected");
-              await gate.outerActionsCompleted;
-
-              gate.resolve("late completion");
-              assertTimedQueueActionUnavailable(await gate.orphanActionResult);
-
-              gate.releaseDetachedAction();
-              assertTimedQueueActionUnavailable(
-                await gate.detachedActionResult,
-              );
-
-              gate.triggerPreExistingResourceAction();
-              assertTimedQueueActionUnavailable(
-                await gate.preExistingResourceActionResult,
-              );
-
-              await harness.waitForIdle();
-
-              if (action === "emit") {
-                const actionEvents = (await readLastEvents(harness, 2)).filter(
-                  (event) => event.eventName === "timed-work.action",
-                );
-
-                assert.equal(actionEvents.length, 1);
-                assert.deepEqual(
-                  Value.Decode(
-                    TimedWorkActionEventSchema,
-                    actionEvents[0]?.payload,
-                  ),
-                  {
-                    origin: "outer",
-                    workKey,
-                  },
-                );
-              }
-
-              if (action === "emitSignal") {
-                assert.deepEqual(observedSignalWorkKeys, [workKey]);
-              }
-            }
-          } finally {
-            subscription[Symbol.dispose]();
-          }
         });
       },
     );
 
     await t.test(
-      "withTimeout fences signal queue queries while preserving the outer query",
+      "external queue operation timeout aborts before settling",
       async () => {
         await withHarness(input.create, async (harness) => {
-          const workKey = "timed-signal-action-query";
-          const gate = harness.prepareTimedWork(workKey, "query");
+          const gate = harness.prepareTimedWork("timed-deadline");
 
-          await emitTimedWork(harness, "signal", workKey, 100);
-          await gate.entered;
-          assertTimedQueueActionUnavailable(await gate.initialActionResult);
+          await emitTimedWork(harness, "timed-deadline");
+          const entered = await gate.entered;
 
-          await harness.advanceByMs(100);
-          const settlement = await gate.settled;
-          assert.equal(settlement.status, "rejected");
-          await gate.outerActionsCompleted;
+          await harness.advanceByMs(99);
+          assert.equal(entered.operationSignal.aborted, false);
+          assert.deepEqual(gate.settlements(), []);
+
+          await harness.advanceByMs(1);
+          await harness.waitForIdle();
+
+          const [settlement] = gate.settlements();
+          assert.equal(entered.operationSignal.aborted, true);
+          assert.ok(settlement?.failure instanceof QueueOperationTimeoutError);
+          assert.equal(settlement.failure.timeoutMs, 100);
+          assert.equal(entered.operationSignal.reason, settlement.failure);
+          assert.equal(settlement.outcome, "timed_out");
+          assert.deepEqual(
+            Value.Decode(
+              TimedWorkSettledSchema,
+              (await readLatestEvent(harness)).payload,
+            ),
+            {
+              outcome: "timed_out",
+              workKey: "timed-deadline",
+            },
+          );
 
           gate.resolve("late completion");
-          assertTimedQueueActionUnavailable(await gate.orphanActionResult);
-
-          gate.releaseDetachedAction();
-          assertTimedQueueActionUnavailable(await gate.detachedActionResult);
-
-          await harness.waitForIdle();
+          await harness.flush();
+          assert.equal(gate.settlements().length, 1);
         });
       },
     );
 
     await t.test(
-      "detached timed descendants remain fenced after successful completion",
+      "external queue operation lease cancellation skips settlement",
       async () => {
         await withHarness(input.create, async (harness) => {
-          const workKey = "timed-action-detached-after-success";
-          const gate = harness.prepareTimedWork(workKey, "emit");
+          const gate = harness.prepareTimedWork("timed-cancelled");
 
-          await emitTimedWork(harness, "durable", workKey, 100);
-          await gate.entered;
-          assertTimedQueueActionUnavailable(await gate.initialActionResult);
-
-          gate.resolve("completed");
-          assert.deepEqual(await gate.settled, {
-            status: "completed",
-            value: "completed",
+          await emitTimedWork(harness, "timed-cancelled");
+          const entered = await gate.entered;
+          const [work] = await harness.ledger.listWork({
+            queueName: "timed-work.run",
+            states: ["leased"],
           });
-          assertTimedQueueActionUnavailable(await gate.orphanActionResult);
-          await gate.outerActionsCompleted;
 
-          gate.releaseDetachedAction();
-          assertTimedQueueActionUnavailable(await gate.detachedActionResult);
+          if (work?.ref === null || work === undefined) {
+            throw new Error("expected leased timed work");
+          }
 
+          const cancelled = await harness.ledger.cancelWork({
+            ref: work.ref,
+            reason: "contract cancellation",
+          });
+          assert.equal(cancelled.status, "cancelled");
           await harness.waitForIdle();
 
-          const actionEvents = (await readLastEvents(harness, 2)).filter(
-            (event) => event.eventName === "timed-work.action",
+          assert.equal(entered.operationSignal.aborted, true);
+          assert.equal(
+            entered.operationSignal.reason.message,
+            "contract cancellation",
           );
+          assert.deepEqual(gate.settlements(), []);
 
-          assert.equal(actionEvents.length, 1);
-          assert.deepEqual(
-            Value.Decode(TimedWorkActionEventSchema, actionEvents[0]?.payload),
-            {
-              origin: "outer",
-              workKey,
-            },
-          );
+          gate.resolve("late completion");
+          await harness.flush();
+          assert.deepEqual(gate.settlements(), []);
         });
+      },
+    );
+
+    await t.test(
+      "external queue operation rejects invalid timeouts at registration",
+      async () => {
+        const shape = defineLedgerShape({
+          moduleId: "ledger.contract.invalid-operation",
+          events: {},
+          queues: {
+            run: TimedWorkSchema,
+          },
+        });
+
+        for (const timeoutMs of [0, -1, 1.5, 2_147_483_648]) {
+          assert.throws(
+            () =>
+              shape.register({
+                queues: {
+                  run: {
+                    timeoutMs,
+                    execute: async () => () => {},
+                    onFailure: () => () => {},
+                  },
+                },
+              }),
+            /timeoutMs must be a positive integer/,
+          );
+        }
       },
     );
 
