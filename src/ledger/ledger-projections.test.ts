@@ -1413,6 +1413,204 @@ test("projection access rejects non-serializable JSON values before storage", as
   assert.deepEqual(invalidUpdateFake.calls, []);
 });
 
+test("projection access distinguishes SQL null from JSON literal null", async () => {
+  const JsonNullValueSchema = Type.Union([
+    Type.Null(),
+    Type.Object({
+      value: Type.String(),
+    }),
+  ]);
+  const jsonNullMaterializations = defineMaterialization(shape, {
+    namespace: "json-null",
+  })
+    .version(1, "create json null rows", (s) =>
+      s.createTable("jsonNullRows", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            nullableValue: t.json<{ readonly value: string } | null>(),
+            nullableUnknownValue: t.json<unknown>(),
+            requiredJsonNull: t.json<null>().notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {
+        insertJsonNulls: {
+          sourceEvent: "user.created",
+          input: Type.Object({
+            userId: Type.String(),
+          }),
+        },
+      },
+      queries: {
+        nullValues: {
+          params: Type.Object({}),
+          result: Type.Array(
+            Type.Object({
+              nullableValue: JsonNullValueSchema,
+              requiredJsonNull: Type.Null(),
+            }),
+          ),
+        },
+        nullableJsonByValues: {
+          params: Type.Object({
+            values: Type.Array(JsonNullValueSchema),
+          }),
+          result: Type.Array(Type.String()),
+        },
+        nullableJsonByPriority: {
+          params: Type.Object({
+            values: Type.Array(JsonNullValueSchema),
+          }),
+          result: Type.Array(Type.String()),
+        },
+      },
+    });
+  const jsonNullModel = withMaterializations(
+    shape,
+    jsonNullMaterializations,
+  ).register({
+    indexers: {
+      insertJsonNulls: async ({ input, db }) => {
+        await db
+          .insertInto("jsonNullRows")
+          .values({
+            userId: input.userId,
+            nullableValue: null,
+            nullableUnknownValue: null,
+            requiredJsonNull: null,
+          })
+          .execute();
+      },
+    },
+    queries: {
+      nullValues: async ({ db }) => {
+        const rows = await db
+          .selectFrom("jsonNullRows")
+          .select(["nullableValue", "requiredJsonNull"])
+          .whereNull("nullableValue")
+          .whereNotNull("requiredJsonNull")
+          .execute();
+
+        return [...rows];
+      },
+      nullableJsonByValues: async ({ params, db }) => {
+        if (false) {
+          db.selectFrom("jsonNullRows")
+            .select(["userId"])
+            // @ts-expect-error nullable JSON predicates must use whereNull for null.
+            .whereIn("nullableValue", params.values);
+          db.selectFrom("jsonNullRows")
+            .select(["userId"])
+            // @ts-expect-error nullable unknown JSON predicates must use whereNull for null.
+            .where("nullableUnknownValue", "=", null);
+        }
+
+        const rows = await db
+          .selectFrom("jsonNullRows")
+          .select(["userId"])
+          // Runtime validation still guards untrusted values that bypass types.
+          .whereIn("nullableValue", params.values as never)
+          .execute();
+
+        return rows.map((row) => row.userId);
+      },
+      nullableJsonByPriority: async ({ params, db }) => {
+        if (false) {
+          db.selectFrom("jsonNullRows")
+            .select(["userId"])
+            // @ts-expect-error nullable JSON value-list ordering uses orderByNulls for null.
+            .orderByList("nullableValue", params.values);
+        }
+
+        const rows = await db
+          .selectFrom("jsonNullRows")
+          .select(["userId"])
+          // Runtime validation still guards untrusted values that bypass types.
+          .orderByList("nullableValue", params.values as never)
+          .execute();
+
+        return rows.map((row) => row.userId);
+      },
+    },
+  });
+  const implementations = readTestLedgerImplementations(jsonNullModel);
+  const insertJsonNulls = implementations.indexers?.insertJsonNulls;
+  const nullValues = implementations.queries?.nullValues;
+  const nullableJsonByValues = implementations.queries?.nullableJsonByValues;
+  const nullableJsonByPriority =
+    implementations.queries?.nullableJsonByPriority;
+
+  if (insertJsonNulls === undefined) {
+    throw new Error("expected insertJsonNulls indexer implementation");
+  }
+
+  if (nullValues === undefined) {
+    throw new Error("expected nullValues query implementation");
+  }
+
+  if (nullableJsonByValues === undefined) {
+    throw new Error("expected nullableJsonByValues query implementation");
+  }
+
+  if (nullableJsonByPriority === undefined) {
+    throw new Error("expected nullableJsonByPriority query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        nullableValue: null,
+        requiredJsonNull: JSON.stringify(null),
+      },
+    ],
+    getRow: undefined,
+  });
+
+  await insertJsonNulls(
+    fake.scope,
+    {
+      userId: "u_null",
+    },
+    createUserCreatedContext(47),
+  );
+
+  assert.deepEqual(fake.calls[0], {
+    method: "run",
+    params: ["u_null", null, null, JSON.stringify(null)],
+    sql: 'INSERT INTO "jsonNullRows" ("userId", "nullableValue", "nullableUnknownValue", "requiredJsonNull") VALUES (?, ?, ?, ?)',
+  });
+
+  const rows = await nullValues(fake.scope, {});
+
+  assert.deepEqual(fake.calls[1], {
+    method: "all",
+    params: [],
+    sql: 'SELECT "nullableValue" AS "nullableValue", "requiredJsonNull" AS "requiredJsonNull" FROM "jsonNullRows" WHERE "nullableValue" IS NULL AND "requiredJsonNull" IS NOT NULL',
+  });
+  assert.deepEqual(rows, [
+    {
+      nullableValue: null,
+      requiredJsonNull: null,
+    },
+  ]);
+
+  await assert.rejects(async () => {
+    await nullableJsonByValues(fake.scope, {
+      values: [null],
+    });
+  }, /nullableValue predicate value cannot be null; use whereNull or whereNotNull/);
+
+  await assert.rejects(async () => {
+    await nullableJsonByPriority(fake.scope, {
+      values: [null],
+    });
+  }, /nullableValue value-list order cannot include null; use orderByNulls/);
+  assert.equal(fake.calls.length, 2);
+});
+
 test("projection access supports stateful indexers and ordered range queries", async () => {
   const stateMaterializations = defineMaterialization(shape, {
     namespace: "stateful",

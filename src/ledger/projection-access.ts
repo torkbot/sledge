@@ -210,9 +210,11 @@ type ProjectionWhereValue<
   ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
     "json",
     infer TValue,
-    boolean
+    infer TNullable
   >
-    ? TValue
+    ? TNullable extends true
+      ? NonNullable<TValue>
+      : TValue
     : NonNullable<
         ProjectionColumnValue<ProjectionTableColumns<TTable>[TColumnName]>
       >;
@@ -4144,7 +4146,7 @@ function serializeProjectionPredicateValue(
 ): unknown {
   const column = table.columns[columnName];
 
-  if (value === null && column?.kind !== "json") {
+  if (value === null && (column?.kind !== "json" || column.nullable)) {
     throw new Error(
       `${table.name}.${columnName} predicate value cannot be null; use whereNull or whereNotNull`,
     );
@@ -4182,6 +4184,12 @@ function createProjectionValueListOrderClause(
 
   if (values.length === 0) {
     throw new Error("value-list order clause must include values");
+  }
+
+  if (values.includes(null) && table.columns[columnName]?.nullable) {
+    throw new Error(
+      `${table.name}.${columnName} value-list order cannot include null; use orderByNulls`,
+    );
   }
 
   return {
@@ -4871,16 +4879,18 @@ function serializeProjectionColumnValue(
     throw new Error(`${context} references unknown column metadata`);
   }
 
+  // Nullable columns reserve null for SQL NULL. A non-null JSON column can
+  // instead encode null as the JSON literal when its value type permits it.
+  if (value === null && column.nullable) {
+    return null;
+  }
+
   if (column.kind === "json") {
     return serializeJson(value, context);
   }
 
   if (value === null) {
-    if (!column.nullable) {
-      throw new Error(`${context} cannot be null`);
-    }
-
-    return null;
+    throw new Error(`${context} cannot be null`);
   }
 
   switch (column.kind) {
