@@ -37,8 +37,10 @@ runLedgerContractSuite({
         nowMs: () => runtime.nowMs(),
         runControlledWork: (workKey, attempt) =>
           controlledWork.run(workKey, attempt),
-        runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
-          timedWork.run(workKey, timeoutMs, leaseSignal, control),
+        runTimedWork: (workKey, timeoutMs, leaseSignal, control, runAction) =>
+          timedWork.run(workKey, timeoutMs, leaseSignal, control, runAction),
+        completeTimedWorkOuterActions: (workKey) =>
+          timedWork.completeOuterActions(workKey),
       });
       const ledger = await createTursoLedger({
         databaseUrl,
@@ -153,7 +155,7 @@ runLedgerContractSuite({
       prepareControlledWork: (workKey) => controlledWork.prepare(workKey),
       prepareControlledWorkAttempt: (workKey, attempt, outcome) =>
         controlledWork.prepareAttempt(workKey, attempt, outcome),
-      prepareTimedWork: (workKey) => timedWork.prepare(workKey),
+      prepareTimedWork: (workKey, action) => timedWork.prepare(workKey, action),
       getStartedControlledWorkKeys: () => controlledWork.startedWorkKeys(),
       getDecisionAttempts: (sourceEventId) =>
         ledger.query("decisionAttempts", {

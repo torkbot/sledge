@@ -4,7 +4,8 @@
 
 - Add deterministic `control.withTimeout(...)` operation deadlines to durable
   and signal queue handlers, composing timeout and active-lease cancellation
-  through one handler-facing `AbortSignal`.
+  through one handler-facing `AbortSignal` while preventing timed callbacks and
+  their async descendants from using captured queue actions.
 - Store `null` written to nullable JSON projection columns as SQL `NULL`, so
   `whereNull(...)`, `whereNotNull(...)`, and nullable reads agree while
   non-null JSON columns can still store the JSON literal `null`.

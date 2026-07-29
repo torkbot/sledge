@@ -560,6 +560,12 @@ retry behavior, while handlers may catch them and choose another outcome.
 Timeout durations must be positive integer milliseconds no greater than
 `2,147,483,647`.
 
+The timed callback and every async descendant it creates cannot use captured
+queue handler actions (`emit`, `emitSignal`, or `query`). This remains true for
+detached work after the callback completes or times out. Commit ledger effects
+from the outer handler after `withTimeout(...)` settles. This keeps orphaned
+timed work from mutating the ledger after the outer handler has resumed.
+
 Timeout cancellation cannot forcibly stop JavaScript. An operation that ignores
 its signal may continue after the handler stops awaiting it, and external side
 effects may have an unknown outcome. Propagate the signal and use

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import { Type, type Static, type TSchema } from "typebox";
@@ -753,6 +754,15 @@ class DeadLetterRequested {
 }
 
 const maxRuntimeTimeoutMs = 2_147_483_647;
+const timedOperationActionFence = new AsyncLocalStorage<true>();
+
+function assertQueueHandlerActionsAvailable(): void {
+  if (timedOperationActionFence.getStore() === true) {
+    throw new Error(
+      "queue handler actions are unavailable inside control.withTimeout operations",
+    );
+  }
+}
 
 async function runWorkOperationWithTimeout<TResult>(input: {
   readonly leaseSignal: AbortSignal;
@@ -796,8 +806,10 @@ async function runWorkOperationWithTimeout<TResult>(input: {
     try {
       operationAbortController.signal.throwIfAborted();
 
-      const operation = Promise.resolve().then(async () => {
-        return await input.operation(operationAbortController.signal);
+      const operation = timedOperationActionFence.run(true, () => {
+        return Promise.resolve().then(async () => {
+          return await input.operation(operationAbortController.signal);
+        });
       });
       const result = await raceWithSignal(
         operation,
@@ -3475,6 +3487,8 @@ function openDatabaseLedgerEngine<
 
       const actions: QueueActions<any, any, any> = {
         emit: (eventName, event, options) => {
+          assertQueueHandlerActionsAvailable();
+
           stagedEvents.push({
             eventName: String(eventName),
             payload: event,
@@ -3484,6 +3498,8 @@ function openDatabaseLedgerEngine<
           });
         },
         emitSignal: async (signalName, signal, options) => {
+          assertQueueHandlerActionsAvailable();
+
           type ImmediateSignalEmission = {
             readonly created: boolean;
             readonly event: EventEnvelope<TSignals, keyof TSignals> | null;
@@ -3530,6 +3546,8 @@ function openDatabaseLedgerEngine<
           }
         },
         query: async (queryName, params) => {
+          assertQueueHandlerActionsAvailable();
+
           return await runLedgerQuery(
             queryName as keyof TQueries,
             params as never,

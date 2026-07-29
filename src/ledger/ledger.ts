@@ -600,6 +600,11 @@ interface WorkHandlerControl {
    *
    * `timeoutMs` must be a positive integer no greater than 2,147,483,647.
    *
+   * Queue handler actions captured by the operation are unavailable for the
+   * operation and every async descendant it creates, including detached work
+   * that outlives successful completion or timeout. Commit ledger effects
+   * after this promise settles, from the outer handler.
+   *
    * Aborting cannot forcibly stop JavaScript. An operation that ignores its
    * signal may continue after this promise rejects, so external side effects
    * still require application-level idempotency.
