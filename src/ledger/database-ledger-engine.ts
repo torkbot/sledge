@@ -41,8 +41,6 @@ import type {
   QueueActions,
   QueueHandlerControl,
   QueueHandlerFunction,
-  QueueOperationHandler,
-  QueueOperationSettlementFunction,
   QueueWorkItem,
   SignalObserverFunction,
   SignalQueueActions,
@@ -58,7 +56,7 @@ import type {
   QueryWorkInput,
   SignalSubscription,
 } from "./ledger.ts";
-import { QueueOperationTimeoutError } from "./ledger.ts";
+import { WorkOperationTimeoutError } from "./ledger.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
@@ -754,51 +752,25 @@ class DeadLetterRequested {
   }
 }
 
-type RuntimeQueueOperationSettlement = QueueOperationSettlementFunction<
-  Record<string, TSchema>,
-  Record<string, QuerySchema<TSchema, TSchema>>,
-  Record<string, TSchema>
->;
+const maxRuntimeTimeoutMs = 2_147_483_647;
 
-type QueueOperationPreparation =
-  | {
-      readonly status: "settle";
-      readonly settlement: RuntimeQueueOperationSettlement;
-    }
-  | {
-      readonly status: "lease_lost";
-    };
-
-type PreparedQueueExecution =
-  | {
-      readonly kind: "handler";
-    }
-  | {
-      readonly kind: "settlement";
-      readonly settlement: RuntimeQueueOperationSettlement;
-    }
-  | {
-      readonly kind: "failed";
-      readonly error: unknown;
-    };
-
-async function prepareQueueOperationSettlement(input: {
-  readonly handler: QueueOperationHandler<
-    Record<string, TSchema>,
-    Record<string, TSchema>,
-    string,
-    Record<string, QuerySchema<TSchema, TSchema>>,
-    Record<string, TSchema>
-  >;
+async function runWorkOperationWithTimeout<TResult>(input: {
   readonly leaseSignal: AbortSignal;
+  readonly operation: (signal: AbortSignal) => Promise<TResult>;
   readonly scheduler: RuntimeScheduler;
-  readonly work: QueueWorkItem<Record<string, TSchema>, string>;
-}): Promise<QueueOperationPreparation> {
-  if (input.leaseSignal.aborted) {
-    return {
-      status: "lease_lost",
-    };
+  readonly timeoutMs: number;
+}): Promise<TResult> {
+  if (
+    !Number.isInteger(input.timeoutMs) ||
+    input.timeoutMs <= 0 ||
+    input.timeoutMs > maxRuntimeTimeoutMs
+  ) {
+    throw new Error(
+      `timeoutMs must be a positive integer no greater than ${maxRuntimeTimeoutMs}, received ${input.timeoutMs}`,
+    );
   }
+
+  input.leaseSignal.throwIfAborted();
 
   const operationAbortController = new AbortController();
   const abortForLease = (): void => {
@@ -810,103 +782,34 @@ async function prepareQueueOperationSettlement(input: {
   });
 
   try {
-    const timeoutError = new QueueOperationTimeoutError(
-      input.handler.timeoutMs,
-    );
-    const timeoutTask = input.scheduler.scheduleOnce(
-      input.handler.timeoutMs,
-      () => {
-        operationAbortController.abort(timeoutError);
-      },
-    );
+    if (input.leaseSignal.aborted) {
+      abortForLease();
+    }
+
+    operationAbortController.signal.throwIfAborted();
+
+    const timeoutError = new WorkOperationTimeoutError(input.timeoutMs);
+    const timeoutTask = input.scheduler.scheduleOnce(input.timeoutMs, () => {
+      operationAbortController.abort(timeoutError);
+    });
 
     try {
-      if (input.leaseSignal.aborted) {
-        abortForLease();
-      }
-
-      if (operationAbortController.signal.aborted) {
-        return {
-          status: "lease_lost",
-        };
-      }
+      operationAbortController.signal.throwIfAborted();
 
       const operation = Promise.resolve().then(async () => {
-        return await input.handler.execute({
-          work: input.work,
-          signal: operationAbortController.signal,
-        });
+        return await input.operation(operationAbortController.signal);
       });
-      let result:
-        | {
-            readonly status: "completed";
-            readonly value: RuntimeQueueOperationSettlement;
-          }
-        | {
-            readonly status: "aborted";
-          };
-
-      try {
-        result = await raceWithSignal(
-          operation,
-          operationAbortController.signal,
-        );
-      } catch (error: unknown) {
-        if (input.leaseSignal.aborted) {
-          return {
-            status: "lease_lost",
-          };
-        }
-
-        const failure =
-          operationAbortController.signal.reason === timeoutError
-            ? {
-                kind: "timeout" as const,
-                error: timeoutError,
-              }
-            : {
-                kind: "error" as const,
-                error,
-              };
-
-        return {
-          status: "settle",
-          settlement: input.handler.onFailure({
-            work: input.work,
-            failure,
-          }),
-        };
-      }
+      const result = await raceWithSignal(
+        operation,
+        operationAbortController.signal,
+      );
 
       if (result.status === "completed") {
-        if (input.leaseSignal.aborted) {
-          return {
-            status: "lease_lost",
-          };
-        }
-
-        return {
-          status: "settle",
-          settlement: result.value,
-        };
+        return result.value;
       }
 
-      if (input.leaseSignal.aborted) {
-        return {
-          status: "lease_lost",
-        };
-      }
-
-      return {
-        status: "settle",
-        settlement: input.handler.onFailure({
-          work: input.work,
-          failure: {
-            kind: "timeout",
-            error: timeoutError,
-          },
-        }),
-      };
+      operationAbortController.signal.throwIfAborted();
+      throw new Error("work operation stopped without an abort reason");
     } finally {
       timeoutTask.cancel();
     }
@@ -3420,7 +3323,6 @@ function openDatabaseLedgerEngine<
     claimed: PersistedWorkLease,
     handler:
       | QueueHandlerFunction<any, any, any, any, any>
-      | QueueOperationHandler<any, any, any, any, any>
       | SignalQueueHandlerFunction<any, any, any>,
   ): Promise<void> {
     const leaseAbortController = new AbortController();
@@ -3569,40 +3471,6 @@ function openDatabaseLedgerEngine<
         signal: leaseAbortController.signal,
       };
 
-      let preparedExecution: PreparedQueueExecution = {
-        kind: "handler",
-      };
-
-      if (!claimed.signal && typeof handler !== "function") {
-        let preparation: QueueOperationPreparation | null = null;
-
-        try {
-          preparation = await prepareQueueOperationSettlement({
-            handler,
-            leaseSignal: lease.signal,
-            scheduler: worker.scheduler,
-            work,
-          });
-        } catch (error: unknown) {
-          preparedExecution = {
-            kind: "failed",
-            error,
-          };
-        }
-
-        if (preparation?.status === "lease_lost") {
-          leaseSettled = true;
-          return;
-        }
-
-        if (preparation?.status === "settle") {
-          preparedExecution = {
-            kind: "settlement",
-            settlement: preparation.settlement,
-          };
-        }
-      }
-
       const stagedEvents: AppendEventInput[] = [];
 
       const actions: QueueActions<any, any, any> = {
@@ -3673,7 +3541,20 @@ function openDatabaseLedgerEngine<
         query: actions.query,
       };
 
+      const withTimeout = async <TResult>(
+        timeoutMs: number,
+        operation: (signal: AbortSignal) => Promise<TResult>,
+      ): Promise<TResult> => {
+        return await runWorkOperationWithTimeout({
+          leaseSignal: lease.signal,
+          operation,
+          scheduler: worker.scheduler,
+          timeoutMs,
+        });
+      };
+
       const queueControl: QueueHandlerControl = {
+        withTimeout,
         retry: (error, options) => {
           throw new RetryRequested(error, options?.retryAtMs);
         },
@@ -3683,6 +3564,7 @@ function openDatabaseLedgerEngine<
       };
 
       const signalQueueControl: SignalQueueHandlerControl = {
+        withTimeout,
         retry: (error, options) => {
           throw new RetryRequested(error, options?.retryAtMs);
         },
@@ -3701,28 +3583,12 @@ function openDatabaseLedgerEngine<
             control: signalQueueControl,
           });
         } else {
-          switch (preparedExecution.kind) {
-            case "handler":
-              if (typeof handler !== "function") {
-                throw new Error("queue operation did not produce a settlement");
-              }
-
-              await (handler as QueueHandlerFunction<any, any, any, any, any>)({
-                work,
-                lease,
-                actions,
-                control: queueControl,
-              });
-              break;
-            case "settlement":
-              await preparedExecution.settlement({
-                actions,
-                control: queueControl,
-              });
-              break;
-            case "failed":
-              throw preparedExecution.error;
-          }
+          await (handler as QueueHandlerFunction<any, any, any, any, any>)({
+            work,
+            lease,
+            actions,
+            control: queueControl,
+          });
         }
       } catch (error: unknown) {
         if (error instanceof RetryRequested) {

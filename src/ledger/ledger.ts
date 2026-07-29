@@ -572,26 +572,50 @@ export type QueueHandlerRetryOptions = {
 };
 
 /**
- * Raised when an external queue operation exceeds its engine-scheduled
- * timeout.
+ * Raised when a queue operation exceeds its engine-scheduled timeout.
  *
- * The same error instance aborts the operation signal and is supplied to the
- * operation's failure settlement.
+ * The same error instance is used as the operation signal's abort reason and
+ * as the rejection from `withTimeout`.
  */
-export class QueueOperationTimeoutError extends Error {
+export class WorkOperationTimeoutError extends Error {
   readonly timeoutMs: number;
 
   constructor(timeoutMs: number) {
-    super(`queue operation timed out after ${timeoutMs}ms`);
-    this.name = "QueueOperationTimeoutError";
+    super(`work operation timed out after ${timeoutMs}ms`);
+    this.name = "WorkOperationTimeoutError";
     this.timeoutMs = timeoutMs;
   }
+}
+
+interface WorkHandlerControl {
+  /**
+   * Runs an asynchronous operation under a timeout scheduled by the active
+   * worker runtime.
+   *
+   * The operation receives a child of the active work lease signal. Timeout
+   * and lease cancellation both abort that exact signal before this promise
+   * rejects. A timeout does not choose a work disposition: an uncaught timeout
+   * follows normal thrown-handler retry semantics, while a handler may catch
+   * it and choose another outcome.
+   *
+   * `timeoutMs` must be a positive integer no greater than 2,147,483,647.
+   *
+   * Aborting cannot forcibly stop JavaScript. An operation that ignores its
+   * signal may continue after this promise rejects. This method is a timing
+   * primitive, not an execution sandbox: the operation retains access to
+   * anything its closure captures. Pass only the capabilities it should retain,
+   * and use application-level idempotency for external side effects.
+   */
+  withTimeout<TResult>(
+    timeoutMs: number,
+    operation: (signal: AbortSignal) => Promise<TResult>,
+  ): Promise<TResult>;
 }
 
 /**
  * Explicit queue control methods for non-default outcomes.
  */
-export interface QueueHandlerControl {
+export interface QueueHandlerControl extends WorkHandlerControl {
   retry(error: unknown, options?: QueueHandlerRetryOptions): never;
   deadLetter(error: unknown): never;
 }
@@ -599,7 +623,7 @@ export interface QueueHandlerControl {
 /**
  * Explicit signal queue control methods for non-default outcomes.
  */
-export interface SignalQueueHandlerControl {
+export interface SignalQueueHandlerControl extends WorkHandlerControl {
   retry(error: unknown, options?: QueueHandlerRetryOptions): never;
 }
 
@@ -691,72 +715,6 @@ export type QueueHandlerFunction<
 }) => void | Promise<void>;
 
 /**
- * Failure observed while executing the authority-free phase of an external
- * queue operation.
- */
-export type QueueOperationFailure =
-  | {
-      readonly kind: "error";
-      readonly error: unknown;
-    }
-  | {
-      readonly kind: "timeout";
-      readonly error: QueueOperationTimeoutError;
-    };
-
-/**
- * Settlement returned by an external queue operation.
- *
- * Sledge invokes this function only while the work lease remains active. It
- * receives fresh ledger authority that was never available to the external
- * execution phase, so a timed-out execution cannot retain or recover it.
- */
-export type QueueOperationSettlementFunction<
-  TEvents extends Record<string, TSchema>,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema> = {},
-> = (input: {
-  readonly actions: QueueActions<TEvents, TQueries, TSignals>;
-  readonly control: QueueHandlerControl;
-}) => void | Promise<void>;
-
-/**
- * Two-phase handler for external work such as network requests or tool calls.
- *
- * `execute` receives no ledger actions. It returns the settlement to run if
- * execution completes. Exceptions and engine timeouts are converted by
- * `onFailure` into the same settlement form. Lease loss cancels execution and
- * skips settlement because this worker no longer owns the work.
- *
- * Aborting cannot forcibly stop JavaScript. Implementations must propagate the
- * supplied signal and make external side effects idempotent. A late completion
- * is ignored and never receives settlement authority.
- */
-export type QueueOperationHandler<
-  TEvents extends Record<string, TSchema>,
-  TQueues extends Record<string, TSchema>,
-  TQueueName extends keyof TQueues,
-  TQueries extends Record<string, AnyQuerySchema>,
-  TSignals extends Record<string, TSchema> = {},
-> = {
-  /**
-   * Positive integer timeout supported by the runtime scheduler, in
-   * milliseconds. Sledge validates this when the model is registered.
-   */
-  readonly timeoutMs: number;
-
-  readonly execute: (input: {
-    readonly work: QueueWorkItem<TQueues, TQueueName>;
-    readonly signal: AbortSignal;
-  }) => Promise<QueueOperationSettlementFunction<TEvents, TQueries, TSignals>>;
-
-  readonly onFailure: (input: {
-    readonly work: QueueWorkItem<TQueues, TQueueName>;
-    readonly failure: QueueOperationFailure;
-  }) => QueueOperationSettlementFunction<TEvents, TQueries, TSignals>;
-};
-
-/**
  * Signal queue work handler function.
  */
 export type SignalQueueHandlerFunction<
@@ -800,9 +758,13 @@ export type RegisterFunction<
     >;
   };
   readonly queues?: {
-    readonly [TQueueName in keyof TQueues]?:
-      | QueueHandlerFunction<TEvents, TQueues, TQueueName, TQueries, TSignals>
-      | QueueOperationHandler<TEvents, TQueues, TQueueName, TQueries, TSignals>;
+    readonly [TQueueName in keyof TQueues]?: QueueHandlerFunction<
+      TEvents,
+      TQueues,
+      TQueueName,
+      TQueries,
+      TSignals
+    >;
   };
   readonly signalQueues?: {
     readonly [TSignalQueueName in keyof TSignalQueues]?: SignalQueueHandlerFunction<
@@ -2205,11 +2167,9 @@ export function composeLedgerModels<
   };
   const registration = {
     events: mergeContributionHandlers(modules, "events"),
-    queues: mergeExclusiveHandlers<RuntimeQueueRegistration>(modules, "queues"),
+    queues: mergeExclusiveHandlers(modules, "queues"),
     signals: mergeContributionHandlers(modules, "signals"),
-    signalQueues: mergeExclusiveHandlers<
-      (input: RuntimeSignalQueueHandlerInput) => void | Promise<void>
-    >(modules, "signalQueues"),
+    signalQueues: mergeExclusiveHandlers(modules, "signalQueues"),
   };
   const firstMaterializedRuntime = modules
     .map((module) => module[registeredLedgerRuntimeBrand])
@@ -2305,16 +2265,18 @@ function mergeContributionHandlers(
   );
 }
 
-function mergeExclusiveHandlers<THandler>(
+function mergeExclusiveHandlers(
   modules: readonly RegisteredLedgerModelRuntime[],
   key: "queues" | "signalQueues",
-): Readonly<Record<string, THandler>> {
-  const merged: Record<string, THandler> = {};
+): Readonly<Record<string, (input: unknown) => void | Promise<void>>> {
+  const merged: Record<string, (input: unknown) => void | Promise<void>> = {};
 
   for (const module of modules) {
     const handlers = (
       module[registeredLedgerRuntimeBrand].register as RuntimeRegister
-    )[key] as Readonly<Record<string, THandler>> | undefined;
+    )[key] as
+      | Readonly<Record<string, (input: unknown) => void | Promise<void>>>
+      | undefined;
 
     for (const [physicalName, handler] of Object.entries(handlers ?? {})) {
       if (merged[physicalName] !== undefined) {
@@ -3665,27 +3627,6 @@ type RuntimeQueueHandlerInput = {
   readonly control: QueueHandlerControl;
 };
 
-type RuntimeQueueOperationSettlementFunction = (input: {
-  readonly actions: RuntimeQueueHandlerInput["actions"];
-  readonly control: QueueHandlerControl;
-}) => void | Promise<void>;
-
-type RuntimeQueueOperationHandler = {
-  readonly timeoutMs: number;
-  readonly execute: (input: {
-    readonly work: RuntimeQueueHandlerInput["work"];
-    readonly signal: AbortSignal;
-  }) => Promise<RuntimeQueueOperationSettlementFunction>;
-  readonly onFailure: (input: {
-    readonly work: RuntimeQueueHandlerInput["work"];
-    readonly failure: QueueOperationFailure;
-  }) => RuntimeQueueOperationSettlementFunction;
-};
-
-type RuntimeQueueRegistration =
-  | ((input: RuntimeQueueHandlerInput) => void | Promise<void>)
-  | RuntimeQueueOperationHandler;
-
 type RuntimeSignalQueueHandlerInput = {
   readonly work: RuntimeQueueHandlerInput["work"];
   readonly lease: RuntimeQueueHandlerInput["lease"];
@@ -3702,7 +3643,9 @@ type RuntimeRegister = {
   readonly signals?: Readonly<
     Record<string, (input: RuntimeSignalHandlerInput) => void | Promise<void>>
   >;
-  readonly queues?: Readonly<Record<string, RuntimeQueueRegistration>>;
+  readonly queues?: Readonly<
+    Record<string, (input: RuntimeQueueHandlerInput) => void | Promise<void>>
+  >;
   readonly signalQueues?: Readonly<
     Record<
       string,
@@ -3878,7 +3821,10 @@ function createPhysicalRegisteredModule<
     };
   }
 
-  const queues: Record<string, RuntimeQueueRegistration> = {};
+  const queues: Record<
+    string,
+    (input: RuntimeQueueHandlerInput) => void | Promise<void>
+  > = {};
 
   for (const [localName, handler] of Object.entries(
     runtimeRegister.queues ?? {},
@@ -3888,103 +3834,52 @@ function createPhysicalRegisteredModule<
       "queue",
       localName,
     );
-
-    const localizeWork = (
-      work: RuntimeQueueHandlerInput["work"],
-    ): RuntimeQueueHandlerInput["work"] => ({
-      ...work,
-      queueName: localName,
-    });
-    const localizeActions = (
-      physicalActions: RuntimeQueueHandlerInput["actions"],
-    ): RuntimeQueueHandlerInput["actions"] => ({
-      emit: (eventName, event, options) => {
-        physicalActions.emit(
-          readTokenPhysicalName(
-            input.contracts.events[eventName],
-            "event",
-            eventName,
-          ),
-          event,
-          options,
-        );
-      },
-      emitSignal: (signalName, signal, options) => {
-        return physicalActions.emitSignal(
-          readTokenPhysicalName(
-            input.contracts.signals[signalName],
-            "signal",
-            signalName,
-          ),
-          signal,
-          options,
-        );
-      },
-      query: (queryName, params) => {
-        return physicalActions.query(
-          readTokenPhysicalName(
-            input.contracts.queries[queryName],
-            "query",
-            queryName,
-          ),
-          params,
-        );
-      },
-    });
-    const localizeSettlement = (
-      settlement: RuntimeQueueOperationSettlementFunction,
-    ): RuntimeQueueOperationSettlementFunction => {
-      return (physicalInput) => {
-        return settlement({
-          actions: localizeActions(physicalInput.actions),
-          control: physicalInput.control,
-        });
-      };
-    };
-
-    if (typeof handler === "function") {
-      queues[physicalName] = (physicalInput) => {
-        return handler({
-          ...physicalInput,
-          work: localizeWork(physicalInput.work),
-          lease: {
-            ...physicalInput.lease,
-            queueName: localName,
+    queues[physicalName] = (physicalInput) => {
+      return handler({
+        ...physicalInput,
+        work: {
+          ...physicalInput.work,
+          queueName: localName,
+        },
+        lease: {
+          ...physicalInput.lease,
+          queueName: localName,
+        },
+        actions: {
+          emit: (eventName, event, options) => {
+            physicalInput.actions.emit(
+              readTokenPhysicalName(
+                input.contracts.events[eventName],
+                "event",
+                eventName,
+              ),
+              event,
+              options,
+            );
           },
-          actions: localizeActions(physicalInput.actions),
-        });
-      };
-      continue;
-    }
-
-    if (
-      !Number.isInteger(handler.timeoutMs) ||
-      handler.timeoutMs <= 0 ||
-      handler.timeoutMs > 2_147_483_647
-    ) {
-      throw new Error(
-        `queue operation ${localName} timeoutMs must be a positive integer no greater than 2147483647, received ${handler.timeoutMs}`,
-      );
-    }
-
-    queues[physicalName] = {
-      timeoutMs: handler.timeoutMs,
-      execute: async ({ work, signal }) => {
-        const settlement = await handler.execute({
-          work: localizeWork(work),
-          signal,
-        });
-
-        return localizeSettlement(settlement);
-      },
-      onFailure: ({ work, failure }) => {
-        return localizeSettlement(
-          handler.onFailure({
-            work: localizeWork(work),
-            failure,
-          }),
-        );
-      },
+          emitSignal: (signalName, signal, options) => {
+            return physicalInput.actions.emitSignal(
+              readTokenPhysicalName(
+                input.contracts.signals[signalName],
+                "signal",
+                signalName,
+              ),
+              signal,
+              options,
+            );
+          },
+          query: (queryName, params) => {
+            return physicalInput.actions.query(
+              readTokenPhysicalName(
+                input.contracts.queries[queryName],
+                "query",
+                queryName,
+              ),
+              params,
+            );
+          },
+        },
+      });
     };
   }
 

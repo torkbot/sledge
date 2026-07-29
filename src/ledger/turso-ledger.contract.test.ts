@@ -37,10 +37,8 @@ runLedgerContractSuite({
         nowMs: () => runtime.nowMs(),
         runControlledWork: (workKey, attempt) =>
           controlledWork.run(workKey, attempt),
-        executeTimedWork: (workKey, signal, inputKeys) =>
-          timedWork.execute(workKey, signal, inputKeys),
-        recordTimedWorkSettlement: (workKey, settlement) =>
-          timedWork.recordSettlement(workKey, settlement),
+        runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
+          timedWork.run(workKey, timeoutMs, leaseSignal, control),
       });
       const ledger = await createTursoLedger({
         databaseUrl,

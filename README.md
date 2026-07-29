@@ -531,53 +531,51 @@ Queue and signal queue handlers implicitly ack on normal return.
 - Throw: retry using the default retry delay
 - `control.retry(error, { retryAtMs? })`: explicit retry timing
 - `control.deadLetter(error)`: terminal durable queue failure
+- `control.withTimeout(timeoutMs, operation)`: run an operation under a
+  worker-scheduled timeout
 
 Handlers receive a lease with an `AbortSignal`; long-running handlers should
 stop when that signal aborts during shutdown or restart.
 
-Register an external queue operation when nondeterministic work such as a
-network request or tool call needs an engine-enforced timeout:
+Use `control.withTimeout(...)` when one operation inside a handler needs a
+shorter lifetime than the work lease:
 
 ```ts
 queues: {
-  "tools.execute": {
-    timeoutMs: 30_000,
-    execute: async ({ work, signal }) => {
-      const result = await executeTool(work.payload, { signal });
+  "tools.execute": async ({ work, actions, control }) => {
+    try {
+      const result = await control.withTimeout(30_000, async (signal) => {
+        return await executeTool(work.payload, { signal });
+      });
 
-      return ({ actions }) => {
-        actions.emit("tool.completed", result);
-      };
-    },
-    onFailure: ({ work, failure }) => {
-      return ({ actions }) => {
-        actions.emit("tool.failed", {
-          callId: work.payload.callId,
-          reason:
-            failure.kind === "timeout"
-              ? "timed_out"
-              : String(failure.error),
-        });
-      };
-    },
+      actions.emit("tool.completed", result);
+    } catch (error: unknown) {
+      actions.emit("tool.failed", {
+        callId: work.payload.callId,
+        reason:
+          error instanceof WorkOperationTimeoutError
+            ? "timed_out"
+            : String(error),
+      });
+    }
   },
 },
 ```
 
-The `execute` phase receives no ledger actions. A successful execution returns
-its settlement function; exceptions and `QueueOperationTimeoutError` are passed
-to `onFailure`, which returns the same settlement form. Sledge invokes the
-settlement afterward with fresh `actions` and `control`, then commits its staged
-events atomically with the work disposition.
+Sledge schedules the timeout through the worker's `RuntimeScheduler`. The
+operation receives one child signal that aborts before `withTimeout(...)`
+rejects, whether the timeout expires or the active lease is cancelled. Timeout
+rejections use `WorkOperationTimeoutError`; uncaught errors retain the normal
+retry behavior, while handlers may catch them and choose another outcome.
+Timeout durations must be positive integer milliseconds no greater than
+`2,147,483,647`.
 
-Lease cancellation aborts the operation signal and skips settlement because
-that worker no longer owns the work. A timeout aborts the same signal before
-settling the timeout failure while the lease remains active. Timeout durations
-must be positive integer milliseconds no greater than `2,147,483,647`.
-
-Cancellation cannot forcibly stop JavaScript. Sledge ignores a late completion,
-but external effects may have an unknown outcome. Propagate the signal and use
-application-level idempotency where that matters.
+Timeout cancellation cannot forcibly stop JavaScript. An operation that ignores
+its signal may continue after the handler stops awaiting it.
+`control.withTimeout(...)` is a deterministic timing primitive, not an execution
+sandbox: the operation retains anything captured by its closure. Pass only the
+capabilities it should retain, propagate the signal, and use application-level
+idempotency for external side effects.
 
 ### Partitioned Work
 
