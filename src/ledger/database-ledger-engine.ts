@@ -754,12 +754,12 @@ class DeadLetterRequested {
 }
 
 const maxRuntimeTimeoutMs = 2_147_483_647;
-const timedOperationActionFence = new AsyncLocalStorage<true>();
+const queueHandlerActionScope = new AsyncLocalStorage<object | null>();
 
-function assertQueueHandlerActionsAvailable(): void {
-  if (timedOperationActionFence.getStore() === true) {
+function assertQueueHandlerActionsAvailable(capability: object): void {
+  if (queueHandlerActionScope.getStore() !== capability) {
     throw new Error(
-      "queue handler actions are unavailable inside control.withTimeout operations",
+      "queue handler actions are unavailable outside their owning handler context",
     );
   }
 }
@@ -806,7 +806,7 @@ async function runWorkOperationWithTimeout<TResult>(input: {
     try {
       operationAbortController.signal.throwIfAborted();
 
-      const operation = timedOperationActionFence.run(true, () => {
+      const operation = queueHandlerActionScope.run(null, () => {
         return Promise.resolve().then(async () => {
           return await input.operation(operationAbortController.signal);
         });
@@ -3484,10 +3484,11 @@ function openDatabaseLedgerEngine<
       };
 
       const stagedEvents: AppendEventInput[] = [];
+      const actionCapability = {};
 
       const actions: QueueActions<any, any, any> = {
         emit: (eventName, event, options) => {
-          assertQueueHandlerActionsAvailable();
+          assertQueueHandlerActionsAvailable(actionCapability);
 
           stagedEvents.push({
             eventName: String(eventName),
@@ -3498,7 +3499,7 @@ function openDatabaseLedgerEngine<
           });
         },
         emitSignal: async (signalName, signal, options) => {
-          assertQueueHandlerActionsAvailable();
+          assertQueueHandlerActionsAvailable(actionCapability);
 
           type ImmediateSignalEmission = {
             readonly created: boolean;
@@ -3546,7 +3547,7 @@ function openDatabaseLedgerEngine<
           }
         },
         query: async (queryName, params) => {
-          assertQueueHandlerActionsAvailable();
+          assertQueueHandlerActionsAvailable(actionCapability);
 
           return await runLedgerQuery(
             queryName as keyof TQueries,
@@ -3593,21 +3594,23 @@ function openDatabaseLedgerEngine<
       };
 
       try {
-        if (claimed.signal) {
-          await (handler as SignalQueueHandlerFunction<any, any, any>)({
-            work,
-            lease,
-            actions: signalActions,
-            control: signalQueueControl,
-          });
-        } else {
-          await (handler as QueueHandlerFunction<any, any, any, any, any>)({
-            work,
-            lease,
-            actions,
-            control: queueControl,
-          });
-        }
+        await queueHandlerActionScope.run(actionCapability, async () => {
+          if (claimed.signal) {
+            await (handler as SignalQueueHandlerFunction<any, any, any>)({
+              work,
+              lease,
+              actions: signalActions,
+              control: signalQueueControl,
+            });
+          } else {
+            await (handler as QueueHandlerFunction<any, any, any, any, any>)({
+              work,
+              lease,
+              actions,
+              control: queueControl,
+            });
+          }
+        });
       } catch (error: unknown) {
         if (error instanceof RetryRequested) {
           disposition = {

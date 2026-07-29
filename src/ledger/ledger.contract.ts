@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 
 import type {
@@ -616,9 +617,11 @@ export type LedgerContractTimedWorkGate = {
   readonly initialActionResult: Promise<unknown>;
   readonly orphanActionResult: Promise<unknown>;
   readonly detachedActionResult: Promise<unknown>;
+  readonly preExistingResourceActionResult: Promise<unknown>;
   readonly outerActionsCompleted: Promise<void>;
   readonly settled: Promise<LedgerContractTimedWorkSettlement>;
   releaseDetachedAction(): void;
+  triggerPreExistingResourceAction(): void;
   resolve(value: string): void;
   reject(error: unknown): void;
 };
@@ -740,6 +743,8 @@ export function createLedgerContractTimedWork(): LedgerContractTimedWork {
       readonly operation: PromiseWithResolvers<string>;
       readonly orphanActionResult: PromiseWithResolvers<unknown>;
       readonly outerActionsCompleted: PromiseWithResolvers<void>;
+      readonly preExistingResource: EventEmitter;
+      readonly preExistingResourceActionResult: PromiseWithResolvers<unknown>;
       readonly settled: PromiseWithResolvers<LedgerContractTimedWorkSettlement>;
     }
   >();
@@ -772,6 +777,8 @@ export function createLedgerContractTimedWork(): LedgerContractTimedWork {
       const operation = Promise.withResolvers<string>();
       const orphanActionResult = Promise.withResolvers<unknown>();
       const outerActionsCompleted = Promise.withResolvers<void>();
+      const preExistingResource = new EventEmitter();
+      const preExistingResourceActionResult = Promise.withResolvers<unknown>();
       const settled =
         Promise.withResolvers<LedgerContractTimedWorkSettlement>();
 
@@ -784,6 +791,8 @@ export function createLedgerContractTimedWork(): LedgerContractTimedWork {
         operation,
         orphanActionResult,
         outerActionsCompleted,
+        preExistingResource,
+        preExistingResourceActionResult,
         settled,
       });
 
@@ -792,9 +801,14 @@ export function createLedgerContractTimedWork(): LedgerContractTimedWork {
         initialActionResult: initialActionResult.promise,
         orphanActionResult: orphanActionResult.promise,
         detachedActionResult: detachedActionResult.promise,
+        preExistingResourceActionResult:
+          preExistingResourceActionResult.promise,
         outerActionsCompleted: outerActionsCompleted.promise,
         settled: settled.promise,
         releaseDetachedAction: () => detachedActionRelease.resolve(),
+        triggerPreExistingResourceAction: () => {
+          preExistingResource.emit("action");
+        },
         resolve: (value) => operation.resolve(value),
         reject: (error) => operation.reject(error),
       };
@@ -819,6 +833,16 @@ export function createLedgerContractTimedWork(): LedgerContractTimedWork {
           const action = gate.action;
 
           if (action !== "none") {
+            gate.preExistingResource.once("action", () => {
+              void (async () => {
+                gate.preExistingResourceActionResult.resolve(
+                  await captureActionResult(async () => {
+                    await runAction(action);
+                  }),
+                );
+              })();
+            });
+
             gate.initialActionResult.resolve(
               await captureActionResult(async () => {
                 await runAction(action);
@@ -1397,7 +1421,7 @@ export function runLedgerContractSuite(input: {
       assert.ok(result instanceof Error);
       assert.equal(
         result.message,
-        "queue handler actions are unavailable inside control.withTimeout operations",
+        "queue handler actions are unavailable outside their owning handler context",
       );
     };
 
@@ -1634,6 +1658,11 @@ export function runLedgerContractSuite(input: {
               gate.releaseDetachedAction();
               assertTimedQueueActionUnavailable(
                 await gate.detachedActionResult,
+              );
+
+              gate.triggerPreExistingResourceAction();
+              assertTimedQueueActionUnavailable(
+                await gate.preExistingResourceActionResult,
               );
 
               await harness.waitForIdle();
