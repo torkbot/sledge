@@ -9,6 +9,7 @@ import {
   createLedgerContractControlledWork,
   createLedgerContractHarnessLedger,
   createLedgerContractModel,
+  createLedgerContractTimedWork,
   LedgerContractPausableScheduler,
   runLedgerContractSuite,
   type LedgerContractDecisionMode,
@@ -27,6 +28,7 @@ runLedgerContractSuite({
     let decisionMode: LedgerContractDecisionMode = "ack";
     let materializationFailureText: string | null = null;
     const controlledWork = createLedgerContractControlledWork();
+    const timedWork = createLedgerContractTimedWork();
 
     const createRuntimeLedger = () => {
       const model = createLedgerContractModel({
@@ -35,6 +37,8 @@ runLedgerContractSuite({
         nowMs: () => runtime.nowMs(),
         runControlledWork: (workKey, attempt) =>
           controlledWork.run(workKey, attempt),
+        runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
+          timedWork.run(workKey, timeoutMs, leaseSignal, control),
       });
       const ledger = createBetterSqliteLedger({
         databaseUrl,
@@ -133,6 +137,7 @@ runLedgerContractSuite({
       },
       stop: async () => {
         controlledWork.releaseAll();
+        timedWork.releaseAll();
         await stopCompetingWorkers();
         await workers.close();
         await ledger.close();
@@ -147,6 +152,7 @@ runLedgerContractSuite({
       prepareControlledWork: (workKey) => controlledWork.prepare(workKey),
       prepareControlledWorkAttempt: (workKey, attempt, outcome) =>
         controlledWork.prepareAttempt(workKey, attempt, outcome),
+      prepareTimedWork: (workKey) => timedWork.prepare(workKey),
       getStartedControlledWorkKeys: () => controlledWork.startedWorkKeys(),
       getDecisionAttempts: (sourceEventId) =>
         ledger.query("decisionAttempts", {

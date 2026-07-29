@@ -531,9 +531,37 @@ Queue and signal queue handlers implicitly ack on normal return.
 - Throw: retry using the default retry delay
 - `control.retry(error, { retryAtMs? })`: explicit retry timing
 - `control.deadLetter(error)`: terminal durable queue failure
+- `control.withTimeout(timeoutMs, operation)`: run an operation under a
+  worker-scheduled timeout
 
 Handlers receive a lease with an `AbortSignal`; long-running handlers should
 stop when that signal aborts during shutdown or restart.
+
+Use `control.withTimeout(...)` when one operation inside a handler needs a
+shorter lifetime than the work lease:
+
+```ts
+queues: {
+  "tools.execute": async ({ work, control }) => {
+    const result = await control.withTimeout(30_000, async (signal) => {
+      return await executeTool(work.payload, { signal });
+    });
+
+    // Commit the result through normal handler actions.
+  },
+},
+```
+
+Sledge schedules the timeout through the worker's `RuntimeScheduler`. The
+operation receives one child signal that aborts before `withTimeout(...)`
+rejects, whether the timeout expires or the active lease is cancelled. Timeout
+rejections use `WorkOperationTimeoutError`; uncaught errors retain the normal
+retry behavior, while handlers may catch them and choose another outcome.
+
+Timeout cancellation cannot forcibly stop JavaScript. An operation that ignores
+its signal may continue after the handler stops awaiting it, and external side
+effects may have an unknown outcome. Propagate the signal and use
+application-level idempotency where that matters.
 
 ### Partitioned Work
 

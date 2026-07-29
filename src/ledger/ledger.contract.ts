@@ -10,6 +10,7 @@ import type {
 import type {
   LedgerCursor,
   MaterializationImplementationRegistration,
+  QueueHandlerControl,
   WorkRef,
 } from "./ledger.ts";
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
@@ -17,6 +18,7 @@ import {
   createEventRef,
   defineLedgerShape,
   defineMaterialization,
+  WorkOperationTimeoutError,
   withMaterializations,
 } from "./ledger.ts";
 
@@ -55,6 +57,11 @@ const ControlledWorkAttemptedSchema = Type.Object({
 const ControlledSignalWorkSchema = Type.Object({
   workKey: Type.String(),
   partitionKey: Type.String(),
+});
+
+const TimedWorkSchema = Type.Object({
+  workKey: Type.String(),
+  timeoutMs: Type.Number(),
 });
 
 const EvaluateMessageQueueSchema = Type.Object({
@@ -131,18 +138,24 @@ const ledgerContractShape = defineLedgerShape({
     "controlled-work.requested": ControlledWorkRequestedSchema,
     "controlled-work.attempted": ControlledWorkAttemptedSchema,
     "controlled-signal-work.requested": ControlledSignalWorkSchema,
+    "timed-work.requested": TimedWorkSchema,
+    "timed-signal-work.requested": TimedWorkSchema,
   },
   queues: {
     "evaluate.message": EvaluateMessageQueueSchema,
     "dispatch.intent": DispatchIntentQueueSchema,
     "controlled-work.run": ControlledWorkQueueSchema,
     "controlled-signal-work.publish": ControlledSignalWorkSchema,
+    "timed-work.run": TimedWorkSchema,
+    "timed-signal-work.publish": TimedWorkSchema,
   },
   signals: {
     "controlled-work.signalled": ControlledSignalWorkSchema,
+    "timed-work.signalled": TimedWorkSchema,
   },
   signalQueues: {
     "controlled-signal-work.run": ControlledWorkQueueSchema,
+    "timed-signal-work.run": TimedWorkSchema,
   },
 });
 
@@ -562,6 +575,38 @@ export type LedgerContractControlledWork = {
   releaseAll(): void;
 };
 
+export type LedgerContractTimedWorkSettlement =
+  | {
+      readonly status: "completed";
+      readonly value: string;
+    }
+  | {
+      readonly status: "rejected";
+      readonly error: unknown;
+      readonly operationWasInvoked: boolean;
+    };
+
+export type LedgerContractTimedWorkGate = {
+  readonly entered: Promise<{
+    readonly leaseSignal: AbortSignal;
+    readonly operationSignal: AbortSignal;
+  }>;
+  readonly settled: Promise<LedgerContractTimedWorkSettlement>;
+  resolve(value: string): void;
+  reject(error: unknown): void;
+};
+
+export type LedgerContractTimedWork = {
+  prepare(workKey: string): LedgerContractTimedWorkGate;
+  run(
+    workKey: string,
+    timeoutMs: number,
+    leaseSignal: AbortSignal,
+    control: Pick<QueueHandlerControl, "withTimeout">,
+  ): Promise<void>;
+  releaseAll(): void;
+};
+
 export class LedgerContractPausableScheduler implements RuntimeScheduler {
   readonly #scheduler: RuntimeScheduler;
   #paused = false;
@@ -648,6 +693,86 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
   };
 }
 
+export function createLedgerContractTimedWork(): LedgerContractTimedWork {
+  const gates = new Map<
+    string,
+    {
+      readonly entered: PromiseWithResolvers<{
+        readonly leaseSignal: AbortSignal;
+        readonly operationSignal: AbortSignal;
+      }>;
+      readonly operation: PromiseWithResolvers<string>;
+      readonly settled: PromiseWithResolvers<LedgerContractTimedWorkSettlement>;
+    }
+  >();
+
+  return {
+    prepare: (workKey) => {
+      if (gates.has(workKey)) {
+        throw new Error(`timed work was already prepared: ${workKey}`);
+      }
+
+      const entered = Promise.withResolvers<{
+        readonly leaseSignal: AbortSignal;
+        readonly operationSignal: AbortSignal;
+      }>();
+      const operation = Promise.withResolvers<string>();
+      const settled =
+        Promise.withResolvers<LedgerContractTimedWorkSettlement>();
+
+      gates.set(workKey, {
+        entered,
+        operation,
+        settled,
+      });
+
+      return {
+        entered: entered.promise,
+        settled: settled.promise,
+        resolve: (value) => operation.resolve(value),
+        reject: (error) => operation.reject(error),
+      };
+    },
+    run: async (workKey, timeoutMs, leaseSignal, control) => {
+      const gate = gates.get(workKey);
+
+      if (gate === undefined) {
+        throw new Error(`timed work was not prepared: ${workKey}`);
+      }
+
+      let operationWasInvoked = false;
+
+      try {
+        const value = await control.withTimeout(timeoutMs, async (signal) => {
+          operationWasInvoked = true;
+          gate.entered.resolve({
+            leaseSignal,
+            operationSignal: signal,
+          });
+
+          return await gate.operation.promise;
+        });
+
+        gate.settled.resolve({
+          status: "completed",
+          value,
+        });
+      } catch (error: unknown) {
+        gate.settled.resolve({
+          status: "rejected",
+          error,
+          operationWasInvoked,
+        });
+      }
+    },
+    releaseAll: () => {
+      for (const gate of gates.values()) {
+        gate.operation.resolve("released");
+      }
+    },
+  };
+}
+
 export type LedgerContractHarness = {
   readonly ledger: DatabaseLedger<
     LedgerContractEvents,
@@ -676,6 +801,7 @@ export type LedgerContractHarness = {
     attempt: number,
     outcome: LedgerContractControlledWorkOutcome,
   ): LedgerContractControlledWorkGate;
+  prepareTimedWork(workKey: string): LedgerContractTimedWorkGate;
   getStartedControlledWorkKeys(): readonly string[];
 
   getDecisionAttempts(sourceEventId: number): Promise<number>;
@@ -693,6 +819,12 @@ export function createLedgerContractModel(input: {
     workKey: string,
     attempt: number,
   ): Promise<LedgerContractControlledWorkOutcome>;
+  runTimedWork(
+    workKey: string,
+    timeoutMs: number,
+    leaseSignal: AbortSignal,
+    control: Pick<QueueHandlerControl, "withTimeout">,
+  ): Promise<void>;
 }): LedgerContractModel {
   return ledgerContractDefinition.register({
     indexers: ledgerContractImplementations.indexers,
@@ -776,6 +908,16 @@ export function createLedgerContractModel(input: {
       },
       "controlled-signal-work.requested": ({ event, actions }) => {
         actions.enqueue("controlled-signal-work.publish", event.payload, {
+          workKey: event.payload.workKey,
+        });
+      },
+      "timed-work.requested": ({ event, actions }) => {
+        actions.enqueue("timed-work.run", event.payload, {
+          workKey: event.payload.workKey,
+        });
+      },
+      "timed-signal-work.requested": ({ event, actions }) => {
+        actions.enqueue("timed-signal-work.publish", event.payload, {
           workKey: event.payload.workKey,
         });
       },
@@ -894,6 +1036,19 @@ export function createLedgerContractModel(input: {
           dedupeKey: `controlled-signal:${work.sourceEventId}`,
         });
       },
+      "timed-work.run": async ({ work, lease, control }) => {
+        await input.runTimedWork(
+          work.payload.workKey,
+          work.payload.timeoutMs,
+          lease.signal,
+          control,
+        );
+      },
+      "timed-signal-work.publish": async ({ work, actions }) => {
+        await actions.emitSignal("timed-work.signalled", work.payload, {
+          dedupeKey: `timed-signal:${work.sourceEventId}`,
+        });
+      },
     },
     signals: {
       "controlled-work.signalled": ({ event, actions }) => {
@@ -907,6 +1062,11 @@ export function createLedgerContractModel(input: {
             workKey: event.payload.workKey,
           },
         );
+      },
+      "timed-work.signalled": ({ event, actions }) => {
+        actions.enqueueSignal("timed-signal-work.run", event.payload, {
+          workKey: event.payload.workKey,
+        });
       },
     },
     signalQueues: {
@@ -926,6 +1086,14 @@ export function createLedgerContractModel(input: {
           case "dead_letter":
             throw new Error("controlled signal work cannot dead-letter");
         }
+      },
+      "timed-signal-work.run": async ({ work, lease, control }) => {
+        await input.runTimedWork(
+          work.payload.workKey,
+          work.payload.timeoutMs,
+          lease.signal,
+          control,
+        );
       },
     },
   });
@@ -1029,6 +1197,186 @@ export function runLedgerContractSuite(input: {
 
       return sourceEventId;
     };
+
+    const emitTimedWork = async (
+      harness: LedgerContractHarness,
+      kind: "durable" | "signal",
+      workKey: string,
+      timeoutMs: number,
+    ): Promise<void> => {
+      if (kind === "durable") {
+        await harness.ledger.emit("timed-work.requested", {
+          workKey,
+          timeoutMs,
+        });
+      } else {
+        await harness.ledger.emit("timed-signal-work.requested", {
+          workKey,
+          timeoutMs,
+        });
+      }
+
+      await harness.flush();
+    };
+
+    await t.test(
+      "withTimeout returns values and preserves operation failures",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const completed = harness.prepareTimedWork("timed-completed");
+
+          await emitTimedWork(harness, "durable", "timed-completed", 100);
+          const completedEntry = await completed.entered;
+          completed.resolve("completed value");
+
+          assert.deepEqual(await completed.settled, {
+            status: "completed",
+            value: "completed value",
+          });
+
+          await harness.advanceByMs(100);
+          assert.equal(completedEntry.operationSignal.aborted, false);
+
+          const failed = harness.prepareTimedWork("timed-failed");
+          const expectedError = new Error("operation failed");
+
+          await emitTimedWork(harness, "durable", "timed-failed", 100);
+          const failedEntry = await failed.entered;
+          failed.reject(expectedError);
+
+          assert.deepEqual(await failed.settled, {
+            status: "rejected",
+            error: expectedError,
+            operationWasInvoked: true,
+          });
+          assert.equal(failedEntry.operationSignal.aborted, false);
+
+          await harness.waitForIdle();
+        });
+      },
+    );
+
+    for (const kind of ["durable", "signal"] as const) {
+      await t.test(
+        `withTimeout aborts the ${kind} queue operation signal before rejecting`,
+        async () => {
+          await withHarness(input.create, async (harness) => {
+            const workKey = `timed-${kind}-deadline`;
+            const gate = harness.prepareTimedWork(workKey);
+
+            await emitTimedWork(harness, kind, workKey, 100);
+            const entered = await gate.entered;
+            let didSettle = false;
+            void gate.settled.then(() => {
+              didSettle = true;
+            });
+
+            await harness.advanceByMs(99);
+            assert.equal(entered.operationSignal.aborted, false);
+            assert.equal(didSettle, false);
+
+            await harness.advanceByMs(1);
+            const settled = await gate.settled;
+
+            assert.equal(settled.status, "rejected");
+
+            if (settled.status !== "rejected") {
+              assert.fail("expected timed work to reject");
+            }
+
+            assert.equal(settled.operationWasInvoked, true);
+            assert.equal(entered.operationSignal.aborted, true);
+            assert.ok(settled.error instanceof WorkOperationTimeoutError);
+            assert.equal(settled.error.timeoutMs, 100);
+            assert.equal(entered.operationSignal.reason, settled.error);
+            assert.equal(entered.leaseSignal.aborted, false);
+
+            await harness.waitForIdle();
+          });
+        },
+      );
+
+      await t.test(
+        `withTimeout preserves ${kind} queue lease cancellation`,
+        async () => {
+          await withHarness(input.create, async (harness) => {
+            const workKey = `timed-${kind}-cancelled`;
+            const queueName =
+              kind === "durable" ? "timed-work.run" : "timed-signal-work.run";
+            const gate = harness.prepareTimedWork(workKey);
+
+            await emitTimedWork(harness, kind, workKey, 500);
+            const entered = await gate.entered;
+            const [work] = await harness.ledger.listWork({
+              queueName,
+              states: ["leased"],
+            });
+
+            if (work?.ref === null || work === undefined) {
+              throw new Error(`expected leased ${kind} timed work`);
+            }
+
+            const cancelled = await harness.ledger.cancelWork({
+              ref: work.ref,
+              reason: "contract cancellation",
+            });
+            assert.equal(cancelled.status, "cancelled");
+
+            const settled = await gate.settled;
+            assert.equal(settled.status, "rejected");
+
+            if (settled.status !== "rejected") {
+              assert.fail("expected cancelled timed work to reject");
+            }
+
+            assert.equal(settled.operationWasInvoked, true);
+            assert.equal(entered.operationSignal.aborted, true);
+            assert.equal(entered.leaseSignal.aborted, true);
+            assert.equal(
+              entered.operationSignal.reason,
+              entered.leaseSignal.reason,
+            );
+            assert.equal(entered.operationSignal.reason, settled.error);
+            assert.equal(
+              settled.error instanceof WorkOperationTimeoutError,
+              false,
+            );
+
+            await harness.advanceByMs(500);
+            assert.equal(
+              entered.operationSignal.reason,
+              entered.leaseSignal.reason,
+            );
+            await harness.waitForIdle();
+          });
+        },
+      );
+    }
+
+    await t.test(
+      "withTimeout rejects invalid durations without invoking the operation",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          for (const timeoutMs of [0, -1, 1.5]) {
+            const workKey = `timed-invalid-${String(timeoutMs)}`;
+            const gate = harness.prepareTimedWork(workKey);
+
+            await emitTimedWork(harness, "durable", workKey, timeoutMs);
+            const settled = await gate.settled;
+
+            assert.equal(settled.status, "rejected");
+
+            if (settled.status !== "rejected") {
+              assert.fail("expected invalid timeout to reject");
+            }
+
+            assert.equal(settled.operationWasInvoked, false);
+          }
+
+          await harness.waitForIdle();
+        });
+      },
+    );
 
     await t.test(
       "partitioned work is serial while other partitions remain concurrent",
