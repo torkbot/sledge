@@ -752,15 +752,21 @@ class DeadLetterRequested {
   }
 }
 
+const maxRuntimeTimeoutMs = 2_147_483_647;
+
 async function runWorkOperationWithTimeout<TResult>(input: {
   readonly leaseSignal: AbortSignal;
   readonly operation: (signal: AbortSignal) => Promise<TResult>;
   readonly scheduler: RuntimeScheduler;
   readonly timeoutMs: number;
 }): Promise<TResult> {
-  if (!Number.isInteger(input.timeoutMs) || input.timeoutMs <= 0) {
+  if (
+    !Number.isInteger(input.timeoutMs) ||
+    input.timeoutMs <= 0 ||
+    input.timeoutMs > maxRuntimeTimeoutMs
+  ) {
     throw new Error(
-      `timeoutMs must be a positive integer, received ${input.timeoutMs}`,
+      `timeoutMs must be a positive integer no greater than ${maxRuntimeTimeoutMs}, received ${input.timeoutMs}`,
     );
   }
 

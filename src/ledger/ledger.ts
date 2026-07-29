@@ -598,6 +598,8 @@ interface WorkHandlerControl {
    * follows normal thrown-handler retry semantics, while a handler may catch
    * it and choose another outcome.
    *
+   * `timeoutMs` must be a positive integer no greater than 2,147,483,647.
+   *
    * Aborting cannot forcibly stop JavaScript. An operation that ignores its
    * signal may continue after this promise rejects, so external side effects
    * still require application-level idempotency.

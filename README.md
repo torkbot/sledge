@@ -557,6 +557,8 @@ operation receives one child signal that aborts before `withTimeout(...)`
 rejects, whether the timeout expires or the active lease is cancelled. Timeout
 rejections use `WorkOperationTimeoutError`; uncaught errors retain the normal
 retry behavior, while handlers may catch them and choose another outcome.
+Timeout durations must be positive integer milliseconds no greater than
+`2,147,483,647`.
 
 Timeout cancellation cannot forcibly stop JavaScript. An operation that ignores
 its signal may continue after the handler stops awaiting it, and external side

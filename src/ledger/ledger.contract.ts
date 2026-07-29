@@ -1357,7 +1357,7 @@ export function runLedgerContractSuite(input: {
       "withTimeout rejects invalid durations without invoking the operation",
       async () => {
         await withHarness(input.create, async (harness) => {
-          for (const timeoutMs of [0, -1, 1.5]) {
+          for (const timeoutMs of [0, -1, 1.5, 2_147_483_648]) {
             const workKey = `timed-invalid-${String(timeoutMs)}`;
             const gate = harness.prepareTimedWork(workKey);
 
