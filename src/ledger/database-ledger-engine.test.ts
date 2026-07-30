@@ -27,6 +27,7 @@ import {
   type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
+  type SignalEnqueueOptions,
 } from "./ledger.ts";
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
 import type {
@@ -4104,6 +4105,79 @@ test("durable coalescing has one unambiguous enqueue identity", async () => {
   );
 });
 
+test("signal enqueue rejects coalescing options from untyped callers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  let signalError: unknown = null;
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({ id: Type.Number() }),
+    },
+    signals: {
+      "job.signalled": Type.Object({ id: Type.Number() }),
+    },
+    queues: {
+      "job.run": Type.Object({ id: Type.Number() }),
+    },
+    signalQueues: {
+      "job.signal": Type.Object({ id: Type.Number() }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.run", { id: event.payload.id });
+        },
+      },
+      queues: {
+        "job.run": async ({ work, actions }) => {
+          try {
+            await actions.emitSignal("job.signalled", {
+              id: work.payload.id,
+            });
+          } catch (error: unknown) {
+            signalError = error;
+          }
+        },
+      },
+      signals: {
+        "job.signalled": ({ event, actions }) => {
+          const uncheckedOptions = {
+            coalescingKey: "job",
+          } as unknown as SignalEnqueueOptions;
+
+          actions.enqueueSignal(
+            "job.signal",
+            { id: event.payload.id },
+            uncheckedOptions,
+          );
+        },
+      },
+      signalQueues: {},
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  await waitFor(runtime, () => signalError !== null);
+
+  assert.match(
+    String(signalError),
+    /signal queue work does not support coalescingKey/,
+  );
+  assert.deepEqual(await ledger.listWork({ queueName: "job.signal" }), []);
+});
+
 test("enqueue option types keep coalescing off signal queues", () => {
   defineEngineFixtureModel({
     events: {
@@ -4133,11 +4207,21 @@ test("enqueue option types keep coalescing off signal queues", () => {
       },
       signals: {
         "job.signalled": ({ event, actions }) => {
+          const durableOptions: EnqueueOptions = {
+            coalescingKey: "job",
+          };
+
           actions.enqueueSignal(
             "job.signal",
             { id: event.payload.id },
             // @ts-expect-error Process-local signal queues do not coalesce.
             { coalescingKey: "job" },
+          );
+          actions.enqueueSignal(
+            "job.signal",
+            { id: event.payload.id },
+            // @ts-expect-error Durable coalescing options cannot be reused.
+            durableOptions,
           );
         },
       },

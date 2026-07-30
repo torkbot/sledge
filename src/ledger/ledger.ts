@@ -357,6 +357,7 @@ export type EnqueueOptions = {
  */
 export type SignalEnqueueOptions = {
   readonly availableAtMs?: number;
+  readonly coalescingKey?: never;
   readonly partitionKey?: string;
   readonly workKey?: string;
 };

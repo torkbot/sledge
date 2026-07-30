@@ -2730,6 +2730,15 @@ function openDatabaseLedgerEngine<
               validateWorkKey(options.workKey);
             }
 
+            if (
+              options !== undefined &&
+              Object.hasOwn(options, "coalescingKey")
+            ) {
+              throw new Error(
+                "signal queue work does not support coalescingKey",
+              );
+            }
+
             if (options?.partitionKey !== undefined) {
               validatePartitionKey(options.partitionKey);
             }
