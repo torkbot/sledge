@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add durable `coalescingKey` enqueue semantics so repeated requests for one
+  queue identity converge on one unattempted work item and can only move its
+  availability earlier. Attempted work and retry backoff remain immutable;
+  later requests create one coalesced successor.
 - Add deterministic `control.withTimeout(...)` operation deadlines to durable
   and signal queue handlers, composing timeout and active-lease cancellation
   through one handler-facing `AbortSignal`.

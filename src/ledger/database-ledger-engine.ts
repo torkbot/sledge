@@ -898,6 +898,14 @@ const WorkIdRowSchema = Type.Object({
   work_id: Type.Number(),
 });
 
+const CoalescedWorkRowSchema = Type.Object({
+  available_at_ms: Type.Number(),
+  partition_key: Type.Union([Type.Null(), Type.String()]),
+  payload_json: Type.String(),
+  work_id: Type.Number(),
+});
+
+const CoalescingKeySchema = Type.String({ minLength: 1 });
 const PartitionKeySchema = Type.String({ minLength: 1 });
 const WorkRefSchema = Type.String({
   pattern:
@@ -1186,6 +1194,7 @@ function openDatabaseLedgerEngine<
         work_ref TEXT,
         queue_name TEXT NOT NULL,
         work_key TEXT,
+        coalescing_key TEXT,
         partition_key TEXT,
         payload_json TEXT NOT NULL,
         source_event_id INTEGER NOT NULL,
@@ -1212,12 +1221,16 @@ function openDatabaseLedgerEngine<
         await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
+        await ensureColumn("work", "coalescing_key", "TEXT");
         await ensureColumn("work", "partition_key", "TEXT");
         await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
         await ensureColumn("work", "cancel_reason", "TEXT");
         await ensureColumn("work", "terminal_at_ms", "INTEGER");
         await storage.write(async (database) => {
+          // coalescing_key is non-null only while it reserves an unattempted
+          // generation, so SQLite's normal NULL-distinct unique semantics
+          // enforce one pending row without a lease-sensitive partial index.
           await database.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_key
           ON work(source_event_id, signal, queue_name, work_key)
@@ -1226,6 +1239,9 @@ function openDatabaseLedgerEngine<
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_ref
           ON work(work_ref)
           WHERE work_ref IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_work_coalescing_pending
+          ON work(queue_name, coalescing_key);
 
         CREATE INDEX IF NOT EXISTS idx_work_partition_order
           ON work(signal, queue_name, partition_key, work_id)
@@ -1362,6 +1378,14 @@ function openDatabaseLedgerEngine<
   function validateWorkKey(workKey: string): void {
     if (workKey.length === 0) {
       throw new Error("workKey must be non-empty");
+    }
+  }
+
+  function validateCoalescingKey(coalescingKey: string): void {
+    try {
+      decodeValue(CoalescingKeySchema, coalescingKey);
+    } catch {
+      throw new Error("coalescingKey must be non-empty");
     }
   }
 
@@ -2225,6 +2249,120 @@ function openDatabaseLedgerEngine<
     };
   }
 
+  type PendingDurableWork = {
+    readonly availableAtMs: number;
+    readonly coalescingKey: string | null;
+    readonly partitionKey: string | null;
+    readonly payload: unknown;
+    readonly queueName: string;
+    readonly workKey: string | null;
+  };
+
+  async function materializeDurableWork(
+    database: StorageDatabase,
+    sourceEventId: number,
+    work: PendingDurableWork,
+  ): Promise<void> {
+    const payloadJson = JSON.stringify(work.payload);
+
+    if (work.coalescingKey !== null) {
+      const existing = await database
+        .prepare(
+          `SELECT
+             work_id,
+             partition_key,
+             payload_json,
+             available_at_ms
+           FROM work
+           WHERE queue_name = ?
+             AND coalescing_key = ?
+             AND attempt = 0
+             AND lease_id IS NULL
+             AND dead = 0
+             AND cancelled = 0`,
+        )
+        .get(work.queueName, work.coalescingKey);
+
+      if (existing !== undefined) {
+        const decodedExisting = decodeRow(existing, CoalescedWorkRowSchema);
+        const queueSchema = model.queues[work.queueName as keyof TQueues];
+
+        if (queueSchema === undefined) {
+          throw new Error(`unknown queue: ${work.queueName}`);
+        }
+
+        const existingPayload = decodeValue(
+          queueSchema,
+          parseJson(
+            decodedExisting.payload_json,
+            `coalesced work ${work.queueName}/${work.coalescingKey}`,
+          ),
+        );
+
+        if (!Value.Equal(existingPayload, work.payload)) {
+          throw new Error(
+            `coalesced work ${work.queueName}/${work.coalescingKey} payload does not match the pending item`,
+          );
+        }
+
+        if (decodedExisting.partition_key !== work.partitionKey) {
+          throw new Error(
+            `coalesced work ${work.queueName}/${work.coalescingKey} partition does not match the pending item`,
+          );
+        }
+
+        if (work.availableAtMs < decodedExisting.available_at_ms) {
+          await database
+            .prepare(
+              `UPDATE work
+               SET available_at_ms = ?
+               WHERE work_id = ?
+                 AND attempt = 0
+                 AND lease_id IS NULL
+                 AND dead = 0
+                 AND cancelled = 0`,
+            )
+            .run(work.availableAtMs, decodedExisting.work_id);
+        }
+
+        return;
+      }
+    }
+
+    await database
+      .prepare(
+        `INSERT INTO work (
+            work_ref,
+            queue_name,
+            work_key,
+            coalescing_key,
+            partition_key,
+            payload_json,
+            source_event_id,
+            signal,
+            attempt,
+            available_at_ms,
+            dead,
+            lease_id,
+            lease_acquired_at_ms,
+            lease_expires_at_ms,
+            last_error
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
+      )
+      .run(
+        work.workKey === null && work.coalescingKey === null
+          ? null
+          : createWorkRef(),
+        work.queueName,
+        work.workKey,
+        work.coalescingKey,
+        work.partitionKey,
+        payloadJson,
+        sourceEventId,
+        work.availableAtMs,
+      );
+  }
+
   async function appendEventInTransaction(
     database: StorageDatabase,
     tx: TransactionScope,
@@ -2330,6 +2468,7 @@ function openDatabaseLedgerEngine<
     const queued: {
       queueName: string;
       workKey: string | null;
+      coalescingKey: string | null;
       partitionKey: string | null;
       payload: unknown;
       availableAtMs: number;
@@ -2404,6 +2543,19 @@ function openDatabaseLedgerEngine<
                 validateWorkKey(options.workKey);
               }
 
+              if (options?.coalescingKey !== undefined) {
+                validateCoalescingKey(options.coalescingKey);
+              }
+
+              if (
+                options?.workKey !== undefined &&
+                options.coalescingKey !== undefined
+              ) {
+                throw new Error(
+                  "workKey and coalescingKey are mutually exclusive",
+                );
+              }
+
               if (options?.partitionKey !== undefined) {
                 validatePartitionKey(options.partitionKey);
               }
@@ -2411,6 +2563,7 @@ function openDatabaseLedgerEngine<
               queued.push({
                 queueName: String(queueName),
                 workKey: options?.workKey ?? null,
+                coalescingKey: options?.coalescingKey ?? null,
                 partitionKey: options?.partitionKey ?? null,
                 payload: decodedQueuePayload,
                 availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
@@ -2443,34 +2596,7 @@ function openDatabaseLedgerEngine<
     }
 
     for (const work of queued) {
-      await database
-        .prepare(
-          `INSERT INTO work (
-              work_ref,
-              queue_name,
-              work_key,
-              partition_key,
-              payload_json,
-              source_event_id,
-              signal,
-              attempt,
-              available_at_ms,
-              dead,
-              lease_id,
-              lease_acquired_at_ms,
-              lease_expires_at_ms,
-              last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
-        )
-        .run(
-          work.workKey === null ? null : createWorkRef(),
-          work.queueName,
-          work.workKey,
-          work.partitionKey,
-          JSON.stringify(work.payload),
-          eventId,
-          work.availableAtMs,
-        );
+      await materializeDurableWork(database, eventId, work);
     }
 
     return {
@@ -3083,11 +3209,15 @@ function openDatabaseLedgerEngine<
       const leaseId = randomUUID();
       const leaseExpiresAtMs = nowMs + worker.leaseMs;
 
+      // The coalescing key reserves only an unattempted generation. Releasing
+      // it in the claim transaction lets later events create one successor
+      // without mutating this attempt or its backoff.
       const updateResult = await database
         .prepare(
           `UPDATE work
            SET
              attempt = attempt + 1,
+             coalescing_key = NULL,
              lease_id = ?,
              lease_acquired_at_ms = ?,
              lease_expires_at_ms = ?
@@ -3273,6 +3403,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   coalescing_key = NULL,
                    partition_key = NULL,
                    last_error = ?,
                    terminal_at_ms = ?
@@ -3718,6 +3849,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   coalescing_key = NULL,
                    partition_key = NULL,
                    last_error = ?,
                    terminal_at_ms = ?
@@ -3961,6 +4093,7 @@ function openDatabaseLedgerEngine<
                lease_id = NULL,
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
+               coalescing_key = NULL,
                partition_key = NULL,
                last_error = ?
              WHERE work_ref = ?

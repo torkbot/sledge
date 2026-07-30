@@ -21,6 +21,7 @@ import {
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
+  type EnqueueOptions,
   type LedgerTiming,
   type RegisteredLedgerModel,
   type LedgerModel,
@@ -3820,6 +3821,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
 
   assert.ok(columnNames.includes("work_ref"));
   assert.ok(columnNames.includes("work_key"));
+  assert.ok(columnNames.includes("coalescing_key"));
   assert.ok(columnNames.includes("partition_key"));
 
   const indexes = database.prepare("PRAGMA index_list(work)").all();
@@ -3829,6 +3831,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
 
   assert.ok(indexNames.includes("idx_work_ref"));
   assert.ok(indexNames.includes("idx_work_key"));
+  assert.ok(indexNames.includes("idx_work_coalescing_pending"));
   assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 
@@ -3865,4 +3868,88 @@ test("enqueue rejects empty work keys", async () => {
     async () => await ledger.emit("job.requested", { id: 1 }),
     /workKey must be non-empty/,
   );
+});
+
+test("durable coalescing has one unambiguous enqueue identity", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({ id: Type.Number() }),
+    },
+    queues: {
+      "job.run": Type.Object({ id: Type.Number() }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          const uncheckedOptions = {
+            coalescingKey: "job",
+            workKey: "job",
+          } as unknown as EnqueueOptions;
+
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            uncheckedOptions,
+          );
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+
+  await assert.rejects(
+    async () => await ledger.emit("job.requested", { id: 1 }),
+    /workKey and coalescingKey are mutually exclusive/,
+  );
+});
+
+test("enqueue option types keep coalescing off signal queues", () => {
+  defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({ id: Type.Number() }),
+    },
+    signals: {
+      "job.signalled": Type.Object({ id: Type.Number() }),
+    },
+    queues: {
+      "job.run": Type.Object({ id: Type.Number() }),
+    },
+    signalQueues: {
+      "job.signal": Type.Object({ id: Type.Number() }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            // @ts-expect-error Durable work cannot have two logical identities.
+            { coalescingKey: "job", workKey: "job" },
+          );
+        },
+      },
+      signals: {
+        "job.signalled": ({ event, actions }) => {
+          actions.enqueueSignal(
+            "job.signal",
+            { id: event.payload.id },
+            // @ts-expect-error Process-local signal queues do not coalesce.
+            { coalescingKey: "job" },
+          );
+        },
+      },
+    },
+  });
 });

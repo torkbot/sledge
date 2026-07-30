@@ -577,6 +577,45 @@ sandbox: the operation retains anything captured by its closure. Pass only the
 capabilities it should retain, propagate the signal, and use application-level
 idempotency for external side effects.
 
+### Coalesced Work
+
+Use `coalescingKey` when many durable events request the same logical work and
+only the earliest requested availability matters:
+
+```ts
+const deadlineAtMs = event.payload.oldestPendingAtMs + 5_000;
+const availableAtMs =
+  event.payload.pendingCount >= 20 ? event.tsMs : deadlineAtMs;
+
+actions.enqueue(
+  "agent-lane.wake",
+  { laneId: event.payload.laneId },
+  {
+    availableAtMs,
+    coalescingKey: event.payload.laneId,
+    partitionKey: event.payload.laneId,
+  },
+);
+```
+
+For one physical queue, repeated enqueues with the same non-empty
+`coalescingKey` converge on one live, unattempted work item. The first request
+creates it; later requests preserve its original payload, source event, and
+`WorkRef` while setting `availableAtMs` to the earlier of the stored and
+requested times. A request with a different decoded payload or
+`partitionKey` fails its enclosing event transaction.
+
+Claiming work ends that coalescing generation. Requests arriving after claim
+create or promote one unattempted successor instead of changing the active
+attempt or its retry backoff. Give both generations the same `partitionKey`
+when they must not execute concurrently.
+
+`coalescingKey` is available only to durable event `actions.enqueue(...)`.
+It is mutually exclusive with `workKey`; coalesced work already receives a
+Sledge-generated `WorkRef` for inspection and cancellation. Successful,
+cancelled, and dead-lettered work release the identity for reuse. Delayed and
+partition-blocked coalesced work remains non-idle and survives restart.
+
 ### Partitioned Work
 
 Use `partitionKey` when work belongs to an ordered logical stream:
@@ -596,8 +635,8 @@ worker runtimes. Dead-lettering or cancelling the head releases its successor.
 Different partitions can execute concurrently, and work without a
 `partitionKey` retains the existing unconstrained scheduling behavior.
 
-Partitions do not coalesce work. Each enqueue remains a durable work item, so a
-handler may treat a redundant wake as a no-op. Sledge stores no separate
+`partitionKey` alone does not coalesce work. Each enqueue remains a durable work
+item unless the caller also supplies `coalescingKey`. Sledge stores no separate
 partition registry: the key exists only on nonterminal work, successful work is
 deleted, and terminal retained work releases the key. Reusing a key after all
 of its work becomes terminal starts a fresh stream.
@@ -607,7 +646,8 @@ of its work becomes terminal starts a fresh stream.
 Sledge stores durable work rows for queued, leased, delayed-retry,
 dead-lettered, and cancelled work. Successful work is deleted when it acks.
 
-Use `workKey` when enqueueing work to get a durable `WorkRef` for cancellation:
+Use `workKey` when enqueueing independently addressable work to get a durable
+`WorkRef` for cancellation:
 
 ```ts
 actions.enqueue(

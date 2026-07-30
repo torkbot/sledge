@@ -79,6 +79,7 @@ const ledgerContractTokenMetadata = new WeakMap<
 const physicalNameSeparator = "::";
 const reservedMaterializationSqliteObjectNames = [
   "events",
+  "idx_work_coalescing_pending",
   "idx_work_due",
   "idx_work_key",
   "idx_work_partition_order",
@@ -332,6 +333,30 @@ export type EnqueueOptions = {
    * partition. The partition remains blocked while its head is delayed,
    * leased, or retrying.
    */
+  readonly partitionKey?: string;
+} & (
+  | {
+      /**
+       * Coalesces requests for the same physical queue and logical identity
+       * while work remains live and unattempted. Repeated requests must have
+       * the same decoded payload and partition, preserve the first request's
+       * causation and WorkRef, and can only move availability earlier. Once
+       * claimed, later requests create one independently coalesced successor.
+       */
+      readonly coalescingKey: string;
+      readonly workKey?: never;
+    }
+  | {
+      readonly coalescingKey?: never;
+      readonly workKey?: string;
+    }
+);
+
+/**
+ * Optional knobs for signal->signal-queue materialization.
+ */
+export type SignalEnqueueOptions = {
+  readonly availableAtMs?: number;
   readonly partitionKey?: string;
   readonly workKey?: string;
 };
@@ -693,7 +718,7 @@ export type SignalHandlerFunction<
     >(
       queueName: TSignalQueueName,
       payload: Static<TSignalQueues[TSignalQueueName]>,
-      options?: EnqueueOptions,
+      options?: SignalEnqueueOptions,
     ) => void;
   };
 }) => void | Promise<void>;
@@ -3592,7 +3617,7 @@ type RuntimeSignalHandlerInput = {
     enqueueSignal(
       queueName: string,
       payload: unknown,
-      options?: EnqueueOptions,
+      options?: SignalEnqueueOptions,
     ): void;
   };
 };

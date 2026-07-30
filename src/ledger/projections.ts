@@ -12,6 +12,7 @@ declare const projectionTableUniqueKeysBrand: unique symbol;
 
 const reservedProjectionTableNames = new Set([
   "events",
+  "idx_work_coalescing_pending",
   "idx_work_due",
   "idx_work_partition_order",
   "idx_work_ref",
@@ -20,6 +21,7 @@ const reservedProjectionTableNames = new Set([
   "work",
 ]);
 const reservedProjectionIndexNames = new Set([
+  "idx_work_coalescing_pending",
   "idx_work_due",
   "idx_work_partition_order",
   "idx_work_ref",
