@@ -49,6 +49,13 @@ const ControlledWorkRequestedSchema = Type.Object({
   partitionKey: Type.Union([Type.Null(), Type.String()]),
 });
 
+const CoalescedWorkRequestedSchema = Type.Object({
+  availableAtMs: Type.Number(),
+  coalescingKey: Type.String(),
+  partitionKey: Type.Union([Type.Null(), Type.String()]),
+  workKey: Type.String(),
+});
+
 const ControlledWorkAttemptedSchema = Type.Object({
   attempt: Type.Number(),
   workKey: Type.String(),
@@ -140,6 +147,7 @@ const ledgerContractShape = defineLedgerShape({
     "intent.planned": IntentPlannedSchema,
     "dispatch.completed": DispatchCompletedSchema,
     "controlled-work.requested": ControlledWorkRequestedSchema,
+    "coalesced-work.requested": CoalescedWorkRequestedSchema,
     "controlled-work.attempted": ControlledWorkAttemptedSchema,
     "controlled-signal-work.requested": ControlledSignalWorkSchema,
     "timed-work.requested": TimedWorkSchema,
@@ -911,6 +919,28 @@ export function createLedgerContractModel(input: {
           enqueueOptions,
         );
       },
+      "coalesced-work.requested": ({ event, actions }) => {
+        const enqueueOptions: {
+          availableAtMs: number;
+          coalescingKey: string;
+          partitionKey?: string;
+        } = {
+          availableAtMs: event.payload.availableAtMs,
+          coalescingKey: event.payload.coalescingKey,
+        };
+
+        if (event.payload.partitionKey !== null) {
+          enqueueOptions.partitionKey = event.payload.partitionKey;
+        }
+
+        actions.enqueue(
+          "controlled-work.run",
+          {
+            workKey: event.payload.workKey,
+          },
+          enqueueOptions,
+        );
+      },
       "controlled-signal-work.requested": ({ event, actions }) => {
         actions.enqueue("controlled-signal-work.publish", event.payload, {
           workKey: event.payload.workKey,
@@ -1229,6 +1259,19 @@ export function runLedgerContractSuite(input: {
       await harness.flush();
     };
 
+    const emitCoalescedWork = async (
+      harness: LedgerContractHarness,
+      input: {
+        readonly availableAtMs: number;
+        readonly coalescingKey: string;
+        readonly partitionKey: string | null;
+        readonly workKey: string;
+      },
+    ): Promise<void> => {
+      await harness.ledger.emit("coalesced-work.requested", input);
+      await harness.flush();
+    };
+
     const readLatestEvent = async (
       harness: LedgerContractHarness,
     ): Promise<{
@@ -1440,6 +1483,407 @@ export function runLedgerContractSuite(input: {
         });
       },
     );
+
+    await t.test(
+      "coalesced work keeps one pending row and only moves availability earlier",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const firstAvailableAtMs = harness.nowMs() + 500;
+          const promotedAvailableAtMs = harness.nowMs() + 200;
+          const firstEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: firstAvailableAtMs,
+              coalescingKey: "wake:lane-a",
+              partitionKey: "lane-a",
+              workKey: "coalesced-earliest",
+            },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: promotedAvailableAtMs,
+            coalescingKey: "wake:lane-a",
+            partitionKey: "lane-a",
+            workKey: "coalesced-earliest",
+          });
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs() + 400,
+            coalescingKey: "wake:lane-a",
+            partitionKey: "lane-a",
+            workKey: "coalesced-earliest",
+          });
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["delayed"],
+          });
+
+          assert.equal(work.length, 1);
+          assert.equal(work[0]?.availableAtMs, promotedAvailableAtMs);
+          assert.equal(work[0]?.sourceEventId, firstEvent.eventId);
+          assert.notEqual(work[0]?.ref, null);
+        });
+      },
+    );
+
+    await t.test(
+      "concurrent coalescing requests converge and survive restart",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const times = [500, 200, 400, 300].map(
+            (offsetMs) => harness.nowMs() + offsetMs,
+          );
+
+          await Promise.all(
+            times.map(async (availableAtMs) => {
+              await harness.ledger.emit("coalesced-work.requested", {
+                availableAtMs,
+                coalescingKey: "wake:concurrent",
+                partitionKey: "concurrent",
+                workKey: "coalesced-concurrent",
+              });
+            }),
+          );
+
+          await harness.restart();
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["delayed"],
+          });
+
+          assert.equal(work.length, 1);
+          assert.equal(work[0]?.availableAtMs, Math.min(...times));
+        });
+      },
+    );
+
+    await t.test(
+      "a leased coalesced item gets one independently coalesced successor",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const active = harness.prepareControlledWork("coalesced-active");
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:active",
+            partitionKey: "active",
+            workKey: "coalesced-active",
+          });
+          await active.entered;
+
+          const firstSuccessorAtMs = harness.nowMs() + 500;
+          const promotedSuccessorAtMs = harness.nowMs() + 200;
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: firstSuccessorAtMs,
+            coalescingKey: "wake:active",
+            partitionKey: "active",
+            workKey: "coalesced-active",
+          });
+          await emitCoalescedWork(harness, {
+            availableAtMs: promotedSuccessorAtMs,
+            coalescingKey: "wake:active",
+            partitionKey: "active",
+            workKey: "coalesced-active",
+          });
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(work.length, 2);
+          assert.equal(
+            work.find((item) => item.state === "leased")?.attempt,
+            1,
+          );
+          assert.equal(
+            work.find((item) => item.state === "delayed")?.availableAtMs,
+            promotedSuccessorAtMs,
+          );
+
+          await observeControlledAttempt(
+            harness,
+            "coalesced-active",
+            1,
+            active.release,
+          );
+          await harness.advanceByMs(199);
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "coalesced-active",
+          ]);
+
+          await harness.advanceByMs(1);
+          const kick = harness.prepareControlledWork("coalesced-active-kick");
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            partitionKey: "coalesced-active-kick",
+            workKey: "coalesced-active-kick",
+          });
+          await harness.flush();
+          await kick.entered;
+          await waitFor(
+            harness,
+            async () =>
+              harness
+                .getStartedControlledWorkKeys()
+                .filter((workKey) => workKey === "coalesced-active").length ===
+              2,
+            100,
+            1,
+          );
+          assert.deepEqual(
+            harness
+              .getStartedControlledWorkKeys()
+              .filter((workKey) => workKey === "coalesced-active"),
+            ["coalesced-active", "coalesced-active"],
+          );
+          kick.release();
+        });
+      },
+    );
+
+    await t.test(
+      "coalescing never promotes an attempted item's retry backoff",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const retryAtMs = harness.nowMs() + 500;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-retry",
+            1,
+            { kind: "retry", retryAtMs },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:retry",
+            partitionKey: "retry",
+            workKey: "coalesced-retry",
+          });
+          await firstAttempt.entered;
+          await observeControlledAttempt(
+            harness,
+            "coalesced-retry",
+            1,
+            firstAttempt.release,
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:retry",
+            partitionKey: "retry",
+            workKey: "coalesced-retry",
+          });
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(work.length, 2);
+          assert.equal(
+            work.find((item) => item.attempt === 1)?.availableAtMs,
+            retryAtMs,
+          );
+          assert.equal(
+            work.find((item) => item.attempt === 0)?.availableAtMs,
+            harness.nowMs(),
+          );
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "coalesced-retry",
+          ]);
+        });
+      },
+    );
+
+    await t.test(
+      "coalescing conflicts roll back without mutating the pending item",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const originalAvailableAtMs = harness.nowMs() + 500;
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: originalAvailableAtMs,
+            coalescingKey: "wake:conflict",
+            partitionKey: "conflict",
+            workKey: "coalesced-original",
+          });
+
+          await assert.rejects(
+            harness.ledger.emit("coalesced-work.requested", {
+              availableAtMs: harness.nowMs(),
+              coalescingKey: "wake:conflict",
+              partitionKey: "conflict",
+              workKey: "coalesced-other-payload",
+            }),
+            /payload does not match/,
+          );
+          await assert.rejects(
+            harness.ledger.emit("coalesced-work.requested", {
+              availableAtMs: harness.nowMs(),
+              coalescingKey: "wake:conflict",
+              partitionKey: "other-partition",
+              workKey: "coalesced-original",
+            }),
+            /partition does not match/,
+          );
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(work.length, 1);
+          assert.equal(work[0]?.availableAtMs, originalAvailableAtMs);
+        });
+      },
+    );
+
+    await t.test(
+      "coalescing keys are reusable after ack, cancellation, and dead-letter",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const acked = harness.prepareControlledWork("coalesced-reuse-ack");
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:reuse",
+            partitionKey: "reuse",
+            workKey: "coalesced-reuse-ack",
+          });
+          await acked.entered;
+          acked.release();
+          await harness.waitForIdle();
+
+          const cancelledEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: harness.nowMs() + 500,
+              coalescingKey: "wake:reuse",
+              partitionKey: "reuse",
+              workKey: "coalesced-reuse-cancel",
+            },
+          );
+          const [pendingCancellation] = await harness.ledger.listWork({
+            sourceEventId: cancelledEvent.eventId,
+          });
+
+          if (
+            pendingCancellation === undefined ||
+            pendingCancellation.ref === null
+          ) {
+            throw new Error("expected coalesced work to have a durable ref");
+          }
+
+          const cancelled = await harness.ledger.cancelWork({
+            ref: pendingCancellation.ref,
+          });
+          assert.equal(cancelled.status, "cancelled");
+
+          const dead = harness.prepareControlledWorkAttempt(
+            "coalesced-reuse-dead",
+            1,
+            { kind: "dead_letter" },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:reuse",
+            partitionKey: "reuse",
+            workKey: "coalesced-reuse-dead",
+          });
+          await dead.entered;
+          await observeControlledAttempt(
+            harness,
+            "coalesced-reuse-dead",
+            1,
+            dead.release,
+          );
+          await harness.waitForIdle();
+
+          harness.pausePrimaryScheduler();
+          await harness.ledger.emit("coalesced-work.requested", {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:reuse",
+            partitionKey: "reuse",
+            workKey: "coalesced-reuse-final",
+          });
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(
+            work.filter(
+              (item) => item.state !== "cancelled" && item.state !== "dead",
+            ).length,
+            1,
+          );
+        });
+      },
+    );
+
+    await t.test(
+      "an empty coalescing key rolls back event materialization",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          await assert.rejects(
+            harness.ledger.emit("coalesced-work.requested", {
+              availableAtMs: harness.nowMs(),
+              coalescingKey: "",
+              partitionKey: null,
+              workKey: "invalid-coalescing",
+            }),
+            /coalescingKey must be non-empty/,
+          );
+
+          assert.deepEqual(await harness.ledger.listWork(), []);
+        });
+      },
+    );
+
+    await t.test("waitForIdle includes delayed coalesced work", async () => {
+      await withHarness(input.create, async (harness) => {
+        const delayedEvent = await harness.ledger.emit(
+          "coalesced-work.requested",
+          {
+            availableAtMs: harness.nowMs() + 500,
+            coalescingKey: "wake:idle",
+            partitionKey: "idle",
+            workKey: "coalesced-idle",
+          },
+        );
+        await harness.flush();
+
+        let idleResolved = false;
+        const idle = harness.waitForIdle().then(() => {
+          idleResolved = true;
+        });
+
+        const barrier = harness.prepareControlledWork("coalesced-idle-barrier");
+        await harness.ledger.emit("controlled-work.requested", {
+          availableAtMs: null,
+          workKey: "coalesced-idle-barrier",
+          partitionKey: "coalesced-idle-barrier",
+        });
+        await harness.flush();
+        await barrier.entered;
+        barrier.release();
+        await harness.flush();
+
+        assert.equal(idleResolved, false);
+
+        const [delayed] = await harness.ledger.listWork({
+          sourceEventId: delayedEvent.eventId,
+        });
+
+        if (delayed === undefined || delayed.ref === null) {
+          throw new Error("expected delayed coalesced work ref");
+        }
+
+        await harness.ledger.cancelWork({ ref: delayed.ref });
+        await idle;
+        assert.equal(idleResolved, true);
+      });
+    });
 
     await t.test(
       "partitioned work is serial while other partitions remain concurrent",
