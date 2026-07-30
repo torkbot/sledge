@@ -2286,11 +2286,14 @@ function openDatabaseLedgerEngine<
              available_at_ms
            FROM work
            WHERE queue_name = ?
-             AND coalescing_key = ?
-             AND attempt = 0
-             AND lease_id IS NULL
-             AND dead = 0
-             AND cancelled = 0`,
+             AND CASE
+               WHEN attempt = 0
+                 AND lease_id IS NULL
+                 AND dead = 0
+                 AND cancelled = 0
+               THEN coalescing_key
+               ELSE NULL
+             END = ?`,
         )
         .get(work.queueName, work.coalescingKey);
 
