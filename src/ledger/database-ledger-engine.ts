@@ -1228,9 +1228,10 @@ function openDatabaseLedgerEngine<
         await ensureColumn("work", "cancel_reason", "TEXT");
         await ensureColumn("work", "terminal_at_ms", "INTEGER");
         await storage.write(async (database) => {
-          // coalescing_key is non-null only while it reserves an unattempted
-          // generation, so SQLite's normal NULL-distinct unique semantics
-          // enforce one pending row without a lease-sensitive partial index.
+          // Deriving the reservation from durable work state makes claim
+          // updates release it even when an older worker binary does not know
+          // about coalescing_key. A normal expression index avoids the
+          // lease-sensitive query planning behavior of a partial index.
           await database.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_key
           ON work(source_event_id, signal, queue_name, work_key)
@@ -1241,7 +1242,17 @@ function openDatabaseLedgerEngine<
           WHERE work_ref IS NOT NULL;
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_coalescing_pending
-          ON work(queue_name, coalescing_key);
+          ON work(
+            queue_name,
+            CASE
+              WHEN attempt = 0
+                AND lease_id IS NULL
+                AND dead = 0
+                AND cancelled = 0
+              THEN coalescing_key
+              ELSE NULL
+            END
+          );
 
         CREATE INDEX IF NOT EXISTS idx_work_partition_order
           ON work(signal, queue_name, partition_key, work_id)

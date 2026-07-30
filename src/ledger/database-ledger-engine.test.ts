@@ -3835,6 +3835,197 @@ test("work metadata migration adds columns before creating indexes", async () =>
   assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 
+test("storage releases coalescing reservations claimed by older workers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({ logicalId: Type.String() }),
+    },
+    queues: {
+      "job.run": Type.Object({ logicalId: Type.String() }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { logicalId: event.payload.logicalId },
+            {
+              coalescingKey: event.payload.logicalId,
+              partitionKey: event.payload.logicalId,
+            },
+          );
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock },
+  });
+
+  const firstEvent = await ledger.emit("job.requested", {
+    logicalId: "job",
+  });
+
+  // Older workers do not know about coalescing_key. The storage index must
+  // still release the pending-generation reservation from their claim update.
+  const oldWorkerClaim = database
+    .prepare(
+      `UPDATE work
+       SET
+         attempt = attempt + 1,
+         lease_id = ?,
+         lease_acquired_at_ms = ?,
+         lease_expires_at_ms = ?
+       WHERE source_event_id = ?`,
+    )
+    .run(
+      "old-worker-lease",
+      runtime.nowMs(),
+      runtime.nowMs() + 30_000,
+      firstEvent.eventId,
+    );
+
+  assert.equal(oldWorkerClaim.changes, 1);
+
+  const retainedKey = database
+    .prepare(
+      `SELECT coalescing_key
+       FROM work
+       WHERE source_event_id = ?`,
+    )
+    .pluck()
+    .get(firstEvent.eventId);
+
+  assert.equal(retainedKey, "job");
+
+  const successorEvent = await ledger.emit("job.requested", {
+    logicalId: "job",
+  });
+  const work = await ledger.listWork();
+
+  assert.deepEqual(
+    work.map((item) => ({
+      sourceEventId: item.sourceEventId,
+      attempt: item.attempt,
+      state: item.state,
+    })),
+    [
+      {
+        sourceEventId: firstEvent.eventId,
+        attempt: 1,
+        state: "leased",
+      },
+      {
+        sourceEventId: successorEvent.eventId,
+        attempt: 0,
+        state: "pending",
+      },
+    ],
+  );
+});
+
+test("turso storage releases coalescing reservations claimed by older workers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({ logicalId: Type.String() }),
+    },
+    queues: {
+      "job.run": Type.Object({ logicalId: Type.String() }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { logicalId: event.payload.logicalId },
+            {
+              coalescingKey: event.payload.logicalId,
+              partitionKey: event.payload.logicalId,
+            },
+          );
+        },
+      },
+    },
+  });
+  const storage = await createTursoStorageRuntime(databaseUrl);
+
+  await using ledger = createDatabaseLedger({
+    storage,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    projectionCompiler,
+    timing: { clock: runtime.clock },
+  });
+
+  const firstEvent = await ledger.emit("job.requested", {
+    logicalId: "job",
+  });
+  const oldWorkerStorage = await createTursoStorageRuntime(databaseUrl);
+
+  try {
+    const oldWorkerClaim = await oldWorkerStorage.write(async (database) => {
+      return await database
+        .prepare(
+          `UPDATE work
+           SET
+             attempt = attempt + 1,
+             lease_id = ?,
+             lease_acquired_at_ms = ?,
+             lease_expires_at_ms = ?
+           WHERE source_event_id = ?`,
+        )
+        .run(
+          "old-worker-lease",
+          runtime.nowMs(),
+          runtime.nowMs() + 30_000,
+          firstEvent.eventId,
+        );
+    });
+
+    assert.equal(oldWorkerClaim.changes, 1);
+  } finally {
+    await oldWorkerStorage.close();
+  }
+
+  const successorEvent = await ledger.emit("job.requested", {
+    logicalId: "job",
+  });
+  const work = await ledger.listWork();
+
+  assert.deepEqual(
+    work.map((item) => ({
+      sourceEventId: item.sourceEventId,
+      attempt: item.attempt,
+      state: item.state,
+    })),
+    [
+      {
+        sourceEventId: firstEvent.eventId,
+        attempt: 1,
+        state: "leased",
+      },
+      {
+        sourceEventId: successorEvent.eventId,
+        attempt: 0,
+        state: "pending",
+      },
+    ],
+  );
+});
+
 test("enqueue rejects empty work keys", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
