@@ -8,7 +8,10 @@ import test from "node:test";
 import { Type, type TSchema } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
-import { createBetterSqliteStorageRuntime } from "./better-sqlite3-ledger.ts";
+import {
+  createBetterSqliteLedger as createPublicBetterSqliteLedger,
+  createBetterSqliteStorageRuntime,
+} from "./better-sqlite3-ledger.ts";
 import {
   createDatabaseLedger,
   type StorageDatabase,
@@ -21,6 +24,8 @@ import {
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
+  composeLedgerModels,
+  defineLedgerShape,
   type EnqueueOptions,
   type LedgerTiming,
   type RegisteredLedgerModel,
@@ -1370,7 +1375,7 @@ test("ledger close closes storage after startup failure", async () => {
     register: {},
   });
 
-  const ledger = createDatabaseLedger({
+  await using ledger = createDatabaseLedger({
     projectionCompiler,
     storage,
     model: model.withImplementations({
@@ -2441,6 +2446,113 @@ test("signals materialize signal work and are pruned after ack", async () => {
   await ledger.emit("response.generate", { id: 1 });
   await waitFor(runtime, () => broadcasts === 2);
   assert.equal(observedSignals.length, 1);
+});
+
+test("queue emissions require an unexpired authenticated lease", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+  const releaseFirstAttempt = Promise.withResolvers<void>();
+  const firstAttemptReturned = Promise.withResolvers<void>();
+  let firstAttemptEntered = false;
+  let secondAttemptEntered = false;
+  let immediateError: unknown;
+
+  const shape = defineLedgerShape({
+    moduleId: "lease-authentication.test",
+    events: {
+      jobRequested: Type.Object({
+        id: Type.Number(),
+      }),
+      jobCompleted: Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      runJob: Type.Object({
+        id: Type.Number(),
+      }),
+    },
+  });
+  const module = shape.register({
+    events: {
+      jobRequested: ({ event, actions }) => {
+        actions.enqueue("runJob", event.payload);
+      },
+    },
+    queues: {
+      runJob: async ({ work, lease, actions, ledger }) => {
+        if (work.attempt > 1) {
+          secondAttemptEntered = true;
+          await new Promise<void>((resolve) => {
+            lease.signal.addEventListener("abort", () => resolve(), {
+              once: true,
+            });
+          });
+          lease.signal.throwIfAborted();
+          return;
+        }
+
+        firstAttemptEntered = true;
+        await releaseFirstAttempt.promise;
+
+        try {
+          await ledger.emit(shape.events.jobCompleted, {
+            id: work.payload.id,
+          });
+        } catch (error: unknown) {
+          immediateError = error;
+        }
+
+        actions.emit("jobCompleted", {
+          id: work.payload.id,
+        });
+        firstAttemptReturned.resolve();
+      },
+    },
+  });
+
+  await using ledger = createPublicBetterSqliteLedger({
+    databaseUrl,
+    model: composeLedgerModels(module),
+    timing: { clock: runtime.clock },
+  });
+  await using workers = await ledger.startWorkers({
+    scheduler: runtime.scheduler,
+    leaseMs: 1_000,
+  });
+
+  const requested = await ledger.emit(shape.events.jobRequested, {
+    id: 1,
+  });
+  await waitFor(runtime, () => firstAttemptEntered);
+
+  const expiry = database
+    .prepare(
+      `UPDATE work
+       SET lease_expires_at_ms = ?
+       WHERE lease_id IS NOT NULL`,
+    )
+    .run(runtime.nowMs() - 1);
+
+  assert.equal(expiry.changes, 1);
+  releaseFirstAttempt.resolve();
+  await firstAttemptReturned.promise;
+  await runtime.advanceByMs(1_000);
+  await waitFor(runtime, () => secondAttemptEntered);
+
+  assert.match(String(immediateError), /lost its lease/);
+  assert.equal(
+    database
+      .prepare(
+        `SELECT COUNT(*)
+         FROM events
+         WHERE event_id > ?`,
+      )
+      .pluck()
+      .get(requested.eventId),
+    0,
+  );
 });
 
 test("queue handlers publish signals immediately before handler completion", async () => {
@@ -3762,7 +3874,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
   await assert.rejects(async () => await emitPromise, /rollback append/);
 });
 
-test("work metadata migration adds columns before creating indexes", async () => {
+test("storage metadata migration adds event and work columns before indexes", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
@@ -3787,6 +3899,22 @@ test("work metadata migration adds columns before creating indexes", async () =>
       signal INTEGER NOT NULL DEFAULT 0
     );
 
+    INSERT INTO events (
+      ts_ms,
+      event_name,
+      payload_json,
+      causation_event_id,
+      dedupe_key,
+      signal
+    ) VALUES (
+      1899999999999,
+      'job.requested',
+      '{"id":0}',
+      NULL,
+      'legacy-event',
+      0
+    );
+
     CREATE TABLE work (
       work_id INTEGER PRIMARY KEY AUTOINCREMENT,
       queue_name TEXT NOT NULL,
@@ -3804,6 +3932,32 @@ test("work metadata migration adds columns before creating indexes", async () =>
       cancel_requested_at_ms INTEGER,
       cancel_reason TEXT,
       terminal_at_ms INTEGER
+    );
+
+    INSERT INTO work (
+      queue_name,
+      payload_json,
+      source_event_id,
+      signal,
+      attempt,
+      available_at_ms,
+      dead,
+      lease_id,
+      lease_acquired_at_ms,
+      lease_expires_at_ms,
+      last_error
+    ) VALUES (
+      'legacy.run',
+      '{}',
+      1,
+      0,
+      1,
+      1899999999999,
+      0,
+      'legacy-lease',
+      1899999999999,
+      1900000001000,
+      NULL
     );
   `);
 
@@ -3825,6 +3979,27 @@ test("work metadata migration adds columns before creating indexes", async () =>
 
   await ledger.emit("job.requested", { id: 1 });
 
+  const eventColumns = database.prepare("PRAGMA table_info(events)").all();
+  const eventColumnNames = eventColumns.map((row) => {
+    return (row as { readonly name?: unknown }).name;
+  });
+
+  assert.ok(eventColumnNames.includes("causation_work_json"));
+  assert.equal(
+    (
+      database
+        .prepare(
+          `SELECT causation_work_json
+           FROM events
+           WHERE dedupe_key = ?`,
+        )
+        .get("legacy-event") as
+        | { readonly causation_work_json?: unknown }
+        | undefined
+    )?.causation_work_json,
+    null,
+  );
+
   const columns = database.prepare("PRAGMA table_info(work)").all();
   const columnNames = columns.map((row) => {
     return (row as { readonly name?: unknown }).name;
@@ -3834,6 +4009,45 @@ test("work metadata migration adds columns before creating indexes", async () =>
   assert.ok(columnNames.includes("work_key"));
   assert.ok(columnNames.includes("coalescing_key"));
   assert.ok(columnNames.includes("partition_key"));
+  assert.ok(columnNames.includes("lease_protocol_version"));
+
+  assert.deepEqual(
+    database
+      .prepare(
+        `SELECT lease_id, lease_protocol_version
+         FROM work
+         WHERE queue_name = 'legacy.run'`,
+      )
+      .get(),
+    {
+      lease_id: null,
+      lease_protocol_version: 0,
+    },
+  );
+  assert.deepEqual(
+    database
+      .prepare(
+        `SELECT version
+         FROM sledge_storage_layout
+         WHERE singleton = 1`,
+      )
+      .get(),
+    {
+      version: 2,
+    },
+  );
+  assert.throws(() => {
+    database
+      .prepare(
+        `UPDATE work
+           SET
+             lease_id = 'legacy-reclaim',
+             lease_acquired_at_ms = 1900000000000,
+             lease_expires_at_ms = 1900000001000
+           WHERE queue_name = 'legacy.run'`,
+      )
+      .run();
+  }, /sledge_authenticated_queue_lease/);
 
   const indexes = database.prepare("PRAGMA index_list(work)").all();
   const indexNames = indexes.map((row) => {
@@ -3846,7 +4060,7 @@ test("work metadata migration adds columns before creating indexes", async () =>
   assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 
-test("storage releases coalescing reservations claimed by older workers", async () => {
+test("storage derives coalescing reservations from authenticated claim state", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
@@ -3886,16 +4100,17 @@ test("storage releases coalescing reservations claimed by older workers", async 
     logicalId: "job",
   });
 
-  // Older workers do not know about coalescing_key. The storage index must
-  // still release the pending-generation reservation from their claim update.
-  const oldWorkerClaim = database
+  // Reservation membership derives from the attempt and lease fields rather
+  // than requiring every claimant to clear coalescing_key itself.
+  const claim = database
     .prepare(
       `UPDATE work
        SET
          attempt = attempt + 1,
          lease_id = ?,
          lease_acquired_at_ms = ?,
-         lease_expires_at_ms = ?
+         lease_expires_at_ms = ?,
+         lease_protocol_version = 1
        WHERE source_event_id = ?`,
     )
     .run(
@@ -3905,7 +4120,7 @@ test("storage releases coalescing reservations claimed by older workers", async 
       firstEvent.eventId,
     );
 
-  assert.equal(oldWorkerClaim.changes, 1);
+  assert.equal(claim.changes, 1);
 
   const retainedKey = database
     .prepare(
@@ -3944,7 +4159,7 @@ test("storage releases coalescing reservations claimed by older workers", async 
   );
 });
 
-test("turso storage releases coalescing reservations claimed by older workers", async () => {
+test("turso storage derives coalescing reservations from authenticated claim state", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
 
@@ -3974,7 +4189,7 @@ test("turso storage releases coalescing reservations claimed by older workers", 
   });
   const storage = await createTursoStorageRuntime(databaseUrl);
 
-  await using ledger = createDatabaseLedger({
+  const ledger = createDatabaseLedger({
     storage,
     model: model.withImplementations({ indexers: {}, queries: {} }),
     projectionCompiler,
@@ -3984,10 +4199,10 @@ test("turso storage releases coalescing reservations claimed by older workers", 
   const firstEvent = await ledger.emit("job.requested", {
     logicalId: "job",
   });
-  const oldWorkerStorage = await createTursoStorageRuntime(databaseUrl);
+  const claimantStorage = await createTursoStorageRuntime(databaseUrl);
 
   try {
-    const oldWorkerClaim = await oldWorkerStorage.write(async (database) => {
+    const claim = await claimantStorage.write(async (database) => {
       return await database
         .prepare(
           `UPDATE work
@@ -3995,7 +4210,8 @@ test("turso storage releases coalescing reservations claimed by older workers", 
              attempt = attempt + 1,
              lease_id = ?,
              lease_acquired_at_ms = ?,
-             lease_expires_at_ms = ?
+             lease_expires_at_ms = ?,
+             lease_protocol_version = 1
            WHERE source_event_id = ?`,
         )
         .run(
@@ -4006,9 +4222,9 @@ test("turso storage releases coalescing reservations claimed by older workers", 
         );
     });
 
-    assert.equal(oldWorkerClaim.changes, 1);
+    assert.equal(claim.changes, 1);
   } finally {
-    await oldWorkerStorage.close();
+    await claimantStorage.close();
   }
 
   const successorEvent = await ledger.emit("job.requested", {

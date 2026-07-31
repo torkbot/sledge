@@ -8,6 +8,7 @@ import type {
   RuntimeScheduler,
 } from "../runtime/contracts.ts";
 import type {
+  EventCausationWork,
   LedgerCursor,
   MaterializationImplementationRegistration,
   QueueHandlerControl,
@@ -447,6 +448,7 @@ type LedgerContractModel = ReturnType<typeof ledgerContractDefinition.register>;
 
 type LedgerContractTokenEnvelope = {
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
   readonly dedupeKey: string | null;
   readonly event: object;
   readonly eventId: number;
@@ -584,6 +586,7 @@ function createLedgerContractEnvelope(
 ): object {
   return {
     causationEventId: envelope.causationEventId,
+    causationWork: envelope.causationWork,
     dedupeKey: envelope.dedupeKey,
     eventId: envelope.eventId,
     eventName,
@@ -2717,10 +2720,15 @@ export function runLedgerContractSuite(input: {
       "queue ledger commits immediate outcomes and reads their projections",
       async () => {
         await withHarness(input.create, async (harness) => {
-          await harness.ledger.emit("immediate-decision.requested", {
-            sourceEventId: 52,
-            attempt: 7,
-          });
+          const requested = await harness.ledger.emit(
+            "immediate-decision.requested",
+            {
+              sourceEventId: 52,
+              attempt: 7,
+            },
+          );
+
+          assert.equal(requested.causationWork, null);
 
           await waitFor(
             harness,
@@ -2731,6 +2739,38 @@ export function runLedgerContractSuite(input: {
 
           assert.equal(await harness.getDecisionAttempts(52), 7);
           assert.equal(await harness.getDispatchCount(52), 7);
+
+          const observed = [];
+
+          for await (const item of harness.ledger.tailEvents({
+            last: 2,
+            signal: AbortSignal.timeout(2_000),
+          })) {
+            observed.push(item.event);
+
+            if (observed.length === 2) {
+              break;
+            }
+          }
+
+          const immediate = observed[0];
+          const staged = observed[1];
+
+          assert.ok(immediate !== undefined);
+          assert.ok(staged !== undefined);
+          assert.equal(immediate.eventName, "decision.recorded");
+          assert.equal(staged.eventName, "immediate-decision.observed");
+          assert.equal(immediate.causationEventId, requested.eventId);
+          assert.equal(staged.causationEventId, requested.eventId);
+          assert.ok(immediate.causationWork !== null);
+          assert.deepEqual(immediate.causationWork, {
+            moduleId: "ledger.contract",
+            queueName: "immediate-decision.run",
+            workId: immediate.causationWork.workId,
+            attempt: 1,
+          });
+          assert.equal(Object.isFrozen(immediate.causationWork), true);
+          assert.deepEqual(staged.causationWork, immediate.causationWork);
         });
       },
     );

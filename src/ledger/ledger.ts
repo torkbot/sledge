@@ -497,6 +497,20 @@ export type QueryDefinition<
 > = QuerySchema<TParamsSchema, TResultSchema>;
 
 /**
+ * Engine-authored identity of the durable queue attempt that emitted an event.
+ *
+ * Public ledger emissions and events appended outside queue work carry `null`.
+ * Callers cannot supply this value; Sledge derives it from the active,
+ * lease-fenced work attempt and preserves it for replay.
+ */
+export type EventCausationWork = {
+  readonly moduleId: string;
+  readonly queueName: string;
+  readonly workId: number;
+  readonly attempt: number;
+};
+
+/**
  * Durable event envelope shared by event/signal registration handlers.
  */
 export type EventEnvelope<
@@ -509,6 +523,7 @@ export type EventEnvelope<
   readonly eventName: TEventName;
   readonly payload: Static<TEvents[TEventName]>;
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
   readonly dedupeKey: string | null;
 };
 
@@ -573,6 +588,7 @@ export type LedgerEventEnvelope<TEvent extends AnyEventToken | AnySignalToken> =
     readonly tsMs: number;
     readonly payload: Static<LedgerEnvelopeSchema<TEvent>>;
     readonly causationEventId: number | null;
+    readonly causationWork: EventCausationWork | null;
     readonly dedupeKey: string | null;
   };
 
@@ -3947,6 +3963,7 @@ type RuntimeEventHandlerInput = {
     readonly eventName: string;
     readonly payload: unknown;
     readonly causationEventId: number | null;
+    readonly causationWork: EventCausationWork | null;
     readonly dedupeKey: string | null;
   };
   readonly actions: {

@@ -478,7 +478,7 @@ function compileEventReadStatement(
 
   return {
     params: [statement.eventName, 0, ...statement.eventIds],
-    text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
+    text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
   };
 }
 
@@ -487,7 +487,7 @@ function compileEventScanStatement(
 ): ProjectionCompiledSql {
   const where = compileEventStreamWhere(statement);
   const params = [...where.params];
-  let text = `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE ${where.text}`;
+  let text = `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE ${where.text}`;
 
   text += ` ORDER BY "event_id" ${statement.orderDirection.toUpperCase()}`;
 

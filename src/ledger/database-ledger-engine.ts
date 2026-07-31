@@ -29,6 +29,7 @@ import type {
   ComposedLedgerSignalTokens,
   RegisteredLedgerModel,
   EmitOptions,
+  EventCausationWork,
   EventEnvelope,
   EventHandlerFunction,
   Ledger,
@@ -150,6 +151,7 @@ type AppendEventInput = {
   readonly nowMs: number;
   readonly dedupeKey?: string;
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
 };
 
 type AppendSignalInput = {
@@ -158,6 +160,7 @@ type AppendSignalInput = {
   readonly nowMs: number;
   readonly dedupeKey?: string;
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
 };
 
 type MaterializationReplayState = {
@@ -191,7 +194,9 @@ type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
 const storageLayoutTableName = "sledge_storage_layout";
-const storageLayoutVersion = 1;
+const storageLayoutVersion = 2;
+const previousStorageLayoutVersion = 1;
+const queueProvenanceLeaseProtocolVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
@@ -201,6 +206,44 @@ const StorageLayoutRowSchema = Type.Object({
 });
 const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
 const databaseInitializationTails = new Map<string, Promise<void>>();
+
+function createWorkTableSql(
+  tableName: "work" | "work_pre_queue_provenance",
+): string {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      work_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_ref TEXT,
+      queue_name TEXT NOT NULL,
+      work_key TEXT,
+      coalescing_key TEXT,
+      partition_key TEXT,
+      payload_json TEXT NOT NULL,
+      source_event_id INTEGER NOT NULL,
+      signal INTEGER NOT NULL DEFAULT 0,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      available_at_ms INTEGER NOT NULL,
+      dead INTEGER NOT NULL DEFAULT 0,
+      lease_id TEXT,
+      lease_acquired_at_ms INTEGER,
+      lease_expires_at_ms INTEGER,
+      lease_protocol_version INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      cancelled INTEGER NOT NULL DEFAULT 0,
+      cancel_requested_at_ms INTEGER,
+      cancel_reason TEXT,
+      terminal_at_ms INTEGER,
+      CONSTRAINT sledge_authenticated_queue_lease CHECK (
+        (lease_id IS NULL AND lease_protocol_version = 0)
+        OR
+        (
+          lease_id IS NOT NULL
+          AND lease_protocol_version = ${queueProvenanceLeaseProtocolVersion}
+        )
+      )
+    );
+  `;
+}
 
 async function serializeDatabaseInitialization<T>(
   databaseIdentity: string,
@@ -547,6 +590,7 @@ type WorkQueueNameMaps = {
 };
 
 const unavailablePhysicalQueueName = "\u0000";
+const physicalContractNameSeparator = "::";
 
 function createWorkQueueNameMaps(model: {
   readonly [registeredLedgerContractsBrand]: {
@@ -667,9 +711,42 @@ function localizeStoredQueueName(
   return localName;
 }
 
+function readQueueIdentity(
+  storedQueueName: string,
+  fallbackModuleId: string,
+): {
+  readonly moduleId: string;
+  readonly queueName: string;
+} {
+  const parts = storedQueueName.split(physicalContractNameSeparator);
+
+  if (
+    parts.length === 4 &&
+    parts[0] === "sledge" &&
+    parts[1] !== undefined &&
+    parts[1].length > 0 &&
+    parts[2] === "queue" &&
+    parts[3] !== undefined &&
+    parts[3].length > 0
+  ) {
+    return {
+      moduleId: parts[1],
+      queueName: parts[3],
+    };
+  }
+
+  // An unnamespaced engine model owns its local queue names at the root module.
+  // Composed public models always take the namespaced branch above.
+  return {
+    moduleId: fallbackModuleId,
+    queueName: storedQueueName,
+  };
+}
+
 function createContractEnvelope(
   event: {
     readonly causationEventId: number | null;
+    readonly causationWork: EventCausationWork | null;
     readonly eventId: number;
     readonly payload: unknown;
     readonly tsMs: number;
@@ -685,6 +762,7 @@ function createContractEnvelope(
     tsMs: event.tsMs,
     ref: createEventRef(token, event.eventId),
     causationEventId: event.causationEventId,
+    causationWork: event.causationWork,
     dedupeKey: event.dedupeKey,
   };
 
@@ -898,9 +976,28 @@ const EventEnvelopeRowSchema = Type.Object({
   event_name: Type.String(),
   payload_json: Type.String(),
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
+  causation_work_json: Type.Union([Type.Null(), Type.String()]),
   dedupe_key: Type.Union([Type.Null(), Type.String()]),
   outcome_json: Type.Optional(Type.Union([Type.Null(), Type.String()])),
 });
+
+const EventCausationWorkSchema = Type.Object(
+  {
+    moduleId: Type.String({ minLength: 1 }),
+    queueName: Type.String({ minLength: 1 }),
+    workId: Type.Integer({ minimum: 1 }),
+    attempt: Type.Integer({ minimum: 1 }),
+  },
+  { additionalProperties: false },
+);
+
+function encodeEventCausationWork(
+  causationWork: EventCausationWork | null,
+): string | null {
+  return causationWork === null
+    ? null
+    : JSON.stringify(Value.Encode(EventCausationWorkSchema, causationWork));
+}
 
 const EventIdRowSchema = Type.Object({
   event_id: Type.Number(),
@@ -961,6 +1058,7 @@ const ClaimedWorkRowSchema = Type.Object({
   lease_id: Type.Union([Type.Null(), Type.String()]),
   lease_acquired_at_ms: Type.Union([Type.Null(), Type.Number()]),
   lease_expires_at_ms: Type.Union([Type.Null(), Type.Number()]),
+  lease_protocol_version: Type.Number(),
 });
 
 function decodeRow<const TSchemaDef extends TSchema>(
@@ -1001,6 +1099,18 @@ function readEventEnvelopeFromRow<
     eventSchema,
     parseJson(decodedRow.payload_json, "events.payload_json"),
   );
+  const causationWork =
+    decodedRow.causation_work_json === null
+      ? null
+      : Object.freeze(
+          decodeValue(
+            EventCausationWorkSchema,
+            parseJson(
+              decodedRow.causation_work_json,
+              "events.causation_work_json",
+            ),
+          ),
+        );
 
   return {
     eventId: decodedRow.event_id,
@@ -1012,6 +1122,7 @@ function readEventEnvelopeFromRow<
     eventName,
     payload,
     causationEventId: decodedRow.causation_event_id,
+    causationWork,
     dedupeKey: decodedRow.dedupe_key,
   };
 }
@@ -1202,8 +1313,13 @@ function openDatabaseLedgerEngine<
     await serializeDatabaseInitialization(
       storage[storageRuntimeIdentityBrand],
       async () => {
+        let startingStorageLayoutVersion = storageLayoutVersion;
+
         await storage.write(async (database) => {
-          await ensureStorageLayout(database, moduleIds);
+          startingStorageLayoutVersion = await ensureStorageLayout(
+            database,
+            moduleIds,
+          );
         });
         await storage.write(async (database) => {
           await database.exec(`
@@ -1214,32 +1330,12 @@ function openDatabaseLedgerEngine<
         payload_json TEXT NOT NULL,
         outcome_json TEXT,
         causation_event_id INTEGER,
+        causation_work_json TEXT,
         dedupe_key TEXT UNIQUE,
         signal INTEGER NOT NULL DEFAULT 0
       );
 
-      CREATE TABLE IF NOT EXISTS work (
-        work_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        work_ref TEXT,
-        queue_name TEXT NOT NULL,
-        work_key TEXT,
-        coalescing_key TEXT,
-        partition_key TEXT,
-        payload_json TEXT NOT NULL,
-        source_event_id INTEGER NOT NULL,
-        signal INTEGER NOT NULL DEFAULT 0,
-        attempt INTEGER NOT NULL DEFAULT 0,
-        available_at_ms INTEGER NOT NULL,
-        dead INTEGER NOT NULL DEFAULT 0,
-        lease_id TEXT,
-        lease_acquired_at_ms INTEGER,
-        lease_expires_at_ms INTEGER,
-        last_error TEXT,
-        cancelled INTEGER NOT NULL DEFAULT 0,
-        cancel_requested_at_ms INTEGER,
-        cancel_reason TEXT,
-        terminal_at_ms INTEGER
-      );
+      ${createWorkTableSql("work")}
 
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
@@ -1248,6 +1344,7 @@ function openDatabaseLedgerEngine<
 
         await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("events", "outcome_json", "TEXT");
+        await ensureColumn("events", "causation_work_json", "TEXT");
         await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
@@ -1258,10 +1355,16 @@ function openDatabaseLedgerEngine<
         await ensureColumn("work", "cancel_reason", "TEXT");
         await ensureColumn("work", "terminal_at_ms", "INTEGER");
         await storage.write(async (database) => {
-          // Deriving the reservation from durable work state makes claim
-          // updates release it even when an older worker binary does not know
-          // about coalescing_key. A normal expression index avoids the
-          // lease-sensitive query planning behavior of a partial index.
+          await ensureQueueProvenanceProtocol(
+            database,
+            startingStorageLayoutVersion,
+          );
+        });
+        await storage.write(async (database) => {
+          // Deriving the reservation from durable work state keeps claim
+          // updates independent of coalescing_key mechanics. A normal
+          // expression index avoids the lease-sensitive query planning
+          // behavior of a partial index.
           await database.exec(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_work_key
           ON work(source_event_id, signal, queue_name, work_key)
@@ -1491,7 +1594,9 @@ function openDatabaseLedgerEngine<
   async function ensureStorageLayout(
     database: StorageDatabase,
     moduleIds: readonly string[],
-  ): Promise<void> {
+  ): Promise<number> {
+    let verifiedVersion = storageLayoutVersion;
+
     await database.exec("BEGIN IMMEDIATE");
 
     try {
@@ -1551,8 +1656,12 @@ function openDatabaseLedgerEngine<
         }
 
         const decoded = Value.Decode(StorageLayoutRowSchema, row);
+        verifiedVersion = decoded.version;
 
-        if (decoded.version !== storageLayoutVersion) {
+        if (
+          decoded.version !== storageLayoutVersion &&
+          decoded.version !== previousStorageLayoutVersion
+        ) {
           throw new Error(
             `unsupported Sledge storage layout version ${decoded.version}`,
           );
@@ -1578,6 +1687,125 @@ function openDatabaseLedgerEngine<
         }
       }
 
+      await database.exec("COMMIT");
+      return verifiedVersion;
+    } catch (error: unknown) {
+      await database.exec("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async function ensureQueueProvenanceProtocol(
+    database: StorageDatabase,
+    startingLayoutVersion: number,
+  ): Promise<void> {
+    if (startingLayoutVersion === storageLayoutVersion) {
+      return;
+    }
+
+    await database.exec("BEGIN IMMEDIATE");
+
+    try {
+      const layoutRow = await database
+        .prepare(
+          `SELECT version, module_ids_json
+           FROM ${storageLayoutTableName}
+           WHERE singleton = 1`,
+        )
+        .get();
+
+      if (layoutRow === undefined) {
+        throw new Error("Sledge storage layout marker is missing");
+      }
+
+      const layout = Value.Decode(StorageLayoutRowSchema, layoutRow);
+
+      if (layout.version === storageLayoutVersion) {
+        await database.exec("COMMIT");
+        return;
+      }
+
+      if (layout.version !== previousStorageLayoutVersion) {
+        throw new Error(
+          `unsupported Sledge storage layout version ${layout.version}`,
+        );
+      }
+
+      // A worker predating authenticated queue provenance does not populate
+      // lease_protocol_version. Rebuilding the table installs a storage-level
+      // claim invariant that those workers cannot satisfy. Clearing legacy
+      // leases also fences handlers that were already running at cutover.
+      await database.exec(`
+        ALTER TABLE work RENAME TO work_pre_queue_provenance;
+        ${createWorkTableSql("work")}
+      `);
+      await database
+        .prepare(
+          `INSERT INTO work (
+             work_id,
+             work_ref,
+             queue_name,
+             work_key,
+             coalescing_key,
+             partition_key,
+             payload_json,
+             source_event_id,
+             signal,
+             attempt,
+             available_at_ms,
+             dead,
+             lease_id,
+             lease_acquired_at_ms,
+             lease_expires_at_ms,
+             lease_protocol_version,
+             last_error,
+             cancelled,
+             cancel_requested_at_ms,
+             cancel_reason,
+             terminal_at_ms
+           )
+           SELECT
+             work_id,
+             work_ref,
+             queue_name,
+             work_key,
+             coalescing_key,
+             partition_key,
+             payload_json,
+             source_event_id,
+             signal,
+             attempt,
+             CASE
+               WHEN lease_id IS NULL THEN available_at_ms
+               ELSE ?
+             END,
+             dead,
+             NULL,
+             NULL,
+             NULL,
+             0,
+             last_error,
+             cancelled,
+             cancel_requested_at_ms,
+             cancel_reason,
+             terminal_at_ms
+           FROM work_pre_queue_provenance`,
+        )
+        .run(clock.nowMs());
+      await database.exec(`
+        DROP TABLE work_pre_queue_provenance;
+
+        CREATE INDEX IF NOT EXISTS idx_work_due
+          ON work(dead, lease_id, available_at_ms, work_id);
+      `);
+      await database
+        .prepare(
+          `UPDATE ${storageLayoutTableName}
+           SET version = ?
+           WHERE singleton = 1
+             AND version = ?`,
+        )
+        .run(storageLayoutVersion, previousStorageLayoutVersion);
       await database.exec("COMMIT");
     } catch (error: unknown) {
       await database.exec("ROLLBACK").catch(() => undefined);
@@ -2443,6 +2671,9 @@ function openDatabaseLedgerEngine<
     const decodedPayload = decodeEventPayload(eventName, eventInput.payload);
 
     const payloadJson = JSON.stringify(decodedPayload);
+    const causationWorkJson = encodeEventCausationWork(
+      eventInput.causationWork,
+    );
 
     let created = false;
     let eventId = 0;
@@ -2452,14 +2683,23 @@ function openDatabaseLedgerEngine<
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, NULL, 0)`,
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, NULL, 0)`,
         )
         .run(
           eventInput.nowMs,
           eventInput.eventName,
           payloadJson,
           eventInput.causationEventId,
+          causationWorkJson,
         );
 
       created = true;
@@ -2467,8 +2707,16 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, ?, 0)
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, ?, 0)
            ON CONFLICT(dedupe_key) DO NOTHING`,
         )
         .run(
@@ -2476,6 +2724,7 @@ function openDatabaseLedgerEngine<
           eventInput.eventName,
           payloadJson,
           eventInput.causationEventId,
+          causationWorkJson,
           eventInput.dedupeKey,
         );
 
@@ -2485,7 +2734,15 @@ function openDatabaseLedgerEngine<
       } else {
         const existing = await database
           .prepare(
-            `SELECT event_id, ts_ms, event_name, payload_json, outcome_json, causation_event_id, dedupe_key
+            `SELECT
+               event_id,
+               ts_ms,
+               event_name,
+               payload_json,
+               outcome_json,
+               causation_event_id,
+               causation_work_json,
+               dedupe_key
              FROM events
              WHERE dedupe_key = ?
                AND signal = 0`,
@@ -2551,6 +2808,7 @@ function openDatabaseLedgerEngine<
       eventName,
       payload: decodedPayload,
       causationEventId: eventInput.causationEventId,
+      causationWork: eventInput.causationWork,
       dedupeKey: eventInput.dedupeKey ?? null,
     };
 
@@ -2776,6 +3034,7 @@ function openDatabaseLedgerEngine<
     event: Static<TEvents[TEventName]>,
     options: EmitOptions | undefined,
     causationEventId: number | null,
+    causationWork: EventCausationWork | null,
     activeLease?: {
       readonly workId: number;
       readonly leaseId: string;
@@ -2792,9 +3051,16 @@ function openDatabaseLedgerEngine<
              WHERE work_id = ?
                AND lease_id = ?
                AND dead = 0
-               AND cancelled = 0`,
+               AND cancelled = 0
+               AND lease_expires_at_ms > ?
+               AND lease_protocol_version = ?`,
           )
-          .get(activeLease.workId, activeLease.leaseId);
+          .get(
+            activeLease.workId,
+            activeLease.leaseId,
+            clock.nowMs(),
+            queueProvenanceLeaseProtocolVersion,
+          );
 
         if (owned === undefined) {
           throw new Error(
@@ -2809,6 +3075,7 @@ function openDatabaseLedgerEngine<
         nowMs: clock.nowMs(),
         dedupeKey: options?.dedupeKey,
         causationEventId,
+        causationWork,
       });
     });
 
@@ -2843,6 +3110,9 @@ function openDatabaseLedgerEngine<
     const signalName = signalInput.signalName as keyof TSignals;
     const decodedPayload = decodeSignalPayload(signalName, signalInput.payload);
     const payloadJson = JSON.stringify(decodedPayload);
+    const causationWorkJson = encodeEventCausationWork(
+      signalInput.causationWork,
+    );
 
     let created = false;
     let eventId = 0;
@@ -2850,14 +3120,23 @@ function openDatabaseLedgerEngine<
     if (signalInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, NULL, 1)`,
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, NULL, 1)`,
         )
         .run(
           signalInput.nowMs,
           signalInput.signalName,
           payloadJson,
           signalInput.causationEventId,
+          causationWorkJson,
         );
 
       created = true;
@@ -2865,8 +3144,16 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, ?, 1)
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, ?, 1)
            ON CONFLICT(dedupe_key) DO NOTHING`,
         )
         .run(
@@ -2874,6 +3161,7 @@ function openDatabaseLedgerEngine<
           signalInput.signalName,
           payloadJson,
           signalInput.causationEventId,
+          causationWorkJson,
           signalInput.dedupeKey,
         );
 
@@ -2913,6 +3201,7 @@ function openDatabaseLedgerEngine<
       eventName: signalName,
       payload: decodedPayload,
       causationEventId: signalInput.causationEventId,
+      causationWork: signalInput.causationWork,
       dedupeKey: signalInput.dedupeKey ?? null,
     };
 
@@ -3021,11 +3310,12 @@ function openDatabaseLedgerEngine<
              lease_id = NULL,
              lease_acquired_at_ms = NULL,
              lease_expires_at_ms = NULL,
+             lease_protocol_version = 0,
              available_at_ms = ?
            WHERE dead = 0
              AND lease_id IS NOT NULL
              AND lease_expires_at_ms IS NOT NULL
-             AND lease_expires_at_ms < ?`,
+             AND lease_expires_at_ms <= ?`,
         )
         .run(clock.nowMs(), clock.nowMs());
     });
@@ -3216,6 +3506,7 @@ function openDatabaseLedgerEngine<
              event_name,
              payload_json,
              causation_event_id,
+             causation_work_json,
              dedupe_key
            FROM events
            WHERE signal = 0
@@ -3246,6 +3537,7 @@ function openDatabaseLedgerEngine<
              event_name,
              payload_json,
              causation_event_id,
+             causation_work_json,
              dedupe_key
            FROM events
            WHERE signal = 0
@@ -3456,13 +3748,20 @@ function openDatabaseLedgerEngine<
              coalescing_key = NULL,
              lease_id = ?,
              lease_acquired_at_ms = ?,
-             lease_expires_at_ms = ?
+             lease_expires_at_ms = ?,
+             lease_protocol_version = ?
            WHERE work_id = ?
              AND dead = 0
              AND cancelled = 0
              AND lease_id IS NULL`,
         )
-        .run(leaseId, nowMs, leaseExpiresAtMs, candidateWorkId);
+        .run(
+          leaseId,
+          nowMs,
+          leaseExpiresAtMs,
+          queueProvenanceLeaseProtocolVersion,
+          candidateWorkId,
+        );
 
       if (updateResult.changes <= 0) {
         return null;
@@ -3480,7 +3779,8 @@ function openDatabaseLedgerEngine<
             attempt,
             lease_id,
             lease_acquired_at_ms,
-            lease_expires_at_ms
+            lease_expires_at_ms,
+            lease_protocol_version
            FROM work
            WHERE work_id = ?`,
         )
@@ -3498,7 +3798,9 @@ function openDatabaseLedgerEngine<
 
       if (
         decodedClaimed.lease_acquired_at_ms === null ||
-        decodedClaimed.lease_expires_at_ms === null
+        decodedClaimed.lease_expires_at_ms === null ||
+        decodedClaimed.lease_protocol_version !==
+          queueProvenanceLeaseProtocolVersion
       ) {
         return null;
       }
@@ -3529,6 +3831,7 @@ function openDatabaseLedgerEngine<
              lease_id = NULL,
              lease_acquired_at_ms = NULL,
              lease_expires_at_ms = NULL,
+             lease_protocol_version = 0,
              available_at_ms = ?
            WHERE work_id = ?
              AND lease_id = ?
@@ -3639,6 +3942,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   lease_protocol_version = 0,
                    coalescing_key = NULL,
                    partition_key = NULL,
                    last_error = ?,
@@ -3712,6 +4016,7 @@ function openDatabaseLedgerEngine<
                lease_id = NULL,
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
+               lease_protocol_version = 0,
                available_at_ms = ?
              WHERE work_id = ?
                AND lease_id = ?
@@ -3761,9 +4066,17 @@ function openDatabaseLedgerEngine<
              WHERE work_id = ?
                AND lease_id = ?
                AND dead = 0
-               AND cancelled = 0`,
+               AND cancelled = 0
+               AND lease_expires_at_ms > ?
+               AND lease_protocol_version = ?`,
           )
-          .run(renewedLeaseExpiresAtMs, claimed.workId, claimed.leaseId);
+          .run(
+            renewedLeaseExpiresAtMs,
+            claimed.workId,
+            claimed.leaseId,
+            nowMs,
+            queueProvenanceLeaseProtocolVersion,
+          );
       });
 
       if (renewal.changes <= 0) {
@@ -3837,6 +4150,19 @@ function openDatabaseLedgerEngine<
         },
         signal: leaseAbortController.signal,
       };
+      const queueIdentity = claimed.signal
+        ? null
+        : readQueueIdentity(claimed.queueName, rootModule.moduleId);
+
+      const causationWork: EventCausationWork | null =
+        queueIdentity === null
+          ? null
+          : Object.freeze({
+              moduleId: queueIdentity.moduleId,
+              queueName: queueIdentity.queueName,
+              workId: claimed.workId,
+              attempt: claimed.attempt,
+            });
 
       const stagedEvents: AppendEventInput[] = [];
 
@@ -3848,6 +4174,7 @@ function openDatabaseLedgerEngine<
             nowMs: clock.nowMs(),
             dedupeKey: options?.dedupeKey,
             causationEventId: claimed.sourceEventId,
+            causationWork,
           });
         },
         emitSignal: async (signalName, signal, options) => {
@@ -3864,9 +4191,17 @@ function openDatabaseLedgerEngine<
                    FROM work
                    WHERE work_id = ?
                      AND lease_id = ?
-                     AND dead = 0`,
+                     AND dead = 0
+                     AND cancelled = 0
+                     AND lease_expires_at_ms > ?
+                     AND lease_protocol_version = ?`,
                 )
-                .get(claimed.workId, claimed.leaseId);
+                .get(
+                  claimed.workId,
+                  claimed.leaseId,
+                  clock.nowMs(),
+                  queueProvenanceLeaseProtocolVersion,
+                );
 
               if (active === undefined) {
                 return {
@@ -3881,6 +4216,7 @@ function openDatabaseLedgerEngine<
                 nowMs: clock.nowMs(),
                 dedupeKey: options?.dedupeKey,
                 causationEventId: claimed.sourceEventId,
+                causationWork,
               });
 
               return {
@@ -3922,6 +4258,7 @@ function openDatabaseLedgerEngine<
             payload as never,
             options,
             claimed.sourceEventId,
+            causationWork,
             {
               workId: claimed.workId,
               leaseId: claimed.leaseId,
@@ -4029,9 +4366,17 @@ function openDatabaseLedgerEngine<
              FROM work
              WHERE work_id = ?
                AND lease_id = ?
-               AND dead = 0`,
+               AND dead = 0
+               AND cancelled = 0
+               AND lease_expires_at_ms > ?
+               AND lease_protocol_version = ?`,
           )
-          .get(claimed.workId, claimed.leaseId);
+          .get(
+            claimed.workId,
+            claimed.leaseId,
+            clock.nowMs(),
+            queueProvenanceLeaseProtocolVersion,
+          );
 
         if (active === undefined) {
           return {
@@ -4100,6 +4445,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   lease_protocol_version = 0,
                    last_error = ?
                  WHERE work_id = ?
                    AND lease_id = ?
@@ -4123,6 +4469,7 @@ function openDatabaseLedgerEngine<
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
                    lease_expires_at_ms = NULL,
+                   lease_protocol_version = 0,
                    coalescing_key = NULL,
                    partition_key = NULL,
                    last_error = ?,
@@ -4235,6 +4582,7 @@ function openDatabaseLedgerEngine<
                lease_id = NULL,
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
+               lease_protocol_version = 0,
                available_at_ms = ?
              WHERE dead = 0
                AND lease_id IN (${leaseIdPlaceholders})`,
@@ -4304,7 +4652,7 @@ function openDatabaseLedgerEngine<
 
   const ledger: DatabaseLedger<TEvents, TQueries, TSignals> = {
     emit: async (eventName, event, options) => {
-      return await emitDurableEvent(eventName, event, options, null);
+      return await emitDurableEvent(eventName, event, options, null, null);
     },
     query: async (queryName, params) => {
       await startup;
@@ -4345,6 +4693,7 @@ function openDatabaseLedgerEngine<
                lease_id = NULL,
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
+               lease_protocol_version = 0,
                coalescing_key = NULL,
                partition_key = NULL,
                last_error = ?
