@@ -38,6 +38,7 @@ import type {
   LedgerWorkerOptions,
   LedgerWorkers,
   QuerySchema,
+  RegisterFunction,
   QueueActions,
   QueueHandlerControl,
   QueueHandlerFunction,
@@ -80,6 +81,13 @@ type DatabaseLedgerStreamEvent<
   readonly cursor: LedgerCursor;
 };
 
+type DatabaseEventCommit<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends keyof TEvents,
+> = EventEnvelope<TEvents, TEventName> & {
+  readonly outcome?: unknown;
+};
+
 export interface DatabaseLedger<
   TEvents extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQueryDef>,
@@ -89,7 +97,7 @@ export interface DatabaseLedger<
     eventName: TEventName,
     event: Static<TEvents[TEventName]>,
     options?: EmitOptions,
-  ): Promise<EventEnvelope<TEvents, TEventName>>;
+  ): Promise<DatabaseEventCommit<TEvents, TEventName>>;
 
   query<const TQueryName extends keyof TQueries>(
     queryName: TQueryName,
@@ -665,10 +673,11 @@ function createContractEnvelope(
     readonly payload: unknown;
     readonly tsMs: number;
     readonly dedupeKey: string | null;
+    readonly outcome?: unknown;
   },
   token: object,
 ): object {
-  return {
+  const envelope = {
     eventId: event.eventId,
     event: token,
     payload: event.payload,
@@ -677,6 +686,15 @@ function createContractEnvelope(
     causationEventId: event.causationEventId,
     dedupeKey: event.dedupeKey,
   };
+
+  if (Object.hasOwn(event, "outcome")) {
+    return {
+      ...envelope,
+      outcome: event.outcome,
+    };
+  }
+
+  return envelope;
 }
 
 async function* mapContractEventStream<TEvents extends Record<string, TSchema>>(
@@ -880,6 +898,7 @@ const EventEnvelopeRowSchema = Type.Object({
   payload_json: Type.String(),
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
   dedupe_key: Type.Union([Type.Null(), Type.String()]),
+  outcome_json: Type.Optional(Type.Union([Type.Null(), Type.String()])),
 });
 
 const EventIdRowSchema = Type.Object({
@@ -1037,7 +1056,15 @@ function openDatabaseLedgerEngine<
   >(input.model, {
     statementCompiler: input.projectionCompiler,
   });
-  const registration = registeredRuntime.register;
+  const registration = registeredRuntime.register as RegisterFunction<
+    TEvents,
+    TQueues,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TIndexerDefinitions
+  >;
   const rootModule = input.model as unknown as RuntimeMaterializationModule & {
     readonly [composedLedgerModulesBrand]?: readonly RuntimeMaterializationModule[];
   };
@@ -1184,6 +1211,7 @@ function openDatabaseLedgerEngine<
         ts_ms INTEGER NOT NULL,
         event_name TEXT NOT NULL,
         payload_json TEXT NOT NULL,
+        outcome_json TEXT,
         causation_event_id INTEGER,
         dedupe_key TEXT UNIQUE,
         signal INTEGER NOT NULL DEFAULT 0
@@ -1218,6 +1246,7 @@ function openDatabaseLedgerEngine<
         });
 
         await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
+        await ensureColumn("events", "outcome_json", "TEXT");
         await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
@@ -2175,6 +2204,29 @@ function openDatabaseLedgerEngine<
     return decodeValue(schema, payload);
   }
 
+  function decodeEventOutcome(
+    eventName: keyof TEvents,
+    outcome: unknown,
+  ): unknown {
+    const schema = model.eventOutcomes[eventName];
+
+    if (schema === undefined) {
+      throw new Error(`unknown event outcome contract: ${String(eventName)}`);
+    }
+
+    if (schema === null) {
+      if (outcome !== undefined) {
+        throw new Error(
+          `event ${String(eventName)} returned an outcome without declaring one`,
+        );
+      }
+
+      return undefined;
+    }
+
+    return decodeValue(schema, outcome);
+  }
+
   function decodeSignalPayload<const TSignalName extends keyof TSignals>(
     signalName: TSignalName,
     payload: unknown,
@@ -2383,6 +2435,7 @@ function openDatabaseLedgerEngine<
     eventInput: AppendEventInput,
   ): Promise<{
     envelope: EventEnvelope<TEvents, keyof TEvents>;
+    outcome?: unknown;
     created: boolean;
   }> {
     const eventName = eventInput.eventName as keyof TEvents;
@@ -2393,6 +2446,7 @@ function openDatabaseLedgerEngine<
     let created = false;
     let eventId = 0;
     let envelope: EventEnvelope<TEvents, keyof TEvents> | null = null;
+    let outcome: unknown;
 
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
@@ -2430,7 +2484,7 @@ function openDatabaseLedgerEngine<
       } else {
         const existing = await database
           .prepare(
-            `SELECT event_id, ts_ms, event_name, payload_json, causation_event_id, dedupe_key
+            `SELECT event_id, ts_ms, event_name, payload_json, outcome_json, causation_event_id, dedupe_key
              FROM events
              WHERE dedupe_key = ?
                AND signal = 0`,
@@ -2455,6 +2509,34 @@ function openDatabaseLedgerEngine<
           events: model.events,
         });
         eventId = envelope.eventId;
+
+        const outcomeSchema = model.eventOutcomes[eventName];
+
+        if (outcomeSchema === undefined) {
+          throw new Error(
+            `unknown event outcome contract: ${String(eventName)}`,
+          );
+        }
+
+        if (outcomeSchema !== null) {
+          if (existingRow.outcome_json == null) {
+            throw new Error(
+              `result-bearing event ${String(eventName)} has no durable outcome`,
+            );
+          }
+
+          outcome = decodeEventOutcome(
+            eventName,
+            parseJson(
+              existingRow.outcome_json,
+              `events.outcome_json for event ${eventId}`,
+            ),
+          );
+        } else if (existingRow.outcome_json != null) {
+          throw new Error(
+            `plain event ${String(eventName)} unexpectedly has a durable outcome`,
+          );
+        }
       }
     }
 
@@ -2472,13 +2554,34 @@ function openDatabaseLedgerEngine<
     };
 
     if (!created) {
-      return {
+      const existingCommit: {
+        envelope: EventEnvelope<TEvents, keyof TEvents>;
+        outcome?: unknown;
+        created: boolean;
+      } = {
         envelope,
         created: false,
       };
+
+      if (outcome !== undefined) {
+        existingCommit.outcome = outcome;
+      }
+
+      return existingCommit;
     }
 
     const eventHandler = registration.events?.[eventName];
+    const outcomeSchema = model.eventOutcomes[eventName];
+
+    if (outcomeSchema === undefined) {
+      throw new Error(`unknown event outcome contract: ${String(eventName)}`);
+    }
+
+    if (outcomeSchema !== null && eventHandler === undefined) {
+      throw new Error(
+        `result-bearing event ${String(eventName)} has no owning handler`,
+      );
+    }
     const queued: {
       queueName: string;
       workKey: string | null;
@@ -2529,7 +2632,7 @@ function openDatabaseLedgerEngine<
       let handlerError: unknown;
 
       try {
-        await eventHandler({
+        const rawOutcome = await eventHandler({
           event: envelope,
           actions: {
             index: (indexName, indexInput) => {
@@ -2590,6 +2693,7 @@ function openDatabaseLedgerEngine<
             },
           },
         });
+        outcome = decodeEventOutcome(eventName, rawOutcome);
       } catch (error: unknown) {
         handlerFailed = true;
         handlerError = error;
@@ -2609,14 +2713,87 @@ function openDatabaseLedgerEngine<
       }
     }
 
+    if (eventHandler === undefined) {
+      outcome = decodeEventOutcome(eventName, undefined);
+    }
+
+    if (outcomeSchema !== null) {
+      const outcomeJson = JSON.stringify(outcome);
+
+      if (outcomeJson === undefined) {
+        throw new Error(
+          `event ${String(eventName)} produced a non-JSON outcome`,
+        );
+      }
+
+      const outcomeUpdate = await database
+        .prepare(`UPDATE events SET outcome_json = ? WHERE event_id = ?`)
+        .run(outcomeJson, eventId);
+
+      if (outcomeUpdate.changes !== 1) {
+        throw new Error(
+          `event ${String(eventName)} outcome updated ${outcomeUpdate.changes} rows`,
+        );
+      }
+    }
+
     for (const work of queued) {
       await materializeDurableWork(database, eventId, work);
     }
 
-    return {
+    const commit: {
+      envelope: EventEnvelope<TEvents, keyof TEvents>;
+      outcome?: unknown;
+      created: boolean;
+    } = {
       envelope,
       created,
     };
+
+    if (outcomeSchema !== null) {
+      commit.outcome = outcome;
+    }
+
+    return commit;
+  }
+
+  async function emitDurableEvent<const TEventName extends keyof TEvents>(
+    eventName: TEventName,
+    event: Static<TEvents[TEventName]>,
+    options: EmitOptions | undefined,
+    causationEventId: number | null,
+  ): Promise<DatabaseEventCommit<TEvents, TEventName>> {
+    await startup;
+
+    const result = await runInTransaction(
+      async (database, tx) =>
+        await appendEventInTransaction(database, tx, {
+          eventName: String(eventName),
+          payload: event,
+          nowMs: clock.nowMs(),
+          dedupeKey: options?.dedupeKey,
+          causationEventId,
+        }),
+    );
+
+    if (result.created) {
+      committedEventId = Math.max(committedEventId, result.envelope.eventId);
+      eventChanges.notify();
+
+      if (activeWorker !== null) {
+        activeWorker.stateChanges.notify();
+        scheduleDispatchAt(activeWorker, clock.nowMs());
+      }
+    }
+
+    if (result.outcome !== undefined) {
+      return {
+        ...(result.envelope as EventEnvelope<TEvents, TEventName>),
+        outcome: result.outcome,
+      };
+    }
+
+    return result.envelope as EventEnvelope<TEvents, TEventName>;
   }
 
   async function appendSignalInTransaction(
@@ -3694,6 +3871,31 @@ function openDatabaseLedgerEngine<
       const signalActions: SignalQueueActions<any> = {
         query: actions.query,
       };
+      const queueLedger = {
+        emit: async (
+          eventName: unknown,
+          payload: unknown,
+          options?: EmitOptions,
+        ) => {
+          if (typeof eventName !== "string") {
+            throw new Error("expected a physical event name");
+          }
+
+          return await emitDurableEvent(
+            eventName as keyof TEvents,
+            payload as never,
+            options,
+            claimed.sourceEventId,
+          );
+        },
+        query: async (queryName: unknown, params: unknown) => {
+          if (typeof queryName !== "string") {
+            throw new Error("expected a physical query name");
+          }
+
+          return await actions.query(queryName, params);
+        },
+      };
 
       const withTimeout = async <TResult>(
         timeoutMs: number,
@@ -3737,10 +3939,19 @@ function openDatabaseLedgerEngine<
             control: signalQueueControl,
           });
         } else {
-          await (handler as QueueHandlerFunction<any, any, any, any, any>)({
+          const physicalHandler = handler as unknown as (input: {
+            readonly work: typeof work;
+            readonly lease: typeof lease;
+            readonly actions: typeof actions;
+            readonly ledger: typeof queueLedger;
+            readonly control: QueueHandlerControl;
+          }) => void | Promise<void>;
+
+          await physicalHandler({
             work,
             lease,
             actions,
+            ledger: queueLedger,
             control: queueControl,
           });
         }
@@ -4053,29 +4264,7 @@ function openDatabaseLedgerEngine<
 
   const ledger: DatabaseLedger<TEvents, TQueries, TSignals> = {
     emit: async (eventName, event, options) => {
-      await startup;
-
-      const result = await runInTransaction(
-        async (database, tx) =>
-          await appendEventInTransaction(database, tx, {
-            eventName: String(eventName),
-            payload: event,
-            nowMs: clock.nowMs(),
-            dedupeKey: options?.dedupeKey,
-            causationEventId: null,
-          }),
-      );
-
-      if (result.created) {
-        committedEventId = Math.max(committedEventId, result.envelope.eventId);
-        eventChanges.notify();
-        if (activeWorker !== null) {
-          activeWorker.stateChanges.notify();
-          scheduleDispatchAt(activeWorker, clock.nowMs());
-        }
-      }
-
-      return result.envelope as EventEnvelope<TEvents, typeof eventName>;
+      return await emitDurableEvent(eventName, event, options, null);
     },
     query: async (queryName, params) => {
       await startup;

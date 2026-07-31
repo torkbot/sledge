@@ -33,6 +33,20 @@ const DecisionAttemptedSchema = Type.Object({
   attempt: Type.Number(),
 });
 
+const DecisionRecordedOutcomeSchema = Type.Object({
+  attempt: Type.Number(),
+});
+
+const ImmediateDecisionRequestedSchema = Type.Object({
+  sourceEventId: Type.Number(),
+  attempt: Type.Number(),
+});
+
+const ImmediateDecisionObservedSchema = Type.Object({
+  sourceEventId: Type.Number(),
+  attempt: Type.Number(),
+});
+
 export const IntentPlannedSchema = Type.Object({
   type: Type.Literal("intent.planned"),
   sourceEventId: Type.Number(),
@@ -144,6 +158,12 @@ const ledgerContractShape = defineLedgerShape({
   events: {
     "message.received": MessageReceivedSchema,
     "decision.attempted": DecisionAttemptedSchema,
+    "decision.recorded": {
+      payload: DecisionAttemptedSchema,
+      outcome: DecisionRecordedOutcomeSchema,
+    },
+    "immediate-decision.requested": ImmediateDecisionRequestedSchema,
+    "immediate-decision.observed": ImmediateDecisionObservedSchema,
     "intent.planned": IntentPlannedSchema,
     "dispatch.completed": DispatchCompletedSchema,
     "controlled-work.requested": ControlledWorkRequestedSchema,
@@ -156,6 +176,7 @@ const ledgerContractShape = defineLedgerShape({
   },
   queues: {
     "evaluate.message": EvaluateMessageQueueSchema,
+    "immediate-decision.run": ImmediateDecisionRequestedSchema,
     "dispatch.intent": DispatchIntentQueueSchema,
     "controlled-work.run": ControlledWorkQueueSchema,
     "controlled-signal-work.publish": ControlledSignalWorkSchema,
@@ -217,6 +238,14 @@ const ledgerContractMaterializations = defineMaterialization(
       incrementDecisionAttempts: {
         sourceEvent: "decision.attempted",
         input: IncrementDecisionAttemptsIndexerInputSchema,
+      },
+      recordDecisionOutcome: {
+        sourceEvent: "decision.recorded",
+        input: IncrementDecisionAttemptsIndexerInputSchema,
+      },
+      recordImmediateDecisionObserved: {
+        sourceEvent: "immediate-decision.observed",
+        input: IncrementDispatchCountIndexerInputSchema,
       },
       setPlannedIntent: {
         sourceEvent: "intent.planned",
@@ -304,6 +333,36 @@ const ledgerContractImplementations = {
         .onConflict(["sourceEventId"])
         .doUpdateSet({
           decisionAttempts: input.attempt,
+        })
+        .execute();
+    },
+    recordDecisionOutcome: async ({ input, db }) => {
+      await db
+        .insertInto("contractProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          decisionAttempts: input.attempt,
+          dispatchCount: 0,
+          plannedIntentEventId: null,
+        })
+        .onConflict(["sourceEventId"])
+        .doUpdateSet({
+          decisionAttempts: input.attempt,
+        })
+        .execute();
+    },
+    recordImmediateDecisionObserved: async ({ input, db }) => {
+      await db
+        .insertInto("contractProjection")
+        .values({
+          sourceEventId: input.sourceEventId,
+          decisionAttempts: 0,
+          dispatchCount: input.dispatchCount,
+          plannedIntentEventId: null,
+        })
+        .onConflict(["sourceEventId"])
+        .doUpdateSet({
+          dispatchCount: input.dispatchCount,
         })
         .execute();
     },
@@ -869,6 +928,27 @@ export function createLedgerContractModel(input: {
           attempt: event.payload.attempt,
         });
       },
+      "decision.recorded": async ({ event, actions }) => {
+        await actions.index("recordDecisionOutcome", {
+          sourceEventId: event.payload.sourceEventId,
+          attempt: event.payload.attempt,
+        });
+
+        return {
+          attempt: event.payload.attempt,
+        };
+      },
+      "immediate-decision.requested": ({ event, actions }) => {
+        actions.enqueue("immediate-decision.run", event.payload, {
+          workKey: `immediate-decision:${event.eventId}`,
+        });
+      },
+      "immediate-decision.observed": async ({ event, actions }) => {
+        await actions.index("recordImmediateDecisionObserved", {
+          sourceEventId: event.payload.sourceEventId,
+          dispatchCount: event.payload.attempt,
+        });
+      },
       "intent.planned": async ({ event, actions }) => {
         await actions.index("setPlannedIntent", {
           sourceEventId: event.payload.sourceEventId,
@@ -959,6 +1039,32 @@ export function createLedgerContractModel(input: {
       "timed-work.handled": () => {},
     },
     queues: {
+      "immediate-decision.run": async ({ work, actions, ledger }) => {
+        const committed = await ledger.emit(
+          ledgerContractShape.events["decision.recorded"],
+          {
+            type: "decision.attempted",
+            sourceEventId: work.payload.sourceEventId,
+            attempt: work.payload.attempt,
+          },
+          {
+            dedupeKey: `immediate-decision:${work.sourceEventId}`,
+          },
+        );
+        const indexedAttempt = await ledger.query(
+          ledgerContractDefinition.queries.decisionAttempts,
+          {
+            sourceEventId: work.payload.sourceEventId,
+          },
+        );
+
+        assert.equal(indexedAttempt, committed.outcome.attempt);
+
+        actions.emit("immediate-decision.observed", {
+          sourceEventId: work.payload.sourceEventId,
+          attempt: committed.outcome.attempt,
+        });
+      },
       "evaluate.message": async ({ work, lease, actions, control }) => {
         actions.emit("decision.attempted", {
           type: "decision.attempted",
@@ -2553,6 +2659,73 @@ export function runLedgerContractSuite(input: {
         assert.equal(await harness.getDecisionAttempts(sourceEventId), 1);
       });
     });
+
+    await t.test(
+      "result-bearing events return their original outcome across deduplicated emits",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const first = await harness.ledger.emit(
+            "decision.recorded",
+            {
+              type: "decision.attempted",
+              sourceEventId: 41,
+              attempt: 3,
+            },
+            {
+              dedupeKey: "record-decision:41",
+            },
+          );
+          const duplicate = await harness.ledger.emit(
+            "decision.recorded",
+            {
+              type: "decision.attempted",
+              sourceEventId: 41,
+              attempt: 4,
+            },
+            {
+              dedupeKey: "record-decision:41",
+            },
+          );
+
+          assert.equal(first.eventId, duplicate.eventId);
+          assert.deepEqual(
+            Value.Decode(DecisionRecordedOutcomeSchema, first.outcome),
+            {
+              attempt: 3,
+            },
+          );
+          assert.deepEqual(
+            Value.Decode(DecisionRecordedOutcomeSchema, duplicate.outcome),
+            {
+              attempt: 3,
+            },
+          );
+          assert.equal(duplicate.payload.attempt, 3);
+        });
+      },
+    );
+
+    await t.test(
+      "queue ledger commits immediate outcomes and reads their projections",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          await harness.ledger.emit("immediate-decision.requested", {
+            sourceEventId: 52,
+            attempt: 7,
+          });
+
+          await waitFor(
+            harness,
+            async () => (await harness.getDispatchCount(52)) === 7,
+            2_000,
+            25,
+          );
+
+          assert.equal(await harness.getDecisionAttempts(52), 7);
+          assert.equal(await harness.getDispatchCount(52), 7);
+        });
+      },
+    );
 
     await t.test(
       "nullable JSON null round trips through SQL null semantics",
