@@ -656,6 +656,7 @@ function createStorageStatement(
           "event_name",
           "payload_json",
           "causation_event_id",
+          "causation_work_json",
           "dedupe_key",
           "signal",
         ]);

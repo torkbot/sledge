@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add engine-authored `causationWork` metadata to durable event envelopes so
+  projections and replay consumers can authenticate the exact module, queue,
+  work item, and attempt that emitted a fact. Existing and public emissions
+  carry `null`.
 - Add result-bearing events whose owning handler returns a validated durable
   outcome from `ledger.emit(...)`, including stable outcomes for deduplicated
   emissions.

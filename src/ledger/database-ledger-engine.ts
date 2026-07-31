@@ -29,6 +29,7 @@ import type {
   ComposedLedgerSignalTokens,
   RegisteredLedgerModel,
   EmitOptions,
+  EventCausationWork,
   EventEnvelope,
   EventHandlerFunction,
   Ledger,
@@ -150,6 +151,7 @@ type AppendEventInput = {
   readonly nowMs: number;
   readonly dedupeKey?: string;
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
 };
 
 type AppendSignalInput = {
@@ -158,6 +160,7 @@ type AppendSignalInput = {
   readonly nowMs: number;
   readonly dedupeKey?: string;
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
 };
 
 type MaterializationReplayState = {
@@ -547,6 +550,7 @@ type WorkQueueNameMaps = {
 };
 
 const unavailablePhysicalQueueName = "\u0000";
+const physicalContractNameSeparator = "::";
 
 function createWorkQueueNameMaps(model: {
   readonly [registeredLedgerContractsBrand]: {
@@ -667,9 +671,42 @@ function localizeStoredQueueName(
   return localName;
 }
 
+function readQueueIdentity(
+  storedQueueName: string,
+  fallbackModuleId: string,
+): {
+  readonly moduleId: string;
+  readonly queueName: string;
+} {
+  const parts = storedQueueName.split(physicalContractNameSeparator);
+
+  if (
+    parts.length === 4 &&
+    parts[0] === "sledge" &&
+    parts[1] !== undefined &&
+    parts[1].length > 0 &&
+    parts[2] === "queue" &&
+    parts[3] !== undefined &&
+    parts[3].length > 0
+  ) {
+    return {
+      moduleId: parts[1],
+      queueName: parts[3],
+    };
+  }
+
+  // An unnamespaced engine model owns its local queue names at the root module.
+  // Composed public models always take the namespaced branch above.
+  return {
+    moduleId: fallbackModuleId,
+    queueName: storedQueueName,
+  };
+}
+
 function createContractEnvelope(
   event: {
     readonly causationEventId: number | null;
+    readonly causationWork: EventCausationWork | null;
     readonly eventId: number;
     readonly payload: unknown;
     readonly tsMs: number;
@@ -685,6 +722,7 @@ function createContractEnvelope(
     tsMs: event.tsMs,
     ref: createEventRef(token, event.eventId),
     causationEventId: event.causationEventId,
+    causationWork: event.causationWork,
     dedupeKey: event.dedupeKey,
   };
 
@@ -898,9 +936,28 @@ const EventEnvelopeRowSchema = Type.Object({
   event_name: Type.String(),
   payload_json: Type.String(),
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
+  causation_work_json: Type.Union([Type.Null(), Type.String()]),
   dedupe_key: Type.Union([Type.Null(), Type.String()]),
   outcome_json: Type.Optional(Type.Union([Type.Null(), Type.String()])),
 });
+
+const EventCausationWorkSchema = Type.Object(
+  {
+    moduleId: Type.String({ minLength: 1 }),
+    queueName: Type.String({ minLength: 1 }),
+    workId: Type.Integer({ minimum: 1 }),
+    attempt: Type.Integer({ minimum: 1 }),
+  },
+  { additionalProperties: false },
+);
+
+function encodeEventCausationWork(
+  causationWork: EventCausationWork | null,
+): string | null {
+  return causationWork === null
+    ? null
+    : JSON.stringify(Value.Encode(EventCausationWorkSchema, causationWork));
+}
 
 const EventIdRowSchema = Type.Object({
   event_id: Type.Number(),
@@ -1001,6 +1058,16 @@ function readEventEnvelopeFromRow<
     eventSchema,
     parseJson(decodedRow.payload_json, "events.payload_json"),
   );
+  const causationWork =
+    decodedRow.causation_work_json === null
+      ? null
+      : decodeValue(
+          EventCausationWorkSchema,
+          parseJson(
+            decodedRow.causation_work_json,
+            "events.causation_work_json",
+          ),
+        );
 
   return {
     eventId: decodedRow.event_id,
@@ -1012,6 +1079,7 @@ function readEventEnvelopeFromRow<
     eventName,
     payload,
     causationEventId: decodedRow.causation_event_id,
+    causationWork,
     dedupeKey: decodedRow.dedupe_key,
   };
 }
@@ -1214,6 +1282,7 @@ function openDatabaseLedgerEngine<
         payload_json TEXT NOT NULL,
         outcome_json TEXT,
         causation_event_id INTEGER,
+        causation_work_json TEXT,
         dedupe_key TEXT UNIQUE,
         signal INTEGER NOT NULL DEFAULT 0
       );
@@ -1248,6 +1317,7 @@ function openDatabaseLedgerEngine<
 
         await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("events", "outcome_json", "TEXT");
+        await ensureColumn("events", "causation_work_json", "TEXT");
         await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
@@ -2443,6 +2513,9 @@ function openDatabaseLedgerEngine<
     const decodedPayload = decodeEventPayload(eventName, eventInput.payload);
 
     const payloadJson = JSON.stringify(decodedPayload);
+    const causationWorkJson = encodeEventCausationWork(
+      eventInput.causationWork,
+    );
 
     let created = false;
     let eventId = 0;
@@ -2452,14 +2525,23 @@ function openDatabaseLedgerEngine<
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, NULL, 0)`,
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, NULL, 0)`,
         )
         .run(
           eventInput.nowMs,
           eventInput.eventName,
           payloadJson,
           eventInput.causationEventId,
+          causationWorkJson,
         );
 
       created = true;
@@ -2467,8 +2549,16 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, ?, 0)
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, ?, 0)
            ON CONFLICT(dedupe_key) DO NOTHING`,
         )
         .run(
@@ -2476,6 +2566,7 @@ function openDatabaseLedgerEngine<
           eventInput.eventName,
           payloadJson,
           eventInput.causationEventId,
+          causationWorkJson,
           eventInput.dedupeKey,
         );
 
@@ -2485,7 +2576,15 @@ function openDatabaseLedgerEngine<
       } else {
         const existing = await database
           .prepare(
-            `SELECT event_id, ts_ms, event_name, payload_json, outcome_json, causation_event_id, dedupe_key
+            `SELECT
+               event_id,
+               ts_ms,
+               event_name,
+               payload_json,
+               outcome_json,
+               causation_event_id,
+               causation_work_json,
+               dedupe_key
              FROM events
              WHERE dedupe_key = ?
                AND signal = 0`,
@@ -2551,6 +2650,7 @@ function openDatabaseLedgerEngine<
       eventName,
       payload: decodedPayload,
       causationEventId: eventInput.causationEventId,
+      causationWork: eventInput.causationWork,
       dedupeKey: eventInput.dedupeKey ?? null,
     };
 
@@ -2776,6 +2876,7 @@ function openDatabaseLedgerEngine<
     event: Static<TEvents[TEventName]>,
     options: EmitOptions | undefined,
     causationEventId: number | null,
+    causationWork: EventCausationWork | null,
     activeLease?: {
       readonly workId: number;
       readonly leaseId: string;
@@ -2809,6 +2910,7 @@ function openDatabaseLedgerEngine<
         nowMs: clock.nowMs(),
         dedupeKey: options?.dedupeKey,
         causationEventId,
+        causationWork,
       });
     });
 
@@ -2843,6 +2945,9 @@ function openDatabaseLedgerEngine<
     const signalName = signalInput.signalName as keyof TSignals;
     const decodedPayload = decodeSignalPayload(signalName, signalInput.payload);
     const payloadJson = JSON.stringify(decodedPayload);
+    const causationWorkJson = encodeEventCausationWork(
+      signalInput.causationWork,
+    );
 
     let created = false;
     let eventId = 0;
@@ -2850,14 +2955,23 @@ function openDatabaseLedgerEngine<
     if (signalInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, NULL, 1)`,
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, NULL, 1)`,
         )
         .run(
           signalInput.nowMs,
           signalInput.signalName,
           payloadJson,
           signalInput.causationEventId,
+          causationWorkJson,
         );
 
       created = true;
@@ -2865,8 +2979,16 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (ts_ms, event_name, payload_json, causation_event_id, dedupe_key, signal)
-           VALUES (?, ?, ?, ?, ?, 1)
+          `INSERT INTO events (
+             ts_ms,
+             event_name,
+             payload_json,
+             causation_event_id,
+             causation_work_json,
+             dedupe_key,
+             signal
+           )
+           VALUES (?, ?, ?, ?, ?, ?, 1)
            ON CONFLICT(dedupe_key) DO NOTHING`,
         )
         .run(
@@ -2874,6 +2996,7 @@ function openDatabaseLedgerEngine<
           signalInput.signalName,
           payloadJson,
           signalInput.causationEventId,
+          causationWorkJson,
           signalInput.dedupeKey,
         );
 
@@ -2913,6 +3036,7 @@ function openDatabaseLedgerEngine<
       eventName: signalName,
       payload: decodedPayload,
       causationEventId: signalInput.causationEventId,
+      causationWork: signalInput.causationWork,
       dedupeKey: signalInput.dedupeKey ?? null,
     };
 
@@ -3216,6 +3340,7 @@ function openDatabaseLedgerEngine<
              event_name,
              payload_json,
              causation_event_id,
+             causation_work_json,
              dedupe_key
            FROM events
            WHERE signal = 0
@@ -3246,6 +3371,7 @@ function openDatabaseLedgerEngine<
              event_name,
              payload_json,
              causation_event_id,
+             causation_work_json,
              dedupe_key
            FROM events
            WHERE signal = 0
@@ -3837,6 +3963,19 @@ function openDatabaseLedgerEngine<
         },
         signal: leaseAbortController.signal,
       };
+      const queueIdentity = claimed.signal
+        ? null
+        : readQueueIdentity(claimed.queueName, rootModule.moduleId);
+
+      const causationWork: EventCausationWork | null =
+        queueIdentity === null
+          ? null
+          : {
+              moduleId: queueIdentity.moduleId,
+              queueName: queueIdentity.queueName,
+              workId: claimed.workId,
+              attempt: claimed.attempt,
+            };
 
       const stagedEvents: AppendEventInput[] = [];
 
@@ -3848,6 +3987,7 @@ function openDatabaseLedgerEngine<
             nowMs: clock.nowMs(),
             dedupeKey: options?.dedupeKey,
             causationEventId: claimed.sourceEventId,
+            causationWork,
           });
         },
         emitSignal: async (signalName, signal, options) => {
@@ -3881,6 +4021,7 @@ function openDatabaseLedgerEngine<
                 nowMs: clock.nowMs(),
                 dedupeKey: options?.dedupeKey,
                 causationEventId: claimed.sourceEventId,
+                causationWork,
               });
 
               return {
@@ -3922,6 +4063,7 @@ function openDatabaseLedgerEngine<
             payload as never,
             options,
             claimed.sourceEventId,
+            causationWork,
             {
               workId: claimed.workId,
               leaseId: claimed.leaseId,
@@ -4304,7 +4446,7 @@ function openDatabaseLedgerEngine<
 
   const ledger: DatabaseLedger<TEvents, TQueries, TSignals> = {
     emit: async (eventName, event, options) => {
-      return await emitDurableEvent(eventName, event, options, null);
+      return await emitDurableEvent(eventName, event, options, null, null);
     },
     query: async (queryName, params) => {
       await startup;

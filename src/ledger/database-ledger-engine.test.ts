@@ -3762,7 +3762,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
   await assert.rejects(async () => await emitPromise, /rollback append/);
 });
 
-test("work metadata migration adds columns before creating indexes", async () => {
+test("storage metadata migration adds event and work columns before indexes", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
@@ -3785,6 +3785,22 @@ test("work metadata migration adds columns before creating indexes", async () =>
       causation_event_id INTEGER,
       dedupe_key TEXT UNIQUE,
       signal INTEGER NOT NULL DEFAULT 0
+    );
+
+    INSERT INTO events (
+      ts_ms,
+      event_name,
+      payload_json,
+      causation_event_id,
+      dedupe_key,
+      signal
+    ) VALUES (
+      1899999999999,
+      'job.requested',
+      '{"id":0}',
+      NULL,
+      'legacy-event',
+      0
     );
 
     CREATE TABLE work (
@@ -3824,6 +3840,27 @@ test("work metadata migration adds columns before creating indexes", async () =>
   });
 
   await ledger.emit("job.requested", { id: 1 });
+
+  const eventColumns = database.prepare("PRAGMA table_info(events)").all();
+  const eventColumnNames = eventColumns.map((row) => {
+    return (row as { readonly name?: unknown }).name;
+  });
+
+  assert.ok(eventColumnNames.includes("causation_work_json"));
+  assert.equal(
+    (
+      database
+        .prepare(
+          `SELECT causation_work_json
+           FROM events
+           WHERE dedupe_key = ?`,
+        )
+        .get("legacy-event") as
+        | { readonly causation_work_json?: unknown }
+        | undefined
+    )?.causation_work_json,
+    null,
+  );
 
   const columns = database.prepare("PRAGMA table_info(work)").all();
   const columnNames = columns.map((row) => {

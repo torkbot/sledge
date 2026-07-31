@@ -8,6 +8,7 @@ import type {
   LedgerStorageScope,
 } from "./internal-storage.ts";
 import type {
+  EventCausationWork,
   EventEnvelope,
   LedgerIndexerContext,
   QuerySchema,
@@ -56,12 +57,22 @@ declare const projectionUnionValueValueBrand: unique symbol;
 
 const ProjectionEventRowSchema = Type.Object({
   causation_event_id: Type.Union([Type.Null(), Type.Number()]),
+  causation_work_json: Type.Union([Type.Null(), Type.String()]),
   dedupe_key: Type.Union([Type.Null(), Type.String()]),
   event_id: Type.Number(),
   event_name: Type.String(),
   payload_json: Type.String(),
   ts_ms: Type.Number(),
 });
+const ProjectionEventCausationWorkSchema = Type.Object(
+  {
+    moduleId: Type.String({ minLength: 1 }),
+    queueName: Type.String({ minLength: 1 }),
+    workId: Type.Integer({ minimum: 1 }),
+    attempt: Type.Integer({ minimum: 1 }),
+  },
+  { additionalProperties: false },
+);
 const ProjectionEventIdBoundsRowSchema = Type.Object({
   max_event_id: Type.Union([Type.Null(), Type.Number()]),
   min_event_id: Type.Union([Type.Null(), Type.Number()]),
@@ -80,6 +91,7 @@ export type ProjectionIndexerEvent<TEventName extends string> = {
   readonly eventName: TEventName;
   readonly eventId: number;
   readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
   readonly ref: EventRef<TEventName>;
 };
 
@@ -1736,6 +1748,7 @@ function createProjectionIndexerEvent(
     eventName,
     eventId: context.event.eventId,
     causationEventId: context.event.causationEventId,
+    causationWork: context.event.causationWork,
     ref: createEventRef(eventName, context.event.eventId),
   };
 }
@@ -5407,9 +5420,20 @@ function decodeProjectionEventRow<
   const typedRef = createEventRef(eventName, decodedRow.event_id) as EventRef<
     Extract<TEventName, string>
   >;
+  const causationWork =
+    decodedRow.causation_work_json === null
+      ? null
+      : Value.Decode(
+          ProjectionEventCausationWorkSchema,
+          parseJson(
+            decodedRow.causation_work_json,
+            "events.causation_work_json",
+          ),
+        );
 
   return {
     causationEventId: decodedRow.causation_event_id,
+    causationWork,
     dedupeKey: decodedRow.dedupe_key,
     eventId: decodedRow.event_id,
     eventName,

@@ -348,6 +348,7 @@ function createUserCreatedContext(eventId: number): LedgerIndexerContext<{
       email: "alice@example.com",
     },
     causationEventId: null,
+    causationWork: null,
     dedupeKey: null,
   };
 
@@ -3232,6 +3233,7 @@ test("projection access hydrates semantic event references without exposing even
     allRows: [
       {
         causation_event_id: null,
+        causation_work_json: null,
         dedupe_key: null,
         event_id: 42,
         event_name: "user.created",
@@ -3252,7 +3254,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(fake.calls[0], {
     method: "all",
     params: ["user.created", 0, 42],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?)',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?)',
   });
   assert.deepEqual(payload, {
     userId: "u_123",
@@ -3263,6 +3265,7 @@ test("projection access hydrates semantic event references without exposing even
     allRows: [
       {
         causation_event_id: null,
+        causation_work_json: null,
         dedupe_key: null,
         event_id: 42,
         event_name: "user.created",
@@ -3274,6 +3277,7 @@ test("projection access hydrates semantic event references without exposing even
       },
       {
         causation_event_id: null,
+        causation_work_json: null,
         dedupe_key: null,
         event_id: 43,
         event_name: "user.created",
@@ -3294,7 +3298,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(batchFake.calls[0], {
     method: "all",
     params: ["user.created", 0, 43, 42, 99],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?, ?, ?)',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?, ?, ?)',
   });
   assert.deepEqual(payloads, [
     {
@@ -3353,6 +3357,7 @@ test("projection access hydrates semantic event references without exposing even
     allRows: [
       {
         causation_event_id: null,
+        causation_work_json: null,
         dedupe_key: null,
         event_id: 43,
         event_name: "user.created",
@@ -3373,7 +3378,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(scanFake.calls[0], {
     method: "all",
     params: ["user.created", 0, 42, 25],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
   });
   assert.deepEqual(scannedPayloads, [
     {
@@ -3386,6 +3391,7 @@ test("projection access hydrates semantic event references without exposing even
     allRows: [
       {
         causation_event_id: null,
+        causation_work_json: null,
         dedupe_key: null,
         event_id: 44,
         event_name: "user.created",
@@ -3408,7 +3414,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(payloadScanFake.calls[0], {
     method: "all",
     params: ["user.created", 0, "$.userId", "u_456", 1],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? ORDER BY "event_id" DESC LIMIT ?',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? ORDER BY "event_id" DESC LIMIT ?',
   });
   assert.deepEqual(payloadScannedPayloads, [
     {
@@ -3510,6 +3516,7 @@ test("projection access scans semantic signals without exposing events table", a
     allRows: [
       {
         causation_event_id: null,
+        causation_work_json: null,
         dedupe_key: null,
         event_id: 101,
         event_name: "run.stream.frame",
@@ -3532,7 +3539,7 @@ test("projection access scans semantic signals without exposing events table", a
   assert.deepEqual(fake.calls[0], {
     method: "all",
     params: ["run.stream.frame", 1, "$.runId", "run_1", 100, 25],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
   });
   assert.deepEqual(frames, [
     {
@@ -3850,6 +3857,7 @@ test("projection facade supports TorkBot-style surface operation materialization
   const requestedContext: LedgerIndexerContext<typeof surfaceEvents> = {
     event: {
       causationEventId: null,
+      causationWork: null,
       dedupeKey: null,
       eventId: 101,
       eventName: "surface.operation.requested",
@@ -3861,6 +3869,7 @@ test("projection facade supports TorkBot-style surface operation materialization
   const completedContext: LedgerIndexerContext<typeof surfaceEvents> = {
     event: {
       causationEventId: 101,
+      causationWork: null,
       dedupeKey: null,
       eventId: 102,
       eventName: "surface.operation.completed",
@@ -3929,6 +3938,7 @@ test("projection facade supports TorkBot-style surface operation materialization
       [
         {
           causation_event_id: null,
+          causation_work_json: null,
           dedupe_key: null,
           event_id: 101,
           event_name: "surface.operation.requested",
@@ -3939,6 +3949,7 @@ test("projection facade supports TorkBot-style surface operation materialization
       [
         {
           causation_event_id: 101,
+          causation_work_json: null,
           dedupe_key: null,
           event_id: 102,
           event_name: "surface.operation.completed",
@@ -3988,6 +3999,7 @@ test("projection facade supports TorkBot-style surface operation materialization
       [
         {
           causation_event_id: null,
+          causation_work_json: null,
           dedupe_key: null,
           event_id: 101,
           event_name: "surface.operation.requested",
@@ -4661,6 +4673,7 @@ test("materialization data migrations can scan typed ledger events", async () =>
       email: "alice@example.com",
     },
     causationEventId: null,
+    causationWork: null,
     dedupeKey: null,
   };
   const scanBuilder: ProjectionEventScanBuilder<

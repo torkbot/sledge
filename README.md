@@ -613,6 +613,13 @@ disposition while the attempt still owns its lease. Staged events describe the
 attempt; they are not a success-only rollback buffer. The scoped port does not
 expose worker control, storage access, or undeclared module capabilities.
 
+Events emitted through either queue port carry engine-authored
+`causationWork` metadata containing the source module ID, local queue name,
+durable work ID, and attempt number. Event handlers and replay readers can use
+that metadata to require a specific queue authority before accepting a
+correctness-sensitive fact. Public `ledger.emit(...)` calls carry
+`causationWork: null`; callers cannot supply or impersonate queue provenance.
+
 Use `control.withTimeout(...)` when one operation inside a handler needs a
 shorter lifetime than the work lease:
 
@@ -750,10 +757,10 @@ await ledger.cancelWork({
 ```
 
 `WorkRef` is an opaque string generated and persisted by Sledge. Store and
-round-trip the value exactly as returned; do not construct or parse it. Queue
-and module identity remain private to the runtime, so work from different
-modules remains independently addressable even when the modules use the same
-local queue name and `workKey`.
+round-trip the value exactly as returned; do not construct or parse it. Its
+representation remains private to the runtime, so work from different modules
+remains independently addressable even when the modules use the same local
+queue name and `workKey`.
 
 Cancellation is terminal. Cancelled work will not dispatch again, including
 after process restart.
