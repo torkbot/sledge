@@ -30,6 +30,7 @@ import type {
   RegisteredLedgerModel,
   EmitOptions,
   EventEnvelope,
+  EventHandlerFunction,
   Ledger,
   LedgerCursor,
   LedgerTiming,
@@ -2570,7 +2571,20 @@ function openDatabaseLedgerEngine<
       return existingCommit;
     }
 
-    const eventHandler = registration.events?.[eventName];
+    // Result-bearing ownership makes a subset of the public event-handler map
+    // required. Indexing that intersection erases the correlation between the
+    // selected name and its handler, so restore the uniform runtime view here.
+    const eventHandler = registration.events?.[eventName] as
+      | EventHandlerFunction<
+          TEvents,
+          keyof TEvents,
+          TIndexers,
+          TQueues,
+          TQueries,
+          TIndexerDefinitions,
+          unknown
+        >
+      | undefined;
     const outcomeSchema = model.eventOutcomes[eventName];
 
     if (outcomeSchema === undefined) {
@@ -2762,19 +2776,41 @@ function openDatabaseLedgerEngine<
     event: Static<TEvents[TEventName]>,
     options: EmitOptions | undefined,
     causationEventId: number | null,
+    activeLease?: {
+      readonly workId: number;
+      readonly leaseId: string;
+    },
   ): Promise<DatabaseEventCommit<TEvents, TEventName>> {
     await startup;
 
-    const result = await runInTransaction(
-      async (database, tx) =>
-        await appendEventInTransaction(database, tx, {
-          eventName: String(eventName),
-          payload: event,
-          nowMs: clock.nowMs(),
-          dedupeKey: options?.dedupeKey,
-          causationEventId,
-        }),
-    );
+    const result = await runInTransaction(async (database, tx) => {
+      if (activeLease !== undefined) {
+        const owned = await database
+          .prepare(
+            `SELECT work_id
+             FROM work
+             WHERE work_id = ?
+               AND lease_id = ?
+               AND dead = 0
+               AND cancelled = 0`,
+          )
+          .get(activeLease.workId, activeLease.leaseId);
+
+        if (owned === undefined) {
+          throw new Error(
+            "queue handler lost its lease before immediate event emission",
+          );
+        }
+      }
+
+      return await appendEventInTransaction(database, tx, {
+        eventName: String(eventName),
+        payload: event,
+        nowMs: clock.nowMs(),
+        dedupeKey: options?.dedupeKey,
+        causationEventId,
+      });
+    });
 
     if (result.created) {
       committedEventId = Math.max(committedEventId, result.envelope.eventId);
@@ -3886,6 +3922,10 @@ function openDatabaseLedgerEngine<
             payload as never,
             options,
             claimed.sourceEventId,
+            {
+              workId: claimed.workId,
+              leaseId: claimed.leaseId,
+            },
           );
         },
         query: async (queryName: unknown, params: unknown) => {

@@ -607,8 +607,10 @@ const decisions = decisionsShape.register({
 
 `ledger.emit(...)` commits before its promise resolves, so the handler can use a
 result-bearing event outcome or query its updated projection before continuing.
-By contrast, `actions.emit(...)` remains staged with the work disposition and
-commits atomically with a successful acknowledgement. The scoped port does not
+By contrast, `actions.emit(...)` remains staged until the handler settles, then
+commits atomically with the resulting acknowledgement, retry, or dead-letter
+disposition while the attempt still owns its lease. Staged events describe the
+attempt; they are not a success-only rollback buffer. The scoped port does not
 expose worker control, storage access, or undeclared module capabilities.
 
 Use `control.withTimeout(...)` when one operation inside a handler needs a

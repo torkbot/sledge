@@ -841,6 +841,101 @@ type EventHandlerResult<
       : void
     : void;
 
+type RequiredOwnedResultEventNames<
+  TModuleId extends string,
+  TEvents extends Record<string, TSchema>,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+> = {
+  readonly [TEventName in keyof TEvents]: TEventTokens[TEventName] extends EventToken<
+    infer TOwnerModuleId,
+    string,
+    TSchema,
+    infer TOutcomeSchema
+  >
+    ? TOutcomeSchema extends TSchema
+      ? TModuleId extends TOwnerModuleId
+        ? TOwnerModuleId extends TModuleId
+          ? TEventName
+          : never
+        : never
+      : never
+    : never;
+}[keyof TEvents];
+
+type EventHandlerRegistrations<
+  TModuleId extends string,
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+> = {
+  readonly [TEventName in keyof TEvents]?: EventHandlerFunction<
+    TEvents,
+    TEventName,
+    TIndexers,
+    TQueues,
+    TQueries,
+    TIndexerDefinitions,
+    EventHandlerResult<TModuleId, TEventTokens[TEventName]>
+  >;
+} & {
+  readonly [TEventName in RequiredOwnedResultEventNames<
+    TModuleId,
+    TEvents,
+    TEventTokens
+  >]-?: EventHandlerFunction<
+    TEvents,
+    TEventName,
+    TIndexers,
+    TQueues,
+    TQueries,
+    TIndexerDefinitions,
+    EventHandlerResult<TModuleId, TEventTokens[TEventName]>
+  >;
+};
+
+type EventRegistrationProperty<
+  TModuleId extends string,
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TIndexers extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQuerySchema>,
+  TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+> = [RequiredOwnedResultEventNames<TModuleId, TEvents, TEventTokens>] extends [
+  never,
+]
+  ? {
+      readonly events?: EventHandlerRegistrations<
+        TModuleId,
+        TEvents,
+        TQueues,
+        TIndexers,
+        TQueries,
+        TIndexerDefinitions,
+        TEventTokens
+      >;
+    }
+  : {
+      readonly events: EventHandlerRegistrations<
+        TModuleId,
+        TEvents,
+        TQueues,
+        TIndexers,
+        TQueries,
+        TIndexerDefinitions,
+        TEventTokens
+      >;
+    };
+
 /**
  * Signal registration function for signal->signal-queue materialization.
  */
@@ -919,18 +1014,15 @@ export type RegisterFunction<
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
   } = QueryTokensFor<string, TQueries>,
   TModuleId extends string = string,
-> = {
-  readonly events?: {
-    readonly [TEventName in keyof TEvents]?: EventHandlerFunction<
-      TEvents,
-      TEventName,
-      TIndexers,
-      TQueues,
-      TQueries,
-      TIndexerDefinitions,
-      EventHandlerResult<TModuleId, TEventTokens[TEventName]>
-    >;
-  };
+> = EventRegistrationProperty<
+  TModuleId,
+  TEvents,
+  TQueues,
+  TIndexers,
+  TQueries,
+  TIndexerDefinitions,
+  TEventTokens
+> & {
   readonly signals?: {
     readonly [TSignalName in keyof TSignals]?: SignalHandlerFunction<
       TSignals,
@@ -2100,7 +2192,7 @@ export function defineLedgerShape<
     signals,
     shape,
     register: (register) => {
-      return createDefinedLedgerModel({
+      const model = createDefinedLedgerModel({
         moduleId: input.moduleId,
         contracts: {
           events,
@@ -2120,7 +2212,13 @@ export function defineLedgerShape<
             Extract<keyof TEventDefinitions, string>
           >(),
         materializationHistory: null,
-      }).register(register);
+      });
+      type ModelRegister = Parameters<typeof model.register>[0];
+
+      // The projection-free wrapper and the defined model expose the same
+      // registration contract. TypeScript does not reduce the empty
+      // projection conditional through this generic boundary.
+      return model.register(register as unknown as ModelRegister);
     },
   };
 }
@@ -4055,6 +4153,20 @@ function createPhysicalRegisteredModule<
     (input: RuntimeEventHandlerInput) => Promise<unknown>
   > = {};
 
+  for (const [localName, token] of Object.entries(input.contracts.events)) {
+    const eventMetadata = readLedgerContractToken(token, "event");
+
+    if (
+      eventMetadata.moduleId === input.moduleId &&
+      eventMetadata.outcome !== null &&
+      runtimeRegister.events?.[localName] === undefined
+    ) {
+      throw new Error(
+        `result-bearing event ${input.moduleId}.${localName} requires an owning handler`,
+      );
+    }
+  }
+
   for (const [localName, handler] of Object.entries(
     runtimeRegister.events ?? {},
   )) {
@@ -4289,7 +4401,7 @@ function createPhysicalRegisteredModule<
       queues,
       signals,
       signalQueues,
-    } as RegisterFunction<
+    } as unknown as RegisterFunction<
       TEvents,
       TQueues,
       TIndexers,

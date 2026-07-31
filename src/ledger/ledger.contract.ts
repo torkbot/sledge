@@ -629,6 +629,7 @@ export type LedgerContractControlledWorkGate = {
 
 export type LedgerContractControlledWorkOutcome =
   | { readonly kind: "ack" }
+  | { readonly kind: "emit_immediate" }
   | { readonly kind: "retry"; readonly retryAtMs: number }
   | { readonly kind: "dead_letter" };
 
@@ -1151,7 +1152,7 @@ export function createLedgerContractModel(input: {
           sourceEventId: work.payload.sourceEventId,
         });
       },
-      "controlled-work.run": async ({ work, actions, control }) => {
+      "controlled-work.run": async ({ work, actions, control, ledger }) => {
         const outcome = await input.runControlledWork(
           work.payload.workKey,
           work.attempt,
@@ -1164,6 +1165,13 @@ export function createLedgerContractModel(input: {
 
         switch (outcome.kind) {
           case "ack":
+            return;
+          case "emit_immediate":
+            await ledger.emit(ledgerContractShape.events["decision.recorded"], {
+              type: "decision.attempted",
+              sourceEventId: work.sourceEventId,
+              attempt: work.attempt,
+            });
             return;
           case "retry":
             return control.retry("configured controlled retry", {
@@ -2723,6 +2731,47 @@ export function runLedgerContractSuite(input: {
 
           assert.equal(await harness.getDecisionAttempts(52), 7);
           assert.equal(await harness.getDispatchCount(52), 7);
+        });
+      },
+    );
+
+    await t.test(
+      "queue ledger rejects immediate events after lease cancellation",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const workKey = "cancelled-immediate-event";
+          const gate = harness.prepareControlledWorkAttempt(workKey, 1, {
+            kind: "emit_immediate",
+          });
+
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            workKey,
+            partitionKey: null,
+          });
+          await harness.flush();
+          await gate.entered;
+
+          const [leased] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+
+          if (leased?.ref === null || leased === undefined) {
+            throw new Error("expected leased immediate-event work");
+          }
+
+          const cancelled = await harness.ledger.cancelWork({
+            ref: leased.ref,
+            reason: "cancel before immediate emission",
+          });
+          assert.equal(cancelled.status, "cancelled");
+
+          gate.release();
+          await harness.stopPrimaryWorkers();
+
+          const sourceEventId = await readSingleSourceEventId(harness);
+          assert.equal(await harness.getDecisionAttempts(sourceEventId), 0);
         });
       },
     );
