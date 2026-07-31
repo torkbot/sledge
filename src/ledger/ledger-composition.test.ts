@@ -691,7 +691,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             {
               module_ids_json:
                 '["contract.source","contract.consumer","contract.later","contract.failure"]',
-              version: 1,
+              version: 2,
             },
           );
         });

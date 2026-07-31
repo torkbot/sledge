@@ -2769,6 +2769,7 @@ export function runLedgerContractSuite(input: {
             workId: immediate.causationWork.workId,
             attempt: 1,
           });
+          assert.equal(Object.isFrozen(immediate.causationWork), true);
           assert.deepEqual(staged.causationWork, immediate.causationWork);
         });
       },
