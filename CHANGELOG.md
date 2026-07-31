@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add result-bearing events whose owning handler returns a validated durable
+  outcome from `ledger.emit(...)`, including stable outcomes for deduplicated
+  emissions.
+- Give durable queue handlers a capability-scoped `ledger` port for immediately
+  emitting declared events and querying their current projections before the
+  work attempt continues.
 - Add durable `coalescingKey` enqueue semantics so repeated requests for one
   queue identity converge on one unattempted work item and can only move its
   availability earlier. Attempted work and retry backoff remain immutable;

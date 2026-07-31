@@ -1062,6 +1062,32 @@ test("unused queue and signal definitions may be omitted", () => {
   assert.doesNotThrow(() => composeLedgerModels(shape.register({})));
 });
 
+test("result-bearing events require an owning handler at registration", () => {
+  const shape = defineLedgerShape({
+    moduleId: "contract.result-handler",
+    events: {
+      recorded: {
+        payload: Type.Object({
+          id: Type.String(),
+        }),
+        outcome: Type.Object({
+          revision: Type.Number(),
+        }),
+      },
+    },
+  });
+
+  if (false) {
+    // @ts-expect-error A result-bearing event is unusable without its owner.
+    shape.register({});
+  }
+
+  assert.throws(
+    () => Reflect.apply(shape.register, shape, [{}]),
+    /result-bearing event contract\.result-handler\.recorded requires an owning handler/,
+  );
+});
+
 test("contract maps preserve names inherited by Object.prototype", () => {
   const inheritedName = "__proto__" as const;
   const shape = defineLedgerShape({

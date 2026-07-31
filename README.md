@@ -195,6 +195,39 @@ create contracts owned by that module and produce opaque event tokens such as
 `ledgerShape.events["user.created"]`. Runtime APIs accept these tokens instead
 of string names.
 
+An event may declare a durable result alongside its payload:
+
+```ts
+const decisionsShape = defineLedgerShape({
+  moduleId: "decisions",
+  events: {
+    recorded: {
+      payload: Type.Object({
+        decisionId: Type.String(),
+      }),
+      outcome: Type.Object({
+        revision: Type.Integer({ minimum: 1 }),
+      }),
+    },
+    "decision.observed": Type.Object({
+      decisionId: Type.String(),
+      revision: Type.Integer({ minimum: 1 }),
+    }),
+  },
+  queues: {
+    "decisions.record": Type.Object({
+      decisionId: Type.String(),
+    }),
+  },
+});
+```
+
+The event's owning handler returns that outcome after applying its projection
+changes. Sledge validates and persists the result in the same transaction as
+the event. `ledger.emit(...)` then returns the ordinary durable event envelope
+plus its typed `outcome`. A deduplicated emission returns the original event,
+payload, and outcome rather than evaluating the handler again.
+
 ### 2. Define Materializations From Migrations
 
 Call `defineMaterialization(ledgerShape, { namespace })` to define one
@@ -536,6 +569,49 @@ Queue and signal queue handlers implicitly ack on normal return.
 
 Handlers receive a lease with an `AbortSignal`; long-running handlers should
 stop when that signal aborts during shutdown or restart.
+
+Durable queue handlers also receive a capability-scoped `ledger` port. It can
+immediately emit event tokens and run query tokens referenced by the handler's
+module:
+
+```ts
+const decisions = decisionsShape.register({
+  events: {
+    recorded: () => {
+      return {
+        revision: 1,
+      };
+    },
+    "decision.observed": () => {},
+  },
+  queues: {
+    "decisions.record": async ({ work, actions, ledger }) => {
+      const committed = await ledger.emit(
+        decisionsShape.events.recorded,
+        {
+          decisionId: work.payload.decisionId,
+        },
+        {
+          dedupeKey: `decision:${work.payload.decisionId}`,
+        },
+      );
+
+      actions.emit("decision.observed", {
+        decisionId: work.payload.decisionId,
+        revision: committed.outcome.revision,
+      });
+    },
+  },
+});
+```
+
+`ledger.emit(...)` commits before its promise resolves, so the handler can use a
+result-bearing event outcome or query its updated projection before continuing.
+By contrast, `actions.emit(...)` remains staged until the handler settles, then
+commits atomically with the resulting acknowledgement, retry, or dead-letter
+disposition while the attempt still owns its lease. Staged events describe the
+attempt; they are not a success-only rollback buffer. The scoped port does not
+expose worker control, storage access, or undeclared module capabilities.
 
 Use `control.withTimeout(...)` when one operation inside a handler needs a
 shorter lifetime than the work lease:

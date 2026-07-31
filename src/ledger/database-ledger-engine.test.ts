@@ -119,6 +119,9 @@ function defineEngineFixtureModel<
   const TSignalQueues extends Record<string, TSchema> = {},
 >(input: {
   readonly events: TEvents;
+  readonly eventOutcomes?: {
+    readonly [TEventName in keyof TEvents]: TSchema | null;
+  };
   readonly signals?: TSignals;
   readonly queues: TQueues;
   readonly signalQueues?: TSignalQueues;
@@ -149,6 +152,13 @@ function defineEngineFixtureModel<
     TSignalQueues
   > = {
     events: input.events,
+    eventOutcomes:
+      input.eventOutcomes ??
+      (Object.fromEntries(
+        Object.keys(input.events).map((eventName) => [eventName, null]),
+      ) as {
+        readonly [TEventName in keyof TEvents]: TSchema | null;
+      }),
     signals: input.signals ?? ({} as TSignals),
     queues: input.queues,
     signalQueues: input.signalQueues ?? ({} as TSignalQueues),
