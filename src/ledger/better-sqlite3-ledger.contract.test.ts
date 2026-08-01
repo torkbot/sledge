@@ -25,7 +25,7 @@ runSqliteLedgerCloseContract({
   openCheckpointBlocker: async (databaseUrl) => {
     const database = new Database(databaseUrl, { timeout: 0 });
     database.exec("BEGIN");
-    database.prepare("SELECT COUNT(*) FROM events").get();
+    database.prepare("SELECT COUNT(*) FROM sledge_events").get();
 
     return {
       close: async () => {

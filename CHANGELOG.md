@@ -7,8 +7,9 @@
   `LedgerHistoryExpiredError`, and no event rows are physically deleted.
   Event streams discover expiration performed by peer runtimes, including
   while a previously read batch is being consumed. Opening an older database
-  advances its storage protocol so runtimes that ignore the boundary cannot
-  subsequently open it.
+  advances its storage protocol and moves event storage to a v3-only physical
+  name. Older runtimes already open fail their next event read or write, while
+  later opens reject the v3 protocol marker.
 - Add durable queue `control.deferUntil(availableAtMs)` for successful,
   non-retry deferral to an absolute runtime-clock deadline, including clean
   attempt/WorkRef semantics, restart-safe non-idle scheduling, prompt peer

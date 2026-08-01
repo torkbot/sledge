@@ -654,7 +654,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             await database
               .prepare(
                 `SELECT event_name
-                 FROM events
+                 FROM sledge_events
                  ORDER BY event_id`,
               )
               .all(),

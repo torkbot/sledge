@@ -3,6 +3,7 @@ import type {
   ProjectionForeignKeyAction,
   ProjectionForeignKeyMetadata,
 } from "./projections.ts";
+import { ledgerEventTableName } from "./internal-storage.ts";
 import type {
   ProjectionCompiledSql,
   ProjectionCompilerAddColumnStatement,
@@ -247,7 +248,7 @@ function compileEventReadStatement(
   }
 
   const query: KyselyProjectionOperationNode = {
-    from: fromNode([tableNode("events")]),
+    from: fromNode([tableNode(ledgerEventTableName)]),
     kind: "SelectQueryNode",
     selections: projectionEventRowColumnNames.map((columnName) =>
       selectionNode(referenceNode(null, columnName)),
@@ -282,7 +283,7 @@ function compileEventRefSelectStatement(
           kind: "OnNode",
           on: andOperationNodes([
             binaryOperationNode(
-              referenceNode("events", "event_id"),
+              referenceNode(ledgerEventTableName, "event_id"),
               "=",
               referenceNode(
                 statement.fromTableName,
@@ -290,25 +291,28 @@ function compileEventRefSelectStatement(
               ),
             ),
             binaryOperationNode(
-              referenceNode("events", "event_name"),
+              referenceNode(ledgerEventTableName, "event_name"),
               "=",
               valueNode(statement.eventName),
             ),
             binaryOperationNode(
-              referenceNode("events", "signal"),
+              referenceNode(ledgerEventTableName, "signal"),
               "=",
               valueNode(0),
             ),
           ]),
         },
-        table: tableNode("events"),
+        table: tableNode(ledgerEventTableName),
       },
     ],
     kind: "SelectQueryNode",
     selections: [
       ...projectionEventRowColumnNames.map((columnName) =>
         selectionNode(
-          aliasNode(referenceNode("events", columnName), columnName),
+          aliasNode(
+            referenceNode(ledgerEventTableName, columnName),
+            columnName,
+          ),
         ),
       ),
       selectionNode(
@@ -350,7 +354,7 @@ function compileEventScanStatement(
   statement: ProjectionCompilerEventScanStatement,
 ): ProjectionCompiledSql {
   let query: KyselyProjectionOperationNode = {
-    from: fromNode([tableNode("events")]),
+    from: fromNode([tableNode(ledgerEventTableName)]),
     kind: "SelectQueryNode",
     orderBy: orderByNode([
       {
@@ -383,7 +387,7 @@ function compileEventIdBoundsStatement(
   statement: ProjectionCompilerEventIdBoundsStatement,
 ): ProjectionCompiledSql {
   return compileQuery(input.queryCompiler, {
-    from: fromNode([tableNode("events")]),
+    from: fromNode([tableNode(ledgerEventTableName)]),
     kind: "SelectQueryNode",
     selections: [
       selectionNode(
@@ -422,7 +426,7 @@ function compileLatestEventRefsByPayloadStatement(
   );
 
   return compileQuery(input.queryCompiler, {
-    from: fromNode([tableNode("events")]),
+    from: fromNode([tableNode(ledgerEventTableName)]),
     groupBy: groupByNode([referenceNode(null, "payload_value")]),
     kind: "SelectQueryNode",
     selections: [

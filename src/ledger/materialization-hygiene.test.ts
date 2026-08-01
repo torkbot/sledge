@@ -637,7 +637,7 @@ function createStorageStatement(
         sql,
       });
 
-      if (sql === "PRAGMA table_info(events)") {
+      if (sql === "PRAGMA table_info(sledge_events)") {
         return createTableInfoRows([
           "event_id",
           "ts_ms",

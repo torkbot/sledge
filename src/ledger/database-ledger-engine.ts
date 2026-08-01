@@ -10,6 +10,7 @@ import { ChangeSignal, raceWithSignal } from "../runtime/async-signals.ts";
 import { createEventRef } from "./event-ref.ts";
 import {
   composedLedgerModulesBrand,
+  ledgerEventTableName,
   readLedgerProjectionCompiler,
   readLedgerProjectionSchemas,
   readLedgerImplementations,
@@ -202,6 +203,7 @@ type StorageRow = LedgerStorageRow;
 const materializationVersionTableName = "sledge_materialization_versions";
 const historyTableName = "sledge_history";
 const storageLayoutTableName = "sledge_storage_layout";
+const legacyEventTableName = "events";
 const storageLayoutVersion = 3;
 const queueProvenanceStorageLayoutVersion = 2;
 const composableStorageLayoutVersion = 1;
@@ -294,6 +296,24 @@ function createWorkTableSql(
           AND lease_protocol_version = ${queueProvenanceLeaseProtocolVersion}
         )
       )
+    );
+  `;
+}
+
+function createEventTableSql(
+  tableName: typeof ledgerEventTableName | typeof legacyEventTableName,
+): string {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts_ms INTEGER NOT NULL,
+      event_name TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      outcome_json TEXT,
+      causation_event_id INTEGER,
+      causation_work_json TEXT,
+      dedupe_key TEXT UNIQUE,
+      signal INTEGER NOT NULL DEFAULT 0
     );
   `;
 }
@@ -1401,19 +1421,14 @@ function openDatabaseLedgerEngine<
             moduleIds,
           );
         });
+        const startupEventTableName =
+          startingStorageLayoutVersion === storageLayoutVersion
+            ? ledgerEventTableName
+            : legacyEventTableName;
+
         await storage.write(async (database) => {
           await database.exec(`
-      CREATE TABLE IF NOT EXISTS events (
-        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_ms INTEGER NOT NULL,
-        event_name TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        outcome_json TEXT,
-        causation_event_id INTEGER,
-        causation_work_json TEXT,
-        dedupe_key TEXT UNIQUE,
-        signal INTEGER NOT NULL DEFAULT 0
-      );
+      ${createEventTableSql(startupEventTableName)}
 
       CREATE TABLE IF NOT EXISTS ${historyTableName} (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1432,9 +1447,17 @@ function openDatabaseLedgerEngine<
     `);
         });
 
-        await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
-        await ensureColumn("events", "outcome_json", "TEXT");
-        await ensureColumn("events", "causation_work_json", "TEXT");
+        await ensureColumn(
+          startupEventTableName,
+          "signal",
+          "INTEGER NOT NULL DEFAULT 0",
+        );
+        await ensureColumn(startupEventTableName, "outcome_json", "TEXT");
+        await ensureColumn(
+          startupEventTableName,
+          "causation_work_json",
+          "TEXT",
+        );
         await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
@@ -1713,10 +1736,15 @@ function openDatabaseLedgerEngine<
             `SELECT name
              FROM sqlite_schema
              WHERE type = 'table'
-               AND name IN (?, ?, ?)
+               AND name IN (?, ?, ?, ?)
              LIMIT 1`,
           )
-          .get("events", "work", materializationVersionTableName);
+          .get(
+            legacyEventTableName,
+            ledgerEventTableName,
+            "work",
+            materializationVersionTableName,
+          );
 
         if (legacyTable !== undefined) {
           throw new Error(
@@ -1946,10 +1974,14 @@ function openDatabaseLedgerEngine<
         );
       }
 
-      // History expiration changes the meaning of every event-stream read.
-      // Advancing the durable protocol marker prevents an older runtime that
-      // ignores sledge_history from opening the database and exposing expired
-      // events after this runtime has established the boundary.
+      // Publish the new physical name and protocol marker atomically. Removing
+      // the v2 table name invalidates already-open legacy runtimes at their
+      // next event read or write; the marker rejects legacy runtimes that open
+      // after this transaction commits.
+      await database.exec(
+        `ALTER TABLE ${legacyEventTableName} RENAME TO ${ledgerEventTableName}`,
+      );
+
       await database
         .prepare(
           `UPDATE ${storageLayoutTableName}
@@ -1966,7 +1998,10 @@ function openDatabaseLedgerEngine<
   }
 
   async function ensureColumn(
-    tableName: "events" | "work",
+    tableName:
+      | typeof ledgerEventTableName
+      | typeof legacyEventTableName
+      | "work",
     columnName: string,
     definition: string,
   ): Promise<void> {
@@ -2862,7 +2897,7 @@ function openDatabaseLedgerEngine<
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (
+          `INSERT INTO ${ledgerEventTableName} (
              ts_ms,
              event_name,
              payload_json,
@@ -2886,7 +2921,7 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (
+          `INSERT INTO ${ledgerEventTableName} (
              ts_ms,
              event_name,
              payload_json,
@@ -2922,7 +2957,7 @@ function openDatabaseLedgerEngine<
                causation_event_id,
                causation_work_json,
                dedupe_key
-             FROM events
+             FROM ${ledgerEventTableName}
              WHERE dedupe_key = ?
                AND signal = 0`,
           )
@@ -3180,7 +3215,11 @@ function openDatabaseLedgerEngine<
       }
 
       const outcomeUpdate = await database
-        .prepare(`UPDATE events SET outcome_json = ? WHERE event_id = ?`)
+        .prepare(
+          `UPDATE ${ledgerEventTableName}
+           SET outcome_json = ?
+           WHERE event_id = ?`,
+        )
         .run(outcomeJson, eventId);
 
       if (outcomeUpdate.changes !== 1) {
@@ -3311,7 +3350,7 @@ function openDatabaseLedgerEngine<
     if (signalInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (
+          `INSERT INTO ${ledgerEventTableName} (
              ts_ms,
              event_name,
              payload_json,
@@ -3335,7 +3374,7 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO events (
+          `INSERT INTO ${ledgerEventTableName} (
              ts_ms,
              event_name,
              payload_json,
@@ -3361,7 +3400,11 @@ function openDatabaseLedgerEngine<
         eventId = Number(eventInsert.lastInsertRowid);
       } else {
         const existing = await database
-          .prepare(`SELECT event_id FROM events WHERE dedupe_key = ?`)
+          .prepare(
+            `SELECT event_id
+             FROM ${ledgerEventTableName}
+             WHERE dedupe_key = ?`,
+          )
           .get(signalInput.dedupeKey);
 
         if (existing === undefined) {
@@ -3482,7 +3525,11 @@ function openDatabaseLedgerEngine<
 
     if (queued.length === 0) {
       await database
-        .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
+        .prepare(
+          `DELETE FROM ${ledgerEventTableName}
+           WHERE event_id = ?
+             AND signal = 1`,
+        )
         .run(eventId);
     }
 
@@ -3754,7 +3801,7 @@ function openDatabaseLedgerEngine<
              causation_event_id,
              causation_work_json,
              dedupe_key
-           FROM events
+           FROM ${ledgerEventTableName}
            WHERE signal = 0
              AND event_id > ?
              AND event_id <= ?
@@ -3785,7 +3832,7 @@ function openDatabaseLedgerEngine<
              causation_event_id,
              causation_work_json,
              dedupe_key
-           FROM events
+           FROM ${ledgerEventTableName}
            WHERE signal = 0
              AND event_id > ?
              AND event_id <= ?
@@ -3841,7 +3888,7 @@ function openDatabaseLedgerEngine<
              expired_through_event_id,
              (
                SELECT COALESCE(MAX(event_id), 0)
-               FROM events
+               FROM ${ledgerEventTableName}
                WHERE signal = 0
              )
            ) AS latest_event_id
@@ -4747,7 +4794,9 @@ function openDatabaseLedgerEngine<
               if (remainingSignalWork === undefined) {
                 await database
                   .prepare(
-                    `DELETE FROM events WHERE event_id = ? AND signal = 1`,
+                    `DELETE FROM ${ledgerEventTableName}
+                     WHERE event_id = ?
+                       AND signal = 1`,
                   )
                   .run(claimed.sourceEventId);
               }
@@ -5426,7 +5475,7 @@ function openDatabaseLedgerEngine<
                AND expired_through_event_id < ?
                AND EXISTS (
                  SELECT 1
-                 FROM events
+                 FROM ${ledgerEventTableName}
                  WHERE event_id = ?
                    AND signal = 0
                )`,

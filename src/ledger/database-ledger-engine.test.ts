@@ -865,7 +865,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
       queries: {
         eventCount: async () => {
           const row = await wrapBetterSqliteDatabase(database)
-            .prepare("SELECT COUNT(*) AS count FROM events")
+            .prepare("SELECT COUNT(*) AS count FROM sledge_events")
             .get();
 
           return row;
@@ -926,7 +926,7 @@ test("event-handler query actions expire after handler completion", async () => 
         eventCount: async () => {
           queryInvocations += 1;
           const row = await wrapBetterSqliteDatabase(database)
-            .prepare("SELECT COUNT(*) AS count FROM events")
+            .prepare("SELECT COUNT(*) AS count FROM sledge_events")
             .get();
 
           return row;
@@ -1052,7 +1052,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
   assert.equal(rolledBack, true);
 
   const row = await storage
-    .prepare("SELECT COUNT(*) AS count FROM events")
+    .prepare("SELECT COUNT(*) AS count FROM sledge_events")
     .get();
 
   assert.deepEqual(row, { count: 0 });
@@ -2770,7 +2770,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
   assert.equal(
     readCount(
       database,
-      `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+      `SELECT COUNT(*) as total FROM sledge_events WHERE signal = 1`,
     ),
     1,
   );
@@ -2807,7 +2807,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
     return (
       readCount(
         database,
-        `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+        `SELECT COUNT(*) as total FROM sledge_events WHERE signal = 1`,
       ) === 0 &&
       readCount(
         database,
@@ -2921,7 +2921,7 @@ test("queue emissions require an unexpired authenticated lease", async () => {
     database
       .prepare(
         `SELECT COUNT(*)
-         FROM events
+         FROM sledge_events
          WHERE event_id > ?`,
       )
       .pluck()
@@ -3010,7 +3010,7 @@ test("queue handlers publish signals immediately before handler completion", asy
   assert.equal(
     readCount(
       database,
-      `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
+      `SELECT COUNT(*) as total FROM sledge_events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
     ),
     0,
   );
@@ -3023,7 +3023,7 @@ test("queue handlers publish signals immediately before handler completion", asy
   assert.equal(
     readCount(
       database,
-      `SELECT COUNT(*) as total FROM events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
+      `SELECT COUNT(*) as total FROM sledge_events WHERE signal = 1 AND event_id = ${observedSignalEventId}`,
     ),
     0,
   );
@@ -3122,7 +3122,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
   assert.equal(
     readCount(
       database,
-      `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+      `SELECT COUNT(*) as total FROM sledge_events WHERE signal = 1`,
     ),
     1,
   );
@@ -3137,7 +3137,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
     return (
       readCount(
         database,
-        `SELECT COUNT(*) as total FROM events WHERE signal = 1`,
+        `SELECT COUNT(*) as total FROM sledge_events WHERE signal = 1`,
       ) === 0 &&
       readCount(
         database,
@@ -3175,7 +3175,7 @@ test("event consumers abort while a storage read is still pending", async () => 
     prepare: (sql): StorageStatement => {
       const statement = storage.prepare(sql);
 
-      if (sql.includes("FROM events") && sql.includes("event_id > ?")) {
+      if (sql.includes("FROM sledge_events") && sql.includes("event_id > ?")) {
         return {
           run: statement.run,
           get: statement.get,
@@ -4485,7 +4485,9 @@ test("storage metadata migration adds event and work columns before indexes", as
 
   await ledger.emit("job.requested", { id: 1 });
 
-  const eventColumns = database.prepare("PRAGMA table_info(events)").all();
+  const eventColumns = database
+    .prepare("PRAGMA table_info(sledge_events)")
+    .all();
   const eventColumnNames = eventColumns.map((row) => {
     return (row as { readonly name?: unknown }).name;
   });
@@ -4496,7 +4498,7 @@ test("storage metadata migration adds event and work columns before indexes", as
       database
         .prepare(
           `SELECT causation_work_json
-           FROM events
+           FROM sledge_events
            WHERE dedupe_key = ?`,
         )
         .get("legacy-event") as
@@ -4571,6 +4573,7 @@ test("opening a version 2 database establishes the history protocol and fences o
   const databaseUrl = createTempDatabasePath();
   const seedDatabase = new Database(databaseUrl);
 
+  seedDatabase.pragma("journal_mode = WAL");
   seedDatabase.exec(`
     CREATE TABLE sledge_storage_layout (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -4580,8 +4583,22 @@ test("opening a version 2 database establishes the history protocol and fences o
 
     INSERT INTO sledge_storage_layout (singleton, version, module_ids_json)
     VALUES (1, 2, '["engine.fixture"]');
+
+    CREATE TABLE events (
+      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts_ms INTEGER NOT NULL,
+      event_name TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      outcome_json TEXT,
+      causation_event_id INTEGER,
+      causation_work_json TEXT,
+      dedupe_key TEXT UNIQUE,
+      signal INTEGER NOT NULL DEFAULT 0
+    );
   `);
-  seedDatabase.close();
+  const alreadyOpenLegacyRead = seedDatabase.prepare(
+    "SELECT event_id FROM events ORDER BY event_id ASC",
+  );
 
   const model = defineEngineFixtureModel({
     events: {
@@ -4593,6 +4610,8 @@ test("opening a version 2 database establishes the history protocol and fences o
     register: {},
   });
 
+  let expiredEventId = 0;
+
   {
     await using ledger = createBetterSqliteLedger({
       databaseUrl,
@@ -4600,14 +4619,33 @@ test("opening a version 2 database establishes the history protocol and fences o
       timing: { clock: runtime.clock, scheduler: runtime.scheduler },
     });
 
-    await ledger.emit("job.requested", { id: 1 });
-  }
+    const expiredEvent = await ledger.emit("job.requested", { id: 1 });
+    await ledger.emit("job.requested", { id: 2 });
+    expiredEventId = expiredEvent.eventId;
 
-  const upgradedDatabase = new Database(databaseUrl, { readonly: true });
+    const tailAbortController = new AbortController();
+    const tailIterator = ledger
+      .tailEvents({
+        last: 2,
+        signal: tailAbortController.signal,
+      })
+      [Symbol.asyncIterator]();
+    const first = await nextWithTimeout(tailIterator);
+
+    assert.equal(first.done, false);
+
+    if (first.done) {
+      assert.fail("expected event cursor for expiration");
+    }
+
+    await ledger.expireHistory({ through: first.value.cursor });
+    tailAbortController.abort();
+    await tailIterator.return?.();
+  }
 
   try {
     assert.deepEqual(
-      upgradedDatabase
+      seedDatabase
         .prepare(
           `SELECT version
            FROM sledge_storage_layout
@@ -4619,7 +4657,7 @@ test("opening a version 2 database establishes the history protocol and fences o
       },
     );
     assert.deepEqual(
-      upgradedDatabase
+      seedDatabase
         .prepare(
           `SELECT expired_through_event_id
            FROM sledge_history
@@ -4627,11 +4665,16 @@ test("opening a version 2 database establishes the history protocol and fences o
         )
         .get(),
       {
-        expired_through_event_id: 0,
+        expired_through_event_id: expiredEventId,
       },
     );
+    assert.equal(
+      seedDatabase.prepare("SELECT COUNT(*) FROM sledge_events").pluck().get(),
+      2,
+    );
+    assert.throws(() => alreadyOpenLegacyRead.all(), /no such table: events/);
   } finally {
-    upgradedDatabase.close();
+    seedDatabase.close();
     await rm(databaseUrl, { force: true });
   }
 });

@@ -876,8 +876,9 @@ backward.
 Event streams discover appends and expiration from other handles immediately
 within the same process and poll through the injected `RuntimeScheduler` for
 changes made by another process. Opening a version 2 database upgrades its
-storage protocol to version 3 after establishing the history boundary. Older
-Sledge runtimes then reject the database instead of exposing expired events.
+storage protocol to version 3 and atomically moves event storage to a v3-only
+physical name. Already-open older runtimes fail their next event read or write;
+later opens reject the database instead of exposing expired events.
 
 Expiration is a logical stream boundary. It does not delete event rows,
 reclaim storage, or change projections, deduplication, and event-reference
