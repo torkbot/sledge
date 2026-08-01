@@ -164,6 +164,7 @@ runLedgerContractSuite({
           sourceEventId,
         }),
       getSeenSourceEventIds: () => ledger.query("seenSourceEventIds", {}),
+      getObservedMessages: () => ledger.query("observedMessages", {}),
     };
   },
 });

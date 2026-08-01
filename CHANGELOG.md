@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add typed `selectEvent(...)` projection reads that dereference non-null event
+  refs in one storage statement while preserving projection order and duplicate
+  refs, with missing or mismatched events reported as storage corruption.
 - Add engine-authored `causationWork` metadata to durable event envelopes so
   projections and replay consumers can authenticate the exact module, queue,
   work item, and attempt that emitted a fact. Existing and public emissions

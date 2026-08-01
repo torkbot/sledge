@@ -1073,6 +1073,39 @@ test(
       },
     );
     assert.deepEqual(
+      compiler.compileEventRefSelect({
+        eventName: "input.appended",
+        eventRefColumnName: "source",
+        fromTableName: "pendingInputs",
+        limit: 25,
+        orderBy: [
+          {
+            column: {
+              columnName: "sequence",
+              tableName: "pendingInputs",
+            },
+            direction: "asc",
+            kind: "column",
+          },
+        ],
+        where: [
+          {
+            column: {
+              columnName: "laneId",
+              tableName: "pendingInputs",
+            },
+            kind: "comparison",
+            operator: "=",
+            value: "lane-1",
+          },
+        ],
+      }),
+      {
+        params: ["input.appended", 0, "lane-1", 25],
+        text: 'select "events"."event_id" as "event_id", "events"."ts_ms" as "ts_ms", "events"."event_name" as "event_name", "events"."payload_json" as "payload_json", "events"."causation_event_id" as "causation_event_id", "events"."causation_work_json" as "causation_work_json", "events"."dedupe_key" as "dedupe_key", "pendingInputs"."source" as "__sledge_event_ref_id" from "pendingInputs" left join "events" on "events"."event_id" = "pendingInputs"."source" and "events"."event_name" = ? and "events"."signal" = ? where "pendingInputs"."laneId" = ? order by "pendingInputs"."sequence" asc limit ?',
+      },
+    );
+    assert.deepEqual(
       compiler.compileInsert({
         columns: ["userId", "email"],
         conflict: null,

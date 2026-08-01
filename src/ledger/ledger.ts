@@ -92,6 +92,7 @@ const sqliteInternalMaterializationNamePrefix = "sqlite_";
 
 export type {
   ProjectionAggregateBuilder,
+  ProjectionExecutableEventSelect,
   ProjectionExecutableSelect,
   ProjectionExecutableUnionSelect,
   ProjectionExecutableJoinedSelect,
@@ -5101,6 +5102,11 @@ function createModuleProjectionStatementCompiler(
     compileEventRead: (statement) =>
       compiler.compileEventRead({
         ...statement,
+        eventName: physicalStreamName("event", statement.eventName),
+      }),
+    compileEventRefSelect: (statement) =>
+      compiler.compileEventRefSelect({
+        ...namespaceProjectionStatementTables(moduleId, statement),
         eventName: physicalStreamName("event", statement.eventName),
       }),
     compileEventIdBounds: (statement) =>

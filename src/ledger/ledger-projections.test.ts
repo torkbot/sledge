@@ -3424,6 +3424,173 @@ test("projection access hydrates semantic event references without exposing even
   ]);
 });
 
+test("projection access selects referenced events in one ordered storage query", async () => {
+  const eventMaterializations = defineMaterialization(shape, {
+    namespace: "selected-events",
+  })
+    .version(1, "create pending inputs", (s) =>
+      s.createTable("pendingInputs", (t) =>
+        t
+          .columns({
+            inputId: t.text().notNull(),
+            optionalSource: t.eventRef("user.created"),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["inputId"]),
+      ),
+    )
+    .define({
+      indexers: {},
+      queries: {
+        pendingInputEvents: {
+          params: Type.Object({}),
+          result: Type.Array(UserCreatedSchema),
+        },
+        optionalSourceEvents: {
+          params: Type.Object({}),
+          result: Type.Array(UserCreatedSchema),
+        },
+      },
+    });
+  const eventModel = withMaterializations(
+    shape,
+    eventMaterializations,
+  ).register({
+    queries: {
+      pendingInputEvents: async ({ db }) => {
+        const events = await db
+          .selectFrom("pendingInputs")
+          .selectEvent("source")
+          .orderBy("inputId", "desc")
+          .execute();
+
+        return events.map((event) => event.payload);
+      },
+      optionalSourceEvents: async ({ db }) => {
+        const events = await db
+          .selectFrom("pendingInputs")
+          // @ts-expect-error nullable event refs require caller-defined absence semantics.
+          .selectEvent("optionalSource")
+          .execute();
+
+        return events.map((event) => event.payload);
+      },
+    },
+  });
+  const pendingInputEvents =
+    readTestLedgerImplementations(eventModel).queries?.pendingInputEvents;
+  const optionalSourceEvents =
+    readTestLedgerImplementations(eventModel).queries?.optionalSourceEvents;
+
+  if (pendingInputEvents === undefined) {
+    throw new Error("expected pendingInputEvents query implementation");
+  }
+
+  if (optionalSourceEvents === undefined) {
+    throw new Error("expected optionalSourceEvents query implementation");
+  }
+
+  const fake = createFakeScope({
+    allRows: [
+      {
+        __sledge_event_ref_id: 43,
+        causation_event_id: null,
+        causation_work_json: null,
+        dedupe_key: null,
+        event_id: 43,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_456",
+          email: "bob@example.com",
+        }),
+        ts_ms: 1_100,
+      },
+      {
+        __sledge_event_ref_id: 42,
+        causation_event_id: null,
+        causation_work_json: null,
+        dedupe_key: null,
+        event_id: 42,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_123",
+          email: "alice@example.com",
+        }),
+        ts_ms: 1_000,
+      },
+      {
+        __sledge_event_ref_id: 42,
+        causation_event_id: null,
+        causation_work_json: null,
+        dedupe_key: null,
+        event_id: 42,
+        event_name: "user.created",
+        payload_json: JSON.stringify({
+          userId: "u_123",
+          email: "alice@example.com",
+        }),
+        ts_ms: 1_000,
+      },
+    ],
+    getRow: undefined,
+  });
+
+  assert.deepEqual(await pendingInputEvents(fake.scope, {}), [
+    {
+      userId: "u_456",
+      email: "bob@example.com",
+    },
+    {
+      userId: "u_123",
+      email: "alice@example.com",
+    },
+    {
+      userId: "u_123",
+      email: "alice@example.com",
+    },
+  ]);
+  assert.deepEqual(fake.calls, [
+    {
+      method: "all",
+      params: ["user.created", 0],
+      sql: 'SELECT "events"."event_id" AS "event_id", "events"."ts_ms" AS "ts_ms", "events"."event_name" AS "event_name", "events"."payload_json" AS "payload_json", "events"."causation_event_id" AS "causation_event_id", "events"."causation_work_json" AS "causation_work_json", "events"."dedupe_key" AS "dedupe_key", "pendingInputs"."source" AS "__sledge_event_ref_id" FROM "pendingInputs" LEFT JOIN "events" ON "events"."event_id" = "pendingInputs"."source" AND "events"."event_name" = ? AND "events"."signal" = ? ORDER BY "pendingInputs"."inputId" DESC',
+    },
+  ]);
+
+  const missingEventFake = createFakeScope({
+    allRows: [
+      {
+        __sledge_event_ref_id: 99,
+        causation_event_id: null,
+        causation_work_json: null,
+        dedupe_key: null,
+        event_id: null,
+        event_name: null,
+        payload_json: null,
+        ts_ms: null,
+      },
+    ],
+    getRow: undefined,
+  });
+
+  await assert.rejects(
+    async () => pendingInputEvents(missingEventFake.scope, {}),
+    /pendingInputs\.source references missing user\.created event 99/,
+  );
+  assert.equal(missingEventFake.calls.length, 1);
+
+  const nullableRefFake = createFakeScope({
+    allRows: [],
+    getRow: undefined,
+  });
+
+  await assert.rejects(
+    async () => optionalSourceEvents(nullableRefFake.scope, {}),
+    /pendingInputs\.optionalSource must be non-null/,
+  );
+  assert.deepEqual(nullableRefFake.calls, []);
+});
+
 test("projection access scans semantic signals without exposing events table", async () => {
   const signalShape = defineLedgerShape({
     moduleId: "projection.signal-tests",
@@ -5548,6 +5715,26 @@ async function assertLedgerProjectionTypes(): Promise<void> {
           const userId: string = firstEvent.payload.userId;
           void userId;
         }
+
+        const selectedSourceEvents = await db
+          .selectFrom("users")
+          .selectEvent("source")
+          .orderBy("userId", "asc")
+          .execute();
+        const selectedSourceEvent = selectedSourceEvents[0];
+
+        if (selectedSourceEvent !== undefined) {
+          const sourceUserId: string = selectedSourceEvent.payload.userId;
+          // @ts-expect-error selected event payloads retain the referenced event schema.
+          const sourceSessionId: string = selectedSourceEvent.payload.sessionId;
+
+          void sourceUserId;
+          void sourceSessionId;
+        }
+
+        db.selectFrom("users")
+          // @ts-expect-error selectEvent only accepts non-null event-ref columns.
+          .selectEvent("email");
 
         // @ts-expect-error batch event reads must reference known ledger events.
         db.readEvents([createEventRef("session.created", 1)]);

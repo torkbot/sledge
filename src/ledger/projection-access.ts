@@ -20,6 +20,7 @@ import type {
   ProjectionCompilerColumnReference,
   ProjectionCompilerEventStreamKind,
   ProjectionCompilerEventPayloadWhereClause,
+  ProjectionCompilerEventRefSelectStatement,
   ProjectionCompilerExpression,
   ProjectionCompilerJoinClause,
   ProjectionCompilerOrderClause,
@@ -28,6 +29,7 @@ import type {
   ProjectionStatementCompiler,
   ProjectionCompilerWhereClause,
 } from "./projection-sql-compiler.ts";
+import { projectionEventRefIdColumnAlias } from "./projection-sql-compiler.ts";
 import {
   type ProjectionColumn,
   type ProjectionColumnMetadata,
@@ -63,6 +65,9 @@ const ProjectionEventRowSchema = Type.Object({
   event_name: Type.String(),
   payload_json: Type.String(),
   ts_ms: Type.Number(),
+});
+const ProjectionSelectedEventRefRowSchema = Type.Object({
+  [projectionEventRefIdColumnAlias]: Type.Integer({ minimum: 1 }),
 });
 const ProjectionEventCausationWorkSchema = Type.Object(
   {
@@ -586,6 +591,29 @@ type ProjectionNullableColumnName<TTable> = {
     : never;
 }[ProjectionTableColumnName<TTable>];
 
+type ProjectionEventNameByColumn<TTable> = {
+  readonly [TColumnName in ProjectionTableColumnName<TTable>]: ProjectionTableColumns<TTable>[TColumnName] extends ProjectionColumn<
+    "event_ref",
+    infer TValue,
+    false
+  >
+    ? TValue extends EventRef<infer TEventName>
+      ? Extract<TEventName, string>
+      : never
+    : never;
+};
+
+type ProjectionNotNullEventRefColumnName<TTable> = {
+  readonly [TColumnName in ProjectionTableColumnName<TTable>]: ProjectionEventNameByColumn<TTable>[TColumnName] extends never
+    ? never
+    : TColumnName;
+}[ProjectionTableColumnName<TTable>];
+
+type ProjectionEventNameForColumn<
+  TTable,
+  TColumnName extends ProjectionNotNullEventRefColumnName<TTable>,
+> = ProjectionEventNameByColumn<TTable>[TColumnName];
+
 type ProjectionIntegerAggregateValue<
   TTable,
   TColumnName extends ProjectionIntegerColumnName<TTable>,
@@ -706,6 +734,7 @@ export type ProjectionDeleteBuilder<TTable> = ProjectionExecutableWrite & {
 export type ProjectionSelectBuilder<
   TTables,
   TFromTableName extends ProjectionTableName<TTables>,
+  TEvents extends Record<string, TSchema>,
 > = {
   aggregate(): ProjectionAggregateBuilder<
     TTables[TFromTableName],
@@ -739,6 +768,20 @@ export type ProjectionSelectBuilder<
     TJoinedTableName,
     TJoinedTableName
   >;
+  selectEvent<
+    const TColumnName extends ProjectionNotNullEventRefColumnName<
+      TTables[TFromTableName]
+    >,
+  >(
+    columnName: TColumnName,
+  ): ProjectionExecutableEventSelect<
+    TTables[TFromTableName],
+    TEvents,
+    Extract<
+      ProjectionEventNameForColumn<TTables[TFromTableName], TColumnName>,
+      Extract<keyof TEvents, string>
+    >
+  >;
   select<
     const TColumnNames extends readonly ProjectionTableColumnName<
       TTables[TFromTableName]
@@ -751,6 +794,27 @@ export type ProjectionSelectBuilder<
     TTables,
     TFromTableName
   >;
+};
+
+export type ProjectionExecutableEventSelect<
+  TTable,
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+> = {
+  limit(
+    limit: number,
+  ): ProjectionExecutableEventSelect<TTable, TEvents, TEventName>;
+  orderBy<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    direction?: ProjectionOrderDirection,
+  ): ProjectionExecutableEventSelect<TTable, TEvents, TEventName>;
+  where<const TColumnName extends ProjectionTableColumnName<TTable>>(
+    columnName: TColumnName,
+    operator: ProjectionWhereOperator,
+    value: ProjectionWhereValue<TTable, TColumnName>,
+  ): ProjectionExecutableEventSelect<TTable, TEvents, TEventName>;
+  execute(): Promise<readonly EventEnvelope<TEvents, TEventName>[]>;
+  executeTakeFirst(): Promise<EventEnvelope<TEvents, TEventName> | null>;
 };
 
 export type ProjectionJoinedSelectBuilder<
@@ -1100,7 +1164,8 @@ export type ProjectionReadDatabase<
     tableName: TTableName,
   ): ProjectionSelectBuilder<
     ProjectionSchemaTables<TProjectionSchema>,
-    TTableName
+    TTableName,
+    TEvents
   >;
   unionAll<
     const TArms extends readonly [
@@ -2325,8 +2390,13 @@ function createProjectionReadDatabase<
     },
     selectFrom: (tableName) => {
       const table = readProjectionTable(metadata, String(tableName));
+      type SelectBuilder = ProjectionSelectBuilder<
+        ProjectionSchemaTables<TProjectionSchema>,
+        typeof tableName,
+        TEvents
+      >;
 
-      return {
+      const builder: SelectBuilder = {
         aggregate: () => {
           return createProjectionAggregateBuilder(
             metadata,
@@ -2377,6 +2447,29 @@ function createProjectionReadDatabase<
             statementCompiler,
           );
         },
+        // Runtime metadata carries the event name as data, while the public
+        // method preserves the corresponding column/event relationship as a
+        // generic. readProjectionEventRefSelection validates that relationship
+        // before constructing an executable selection.
+        selectEvent: ((columnName: string) => {
+          const eventName = readProjectionEventRefSelection(
+            events,
+            table,
+            columnName,
+          );
+
+          return createProjectionExecutableEventSelect(
+            scope,
+            events,
+            table,
+            columnName,
+            eventName,
+            [],
+            [],
+            null,
+            statementCompiler,
+          );
+        }) as SelectBuilder["selectEvent"],
         select: (columns) => {
           validateProjectionColumns("selected columns", table, columns);
 
@@ -2397,6 +2490,8 @@ function createProjectionReadDatabase<
           );
         },
       };
+
+      return builder;
     },
   };
 }
@@ -2868,6 +2963,119 @@ function createProjectionJoinedSelectBuilder<
         null,
         statementCompiler,
       );
+    },
+  };
+}
+
+function createProjectionExecutableEventSelect<
+  TTable,
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  scope: LedgerStorageScope,
+  events: TEvents,
+  table: ProjectionTableMetadata,
+  eventRefColumnName: string,
+  eventName: TEventName,
+  whereClauses: readonly ProjectionWhereClause[],
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
+  statementCompiler: ProjectionStatementCompiler,
+): ProjectionExecutableEventSelect<TTable, TEvents, TEventName> {
+  const createNext = (
+    nextWhereClauses: readonly ProjectionWhereClause[],
+    nextOrderClauses: readonly ProjectionOrderClause[],
+    nextLimitClause: number | null,
+  ) => {
+    return createProjectionExecutableEventSelect<TTable, TEvents, TEventName>(
+      scope,
+      events,
+      table,
+      eventRefColumnName,
+      eventName,
+      nextWhereClauses,
+      nextOrderClauses,
+      nextLimitClause,
+      statementCompiler,
+    );
+  };
+  const execute = async (
+    limit: number | null,
+  ): Promise<readonly EventEnvelope<TEvents, TEventName>[]> => {
+    const sql = buildEventRefSelectSql(
+      statementCompiler,
+      table,
+      eventRefColumnName,
+      eventName,
+      whereClauses,
+      orderClauses,
+      limit,
+    );
+    const rows = await scope.prepare(sql.text).all(...sql.params);
+
+    return rows.map((row) => {
+      return decodeProjectionSelectedEvent(
+        events,
+        table,
+        eventRefColumnName,
+        eventName,
+        statementCompiler,
+        row,
+      );
+    });
+  };
+
+  return {
+    limit: (limit) => {
+      validateProjectionLimit(limit);
+
+      return createNext(whereClauses, orderClauses, limit);
+    },
+    orderBy: (columnName, direction = "asc") => {
+      validateProjectionColumns("order column", table, [String(columnName)]);
+      validateProjectionOrderDirection(direction);
+
+      return createNext(
+        whereClauses,
+        [
+          ...orderClauses,
+          {
+            column: createProjectionColumnReference(
+              table.name,
+              String(columnName),
+            ),
+            direction,
+            kind: "column",
+          },
+        ],
+        limitClause,
+      );
+    },
+    where: (columnName, operator, value) => {
+      return createNext(
+        [
+          ...whereClauses,
+          createProjectionComparisonWhereClause(
+            table,
+            String(columnName),
+            operator,
+            value,
+            table.name,
+          ),
+        ],
+        orderClauses,
+        limitClause,
+      );
+    },
+    execute: () => execute(limitClause),
+    executeTakeFirst: async () => {
+      if (limitClause === 0) {
+        return null;
+      }
+
+      const [event] = await execute(1);
+
+      return event ?? null;
     },
   };
 }
@@ -3910,6 +4118,27 @@ function buildReadProjectionEventsSql(
   });
 }
 
+function buildEventRefSelectSql(
+  statementCompiler: ProjectionStatementCompiler,
+  table: ProjectionTableMetadata,
+  eventRefColumnName: string,
+  eventName: string,
+  whereClauses: readonly ProjectionWhereClause[],
+  orderClauses: readonly ProjectionOrderClause[],
+  limitClause: number | null,
+): CompiledProjectionSql {
+  const statement: ProjectionCompilerEventRefSelectStatement = {
+    eventName,
+    eventRefColumnName,
+    fromTableName: table.name,
+    limit: limitClause,
+    orderBy: orderClauses,
+    where: whereClauses,
+  };
+
+  return statementCompiler.compileEventRefSelect(statement);
+}
+
 function buildScanProjectionEventsSql(
   statementCompiler: ProjectionStatementCompiler,
   streamKind: ProjectionCompilerEventStreamKind,
@@ -4639,6 +4868,38 @@ function readProjectionTable(
   }
 
   return table;
+}
+
+function readProjectionEventRefSelection<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  events: TEvents,
+  table: ProjectionTableMetadata,
+  columnName: string,
+): TEventName {
+  validateProjectionColumns("event selection column", table, [columnName]);
+  const column = table.columns[columnName];
+
+  if (column?.kind !== "event_ref" || column.eventName === null) {
+    throw new Error(
+      `event selection column ${table.name}.${columnName} must be an event-ref column`,
+    );
+  }
+
+  if (column.nullable) {
+    throw new Error(
+      `event selection column ${table.name}.${columnName} must be non-null`,
+    );
+  }
+
+  if (events[column.eventName] === undefined) {
+    throw new Error(
+      `event selection column ${table.name}.${columnName} references unknown event ${column.eventName}`,
+    );
+  }
+
+  return column.eventName as TEventName;
 }
 
 function validateProjectionWriteRow(
@@ -5441,6 +5702,54 @@ function decodeProjectionEventRow<
     ref: typedRef,
     tsMs: decodedRow.ts_ms,
   };
+}
+
+function decodeProjectionSelectedEvent<
+  TEvents extends Record<string, TSchema>,
+  TEventName extends Extract<keyof TEvents, string>,
+>(
+  events: TEvents,
+  table: ProjectionTableMetadata,
+  eventRefColumnName: string,
+  eventName: TEventName,
+  statementCompiler: ProjectionStatementCompiler,
+  row: LedgerStorageRow,
+): EventEnvelope<TEvents, TEventName> {
+  const selectedRef = Value.Decode(ProjectionSelectedEventRefRowSchema, row);
+  const referencedEventId = selectedRef[projectionEventRefIdColumnAlias];
+
+  if (row["event_id"] === null || row["event_id"] === undefined) {
+    throw new Error(
+      `${table.name}.${eventRefColumnName} references missing ${eventName} event ${referencedEventId}`,
+    );
+  }
+
+  const eventSchema = events[eventName];
+
+  if (eventSchema === undefined) {
+    throw new Error(
+      `projection event selection references unknown event ${eventName}`,
+    );
+  }
+
+  const event = decodeProjectionEventRow(
+    eventSchema,
+    "event",
+    eventName,
+    statementCompiler.resolveStorageStreamName({
+      eventName,
+      streamKind: "event",
+    }),
+    row,
+  ) as EventEnvelope<TEvents, TEventName>;
+
+  if (event.eventId !== referencedEventId) {
+    throw new Error(
+      `${table.name}.${eventRefColumnName} references event ${referencedEventId} but storage returned event ${event.eventId}`,
+    );
+  }
+
+  return event;
 }
 
 function createProjectionEventReadKey(

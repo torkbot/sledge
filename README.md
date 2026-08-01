@@ -408,6 +408,24 @@ one storage round trip per row:
 const events = await db.readEvents(rows.map((row) => row.source));
 ```
 
+When the refs already live in one materialization table, select their events
+in the same storage statement:
+
+```ts
+const events = await db
+  .selectFrom("pendingInputs")
+  .selectEvent("source")
+  .where("laneId", "=", laneId)
+  .orderBy("sequence", "asc")
+  .execute();
+```
+
+`selectEvent(...)` accepts non-null `eventRef(...)` columns and returns typed,
+schema-decoded event envelopes. It preserves the projection row order and one
+result per projection row, including duplicate refs. A ref whose event is
+missing or belongs to a different event contract is reported as storage
+corruption instead of being silently omitted.
+
 Application-defined row priority can be expressed without raw `CASE` SQL:
 
 ```ts
