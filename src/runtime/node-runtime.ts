@@ -4,6 +4,8 @@ import type {
   RuntimeScheduler,
 } from "./contracts.ts";
 
+const maximumNodeTimerDelayMs = 2_147_483_647;
+
 /**
  * Production runtime clock implementation based on system wall time.
  */
@@ -30,10 +32,42 @@ class NodeScheduledTask implements RuntimeScheduledTask {
  */
 export class NodeRuntimeScheduler implements RuntimeScheduler {
   scheduleOnce(delayMs: number, task: () => void): RuntimeScheduledTask {
-    const handle = setTimeout(task, delayMs);
+    let cancelled = false;
+    let handle: ReturnType<typeof setTimeout> | null = null;
+    let remainingDelayMs = delayMs;
+
+    const scheduleNext = (): void => {
+      const scheduledDelayMs = Math.min(
+        remainingDelayMs,
+        maximumNodeTimerDelayMs,
+      );
+      handle = setTimeout(() => {
+        handle = null;
+
+        if (cancelled) {
+          return;
+        }
+
+        remainingDelayMs -= scheduledDelayMs;
+
+        if (remainingDelayMs > 0) {
+          scheduleNext();
+          return;
+        }
+
+        task();
+      }, scheduledDelayMs);
+    };
+
+    scheduleNext();
 
     return new NodeScheduledTask(() => {
-      clearTimeout(handle);
+      cancelled = true;
+
+      if (handle !== null) {
+        clearTimeout(handle);
+        handle = null;
+      }
     });
   }
 

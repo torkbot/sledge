@@ -39,3 +39,39 @@ test("NodeRuntimeScheduler scheduleOnce executes and cancel prevents execution",
 
   assert.deepEqual(observed, ["ran"]);
 });
+
+test("NodeRuntimeScheduler scheduleOnce preserves long delays and cancellation", (context) => {
+  context.mock.timers.enable({
+    apis: ["setTimeout"],
+  });
+
+  const scheduler = new NodeRuntimeScheduler();
+  const maximumTimerDelayMs = 2_147_483_647;
+  let calls = 0;
+
+  const scheduled = scheduler.scheduleOnce(maximumTimerDelayMs + 10, () => {
+    calls += 1;
+  });
+
+  context.mock.timers.tick(1);
+  assert.equal(calls, 0);
+
+  context.mock.timers.tick(maximumTimerDelayMs - 1);
+  assert.equal(calls, 0);
+
+  scheduled.cancel();
+  context.mock.timers.tick(10);
+  assert.equal(calls, 0);
+
+  scheduler.scheduleOnce(maximumTimerDelayMs + 10, () => {
+    calls += 1;
+  });
+  context.mock.timers.tick(maximumTimerDelayMs);
+  assert.equal(calls, 0);
+
+  context.mock.timers.tick(9);
+  assert.equal(calls, 0);
+
+  context.mock.timers.tick(1);
+  assert.equal(calls, 1);
+});
