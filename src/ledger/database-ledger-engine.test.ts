@@ -567,6 +567,54 @@ test("turso runtime close waits for in-flight reads", async () => {
   }
 });
 
+for (const driver of ["better-sqlite3", "turso"] as const) {
+  test(`${driver} runtime close waits for in-flight writes`, async () => {
+    const databaseUrl = createTempDatabasePath();
+    const storage =
+      driver === "better-sqlite3"
+        ? createBetterSqliteStorageRuntime(databaseUrl)
+        : await createTursoStorageRuntime(databaseUrl);
+    const writeStarted = Promise.withResolvers<void>();
+    const releaseWrite = Promise.withResolvers<void>();
+
+    try {
+      const write = storage.write(async (database) => {
+        await database.exec(
+          "CREATE TABLE close_write (id INTEGER PRIMARY KEY)",
+        );
+        writeStarted.resolve();
+        await releaseWrite.promise;
+        await database.prepare("INSERT INTO close_write (id) VALUES (1)").run();
+      });
+
+      await writeStarted.promise;
+
+      const closing = storage.close();
+      assert.equal(await settlesWithin(closing, 10), false);
+
+      releaseWrite.resolve();
+      await write;
+      await closing;
+
+      const inspector = new Database(databaseUrl, { readonly: true });
+      try {
+        assert.equal(
+          inspector.prepare("SELECT COUNT(*) FROM close_write").pluck().get(),
+          1,
+        );
+      } finally {
+        inspector.close();
+      }
+    } finally {
+      releaseWrite.resolve();
+      await storage.close();
+      await rm(databaseUrl, { force: true });
+      await rm(`${databaseUrl}-wal`, { force: true });
+      await rm(`${databaseUrl}-shm`, { force: true });
+    }
+  });
+}
+
 test("ledger queries do not block external write transactions", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
@@ -1352,7 +1400,7 @@ test("ledger startup initialization is isolated per database", async () => {
 
 test("ledger close closes storage after startup failure", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  let closeCalled = false;
+  let closeCalls = 0;
 
   const storage: StorageRuntime = {
     [storageRuntimeIdentityBrand]: `startup-failure-test:${randomUUID()}`,
@@ -1363,7 +1411,7 @@ test("ledger close closes storage after startup failure", async () => {
       throw new Error("startup failed");
     },
     close: async () => {
-      closeCalled = true;
+      closeCalls += 1;
     },
   };
 
@@ -1375,7 +1423,7 @@ test("ledger close closes storage after startup failure", async () => {
     register: {},
   });
 
-  await using ledger = createDatabaseLedger({
+  const ledger = createDatabaseLedger({
     projectionCompiler,
     storage,
     model: model.withImplementations({
@@ -1387,21 +1435,21 @@ test("ledger close closes storage after startup failure", async () => {
     },
   });
 
-  await assert.rejects(
-    async () => await ledger.close(),
-    (error: unknown) => {
-      assert.ok(error instanceof AggregateError);
-      assert.equal(error.message, "failed to close ledger");
-      assert.equal(error.errors.length, 1);
+  const isExpectedFailure = (error: unknown): boolean => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, "failed to close ledger");
+    assert.equal(error.errors.length, 1);
 
-      const failure = error.errors[0];
-      assert.ok(failure instanceof Error);
-      assert.equal(failure.message, "startup failed");
+    const failure = error.errors[0];
+    assert.ok(failure instanceof Error);
+    assert.equal(failure.message, "startup failed");
 
-      return true;
-    },
-  );
-  assert.equal(closeCalled, true);
+    return true;
+  };
+
+  await assert.rejects(ledger.close(), isExpectedFailure);
+  await assert.rejects(ledger.close(), isExpectedFailure);
+  assert.equal(closeCalls, 1);
 });
 
 test("worker failures preserve arbitrary rejection reasons", async () => {

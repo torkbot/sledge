@@ -1184,6 +1184,7 @@ function openDatabaseLedgerEngine<
   const moduleIds = modules.map((module) => module.moduleId);
 
   let closed = false;
+  let closePromise: Promise<void> | null = null;
   let activeWorker: WorkerRuntimeState | null = null;
   const eventChanges = new ChangeSignal();
   type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
@@ -4598,11 +4599,12 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  async function close(): Promise<void> {
-    if (closed) {
-      return;
-    }
+  function close(): Promise<void> {
+    closePromise ??= closeLedger();
+    return closePromise;
+  }
 
+  async function closeLedger(): Promise<void> {
     closed = true;
     eventChanges.notify();
 

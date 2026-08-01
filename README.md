@@ -563,6 +563,13 @@ The opened ledger exposes:
 - `startWorkers(options)`
 - `close()`
 
+`close()` stops new ledger operations, drains Sledge-owned writes and readers,
+checkpoints committed WAL frames into the main SQLite file, truncates the WAL,
+and releases the writer connection. Repeated calls share the same completion
+and outcome. Close independently opened database connections first: if another
+connection keeps the checkpoint busy, `close()` reports the failure after still
+releasing Sledge's writer.
+
 Opening a ledger is passive. It initializes storage and can emit, query, tail,
 resume, and observe signals, but it does not claim or process queue work until
 `startWorkers(...)` is called.
