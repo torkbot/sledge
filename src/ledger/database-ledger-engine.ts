@@ -1290,9 +1290,8 @@ function openDatabaseLedgerEngine<
      */
     readonly terminalWorkRetentionMs: number;
     /**
-     * Fallback cadence for discovering work created by another process while
-     * this worker has no known deadline. Live runtimes in this process notify
-     * one another directly.
+     * Cross-process discovery cadence. This is independent of the exact
+     * scheduler-visible wake installed for known durable work.
      */
     readonly storePollMs: number;
     /**
@@ -1355,7 +1354,8 @@ function openDatabaseLedgerEngine<
     /**
      * Next scheduled dispatch wakeup for this handle, if any.
      */
-    scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
+    scheduledDispatchWake: { dueAtMs: number; cancel(): void } | null;
+    scheduledStoreDiscovery: { cancel(): void } | null;
   };
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
@@ -3416,22 +3416,42 @@ function openDatabaseLedgerEngine<
     }
 
     if (
-      worker.scheduledDispatch !== null &&
-      worker.scheduledDispatch.dueAtMs <= targetAtMs
+      worker.scheduledDispatchWake !== null &&
+      worker.scheduledDispatchWake.dueAtMs <= targetAtMs
     ) {
       return;
     }
 
-    worker.scheduledDispatch?.cancel();
+    worker.scheduledDispatchWake?.cancel();
 
     const delayMs = Math.max(0, targetAtMs - clock.nowMs());
     const task = worker.scheduler.scheduleOnce(delayMs, () => {
-      worker.scheduledDispatch = null;
+      worker.scheduledDispatchWake = null;
       requestDispatchRun(worker);
     });
 
-    worker.scheduledDispatch = {
+    worker.scheduledDispatchWake = {
       dueAtMs: clock.nowMs() + delayMs,
+      cancel: () => task.cancel(),
+    };
+  }
+
+  function scheduleStoreDiscovery(worker: WorkerRuntimeState): void {
+    if (
+      closed ||
+      worker.closed ||
+      worker.failure !== null ||
+      worker.scheduledStoreDiscovery !== null
+    ) {
+      return;
+    }
+
+    const task = worker.scheduler.scheduleOnce(worker.storePollMs, () => {
+      worker.scheduledStoreDiscovery = null;
+      requestDispatchRun(worker);
+    });
+
+    worker.scheduledStoreDiscovery = {
       cancel: () => task.cancel(),
     };
   }
@@ -3466,18 +3486,14 @@ function openDatabaseLedgerEngine<
         .get();
     });
 
-    if (row === undefined) {
-      // SQLite has no cross-process change notification. Keep the existing
-      // empty-store fallback for work created by another process; known work
-      // is always scheduled directly at its durable deadline.
-      scheduleDispatchAt(worker, clock.nowMs() + worker.storePollMs);
-      return;
+    if (row !== undefined) {
+      scheduleDispatchAt(
+        worker,
+        decodeRow(row, AvailableAtRowSchema).available_at_ms,
+      );
     }
 
-    scheduleDispatchAt(
-      worker,
-      decodeRow(row, AvailableAtRowSchema).available_at_ms,
-    );
+    scheduleStoreDiscovery(worker);
   }
 
   async function observeWorkChanges(worker: WorkerRuntimeState): Promise<void> {
@@ -3966,8 +3982,10 @@ function openDatabaseLedgerEngine<
     worker.failure = {
       reason,
     };
-    worker.scheduledDispatch?.cancel();
-    worker.scheduledDispatch = null;
+    worker.scheduledDispatchWake?.cancel();
+    worker.scheduledDispatchWake = null;
+    worker.scheduledStoreDiscovery?.cancel();
+    worker.scheduledStoreDiscovery = null;
     worker.lifecycleAbortController.abort(reason);
     worker.stateChanges.notify();
   }
@@ -4747,8 +4765,10 @@ function openDatabaseLedgerEngine<
       activeWorker = null;
     }
 
-    worker.scheduledDispatch?.cancel();
-    worker.scheduledDispatch = null;
+    worker.scheduledDispatchWake?.cancel();
+    worker.scheduledDispatchWake = null;
+    worker.scheduledStoreDiscovery?.cancel();
+    worker.scheduledStoreDiscovery = null;
 
     // Wait until claiming has quiesced so we can snapshot+abort the final set
     // of leases this worker owns.
@@ -5256,7 +5276,8 @@ function openDatabaseLedgerEngine<
         dispatchLoopQueued: false,
         dispatchLoopSettled: null,
         failure: null,
-        scheduledDispatch: null,
+        scheduledDispatchWake: null,
+        scheduledStoreDiscovery: null,
       };
 
       activeWorker = worker;
