@@ -206,6 +206,15 @@ export type ProjectionCompilerEventReadStatement = {
   readonly eventName: string;
 };
 
+export type ProjectionCompilerEventRefSelectStatement = {
+  readonly eventName: string;
+  readonly eventRefColumnName: string;
+  readonly fromTableName: string;
+  readonly limit: number | null;
+  readonly orderBy: readonly ProjectionCompilerOrderClause[];
+  readonly where: readonly ProjectionCompilerWhereClause[];
+};
+
 export type ProjectionCompilerEventIdBoundsStatement = {
   readonly afterEventId: number | null;
   readonly eventName: string;
@@ -280,6 +289,9 @@ export type ProjectionStatementCompiler = {
   compileEventRead(
     statement: ProjectionCompilerEventReadStatement,
   ): ProjectionCompiledSql;
+  compileEventRefSelect(
+    statement: ProjectionCompilerEventRefSelectStatement,
+  ): ProjectionCompiledSql;
   compileEventIdBounds(
     statement: ProjectionCompilerEventIdBoundsStatement,
   ): ProjectionCompiledSql;
@@ -315,6 +327,7 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileDelete: compileDeleteStatement,
     compileEventIdBounds: compileEventIdBoundsStatement,
     compileEventRead: compileEventReadStatement,
+    compileEventRefSelect: compileEventRefSelectStatement,
     compileEventScan: compileEventScanStatement,
     compileLatestEventRefsByPayload: compileLatestEventRefsByPayloadStatement,
     compileInsert: compileInsertStatement,
@@ -323,6 +336,18 @@ export function createSqliteProjectionStatementCompiler(): ProjectionStatementCo
     compileUpdate: compileUpdateStatement,
   };
 }
+
+const projectionEventRowColumnNames = [
+  "event_id",
+  "ts_ms",
+  "event_name",
+  "payload_json",
+  "causation_event_id",
+  "causation_work_json",
+  "dedupe_key",
+] as const;
+
+export const projectionEventRefIdColumnAlias = "__sledge_event_ref_id";
 
 function compileAddColumnStatement(
   statement: ProjectionCompilerAddColumnStatement,
@@ -479,6 +504,46 @@ function compileEventReadStatement(
   return {
     params: [statement.eventName, 0, ...statement.eventIds],
     text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
+  };
+}
+
+function compileEventRefSelectStatement(
+  statement: ProjectionCompilerEventRefSelectStatement,
+): ProjectionCompiledSql {
+  const selectedSql = [
+    ...projectionEventRowColumnNames.map((columnName) => {
+      return `${compileColumnReference({ columnName, tableName: "events" })} AS ${quoteIdentifier(columnName)}`;
+    }),
+    `${compileColumnReference({ columnName: statement.eventRefColumnName, tableName: statement.fromTableName })} AS ${quoteIdentifier(projectionEventRefIdColumnAlias)}`,
+  ].join(", ");
+  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.fromTableName)} LEFT JOIN "events" ON "events"."event_id" = ${compileColumnReference(
+    {
+      columnName: statement.eventRefColumnName,
+      tableName: statement.fromTableName,
+    },
+  )} AND "events"."event_name" = ? AND "events"."signal" = ?`;
+  const params: unknown[] = [statement.eventName, 0];
+  const whereSql = compileWhere(statement.where);
+
+  if (whereSql.text.length > 0) {
+    text += ` WHERE ${whereSql.text}`;
+    params.push(...whereSql.params);
+  }
+
+  if (statement.orderBy.length > 0) {
+    const orderBySql = compileOrderBy(statement.orderBy);
+    text += ` ORDER BY ${orderBySql.text}`;
+    params.push(...orderBySql.params);
+  }
+
+  if (statement.limit !== null) {
+    text += " LIMIT ?";
+    params.push(statement.limit);
+  }
+
+  return {
+    params,
+    text,
   };
 }
 

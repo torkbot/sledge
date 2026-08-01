@@ -16,6 +16,7 @@ import type {
   ProjectionCompilerEventIdBoundsStatement,
   ProjectionCompilerEventPayloadWhereClause,
   ProjectionCompilerEventReadStatement,
+  ProjectionCompilerEventRefSelectStatement,
   ProjectionCompilerEventScanStatement,
   ProjectionCompilerEventStreamKind,
   ProjectionCompilerExpression,
@@ -31,6 +32,7 @@ import type {
   ProjectionCompilerWhereClause,
   ProjectionStatementCompiler,
 } from "./projection-sql-compiler.ts";
+import { projectionEventRefIdColumnAlias } from "./projection-sql-compiler.ts";
 
 export type KyselyProjectionDialect = "postgres" | "sqlite";
 
@@ -94,6 +96,8 @@ export function createKyselyProjectionStatementCompiler(
       compileEventIdBoundsStatement(input, statement),
     compileEventRead: (statement) =>
       compileEventReadStatement(input, statement),
+    compileEventRefSelect: (statement) =>
+      compileEventRefSelectStatement(input, statement),
     compileEventScan: (statement) =>
       compileEventScanStatement(input, statement),
     compileLatestEventRefsByPayload: (statement) =>
@@ -260,6 +264,83 @@ function compileEventReadStatement(
       ]),
     ),
   };
+
+  return compileQuery(input.queryCompiler, query);
+}
+
+function compileEventRefSelectStatement(
+  input: KyselyProjectionStatementCompilerInput,
+  statement: ProjectionCompilerEventRefSelectStatement,
+): ProjectionCompiledSql {
+  let query: KyselyProjectionOperationNode = {
+    from: fromNode([tableNode(statement.fromTableName)]),
+    joins: [
+      {
+        joinType: "LeftJoin",
+        kind: "JoinNode",
+        on: {
+          kind: "OnNode",
+          on: andOperationNodes([
+            binaryOperationNode(
+              referenceNode("events", "event_id"),
+              "=",
+              referenceNode(
+                statement.fromTableName,
+                statement.eventRefColumnName,
+              ),
+            ),
+            binaryOperationNode(
+              referenceNode("events", "event_name"),
+              "=",
+              valueNode(statement.eventName),
+            ),
+            binaryOperationNode(
+              referenceNode("events", "signal"),
+              "=",
+              valueNode(0),
+            ),
+          ]),
+        },
+        table: tableNode("events"),
+      },
+    ],
+    kind: "SelectQueryNode",
+    selections: [
+      ...projectionEventRowColumnNames.map((columnName) =>
+        selectionNode(
+          aliasNode(referenceNode("events", columnName), columnName),
+        ),
+      ),
+      selectionNode(
+        aliasNode(
+          referenceNode(statement.fromTableName, statement.eventRefColumnName),
+          projectionEventRefIdColumnAlias,
+        ),
+      ),
+    ],
+  };
+  const where = whereNodeForClauses(statement.where);
+
+  if (where !== null) {
+    query = {
+      ...query,
+      where,
+    };
+  }
+
+  if (statement.orderBy.length > 0) {
+    query = {
+      ...query,
+      orderBy: orderByNode(statement.orderBy),
+    };
+  }
+
+  if (statement.limit !== null) {
+    query = {
+      ...query,
+      limit: limitNode(valueNode(statement.limit)),
+    };
+  }
 
   return compileQuery(input.queryCompiler, query);
 }

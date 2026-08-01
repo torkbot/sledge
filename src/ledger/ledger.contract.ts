@@ -10,7 +10,7 @@ import type {
 import type {
   EventCausationWork,
   LedgerCursor,
-  MaterializationImplementationRegistration,
+  MaterializationImplementationRegistrationFor,
   QueueHandlerControl,
   WorkRef,
 } from "./ledger.ts";
@@ -133,6 +133,8 @@ export const DispatchCountQueryParamsSchema = Type.Object({
 
 export const SeenSourceEventIdsQueryParamsSchema = Type.Object({});
 
+export const ObservedMessagesQueryParamsSchema = Type.Object({});
+
 export const CountQueryResultSchema = Type.Number();
 
 export const SourceEventIdsResultSchema = Type.Array(Type.Number());
@@ -220,6 +222,14 @@ const ledgerContractMaterializations = defineMaterialization(
             requiredJsonNull: t.json<null>().notNull(),
           })
           .primaryKey(["sourceEventId"]),
+      )
+      .createTable("messageObservations", (t) =>
+        t
+          .columns({
+            observationId: t.integer().notNull(),
+            source: t.eventRef("message.received").notNull(),
+          })
+          .primaryKey(["observationId"]),
       ),
   )
   .define({
@@ -274,10 +284,12 @@ const ledgerContractMaterializations = defineMaterialization(
         params: JsonNullValuesQueryParamsSchema,
         result: JsonNullValuesQueryResultSchema,
       },
+      observedMessages: {
+        params: ObservedMessagesQueryParamsSchema,
+        result: Type.Array(MessageReceivedSchema),
+      },
     },
   });
-
-const ledgerContractSchema = ledgerContractMaterializations.history.current;
 
 const ledgerContractDefinition = withMaterializations(
   ledgerContractShape,
@@ -286,7 +298,7 @@ const ledgerContractDefinition = withMaterializations(
 
 const ledgerContractImplementations = {
   indexers: {
-    upsertObserved: async ({ input, db }) => {
+    upsertObserved: async ({ input, event, db }) => {
       await db
         .insertInto("contractProjection")
         .values({
@@ -297,6 +309,19 @@ const ledgerContractImplementations = {
         })
         .onConflict(["sourceEventId"])
         .doNothing()
+        .execute();
+      await db
+        .insertInto("messageObservations")
+        .values([
+          {
+            observationId: input.sourceEventId * 2,
+            source: event.ref,
+          },
+          {
+            observationId: input.sourceEventId * 2 + 1,
+            source: event.ref,
+          },
+        ])
         .execute();
     },
     upsertControlledObserved: async ({ input, db }) => {
@@ -434,11 +459,19 @@ const ledgerContractImplementations = {
         .whereNotNull("requiredJsonNull")
         .executeTakeFirst();
     },
+    observedMessages: async ({ db }) => {
+      const events = await db
+        .selectFrom("messageObservations")
+        .selectEvent("source")
+        .orderBy("observationId", "desc")
+        .execute();
+
+      return events.map((event) => event.payload);
+    },
   },
-} satisfies MaterializationImplementationRegistration<
-  typeof ledgerContractSchema,
-  typeof ledgerContractMaterializations.indexers,
-  typeof ledgerContractMaterializations.queries
+} satisfies MaterializationImplementationRegistrationFor<
+  typeof ledgerContractMaterializations,
+  typeof ledgerContractShape.shape.events
 >;
 
 type LedgerContractEvents = typeof ledgerContractShape.shape.events;
@@ -883,6 +916,12 @@ export type LedgerContractHarness = {
   getDecisionAttempts(sourceEventId: number): Promise<number>;
   getDispatchCount(sourceEventId: number): Promise<number>;
   getSeenSourceEventIds(): Promise<readonly number[]>;
+  getObservedMessages(): Promise<
+    readonly {
+      readonly type: "message.received";
+      readonly text: string;
+    }[]
+  >;
 };
 
 type LedgerContractHarnessFactory = () => Promise<LedgerContractHarness>;
@@ -2834,6 +2873,41 @@ export function runLedgerContractSuite(input: {
               requiredJsonNull: null,
             },
           );
+        });
+      },
+    );
+
+    await t.test(
+      "projection event selections preserve projection order and duplicate refs",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          await harness.ledger.emit("message.received", {
+            type: "message.received",
+            text: "first",
+          });
+          await harness.ledger.emit("message.received", {
+            type: "message.received",
+            text: "second",
+          });
+
+          assert.deepEqual(await harness.getObservedMessages(), [
+            {
+              type: "message.received",
+              text: "second",
+            },
+            {
+              type: "message.received",
+              text: "second",
+            },
+            {
+              type: "message.received",
+              text: "first",
+            },
+            {
+              type: "message.received",
+              text: "first",
+            },
+          ]);
         });
       },
     );
