@@ -207,6 +207,41 @@ const StorageLayoutRowSchema = Type.Object({
 });
 const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
 const databaseInitializationTails = new Map<string, Promise<void>>();
+type DatabaseWorkChanges = {
+  readonly signal: ChangeSignal;
+  references: number;
+};
+const databaseWorkChanges = new Map<string, DatabaseWorkChanges>();
+
+function acquireDatabaseWorkChanges(databaseIdentity: string): {
+  readonly signal: ChangeSignal;
+  release(): void;
+} {
+  const changes = databaseWorkChanges.get(databaseIdentity) ?? {
+    signal: new ChangeSignal(),
+    references: 0,
+  };
+  changes.references += 1;
+  databaseWorkChanges.set(databaseIdentity, changes);
+
+  let released = false;
+
+  return {
+    signal: changes.signal,
+    release: () => {
+      if (released) {
+        return;
+      }
+
+      released = true;
+      changes.references -= 1;
+
+      if (changes.references === 0) {
+        databaseWorkChanges.delete(databaseIdentity);
+      }
+    },
+  };
+}
 
 function createWorkTableSql(
   tableName: "work" | "work_pre_queue_provenance",
@@ -218,6 +253,7 @@ function createWorkTableSql(
       queue_name TEXT NOT NULL,
       work_key TEXT,
       coalescing_key TEXT,
+      deferred_generation INTEGER NOT NULL DEFAULT 0,
       partition_key TEXT,
       payload_json TEXT NOT NULL,
       source_event_id INTEGER NOT NULL,
@@ -1027,6 +1063,7 @@ const WorkIdRowSchema = Type.Object({
 
 const CoalescedWorkRowSchema = Type.Object({
   available_at_ms: Type.Number(),
+  deferred_generation: Type.Number(),
   partition_key: Type.Union([Type.Null(), Type.String()]),
   payload_json: Type.String(),
   work_id: Type.Number(),
@@ -1171,6 +1208,9 @@ function openDatabaseLedgerEngine<
 ): DatabaseLedger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
   const storage = input.storage;
+  const workChanges = acquireDatabaseWorkChanges(
+    storage[storageRuntimeIdentityBrand],
+  );
   const runtimeCarrier = input.model as typeof input.model & {
     readonly [registeredLedgerRuntimeBrand]?: typeof input.model;
   };
@@ -1250,9 +1290,9 @@ function openDatabaseLedgerEngine<
      */
     readonly terminalWorkRetentionMs: number;
     /**
-     * Fallback cadence for re-checking durable work when no local append woke
-     * this worker. SQLite gives us cross-connection visibility, not
-     * cross-connection notifications.
+     * Fallback cadence for discovering work created by another process while
+     * this worker has no known deadline. Live runtimes in this process notify
+     * one another directly.
      */
     readonly storePollMs: number;
     /**
@@ -1281,6 +1321,7 @@ function openDatabaseLedgerEngine<
      * Callers still read authoritative runtime and storage state after waking.
      */
     readonly stateChanges: ChangeSignal;
+    workChangeObserverSettled: Promise<void> | null;
     /**
      * Interrupts idle-wait operations when this worker closes or fails. Storage
      * operations remain safely observed because their drivers may not support
@@ -1366,6 +1407,11 @@ function openDatabaseLedgerEngine<
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
         await ensureColumn("work", "coalescing_key", "TEXT");
+        await ensureColumn(
+          "work",
+          "deferred_generation",
+          "INTEGER NOT NULL DEFAULT 0",
+        );
         await ensureColumn("work", "partition_key", "TEXT");
         await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
@@ -2573,12 +2619,14 @@ function openDatabaseLedgerEngine<
     work: PendingDurableWork,
   ): Promise<void> {
     const payloadJson = JSON.stringify(work.payload);
+    let availableAtMs = work.availableAtMs;
 
     if (work.coalescingKey !== null) {
       const existing = await database
         .prepare(
           `SELECT
              work_id,
+             deferred_generation,
              partition_key,
              payload_json,
              available_at_ms
@@ -2597,47 +2645,67 @@ function openDatabaseLedgerEngine<
 
       if (existing !== undefined) {
         const decodedExisting = decodeRow(existing, CoalescedWorkRowSchema);
-        const queueSchema = model.queues[work.queueName as keyof TQueues];
 
-        if (queueSchema === undefined) {
-          throw new Error(`unknown queue: ${work.queueName}`);
-        }
-
-        const existingPayload = decodeValue(
-          queueSchema,
-          parseJson(
-            decodedExisting.payload_json,
-            `coalesced work ${work.queueName}/${work.coalescingKey}`,
-          ),
-        );
-
-        if (!Value.Equal(existingPayload, work.payload)) {
-          throw new Error(
-            `coalesced work ${work.queueName}/${work.coalescingKey} payload does not match the pending item`,
-          );
-        }
-
-        if (decodedExisting.partition_key !== work.partitionKey) {
-          throw new Error(
-            `coalesced work ${work.queueName}/${work.coalescingKey} partition does not match the pending item`,
-          );
-        }
-
-        if (work.availableAtMs < decodedExisting.available_at_ms) {
+        if (decodedExisting.deferred_generation === 1) {
           await database
             .prepare(
-              `UPDATE work
-               SET available_at_ms = ?
+              `DELETE FROM work
                WHERE work_id = ?
                  AND attempt = 0
                  AND lease_id IS NULL
                  AND dead = 0
-                 AND cancelled = 0`,
+                 AND cancelled = 0
+                 AND deferred_generation = 1`,
             )
-            .run(work.availableAtMs, decodedExisting.work_id);
-        }
+            .run(decodedExisting.work_id);
 
-        return;
+          availableAtMs = Math.min(
+            availableAtMs,
+            decodedExisting.available_at_ms,
+          );
+        } else {
+          const queueSchema = model.queues[work.queueName as keyof TQueues];
+
+          if (queueSchema === undefined) {
+            throw new Error(`unknown queue: ${work.queueName}`);
+          }
+
+          const existingPayload = decodeValue(
+            queueSchema,
+            parseJson(
+              decodedExisting.payload_json,
+              `coalesced work ${work.queueName}/${work.coalescingKey}`,
+            ),
+          );
+
+          if (!Value.Equal(existingPayload, work.payload)) {
+            throw new Error(
+              `coalesced work ${work.queueName}/${work.coalescingKey} payload does not match the pending item`,
+            );
+          }
+
+          if (decodedExisting.partition_key !== work.partitionKey) {
+            throw new Error(
+              `coalesced work ${work.queueName}/${work.coalescingKey} partition does not match the pending item`,
+            );
+          }
+
+          if (availableAtMs < decodedExisting.available_at_ms) {
+            await database
+              .prepare(
+                `UPDATE work
+                 SET available_at_ms = ?
+                 WHERE work_id = ?
+                   AND attempt = 0
+                   AND lease_id IS NULL
+                   AND dead = 0
+                   AND cancelled = 0`,
+              )
+              .run(availableAtMs, decodedExisting.work_id);
+          }
+
+          return;
+        }
       }
     }
 
@@ -2671,7 +2739,7 @@ function openDatabaseLedgerEngine<
         work.partitionKey,
         payloadJson,
         sourceEventId,
-        work.availableAtMs,
+        availableAtMs,
       );
   }
 
@@ -3099,6 +3167,7 @@ function openDatabaseLedgerEngine<
     if (result.created) {
       committedEventId = Math.max(committedEventId, result.envelope.eventId);
       eventChanges.notify();
+      workChanges.signal.notify();
 
       if (activeWorker !== null) {
         activeWorker.stateChanges.notify();
@@ -3397,13 +3466,42 @@ function openDatabaseLedgerEngine<
         .get();
     });
 
-    const pollAtMs = clock.nowMs() + worker.storePollMs;
-    const nextWorkAtMs =
-      row === undefined
-        ? pollAtMs
-        : decodeRow(row, AvailableAtRowSchema).available_at_ms;
+    if (row === undefined) {
+      // SQLite has no cross-process change notification. Keep the existing
+      // empty-store fallback for work created by another process; known work
+      // is always scheduled directly at its durable deadline.
+      scheduleDispatchAt(worker, clock.nowMs() + worker.storePollMs);
+      return;
+    }
 
-    scheduleDispatchAt(worker, Math.min(nextWorkAtMs, pollAtMs));
+    scheduleDispatchAt(
+      worker,
+      decodeRow(row, AvailableAtRowSchema).available_at_ms,
+    );
+  }
+
+  async function observeWorkChanges(worker: WorkerRuntimeState): Promise<void> {
+    let observed = workChanges.signal.snapshot();
+
+    while (!closed && !worker.closed && worker.failure === null) {
+      await workChanges.signal.waitForChange(
+        observed,
+        worker.lifecycleAbortController.signal,
+      );
+
+      if (
+        closed ||
+        worker.closed ||
+        worker.failure !== null ||
+        worker.lifecycleAbortController.signal.aborted
+      ) {
+        return;
+      }
+
+      observed = workChanges.signal.snapshot();
+      worker.stateChanges.notify();
+      scheduleDispatchAt(worker, clock.nowMs());
+    }
   }
 
   function assertWorkerWaitActive(
@@ -3857,6 +3955,7 @@ function openDatabaseLedgerEngine<
         )
         .run(clock.nowMs(), claimed.workId, claimed.leaseId);
     });
+    workChanges.signal.notify();
   }
 
   function failWorker(worker: WorkerRuntimeState, reason: unknown): void {
@@ -4246,6 +4345,7 @@ function openDatabaseLedgerEngine<
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
+            workChanges.signal.notify();
             worker.stateChanges.notify();
             scheduleDispatchAt(worker, clock.nowMs());
           }
@@ -4525,6 +4625,7 @@ function openDatabaseLedgerEngine<
                  SET
                    work_ref = ?,
                    attempt = 0,
+                   deferred_generation = 1,
                    available_at_ms = ?,
                    lease_id = NULL,
                    lease_acquired_at_ms = NULL,
@@ -4613,6 +4714,7 @@ function openDatabaseLedgerEngine<
         eventChanges.notify();
       }
 
+      workChanges.signal.notify();
       worker.stateChanges.notify();
       scheduleDispatchAt(worker, clock.nowMs());
     } finally {
@@ -4700,7 +4802,10 @@ function openDatabaseLedgerEngine<
           )
           .run(clock.nowMs(), ...leaseIds);
       });
+      workChanges.signal.notify();
     }
+
+    await worker.workChangeObserverSettled;
 
     const failure = worker.failure ?? observedFailure;
 
@@ -4740,6 +4845,8 @@ function openDatabaseLedgerEngine<
       await storage.close();
     } catch (error: unknown) {
       storageFailures.push(error);
+    } finally {
+      workChanges.release();
     }
 
     const failures = closeResults.flatMap((result) => {
@@ -4840,6 +4947,8 @@ function openDatabaseLedgerEngine<
       }
 
       const worker = activeWorker;
+
+      workChanges.signal.notify();
 
       if (worker !== null) {
         worker.stateChanges.notify();
@@ -5140,6 +5249,7 @@ function openDatabaseLedgerEngine<
         leaseExpiryTasks: new Map(),
         leaseHeartbeatTasks: new Map(),
         stateChanges: new ChangeSignal(),
+        workChangeObserverSettled: null,
         lifecycleAbortController: new AbortController(),
         closed: false,
         dispatchLoopActive: false,
@@ -5150,6 +5260,7 @@ function openDatabaseLedgerEngine<
       };
 
       activeWorker = worker;
+      worker.workChangeObserverSettled = observeWorkChanges(worker);
 
       try {
         await releaseExpiredLeases();

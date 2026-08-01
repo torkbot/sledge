@@ -781,7 +781,9 @@ export interface QueueHandlerControl extends WorkHandlerControl {
    * The successor starts again at attempt one, remains non-idle, and receives
    * a fresh WorkRef when the deferred generation is addressable. If a newer
    * coalesced successor already exists, that generation is preserved and its
-   * availability can only move earlier. `availableAtMs` must be finite.
+   * availability can only move earlier. Later coalesced activity replaces a
+   * deferred generation while retaining the earlier of the two deadlines.
+   * `availableAtMs` must be finite.
    */
   deferUntil(availableAtMs: number): never;
   retry(error: unknown, options?: QueueHandlerRetryOptions): never;

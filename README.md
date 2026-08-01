@@ -727,7 +727,10 @@ that newer row wins: Sledge preserves its work ID, payload, source event, and
 `WorkRef`, sets its availability to the earlier of its existing timestamp and
 the deferred timestamp, and removes the old partition head. Cancelling the
 claimed generation fences a later deferral disposition without cancelling the
-successor.
+successor. If the event arrives after deferral commits, its input replaces the
+deferred generation with a new work ID and `WorkRef`; its payload, source event,
+and partition win while availability remains the earlier of the activity and
+deferral timestamps. The result is independent of transaction order.
 
 ### Coalesced Work
 
