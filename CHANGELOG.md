@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make clean ledger shutdown drain adapter-owned operations, checkpoint committed
+  WAL frames into the main SQLite file, truncate the WAL, and release the writer.
+  A busy external connection now produces a truthful close error without leaking
+  the Sledge-owned writer.
 - Add typed `selectEvent(...)` projection reads that dereference non-null event
   refs in one storage statement while preserving projection order and duplicate
   refs, with missing or mismatched events reported as storage corruption.

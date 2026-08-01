@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +17,24 @@ import {
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
 import { composeLedgerModels, type LedgerWorkers } from "./ledger.ts";
+import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
+
+runSqliteLedgerCloseContract({
+  suiteName: "better-sqlite ledger",
+  create: (input) => createBetterSqliteLedger(input),
+  openCheckpointBlocker: async (databaseUrl) => {
+    const database = new Database(databaseUrl, { timeout: 0 });
+    database.exec("BEGIN");
+    database.prepare("SELECT COUNT(*) FROM events").get();
+
+    return {
+      close: async () => {
+        database.exec("ROLLBACK");
+        database.close();
+      },
+    };
+  },
+});
 
 runLedgerContractSuite({
   suiteName: "better-sqlite ledger contract",

@@ -1,3 +1,4 @@
+import { connect } from "@tursodatabase/database";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +17,24 @@ import {
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
 import { composeLedgerModels, type LedgerWorkers } from "./ledger.ts";
+import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
+
+runSqliteLedgerCloseContract({
+  suiteName: "turso ledger",
+  create: async (input) => await createTursoLedger(input),
+  openCheckpointBlocker: async (databaseUrl) => {
+    const database = await connect(databaseUrl, { timeout: 0 });
+    await database.exec("BEGIN");
+    await database.prepare("SELECT COUNT(*) FROM events").get();
+
+    return {
+      close: async () => {
+        await database.exec("ROLLBACK");
+        await database.close();
+      },
+    };
+  },
+});
 
 runLedgerContractSuite({
   suiteName: "turso ledger contract",

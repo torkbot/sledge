@@ -17,6 +17,7 @@ import {
 } from "./database-ledger-engine.ts";
 import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
+import { assertWalCheckpointTruncated } from "./sqlite-wal-checkpoint.ts";
 
 const connectionOptions = {
   timeout: 0,
@@ -70,6 +71,7 @@ export function createBetterSqliteStorageRuntime(
   const writerStorage = wrapBetterSqliteDatabase(writer);
   const activeReads = new Set<Promise<void>>();
   let closed = false;
+  let closePromise: Promise<void> | null = null;
   let writeTail: Promise<void> = Promise.resolve();
 
   const openConnection = (): Database.Database => {
@@ -118,13 +120,11 @@ export function createBetterSqliteStorageRuntime(
       }
     },
     write: async (run) => {
-      const operation = writeTail.then(async () => {
-        if (closed) {
-          throw new Error("storage runtime is closed");
-        }
+      if (closed) {
+        throw new Error("storage runtime is closed");
+      }
 
-        return await run(writerStorage);
-      });
+      const operation = writeTail.then(async () => await run(writerStorage));
       writeTail = operation.then(
         () => undefined,
         () => undefined,
@@ -132,16 +132,23 @@ export function createBetterSqliteStorageRuntime(
 
       return await operation;
     },
-    close: async () => {
-      if (closed) {
-        return;
-      }
-
-      closed = true;
-      await Promise.all([writeTail, ...activeReads]);
-      writer.close();
+    close: () => {
+      closePromise ??= closeStorageRuntime();
+      return closePromise;
     },
   };
+
+  async function closeStorageRuntime(): Promise<void> {
+    closed = true;
+    await Promise.all([writeTail, ...activeReads]);
+
+    try {
+      const checkpoint = writer.pragma("wal_checkpoint(TRUNCATE)");
+      assertWalCheckpointTruncated(checkpoint);
+    } finally {
+      writer.close();
+    }
+  }
 }
 
 function validateDatabaseUrl(databaseUrl: string): void {
