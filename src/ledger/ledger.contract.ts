@@ -666,6 +666,7 @@ export type LedgerContractControlledWorkGate = {
 export type LedgerContractControlledWorkOutcome =
   | { readonly kind: "ack" }
   | { readonly kind: "emit_immediate" }
+  | { readonly kind: "defer_until"; readonly availableAtMs: number }
   | { readonly kind: "retry"; readonly retryAtMs: number }
   | { readonly kind: "dead_letter" };
 
@@ -746,14 +747,14 @@ export class LedgerContractPausableScheduler implements RuntimeScheduler {
 }
 
 export function createLedgerContractControlledWork(): LedgerContractControlledWork {
-  const gates = new Map<
-    string,
-    {
-      readonly entered: PromiseWithResolvers<void>;
-      readonly outcome: LedgerContractControlledWorkOutcome;
-      readonly release: PromiseWithResolvers<void>;
-    }
-  >();
+  type ControlledWorkGate = {
+    readonly entered: PromiseWithResolvers<void>;
+    readonly outcome: LedgerContractControlledWorkOutcome;
+    readonly release: PromiseWithResolvers<void>;
+  };
+
+  const gates = new Map<string, ControlledWorkGate[]>();
+  const activeGates = new Set<ControlledWorkGate>();
   const startedWorkKeys: string[] = [];
 
   const prepareAttempt = (
@@ -765,11 +766,9 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
     const release = Promise.withResolvers<void>();
     const attemptKey = `${workKey}:${attempt}`;
 
-    if (gates.has(attemptKey)) {
-      throw new Error(`controlled work was already prepared: ${attemptKey}`);
-    }
-
-    gates.set(attemptKey, { entered, outcome, release });
+    const prepared = gates.get(attemptKey) ?? [];
+    prepared.push({ entered, outcome, release });
+    gates.set(attemptKey, prepared);
 
     return {
       entered: entered.promise,
@@ -782,20 +781,42 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
     prepareAttempt,
     run: async (workKey, attempt) => {
       const attemptKey = `${workKey}:${attempt}`;
-      const gate = gates.get(attemptKey);
+      const prepared = gates.get(attemptKey);
+
+      if (prepared === undefined) {
+        throw new Error(`controlled work was not prepared: ${attemptKey}`);
+      }
+
+      const gate = prepared.shift();
 
       if (gate === undefined) {
         throw new Error(`controlled work was not prepared: ${attemptKey}`);
       }
 
+      if (prepared.length === 0) {
+        gates.delete(attemptKey);
+      }
+
       startedWorkKeys.push(workKey);
       gate.entered.resolve();
-      await gate.release.promise;
-      return gate.outcome;
+      activeGates.add(gate);
+
+      try {
+        await gate.release.promise;
+        return gate.outcome;
+      } finally {
+        activeGates.delete(gate);
+      }
     },
     startedWorkKeys: () => [...startedWorkKeys],
     releaseAll: () => {
-      for (const gate of gates.values()) {
+      for (const prepared of gates.values()) {
+        for (const gate of prepared) {
+          gate.release.resolve();
+        }
+      }
+
+      for (const gate of activeGates) {
         gate.release.resolve();
       }
     },
@@ -897,6 +918,12 @@ export type LedgerContractHarness = {
   restart(): Promise<void>;
   restartWorkers(input: { readonly maxInFlight: number }): Promise<void>;
   startCompetingWorkers(input: { readonly maxInFlight: number }): Promise<void>;
+  emitCoalescedFromPeer(input: {
+    readonly availableAtMs: number;
+    readonly coalescingKey: string;
+    readonly partitionKey: string | null;
+    readonly workKey: string;
+  }): Promise<{ readonly eventId: number }>;
   stopCompetingWorkers(): Promise<void>;
   pausePrimaryScheduler(): void;
   stopPrimaryWorkers(): Promise<void>;
@@ -1215,6 +1242,8 @@ export function createLedgerContractModel(input: {
               attempt: work.attempt,
             });
             return;
+          case "defer_until":
+            return control.deferUntil(outcome.availableAtMs);
           case "retry":
             return control.retry("configured controlled retry", {
               retryAtMs: outcome.retryAtMs,
@@ -1340,7 +1369,11 @@ export function runLedgerContractSuite(input: {
       workKey: string,
       attempt: number,
       release: () => void,
-    ): Promise<void> => {
+    ): Promise<{
+      readonly causationEventId: number | null;
+      readonly causationWork: EventCausationWork | null;
+      readonly eventId: number;
+    }> => {
       const abortController = new AbortController();
       const iterator = harness.ledger
         .tailEvents({
@@ -1374,7 +1407,11 @@ export function runLedgerContractSuite(input: {
           );
 
           if (payload.workKey === workKey && payload.attempt === attempt) {
-            return;
+            return {
+              causationEventId: item.value.event.causationEventId,
+              causationWork: item.value.event.causationWork,
+              eventId: item.value.event.eventId,
+            };
           }
         }
       } finally {
@@ -1392,6 +1429,30 @@ export function runLedgerContractSuite(input: {
       assert.ok(sourceEventId !== undefined);
 
       return sourceEventId;
+    };
+
+    const waitForControlledStarts = async (
+      harness: LedgerContractHarness,
+      workKey: string,
+      count: number,
+    ): Promise<void> => {
+      await waitFor(
+        harness,
+        async () => {
+          await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          return (
+            harness
+              .getStartedControlledWorkKeys()
+              .filter((startedWorkKey) => startedWorkKey === workKey).length ===
+            count
+          );
+        },
+        100,
+        1,
+      );
     };
 
     const emitTimedWork = async (
@@ -1641,6 +1702,906 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
+      "deferUntil replaces the claimed generation with one clean successor at the absolute deadline",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const availableAtMs = harness.nowMs() + 500;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-deferred",
+            1,
+            { kind: "defer_until", availableAtMs },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:deferred",
+            partitionKey: "deferred",
+            workKey: "coalesced-deferred",
+          });
+          await firstAttempt.entered;
+
+          const [claimedGeneration] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+
+          assert.ok(claimedGeneration !== undefined);
+          assert.ok(claimedGeneration.ref !== null);
+
+          await observeControlledAttempt(
+            harness,
+            "coalesced-deferred",
+            1,
+            firstAttempt.release,
+          );
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(work.length, 1);
+          assert.equal(work[0]?.workId, claimedGeneration.workId);
+          assert.equal(work[0]?.state, "delayed");
+          assert.equal(work[0]?.availableAtMs, availableAtMs);
+          assert.equal(work[0]?.attempt, 0);
+          assert.equal(work[0]?.lastError, null);
+          assert.notEqual(work[0]?.ref, claimedGeneration.ref);
+          assert.equal(work[0]?.sourceEventId, claimedGeneration.sourceEventId);
+        });
+      },
+    );
+
+    await t.test(
+      "deferred work remains non-idle and wakes at its deadline after restart",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const availableAtMs = harness.nowMs() + 500;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-durable-defer",
+            1,
+            { kind: "defer_until", availableAtMs },
+          );
+          const successorAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-durable-defer",
+            1,
+            { kind: "ack" },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:durable-defer",
+            partitionKey: "durable-defer",
+            workKey: "coalesced-durable-defer",
+          });
+          await firstAttempt.entered;
+          await observeControlledAttempt(
+            harness,
+            "coalesced-durable-defer",
+            1,
+            firstAttempt.release,
+          );
+
+          await harness.restart();
+
+          let idleResolved = false;
+          const idle = harness.waitForIdle().then(() => {
+            idleResolved = true;
+          });
+
+          await harness.advanceByMs(499);
+          assert.equal(idleResolved, false);
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "coalesced-durable-defer",
+          ]);
+
+          await harness.advanceByMs(1);
+          await successorAttempt.entered;
+          assert.equal(idleResolved, false);
+
+          const [successor] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+
+          assert.equal(successor?.attempt, 1);
+          assert.equal(successor?.lastError, null);
+
+          await observeControlledAttempt(
+            harness,
+            "coalesced-durable-defer",
+            1,
+            successorAttempt.release,
+          );
+          await idle;
+          assert.equal(idleResolved, true);
+        });
+      },
+    );
+
+    await t.test(
+      "deferUntil preserves an already-earlier coalesced successor",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const deferredUntilMs = harness.nowMs() + 500;
+          const successorAvailableAtMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-race",
+            1,
+            { kind: "defer_until", availableAtMs: deferredUntilMs },
+          );
+          const successorAttempt = harness.prepareControlledWork(
+            "coalesced-defer-race-new-input",
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:defer-race",
+            partitionKey: "defer-race",
+            workKey: "coalesced-defer-race",
+          });
+          await firstAttempt.entered;
+
+          const successorEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: successorAvailableAtMs,
+              coalescingKey: "wake:defer-race",
+              partitionKey: "defer-race",
+              workKey: "coalesced-defer-race-new-input",
+            },
+          );
+          await harness.flush();
+
+          const beforeDisposition = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+          const pendingSuccessor = beforeDisposition.find(
+            (item) => item.state === "delayed",
+          );
+
+          assert.ok(pendingSuccessor !== undefined);
+          assert.ok(pendingSuccessor.ref !== null);
+          assert.equal(pendingSuccessor.sourceEventId, successorEvent.eventId);
+
+          firstAttempt.release();
+          await waitFor(
+            harness,
+            async () => {
+              const live = await harness.ledger.listWork({
+                queueName: "controlled-work.run",
+              });
+
+              return live.length === 1 && live[0]?.state === "delayed";
+            },
+            100,
+            1,
+          );
+
+          const [successor] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.ok(successor !== undefined);
+          assert.equal(successor.workId, pendingSuccessor.workId);
+          assert.equal(successor.ref, pendingSuccessor.ref);
+          assert.equal(successor.sourceEventId, successorEvent.eventId);
+          assert.equal(successor.availableAtMs, successorAvailableAtMs);
+          assert.equal(successor.attempt, 0);
+          assert.equal(successor.state, "delayed");
+
+          await harness.advanceByMs(199);
+          assert.deepEqual(
+            harness
+              .getStartedControlledWorkKeys()
+              .filter((workKey) => workKey === "coalesced-defer-race"),
+            ["coalesced-defer-race"],
+          );
+
+          await harness.advanceByMs(1);
+          await waitForControlledStarts(
+            harness,
+            "coalesced-defer-race-new-input",
+            1,
+          );
+          successorAttempt.release();
+        });
+      },
+    );
+
+    await t.test(
+      "deferUntil advances a later coalesced successor without replacing it",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const deferredUntilMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-promote",
+            1,
+            { kind: "defer_until", availableAtMs: deferredUntilMs },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:defer-promote",
+            partitionKey: "defer-promote",
+            workKey: "coalesced-defer-promote",
+          });
+          await firstAttempt.entered;
+
+          const successorEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: harness.nowMs() + 500,
+              coalescingKey: "wake:defer-promote",
+              partitionKey: "defer-promote",
+              workKey: "coalesced-defer-promote",
+            },
+          );
+          await harness.flush();
+
+          const beforeDisposition = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["delayed"],
+          });
+          const pendingSuccessor = beforeDisposition[0];
+
+          assert.ok(pendingSuccessor !== undefined);
+          assert.ok(pendingSuccessor.ref !== null);
+
+          await observeControlledAttempt(
+            harness,
+            "coalesced-defer-promote",
+            1,
+            firstAttempt.release,
+          );
+
+          const [successor] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(successor?.workId, pendingSuccessor.workId);
+          assert.equal(successor?.ref, pendingSuccessor.ref);
+          assert.equal(successor?.sourceEventId, successorEvent.eventId);
+          assert.equal(successor?.availableAtMs, deferredUntilMs);
+          assert.equal(successor?.attempt, 0);
+        });
+      },
+    );
+
+    await t.test("deferUntil re-arms ordinary durable queue work", async () => {
+      await withHarness(input.create, async (harness) => {
+        const availableAtMs = harness.nowMs() + 200;
+        const firstAttempt = harness.prepareControlledWorkAttempt(
+          "ordinary-defer",
+          1,
+          { kind: "defer_until", availableAtMs },
+        );
+        const successorAttempt =
+          harness.prepareControlledWork("ordinary-defer");
+        const sourceEvent = await harness.ledger.emit(
+          "controlled-work.requested",
+          {
+            availableAtMs: null,
+            workKey: "ordinary-defer",
+            partitionKey: "ordinary-defer",
+          },
+        );
+        await harness.flush();
+        await firstAttempt.entered;
+
+        const [claimed] = await harness.ledger.listWork({
+          sourceEventId: sourceEvent.eventId,
+          states: ["leased"],
+        });
+
+        assert.ok(claimed !== undefined);
+        assert.ok(claimed.ref !== null);
+
+        await observeControlledAttempt(
+          harness,
+          "ordinary-defer",
+          1,
+          firstAttempt.release,
+        );
+
+        const [deferred] = await harness.ledger.listWork({
+          sourceEventId: sourceEvent.eventId,
+        });
+
+        assert.equal(deferred?.workId, claimed.workId);
+        assert.notEqual(deferred?.ref, claimed.ref);
+        assert.equal(deferred?.attempt, 0);
+        assert.equal(deferred?.availableAtMs, availableAtMs);
+        assert.equal(deferred?.state, "delayed");
+
+        await harness.advanceByMs(199);
+        assert.deepEqual(
+          harness
+            .getStartedControlledWorkKeys()
+            .filter((workKey) => workKey === "ordinary-defer"),
+          ["ordinary-defer"],
+        );
+
+        await harness.advanceByMs(1);
+        await waitForControlledStarts(harness, "ordinary-defer", 2);
+        successorAttempt.release();
+      });
+    });
+
+    await t.test(
+      "deferUntil rejects non-finite deadlines through normal handler retry semantics",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "invalid-defer-deadline",
+            1,
+            { kind: "defer_until", availableAtMs: Number.NaN },
+          );
+
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            workKey: "invalid-defer-deadline",
+            partitionKey: null,
+          });
+          await harness.flush();
+          await firstAttempt.entered;
+          await observeControlledAttempt(
+            harness,
+            "invalid-defer-deadline",
+            1,
+            firstAttempt.release,
+          );
+          await harness.stopPrimaryWorkers();
+
+          const [retrying] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(retrying?.attempt, 1);
+          assert.equal(retrying?.state, "delayed");
+          assert.equal(retrying?.availableAtMs, harness.nowMs() + 1_000);
+          assert.equal(
+            retrying?.lastError,
+            "availableAtMs must be a finite number, received NaN",
+          );
+        });
+      },
+    );
+
+    await t.test(
+      "new activity replaces a deferred generation and never delays it",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const deferredUntilMs = harness.nowMs() + 500;
+          const promotedUntilMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-new-activity",
+            1,
+            { kind: "defer_until", availableAtMs: deferredUntilMs },
+          );
+          await harness.ledger.emit("coalesced-work.requested", {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:defer-new-activity",
+            partitionKey: "defer-new-activity",
+            workKey: "coalesced-defer-new-activity",
+          });
+          await harness.flush();
+          await firstAttempt.entered;
+          await observeControlledAttempt(
+            harness,
+            "coalesced-defer-new-activity",
+            1,
+            firstAttempt.release,
+          );
+
+          const [deferred] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.ok(deferred !== undefined);
+          assert.ok(deferred.ref !== null);
+
+          const promotedEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: promotedUntilMs,
+              coalescingKey: "wake:defer-new-activity",
+              partitionKey: "defer-new-activity",
+              workKey: "coalesced-defer-new-activity-replacement",
+            },
+          );
+          await harness.flush();
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs() + 400,
+            coalescingKey: "wake:defer-new-activity",
+            partitionKey: "defer-new-activity",
+            workKey: "coalesced-defer-new-activity-replacement",
+          });
+
+          const [promoted] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.notEqual(promoted?.workId, deferred.workId);
+          assert.notEqual(promoted?.ref, deferred.ref);
+          assert.equal(promoted?.sourceEventId, promotedEvent.eventId);
+          assert.equal(promoted?.availableAtMs, promotedUntilMs);
+          assert.equal(promoted?.attempt, 0);
+
+          const retired = await harness.ledger.cancelWork({
+            ref: deferred.ref,
+          });
+          assert.equal(retired.status, "not_found");
+        });
+      },
+    );
+
+    await t.test(
+      "peer activity advances a deferred deadline without store polling",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const deferredUntilMs = harness.nowMs() + 5_000;
+          const promotedUntilMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-peer",
+            1,
+            { kind: "defer_until", availableAtMs: deferredUntilMs },
+          );
+          const promotedAttempt = harness.prepareControlledWork(
+            "coalesced-defer-peer-replacement",
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:defer-peer",
+            partitionKey: "defer-peer",
+            workKey: "coalesced-defer-peer",
+          });
+          await firstAttempt.entered;
+          await observeControlledAttempt(
+            harness,
+            "coalesced-defer-peer",
+            1,
+            firstAttempt.release,
+          );
+
+          const promotedEvent = await harness.emitCoalescedFromPeer({
+            availableAtMs: promotedUntilMs,
+            coalescingKey: "wake:defer-peer",
+            partitionKey: "defer-peer",
+            workKey: "coalesced-defer-peer-replacement",
+          });
+
+          await harness.advanceByMs(199);
+          assert.deepEqual(
+            harness
+              .getStartedControlledWorkKeys()
+              .filter((workKey) => workKey.includes("defer-peer")),
+            ["coalesced-defer-peer"],
+          );
+
+          await harness.advanceByMs(1);
+          await waitForControlledStarts(
+            harness,
+            "coalesced-defer-peer-replacement",
+            1,
+          );
+
+          const [promoted] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+          assert.equal(promoted?.sourceEventId, promotedEvent.eventId);
+          assert.equal(promoted?.attempt, 1);
+          promotedAttempt.release();
+        });
+      },
+    );
+
+    await t.test(
+      "concurrent deferral and coalescing converge on one earliest successor",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const deferredUntilMs = harness.nowMs() + 500;
+          const promotedUntilMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-concurrent",
+            1,
+            { kind: "defer_until", availableAtMs: deferredUntilMs },
+          );
+          const sourceEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: harness.nowMs(),
+              coalescingKey: "wake:defer-concurrent",
+              partitionKey: "defer-concurrent",
+              workKey: "coalesced-defer-concurrent",
+            },
+          );
+          await harness.flush();
+          await firstAttempt.entered;
+
+          const [claimed] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+
+          assert.ok(claimed !== undefined);
+          assert.ok(claimed.ref !== null);
+
+          firstAttempt.release();
+          const concurrentEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: promotedUntilMs,
+              coalescingKey: "wake:defer-concurrent",
+              partitionKey: "defer-concurrent",
+              workKey: "coalesced-defer-concurrent",
+            },
+          );
+          await waitFor(
+            harness,
+            async () => {
+              const work = await harness.ledger.listWork({
+                queueName: "controlled-work.run",
+              });
+
+              return work.length === 1 && work[0]?.state === "delayed";
+            },
+            100,
+            1,
+          );
+
+          const [successor] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.ok(successor !== undefined);
+          assert.notEqual(successor.ref, claimed.ref);
+          assert.equal(successor.availableAtMs, promotedUntilMs);
+          assert.equal(successor.attempt, 0);
+          assert.equal(successor.lastError, null);
+          assert.equal(
+            [sourceEvent.eventId, concurrentEvent.eventId].includes(
+              successor.sourceEventId,
+            ),
+            true,
+          );
+        });
+      },
+    );
+
+    await t.test(
+      "deferral retires the claimed WorkRef and makes the successor cancellable",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-cancel",
+            1,
+            {
+              kind: "defer_until",
+              availableAtMs: harness.nowMs() + 500,
+            },
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:defer-cancel",
+            partitionKey: "defer-cancel",
+            workKey: "coalesced-defer-cancel",
+          });
+          await firstAttempt.entered;
+
+          const [claimed] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+
+          assert.ok(claimed !== undefined);
+          assert.ok(claimed.ref !== null);
+
+          await observeControlledAttempt(
+            harness,
+            "coalesced-defer-cancel",
+            1,
+            firstAttempt.release,
+          );
+
+          const [successor] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["delayed"],
+          });
+
+          assert.ok(successor !== undefined);
+          assert.ok(successor.ref !== null);
+          assert.notEqual(successor.ref, claimed.ref);
+
+          const staleCancellation = await harness.ledger.cancelWork({
+            ref: claimed.ref,
+          });
+          assert.equal(staleCancellation.status, "not_found");
+
+          const successorCancellation = await harness.ledger.cancelWork({
+            ref: successor.ref,
+            reason: "deferred successor cancelled",
+          });
+          assert.equal(successorCancellation.status, "cancelled");
+
+          if (successorCancellation.status !== "cancelled") {
+            assert.fail("expected deferred successor cancellation");
+          }
+
+          assert.equal(successorCancellation.work.state, "cancelled");
+          assert.equal(
+            successorCancellation.work.cancellation?.reason,
+            "deferred successor cancelled",
+          );
+          await harness.waitForIdle();
+        });
+      },
+    );
+
+    await t.test(
+      "cancelling the claimed generation fences its defer while preserving its successor",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const successorAvailableAtMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-cancelled-defer",
+            1,
+            {
+              kind: "defer_until",
+              availableAtMs: harness.nowMs() + 500,
+            },
+          );
+          const successorAttempt = harness.prepareControlledWork(
+            "coalesced-cancelled-defer",
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:cancelled-defer",
+            partitionKey: "cancelled-defer",
+            workKey: "coalesced-cancelled-defer",
+          });
+          await firstAttempt.entered;
+
+          const successorEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: successorAvailableAtMs,
+              coalescingKey: "wake:cancelled-defer",
+              partitionKey: "cancelled-defer",
+              workKey: "coalesced-cancelled-defer",
+            },
+          );
+          await harness.flush();
+
+          const beforeCancellation = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+          const claimed = beforeCancellation.find(
+            (item) => item.state === "leased",
+          );
+          const pendingSuccessor = beforeCancellation.find(
+            (item) => item.state === "delayed",
+          );
+
+          assert.ok(claimed !== undefined);
+          assert.ok(claimed.ref !== null);
+          assert.ok(pendingSuccessor !== undefined);
+          assert.ok(pendingSuccessor.ref !== null);
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: claimed.ref,
+            reason: "cancel claimed generation",
+          });
+          assert.equal(cancellation.status, "cancelled");
+
+          firstAttempt.release();
+          await harness.stopPrimaryWorkers();
+          await harness.restartWorkers({ maxInFlight: 16 });
+
+          const afterCancellation = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+          const cancelled = afterCancellation.find(
+            (item) => item.state === "cancelled",
+          );
+          const successor = afterCancellation.find(
+            (item) => item.state === "delayed",
+          );
+
+          assert.equal(cancelled?.ref, claimed.ref);
+          assert.equal(successor?.workId, pendingSuccessor.workId);
+          assert.equal(successor?.ref, pendingSuccessor.ref);
+          assert.equal(successor?.sourceEventId, successorEvent.eventId);
+          assert.equal(successor?.availableAtMs, successorAvailableAtMs);
+
+          await harness.advanceByMs(199);
+          assert.deepEqual(
+            harness
+              .getStartedControlledWorkKeys()
+              .filter((workKey) => workKey === "coalesced-cancelled-defer"),
+            ["coalesced-cancelled-defer"],
+          );
+
+          await harness.advanceByMs(1);
+          await waitFor(
+            harness,
+            async () =>
+              harness
+                .getStartedControlledWorkKeys()
+                .filter((workKey) => workKey === "coalesced-cancelled-defer")
+                .length === 2,
+            100,
+            1,
+          );
+          successorAttempt.release();
+        });
+      },
+    );
+
+    await t.test(
+      "deferred generations reset attempts and retain authenticated queue provenance",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const availableAtMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "coalesced-defer-provenance",
+            1,
+            { kind: "defer_until", availableAtMs },
+          );
+          const successorAttempt = harness.prepareControlledWork(
+            "coalesced-defer-provenance",
+          );
+          const sourceEvent = await harness.ledger.emit(
+            "coalesced-work.requested",
+            {
+              availableAtMs: harness.nowMs(),
+              coalescingKey: "wake:defer-provenance",
+              partitionKey: "defer-provenance",
+              workKey: "coalesced-defer-provenance",
+            },
+          );
+          await harness.flush();
+          await firstAttempt.entered;
+
+          const firstAttemptedEvent = await observeControlledAttempt(
+            harness,
+            "coalesced-defer-provenance",
+            1,
+            firstAttempt.release,
+          );
+
+          assert.equal(
+            firstAttemptedEvent.causationEventId,
+            sourceEvent.eventId,
+          );
+          assert.ok(firstAttemptedEvent.causationWork !== null);
+          assert.deepEqual(firstAttemptedEvent.causationWork, {
+            moduleId: "ledger.contract",
+            queueName: "controlled-work.run",
+            workId: firstAttemptedEvent.causationWork.workId,
+            attempt: 1,
+          });
+          await harness.stopPrimaryWorkers();
+
+          const [successor] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(
+            successor?.workId,
+            firstAttemptedEvent.causationWork.workId,
+          );
+          assert.equal(successor?.sourceEventId, sourceEvent.eventId);
+          assert.equal(successor?.state, "delayed");
+          assert.equal(successor?.attempt, 0);
+
+          await harness.restartWorkers({ maxInFlight: 16 });
+          await harness.advanceByMs(200);
+          await waitForControlledStarts(
+            harness,
+            "coalesced-defer-provenance",
+            2,
+          );
+
+          const successorAttemptedEvent = await observeControlledAttempt(
+            harness,
+            "coalesced-defer-provenance",
+            1,
+            successorAttempt.release,
+          );
+
+          assert.equal(
+            successorAttemptedEvent.causationEventId,
+            sourceEvent.eventId,
+          );
+          assert.deepEqual(successorAttemptedEvent.causationWork, {
+            moduleId: "ledger.contract",
+            queueName: "controlled-work.run",
+            workId: firstAttemptedEvent.causationWork.workId,
+            attempt: 1,
+          });
+        });
+      },
+    );
+
+    await t.test(
+      "deferred work remains the partition head until its clean successor completes",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const availableAtMs = harness.nowMs() + 200;
+          const firstAttempt = harness.prepareControlledWorkAttempt(
+            "partition-defer-head",
+            1,
+            { kind: "defer_until", availableAtMs },
+          );
+          const deferredSuccessor = harness.prepareControlledWork(
+            "partition-defer-head",
+          );
+          const partitionSuccessor = harness.prepareControlledWork(
+            "partition-after-defer",
+          );
+
+          await emitCoalescedWork(harness, {
+            availableAtMs: harness.nowMs(),
+            coalescingKey: "wake:partition-defer-head",
+            partitionKey: "partition-defer",
+            workKey: "partition-defer-head",
+          });
+          await firstAttempt.entered;
+
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            workKey: "partition-after-defer",
+            partitionKey: "partition-defer",
+          });
+          await harness.flush();
+
+          await observeControlledAttempt(
+            harness,
+            "partition-defer-head",
+            1,
+            firstAttempt.release,
+          );
+
+          const work = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+          });
+
+          assert.equal(work.length, 2);
+          assert.equal(work[0]?.state, "delayed");
+          assert.equal(work[0]?.availableAtMs, availableAtMs);
+          assert.equal(work[0]?.attempt, 0);
+          assert.equal(work[1]?.state, "pending");
+          assert.equal(work[1]?.attempt, 0);
+
+          await harness.advanceByMs(199);
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "partition-defer-head",
+          ]);
+
+          await harness.advanceByMs(1);
+          await waitForControlledStarts(harness, "partition-defer-head", 2);
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "partition-defer-head",
+            "partition-defer-head",
+          ]);
+
+          await observeControlledAttempt(
+            harness,
+            "partition-defer-head",
+            1,
+            deferredSuccessor.release,
+          );
+          await waitForControlledStarts(harness, "partition-after-defer", 1);
+          partitionSuccessor.release();
+        });
+      },
+    );
+
+    await t.test(
       "coalesced work keeps one pending row and only moves availability earlier",
       async () => {
         await withHarness(input.create, async (harness) => {
@@ -1719,6 +2680,7 @@ export function runLedgerContractSuite(input: {
       async () => {
         await withHarness(input.create, async (harness) => {
           const active = harness.prepareControlledWork("coalesced-active");
+          const successor = harness.prepareControlledWork("coalesced-active");
 
           await emitCoalescedWork(harness, {
             availableAtMs: harness.nowMs(),
@@ -1794,6 +2756,7 @@ export function runLedgerContractSuite(input: {
               .filter((workKey) => workKey === "coalesced-active"),
             ["coalesced-active", "coalesced-active"],
           );
+          successor.release();
           kick.release();
         });
       },

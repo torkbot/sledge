@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 
+import type { RuntimeScheduler } from "../runtime/contracts.ts";
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
   createBetterSqliteLedger as createPublicBetterSqliteLedger,
@@ -1204,7 +1206,7 @@ test("closing workers during a pending claim releases the claimed work", async (
   );
 });
 
-test("idle workers discover work materialized by another ledger handle", async () => {
+test("idle workers wake promptly for sibling-runtime commits", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const database = new Database(databaseUrl);
@@ -1242,31 +1244,31 @@ test("idle workers discover work materialized by another ledger handle", async (
       },
     },
   });
+  const workerLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const emitterLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {},
+    }),
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
+    null;
 
   try {
-    await using workerLedger = createBetterSqliteLedger({
-      databaseUrl,
-      model: model.withImplementations({
-        indexers: {},
-        queries: {},
-      }),
-      timing: {
-        clock: runtime.clock,
-      },
-    });
-
-    await using emitterLedger = createBetterSqliteLedger({
-      databaseUrl,
-      model: model.withImplementations({
-        indexers: {},
-        queries: {},
-      }),
-      timing: {
-        clock: runtime.clock,
-      },
-    });
-
-    await using workers = await workerLedger.startWorkers({
+    workers = await workerLedger.startWorkers({
       scheduler: runtime.scheduler,
     });
 
@@ -1276,21 +1278,204 @@ test("idle workers discover work materialized by another ledger handle", async (
     assert.equal(processed, 0);
     assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
 
-    await runtime.advanceByMs(999);
     await runtime.flush();
-    assert.equal(processed, 0);
-
-    await runtime.advanceByMs(1);
     await waitFor(runtime, () => processed === 1);
     await waitFor(
       runtime,
       () => readCount(database, `SELECT COUNT(*) as total FROM work`) === 0,
     );
   } finally {
+    await workers?.close();
     database.close();
+    await emitterLedger.close();
+    await workerLedger.close();
     await rm(databaseUrl, {
       force: true,
     });
+  }
+});
+
+test("event-only sibling commits do not wake queue workers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const scheduledDelays: number[] = [];
+  const scheduler: RuntimeScheduler = {
+    scheduleOnce: (delayMs, task) => {
+      scheduledDelays.push(delayMs);
+      return runtime.scheduler.scheduleOnce(delayMs, task);
+    },
+    scheduleRepeating: (everyMs, task) =>
+      runtime.scheduler.scheduleRepeating(everyMs, task),
+  };
+  const model = defineEngineFixtureModel({
+    events: {
+      "note.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  }).withImplementations({
+    indexers: {},
+    queries: {},
+  });
+  const workerLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const emitterLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
+    null;
+
+  try {
+    workers = await workerLedger.startWorkers({ scheduler });
+    scheduledDelays.length = 0;
+
+    await emitterLedger.emit("note.recorded", { id: 1 });
+    await runtime.flush();
+
+    assert.deepEqual(scheduledDelays, []);
+  } finally {
+    await workers?.close();
+    await emitterLedger.close();
+    await workerLedger.close();
+    await rm(databaseUrl, { force: true });
+  }
+});
+
+test("store discovery remains independent of a known durable deadline", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const processed: number[] = [];
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({
+        availableAtMs: Type.Number(),
+        id: Type.Number(),
+      }),
+    },
+    queues: {
+      "job.run": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            {
+              id: event.payload.id,
+            },
+            {
+              availableAtMs: event.payload.availableAtMs,
+              workKey: `job:${event.payload.id}`,
+            },
+          );
+        },
+      },
+      queues: {
+        "job.run": ({ work }) => {
+          processed.push(work.payload.id);
+        },
+      },
+    },
+  }).withImplementations({
+    indexers: {},
+    queries: {},
+  });
+
+  const workerLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
+    null;
+  let emitterDatabase: Database.Database | null = null;
+
+  try {
+    await workerLedger.emit("job.requested", {
+      availableAtMs: runtime.nowMs() + 5_000,
+      id: 1,
+    });
+    workers = await workerLedger.startWorkers({
+      scheduler: runtime.scheduler,
+    });
+    await runtime.flush();
+
+    const externalDatabase = new Database(databaseUrl, { timeout: 0 });
+    emitterDatabase = externalDatabase;
+    externalDatabase.pragma("foreign_keys = ON");
+    const delayed = Value.Decode(
+      Type.Object({
+        queue_name: Type.String(),
+        source_event_id: Type.Number(),
+      }),
+      externalDatabase
+        .prepare(
+          `SELECT queue_name, source_event_id
+           FROM work
+           ORDER BY work_id ASC
+           LIMIT 1`,
+        )
+        .get(),
+    );
+
+    externalDatabase
+      .prepare(
+        `INSERT INTO work (
+           queue_name,
+           payload_json,
+           source_event_id,
+           signal,
+           attempt,
+           available_at_ms,
+           dead
+         ) VALUES (?, ?, ?, 0, 0, ?, 0)`,
+      )
+      .run(
+        delayed.queue_name,
+        JSON.stringify({ id: 2 }),
+        delayed.source_event_id,
+        runtime.nowMs(),
+      );
+
+    await runtime.advanceByMs(999);
+    assert.deepEqual(processed, []);
+
+    await runtime.advanceByMs(1);
+    await waitFor(runtime, () => processed.length === 1);
+    assert.deepEqual(processed, [2]);
+    await waitFor(
+      runtime,
+      () =>
+        readCount(
+          externalDatabase,
+          `SELECT COUNT(*) AS total FROM work WHERE lease_id IS NOT NULL`,
+        ) === 0,
+    );
+  } finally {
+    await workers?.close();
+    emitterDatabase?.close();
+    await workerLedger.close();
+    await rm(databaseUrl, { force: true });
   }
 });
 
@@ -1650,6 +1835,78 @@ test("worker supervision reports work-processing failures", async () => {
     }
   } finally {
     await storage.close();
+  }
+});
+
+test("worker supervision reports sibling wake scheduling failures", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const schedulingFailure = new Error("sibling wake scheduling failed");
+  let failNextOneShot = false;
+
+  const scheduler: RuntimeScheduler = {
+    scheduleOnce: (delayMs, task) => {
+      if (failNextOneShot) {
+        failNextOneShot = false;
+        throw schedulingFailure;
+      }
+
+      return runtime.scheduler.scheduleOnce(delayMs, task);
+    },
+    scheduleRepeating: (everyMs, task) =>
+      runtime.scheduler.scheduleRepeating(everyMs, task),
+  };
+  const model = createImmediateJobTestModel(
+    () => undefined,
+  ).withImplementations({
+    indexers: {},
+    queries: {},
+  });
+  const workerLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const emitterLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    const workers = await workerLedger.startWorkers({ scheduler });
+    const waitAbortController = new AbortController();
+
+    failNextOneShot = true;
+    await emitterLedger.emit("job.requested", { id: 1 });
+    const waiting = workers.waitForIdle({
+      signal: waitAbortController.signal,
+    });
+    await runtime.flush();
+
+    runtime.scheduler.scheduleOnce(1, () => {
+      waitAbortController.abort(new Error("worker failure was not supervised"));
+    });
+    await runtime.advanceByMs(1);
+
+    await assert.rejects(waiting, (error: unknown) => {
+      assert.equal(error, schedulingFailure);
+      return true;
+    });
+    await emitterLedger.close();
+    await assert.rejects(workerLedger.close(), (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "failed to close ledger workers");
+      assert.deepEqual(error.errors, [schedulingFailure]);
+      return true;
+    });
+  } finally {
+    await Promise.allSettled([emitterLedger.close(), workerLedger.close()]);
+    await rm(databaseUrl, { force: true });
   }
 });
 

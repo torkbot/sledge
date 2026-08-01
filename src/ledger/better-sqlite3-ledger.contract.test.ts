@@ -149,6 +149,15 @@ runLedgerContractSuite({
           workers: competingWorkers,
         });
       },
+      emitCoalescedFromPeer: async (input) => {
+        const peerLedger = createRuntimeLedger();
+
+        try {
+          return await peerLedger.emit("coalesced-work.requested", input);
+        } finally {
+          await peerLedger.close();
+        }
+      },
       stopCompetingWorkers,
       pausePrimaryScheduler: () => primaryScheduler.pause(),
       stopPrimaryWorkers: async () => {

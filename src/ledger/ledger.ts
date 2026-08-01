@@ -773,6 +773,19 @@ interface WorkHandlerControl {
  * Explicit queue control methods for non-default outcomes.
  */
 export interface QueueHandlerControl extends WorkHandlerControl {
+  /**
+   * Successfully finishes the current attempt and durably leaves a clean
+   * successor that cannot be claimed before the absolute runtime-clock
+   * timestamp.
+   *
+   * The successor starts again at attempt one, remains non-idle, and receives
+   * a fresh WorkRef when the deferred generation is addressable. If a newer
+   * coalesced successor already exists, that generation is preserved and its
+   * availability can only move earlier. Later coalesced activity replaces a
+   * deferred generation while retaining the earlier of the two deadlines.
+   * `availableAtMs` must be finite.
+   */
+  deferUntil(availableAtMs: number): never;
   retry(error: unknown, options?: QueueHandlerRetryOptions): never;
   deadLetter(error: unknown): never;
 }

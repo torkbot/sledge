@@ -136,6 +136,7 @@ type PersistedWorkLease = {
   readonly workId: number;
   readonly queueName: string;
   readonly workKey: string | null;
+  readonly coalescingKey: string | null;
   readonly payloadJson: string;
   readonly sourceEventId: number;
   readonly attempt: number;
@@ -206,6 +207,41 @@ const StorageLayoutRowSchema = Type.Object({
 });
 const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
 const databaseInitializationTails = new Map<string, Promise<void>>();
+type DatabaseWorkChanges = {
+  readonly signal: ChangeSignal;
+  references: number;
+};
+const databaseWorkChanges = new Map<string, DatabaseWorkChanges>();
+
+function acquireDatabaseWorkChanges(databaseIdentity: string): {
+  readonly signal: ChangeSignal;
+  release(): void;
+} {
+  const changes = databaseWorkChanges.get(databaseIdentity) ?? {
+    signal: new ChangeSignal(),
+    references: 0,
+  };
+  changes.references += 1;
+  databaseWorkChanges.set(databaseIdentity, changes);
+
+  let released = false;
+
+  return {
+    signal: changes.signal,
+    release: () => {
+      if (released) {
+        return;
+      }
+
+      released = true;
+      changes.references -= 1;
+
+      if (changes.references === 0) {
+        databaseWorkChanges.delete(databaseIdentity);
+      }
+    },
+  };
+}
 
 function createWorkTableSql(
   tableName: "work" | "work_pre_queue_provenance",
@@ -217,6 +253,7 @@ function createWorkTableSql(
       queue_name TEXT NOT NULL,
       work_key TEXT,
       coalescing_key TEXT,
+      deferred_generation INTEGER NOT NULL DEFAULT 0,
       partition_key TEXT,
       payload_json TEXT NOT NULL,
       source_event_id INTEGER NOT NULL,
@@ -849,6 +886,14 @@ class DeadLetterRequested {
   }
 }
 
+class DeferRequested {
+  readonly availableAtMs: number;
+
+  constructor(availableAtMs: number) {
+    this.availableAtMs = availableAtMs;
+  }
+}
+
 const maxRuntimeTimeoutMs = 2_147_483_647;
 
 async function runWorkOperationWithTimeout<TResult>(input: {
@@ -917,6 +962,7 @@ async function runWorkOperationWithTimeout<TResult>(input: {
 
 type HandlerDisposition =
   | { readonly kind: "ack" }
+  | { readonly kind: "defer"; readonly availableAtMs: number }
   | {
       readonly kind: "retry";
       readonly error: string;
@@ -1017,8 +1063,14 @@ const WorkIdRowSchema = Type.Object({
 
 const CoalescedWorkRowSchema = Type.Object({
   available_at_ms: Type.Number(),
+  deferred_generation: Type.Number(),
   partition_key: Type.Union([Type.Null(), Type.String()]),
   payload_json: Type.String(),
+  work_id: Type.Number(),
+});
+
+const DeferredSuccessorRowSchema = Type.Object({
+  available_at_ms: Type.Number(),
   work_id: Type.Number(),
 });
 
@@ -1051,6 +1103,7 @@ const ClaimedWorkRowSchema = Type.Object({
   work_id: Type.Number(),
   queue_name: Type.String(),
   work_key: Type.Union([Type.Null(), Type.String()]),
+  coalescing_key: Type.Union([Type.Null(), Type.String()]),
   payload_json: Type.String(),
   source_event_id: Type.Number(),
   signal: Type.Number(),
@@ -1155,6 +1208,9 @@ function openDatabaseLedgerEngine<
 ): DatabaseLedger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
   const storage = input.storage;
+  const workChanges = acquireDatabaseWorkChanges(
+    storage[storageRuntimeIdentityBrand],
+  );
   const runtimeCarrier = input.model as typeof input.model & {
     readonly [registeredLedgerRuntimeBrand]?: typeof input.model;
   };
@@ -1234,9 +1290,8 @@ function openDatabaseLedgerEngine<
      */
     readonly terminalWorkRetentionMs: number;
     /**
-     * Fallback cadence for re-checking durable work when no local append woke
-     * this worker. SQLite gives us cross-connection visibility, not
-     * cross-connection notifications.
+     * Cross-process discovery cadence. This is independent of the exact
+     * scheduler-visible wake installed for known durable work.
      */
     readonly storePollMs: number;
     /**
@@ -1265,6 +1320,7 @@ function openDatabaseLedgerEngine<
      * Callers still read authoritative runtime and storage state after waking.
      */
     readonly stateChanges: ChangeSignal;
+    workChangeObserverSettled: Promise<void> | null;
     /**
      * Interrupts idle-wait operations when this worker closes or fails. Storage
      * operations remain safely observed because their drivers may not support
@@ -1298,7 +1354,8 @@ function openDatabaseLedgerEngine<
     /**
      * Next scheduled dispatch wakeup for this handle, if any.
      */
-    scheduledDispatch: { dueAtMs: number; cancel(): void } | null;
+    scheduledDispatchWake: { dueAtMs: number; cancel(): void } | null;
+    scheduledStoreDiscovery: { cancel(): void } | null;
   };
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
@@ -1350,6 +1407,11 @@ function openDatabaseLedgerEngine<
         await ensureColumn("work", "work_ref", "TEXT");
         await ensureColumn("work", "work_key", "TEXT");
         await ensureColumn("work", "coalescing_key", "TEXT");
+        await ensureColumn(
+          "work",
+          "deferred_generation",
+          "INTEGER NOT NULL DEFAULT 0",
+        );
         await ensureColumn("work", "partition_key", "TEXT");
         await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
         await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
@@ -2555,14 +2617,16 @@ function openDatabaseLedgerEngine<
     database: StorageDatabase,
     sourceEventId: number,
     work: PendingDurableWork,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const payloadJson = JSON.stringify(work.payload);
+    let availableAtMs = work.availableAtMs;
 
     if (work.coalescingKey !== null) {
       const existing = await database
         .prepare(
           `SELECT
              work_id,
+             deferred_generation,
              partition_key,
              payload_json,
              available_at_ms
@@ -2581,47 +2645,69 @@ function openDatabaseLedgerEngine<
 
       if (existing !== undefined) {
         const decodedExisting = decodeRow(existing, CoalescedWorkRowSchema);
-        const queueSchema = model.queues[work.queueName as keyof TQueues];
 
-        if (queueSchema === undefined) {
-          throw new Error(`unknown queue: ${work.queueName}`);
-        }
-
-        const existingPayload = decodeValue(
-          queueSchema,
-          parseJson(
-            decodedExisting.payload_json,
-            `coalesced work ${work.queueName}/${work.coalescingKey}`,
-          ),
-        );
-
-        if (!Value.Equal(existingPayload, work.payload)) {
-          throw new Error(
-            `coalesced work ${work.queueName}/${work.coalescingKey} payload does not match the pending item`,
-          );
-        }
-
-        if (decodedExisting.partition_key !== work.partitionKey) {
-          throw new Error(
-            `coalesced work ${work.queueName}/${work.coalescingKey} partition does not match the pending item`,
-          );
-        }
-
-        if (work.availableAtMs < decodedExisting.available_at_ms) {
+        if (decodedExisting.deferred_generation === 1) {
           await database
             .prepare(
-              `UPDATE work
-               SET available_at_ms = ?
+              `DELETE FROM work
                WHERE work_id = ?
                  AND attempt = 0
                  AND lease_id IS NULL
                  AND dead = 0
-                 AND cancelled = 0`,
+                 AND cancelled = 0
+                 AND deferred_generation = 1`,
             )
-            .run(work.availableAtMs, decodedExisting.work_id);
-        }
+            .run(decodedExisting.work_id);
 
-        return;
+          availableAtMs = Math.min(
+            availableAtMs,
+            decodedExisting.available_at_ms,
+          );
+        } else {
+          const queueSchema = model.queues[work.queueName as keyof TQueues];
+
+          if (queueSchema === undefined) {
+            throw new Error(`unknown queue: ${work.queueName}`);
+          }
+
+          const existingPayload = decodeValue(
+            queueSchema,
+            parseJson(
+              decodedExisting.payload_json,
+              `coalesced work ${work.queueName}/${work.coalescingKey}`,
+            ),
+          );
+
+          if (!Value.Equal(existingPayload, work.payload)) {
+            throw new Error(
+              `coalesced work ${work.queueName}/${work.coalescingKey} payload does not match the pending item`,
+            );
+          }
+
+          if (decodedExisting.partition_key !== work.partitionKey) {
+            throw new Error(
+              `coalesced work ${work.queueName}/${work.coalescingKey} partition does not match the pending item`,
+            );
+          }
+
+          if (availableAtMs < decodedExisting.available_at_ms) {
+            const promotion = await database
+              .prepare(
+                `UPDATE work
+                 SET available_at_ms = ?
+                 WHERE work_id = ?
+                   AND attempt = 0
+                   AND lease_id IS NULL
+                   AND dead = 0
+                   AND cancelled = 0`,
+              )
+              .run(availableAtMs, decodedExisting.work_id);
+
+            return promotion.changes > 0;
+          }
+
+          return false;
+        }
       }
     }
 
@@ -2655,8 +2741,10 @@ function openDatabaseLedgerEngine<
         work.partitionKey,
         payloadJson,
         sourceEventId,
-        work.availableAtMs,
+        availableAtMs,
       );
+
+    return true;
   }
 
   async function appendEventInTransaction(
@@ -2667,6 +2755,7 @@ function openDatabaseLedgerEngine<
     envelope: EventEnvelope<TEvents, keyof TEvents>;
     outcome?: unknown;
     created: boolean;
+    workChanged: boolean;
   }> {
     const eventName = eventInput.eventName as keyof TEvents;
     const decodedPayload = decodeEventPayload(eventName, eventInput.payload);
@@ -2818,9 +2907,11 @@ function openDatabaseLedgerEngine<
         envelope: EventEnvelope<TEvents, keyof TEvents>;
         outcome?: unknown;
         created: boolean;
+        workChanged: boolean;
       } = {
         envelope,
         created: false,
+        workChanged: false,
       };
 
       if (outcome !== undefined) {
@@ -3010,17 +3101,22 @@ function openDatabaseLedgerEngine<
       }
     }
 
+    let workChanged = false;
+
     for (const work of queued) {
-      await materializeDurableWork(database, eventId, work);
+      const changed = await materializeDurableWork(database, eventId, work);
+      workChanged = workChanged || changed;
     }
 
     const commit: {
       envelope: EventEnvelope<TEvents, keyof TEvents>;
       outcome?: unknown;
       created: boolean;
+      workChanged: boolean;
     } = {
       envelope,
       created,
+      workChanged,
     };
 
     if (outcomeSchema !== null) {
@@ -3083,6 +3179,10 @@ function openDatabaseLedgerEngine<
     if (result.created) {
       committedEventId = Math.max(committedEventId, result.envelope.eventId);
       eventChanges.notify();
+    }
+
+    if (result.workChanged) {
+      workChanges.signal.notify();
 
       if (activeWorker !== null) {
         activeWorker.stateChanges.notify();
@@ -3107,6 +3207,7 @@ function openDatabaseLedgerEngine<
     eventId: number;
     created: boolean;
     event: EventEnvelope<TSignals, keyof TSignals> | null;
+    workChanged: boolean;
   }> {
     const signalName = signalInput.signalName as keyof TSignals;
     const decodedPayload = decodeSignalPayload(signalName, signalInput.payload);
@@ -3189,6 +3290,7 @@ function openDatabaseLedgerEngine<
         eventId,
         created: false,
         event: null,
+        workChanged: false,
       };
     }
 
@@ -3299,6 +3401,7 @@ function openDatabaseLedgerEngine<
       eventId,
       created,
       event: envelope,
+      workChanged: queued.length > 0,
     };
   }
 
@@ -3331,22 +3434,42 @@ function openDatabaseLedgerEngine<
     }
 
     if (
-      worker.scheduledDispatch !== null &&
-      worker.scheduledDispatch.dueAtMs <= targetAtMs
+      worker.scheduledDispatchWake !== null &&
+      worker.scheduledDispatchWake.dueAtMs <= targetAtMs
     ) {
       return;
     }
 
-    worker.scheduledDispatch?.cancel();
+    worker.scheduledDispatchWake?.cancel();
 
     const delayMs = Math.max(0, targetAtMs - clock.nowMs());
     const task = worker.scheduler.scheduleOnce(delayMs, () => {
-      worker.scheduledDispatch = null;
+      worker.scheduledDispatchWake = null;
       requestDispatchRun(worker);
     });
 
-    worker.scheduledDispatch = {
+    worker.scheduledDispatchWake = {
       dueAtMs: clock.nowMs() + delayMs,
+      cancel: () => task.cancel(),
+    };
+  }
+
+  function scheduleStoreDiscovery(worker: WorkerRuntimeState): void {
+    if (
+      closed ||
+      worker.closed ||
+      worker.failure !== null ||
+      worker.scheduledStoreDiscovery !== null
+    ) {
+      return;
+    }
+
+    const task = worker.scheduler.scheduleOnce(worker.storePollMs, () => {
+      worker.scheduledStoreDiscovery = null;
+      requestDispatchRun(worker);
+    });
+
+    worker.scheduledStoreDiscovery = {
       cancel: () => task.cancel(),
     };
   }
@@ -3381,13 +3504,38 @@ function openDatabaseLedgerEngine<
         .get();
     });
 
-    const pollAtMs = clock.nowMs() + worker.storePollMs;
-    const nextWorkAtMs =
-      row === undefined
-        ? pollAtMs
-        : decodeRow(row, AvailableAtRowSchema).available_at_ms;
+    if (row !== undefined) {
+      scheduleDispatchAt(
+        worker,
+        decodeRow(row, AvailableAtRowSchema).available_at_ms,
+      );
+    }
 
-    scheduleDispatchAt(worker, Math.min(nextWorkAtMs, pollAtMs));
+    scheduleStoreDiscovery(worker);
+  }
+
+  async function observeWorkChanges(worker: WorkerRuntimeState): Promise<void> {
+    let observed = workChanges.signal.snapshot();
+
+    while (!closed && !worker.closed && worker.failure === null) {
+      await workChanges.signal.waitForChange(
+        observed,
+        worker.lifecycleAbortController.signal,
+      );
+
+      if (
+        closed ||
+        worker.closed ||
+        worker.failure !== null ||
+        worker.lifecycleAbortController.signal.aborted
+      ) {
+        return;
+      }
+
+      observed = workChanges.signal.snapshot();
+      worker.stateChanges.notify();
+      scheduleDispatchAt(worker, clock.nowMs());
+    }
   }
 
   function assertWorkerWaitActive(
@@ -3738,15 +3886,14 @@ function openDatabaseLedgerEngine<
       const leaseId = randomUUID();
       const leaseExpiresAtMs = nowMs + worker.leaseMs;
 
-      // The coalescing key reserves only an unattempted generation. Releasing
-      // it in the claim transaction lets later events create one successor
-      // without mutating this attempt or its backoff.
+      // The partial unique index reserves only an unattempted generation.
+      // Retaining the key on this attempt preserves its identity for a defer
+      // disposition while later events can still create one successor.
       const updateResult = await database
         .prepare(
           `UPDATE work
            SET
              attempt = attempt + 1,
-             coalescing_key = NULL,
              lease_id = ?,
              lease_acquired_at_ms = ?,
              lease_expires_at_ms = ?,
@@ -3774,6 +3921,7 @@ function openDatabaseLedgerEngine<
             work_id,
             queue_name,
             work_key,
+            coalescing_key,
             payload_json,
             source_event_id,
             signal,
@@ -3810,6 +3958,7 @@ function openDatabaseLedgerEngine<
         workId: decodedClaimed.work_id,
         queueName: decodedClaimed.queue_name,
         workKey: decodedClaimed.work_key,
+        coalescingKey: decodedClaimed.coalescing_key,
         payloadJson: decodedClaimed.payload_json,
         sourceEventId: decodedClaimed.source_event_id,
         signal: decodedClaimed.signal === 1,
@@ -3840,6 +3989,7 @@ function openDatabaseLedgerEngine<
         )
         .run(clock.nowMs(), claimed.workId, claimed.leaseId);
     });
+    workChanges.signal.notify();
   }
 
   function failWorker(worker: WorkerRuntimeState, reason: unknown): void {
@@ -3850,8 +4000,10 @@ function openDatabaseLedgerEngine<
     worker.failure = {
       reason,
     };
-    worker.scheduledDispatch?.cancel();
-    worker.scheduledDispatch = null;
+    worker.scheduledDispatchWake?.cancel();
+    worker.scheduledDispatchWake = null;
+    worker.scheduledStoreDiscovery?.cancel();
+    worker.scheduledStoreDiscovery = null;
     worker.lifecycleAbortController.abort(reason);
     worker.stateChanges.notify();
   }
@@ -4182,6 +4334,7 @@ function openDatabaseLedgerEngine<
           type ImmediateSignalEmission = {
             readonly created: boolean;
             readonly event: EventEnvelope<TSignals, keyof TSignals> | null;
+            readonly workChanged: boolean;
           };
 
           const appended = await runInTransaction(
@@ -4208,6 +4361,7 @@ function openDatabaseLedgerEngine<
                 return {
                   created: false,
                   event: null,
+                  workChanged: false,
                 };
               }
 
@@ -4223,12 +4377,17 @@ function openDatabaseLedgerEngine<
               return {
                 created: result.created,
                 event: result.event,
+                workChanged: result.workChanged,
               };
             },
           );
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
+          }
+
+          if (appended.workChanged) {
+            workChanges.signal.notify();
             worker.stateChanges.notify();
             scheduleDispatchAt(worker, clock.nowMs());
           }
@@ -4289,6 +4448,15 @@ function openDatabaseLedgerEngine<
 
       const queueControl: QueueHandlerControl = {
         withTimeout,
+        deferUntil: (availableAtMs) => {
+          if (!Number.isFinite(availableAtMs)) {
+            throw new Error(
+              `availableAtMs must be a finite number, received ${String(availableAtMs)}`,
+            );
+          }
+
+          throw new DeferRequested(availableAtMs);
+        },
         retry: (error, options) => {
           throw new RetryRequested(error, options?.retryAtMs);
         },
@@ -4334,7 +4502,12 @@ function openDatabaseLedgerEngine<
           });
         }
       } catch (error: unknown) {
-        if (error instanceof RetryRequested) {
+        if (error instanceof DeferRequested) {
+          disposition = {
+            kind: "defer",
+            availableAtMs: error.availableAtMs,
+          };
+        } else if (error instanceof RetryRequested) {
           disposition = {
             kind: "retry",
             error: error.error,
@@ -4437,6 +4610,86 @@ function openDatabaseLedgerEngine<
             }
             break;
 
+          case "defer": {
+            if (claimed.coalescingKey !== null) {
+              const existingSuccessor = await database
+                .prepare(
+                  `SELECT work_id, available_at_ms
+                   FROM work
+                   WHERE queue_name = ?
+                     AND CASE
+                       WHEN attempt = 0
+                         AND lease_id IS NULL
+                         AND dead = 0
+                         AND cancelled = 0
+                       THEN coalescing_key
+                       ELSE NULL
+                     END = ?`,
+                )
+                .get(claimed.queueName, claimed.coalescingKey);
+
+              if (existingSuccessor !== undefined) {
+                const successor = decodeRow(
+                  existingSuccessor,
+                  DeferredSuccessorRowSchema,
+                );
+
+                if (disposition.availableAtMs < successor.available_at_ms) {
+                  await database
+                    .prepare(
+                      `UPDATE work
+                       SET available_at_ms = ?
+                       WHERE work_id = ?
+                         AND attempt = 0
+                         AND lease_id IS NULL
+                         AND dead = 0
+                         AND cancelled = 0`,
+                    )
+                    .run(disposition.availableAtMs, successor.work_id);
+                }
+
+                await database
+                  .prepare(
+                    `DELETE FROM work
+                     WHERE work_id = ?
+                       AND lease_id = ?
+                       AND dead = 0
+                       AND cancelled = 0`,
+                  )
+                  .run(claimed.workId, claimed.leaseId);
+                break;
+              }
+            }
+
+            await database
+              .prepare(
+                `UPDATE work
+                 SET
+                   work_ref = ?,
+                   attempt = 0,
+                   deferred_generation = 1,
+                   available_at_ms = ?,
+                   lease_id = NULL,
+                   lease_acquired_at_ms = NULL,
+                   lease_expires_at_ms = NULL,
+                   lease_protocol_version = 0,
+                   last_error = NULL
+                 WHERE work_id = ?
+                   AND lease_id = ?
+                   AND dead = 0
+                   AND cancelled = 0`,
+              )
+              .run(
+                claimed.workKey === null && claimed.coalescingKey === null
+                  ? null
+                  : createWorkRef(),
+                disposition.availableAtMs,
+                claimed.workId,
+                claimed.leaseId,
+              );
+            break;
+          }
+
           case "retry":
             await database
               .prepare(
@@ -4503,6 +4756,7 @@ function openDatabaseLedgerEngine<
         eventChanges.notify();
       }
 
+      workChanges.signal.notify();
       worker.stateChanges.notify();
       scheduleDispatchAt(worker, clock.nowMs());
     } finally {
@@ -4535,8 +4789,10 @@ function openDatabaseLedgerEngine<
       activeWorker = null;
     }
 
-    worker.scheduledDispatch?.cancel();
-    worker.scheduledDispatch = null;
+    worker.scheduledDispatchWake?.cancel();
+    worker.scheduledDispatchWake = null;
+    worker.scheduledStoreDiscovery?.cancel();
+    worker.scheduledStoreDiscovery = null;
 
     // Wait until claiming has quiesced so we can snapshot+abort the final set
     // of leases this worker owns.
@@ -4590,7 +4846,10 @@ function openDatabaseLedgerEngine<
           )
           .run(clock.nowMs(), ...leaseIds);
       });
+      workChanges.signal.notify();
     }
+
+    await worker.workChangeObserverSettled;
 
     const failure = worker.failure ?? observedFailure;
 
@@ -4630,6 +4889,8 @@ function openDatabaseLedgerEngine<
       await storage.close();
     } catch (error: unknown) {
       storageFailures.push(error);
+    } finally {
+      workChanges.release();
     }
 
     const failures = closeResults.flatMap((result) => {
@@ -4730,6 +4991,8 @@ function openDatabaseLedgerEngine<
       }
 
       const worker = activeWorker;
+
+      workChanges.signal.notify();
 
       if (worker !== null) {
         worker.stateChanges.notify();
@@ -5030,16 +5293,23 @@ function openDatabaseLedgerEngine<
         leaseExpiryTasks: new Map(),
         leaseHeartbeatTasks: new Map(),
         stateChanges: new ChangeSignal(),
+        workChangeObserverSettled: null,
         lifecycleAbortController: new AbortController(),
         closed: false,
         dispatchLoopActive: false,
         dispatchLoopQueued: false,
         dispatchLoopSettled: null,
         failure: null,
-        scheduledDispatch: null,
+        scheduledDispatchWake: null,
+        scheduledStoreDiscovery: null,
       };
 
       activeWorker = worker;
+      worker.workChangeObserverSettled = observeWorkChanges(worker).catch(
+        (error: unknown) => {
+          failWorker(worker, error);
+        },
+      );
 
       try {
         await releaseExpiredLeases();
