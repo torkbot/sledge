@@ -34,10 +34,10 @@ export class NodeRuntimeScheduler implements RuntimeScheduler {
   scheduleOnce(delayMs: number, task: () => void): RuntimeScheduledTask {
     let cancelled = false;
     let handle: ReturnType<typeof setTimeout> | null = null;
-    const dueAtMs = Date.now() + delayMs;
+    const dueAtMs = performance.now() + delayMs;
 
     const scheduleNext = (): void => {
-      const remainingDelayMs = Math.max(0, dueAtMs - Date.now());
+      const remainingDelayMs = Math.max(0, dueAtMs - performance.now());
       const scheduledDelayMs = Math.min(
         remainingDelayMs,
         maximumNodeTimerDelayMs,
@@ -49,7 +49,7 @@ export class NodeRuntimeScheduler implements RuntimeScheduler {
           return;
         }
 
-        if (Date.now() < dueAtMs) {
+        if (performance.now() < dueAtMs) {
           scheduleNext();
           return;
         }

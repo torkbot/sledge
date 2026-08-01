@@ -45,7 +45,7 @@ test("NodeRuntimeScheduler scheduleOnce preserves long delays and cancellation",
     apis: ["setTimeout"],
   });
   let nowMs = 1_900_000_000_000;
-  context.mock.method(Date, "now", () => nowMs);
+  context.mock.method(performance, "now", () => nowMs);
 
   const scheduler = new NodeRuntimeScheduler();
   const maximumTimerDelayMs = 2_147_483_647;
@@ -89,7 +89,7 @@ test("NodeRuntimeScheduler scheduleOnce does not add a chunk after a late callba
   });
   const maximumTimerDelayMs = 2_147_483_647;
   let nowMs = 1_900_000_000_000;
-  context.mock.method(Date, "now", () => nowMs);
+  context.mock.method(performance, "now", () => nowMs);
 
   const scheduler = new NodeRuntimeScheduler();
   let calls = 0;
@@ -100,6 +100,29 @@ test("NodeRuntimeScheduler scheduleOnce does not add a chunk after a late callba
 
   nowMs += maximumTimerDelayMs + 20;
   context.mock.timers.tick(maximumTimerDelayMs);
+
+  assert.equal(calls, 1);
+});
+
+test("NodeRuntimeScheduler scheduleOnce is not extended by wall-clock rollback", (context) => {
+  context.mock.timers.enable({
+    apis: ["setTimeout"],
+  });
+  let wallNowMs = 1_900_000_000_000;
+  let monotonicNowMs = 1_000;
+  context.mock.method(Date, "now", () => wallNowMs);
+  context.mock.method(performance, "now", () => monotonicNowMs);
+
+  const scheduler = new NodeRuntimeScheduler();
+  let calls = 0;
+
+  scheduler.scheduleOnce(10, () => {
+    calls += 1;
+  });
+
+  wallNowMs -= 60 * 60 * 1_000;
+  monotonicNowMs += 10;
+  context.mock.timers.tick(10);
 
   assert.equal(calls, 1);
 });

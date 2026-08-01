@@ -1295,6 +1295,65 @@ test("idle workers wake promptly for sibling-runtime commits", async () => {
   }
 });
 
+test("event-only sibling commits do not wake queue workers", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const scheduledDelays: number[] = [];
+  const scheduler: RuntimeScheduler = {
+    scheduleOnce: (delayMs, task) => {
+      scheduledDelays.push(delayMs);
+      return runtime.scheduler.scheduleOnce(delayMs, task);
+    },
+    scheduleRepeating: (everyMs, task) =>
+      runtime.scheduler.scheduleRepeating(everyMs, task),
+  };
+  const model = defineEngineFixtureModel({
+    events: {
+      "note.recorded": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {},
+  }).withImplementations({
+    indexers: {},
+    queries: {},
+  });
+  const workerLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const emitterLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
+    null;
+
+  try {
+    workers = await workerLedger.startWorkers({ scheduler });
+    scheduledDelays.length = 0;
+
+    await emitterLedger.emit("note.recorded", { id: 1 });
+    await runtime.flush();
+
+    assert.deepEqual(scheduledDelays, []);
+  } finally {
+    await workers?.close();
+    await emitterLedger.close();
+    await workerLedger.close();
+    await rm(databaseUrl, { force: true });
+  }
+});
+
 test("store discovery remains independent of a known durable deadline", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();

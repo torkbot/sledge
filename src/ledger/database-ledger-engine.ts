@@ -2617,7 +2617,7 @@ function openDatabaseLedgerEngine<
     database: StorageDatabase,
     sourceEventId: number,
     work: PendingDurableWork,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const payloadJson = JSON.stringify(work.payload);
     let availableAtMs = work.availableAtMs;
 
@@ -2691,7 +2691,7 @@ function openDatabaseLedgerEngine<
           }
 
           if (availableAtMs < decodedExisting.available_at_ms) {
-            await database
+            const promotion = await database
               .prepare(
                 `UPDATE work
                  SET available_at_ms = ?
@@ -2702,9 +2702,11 @@ function openDatabaseLedgerEngine<
                    AND cancelled = 0`,
               )
               .run(availableAtMs, decodedExisting.work_id);
+
+            return promotion.changes > 0;
           }
 
-          return;
+          return false;
         }
       }
     }
@@ -2741,6 +2743,8 @@ function openDatabaseLedgerEngine<
         sourceEventId,
         availableAtMs,
       );
+
+    return true;
   }
 
   async function appendEventInTransaction(
@@ -2751,6 +2755,7 @@ function openDatabaseLedgerEngine<
     envelope: EventEnvelope<TEvents, keyof TEvents>;
     outcome?: unknown;
     created: boolean;
+    workChanged: boolean;
   }> {
     const eventName = eventInput.eventName as keyof TEvents;
     const decodedPayload = decodeEventPayload(eventName, eventInput.payload);
@@ -2902,9 +2907,11 @@ function openDatabaseLedgerEngine<
         envelope: EventEnvelope<TEvents, keyof TEvents>;
         outcome?: unknown;
         created: boolean;
+        workChanged: boolean;
       } = {
         envelope,
         created: false,
+        workChanged: false,
       };
 
       if (outcome !== undefined) {
@@ -3094,17 +3101,22 @@ function openDatabaseLedgerEngine<
       }
     }
 
+    let workChanged = false;
+
     for (const work of queued) {
-      await materializeDurableWork(database, eventId, work);
+      const changed = await materializeDurableWork(database, eventId, work);
+      workChanged = workChanged || changed;
     }
 
     const commit: {
       envelope: EventEnvelope<TEvents, keyof TEvents>;
       outcome?: unknown;
       created: boolean;
+      workChanged: boolean;
     } = {
       envelope,
       created,
+      workChanged,
     };
 
     if (outcomeSchema !== null) {
@@ -3167,6 +3179,9 @@ function openDatabaseLedgerEngine<
     if (result.created) {
       committedEventId = Math.max(committedEventId, result.envelope.eventId);
       eventChanges.notify();
+    }
+
+    if (result.workChanged) {
       workChanges.signal.notify();
 
       if (activeWorker !== null) {
@@ -3192,6 +3207,7 @@ function openDatabaseLedgerEngine<
     eventId: number;
     created: boolean;
     event: EventEnvelope<TSignals, keyof TSignals> | null;
+    workChanged: boolean;
   }> {
     const signalName = signalInput.signalName as keyof TSignals;
     const decodedPayload = decodeSignalPayload(signalName, signalInput.payload);
@@ -3274,6 +3290,7 @@ function openDatabaseLedgerEngine<
         eventId,
         created: false,
         event: null,
+        workChanged: false,
       };
     }
 
@@ -3384,6 +3401,7 @@ function openDatabaseLedgerEngine<
       eventId,
       created,
       event: envelope,
+      workChanged: queued.length > 0,
     };
   }
 
@@ -4316,6 +4334,7 @@ function openDatabaseLedgerEngine<
           type ImmediateSignalEmission = {
             readonly created: boolean;
             readonly event: EventEnvelope<TSignals, keyof TSignals> | null;
+            readonly workChanged: boolean;
           };
 
           const appended = await runInTransaction(
@@ -4342,6 +4361,7 @@ function openDatabaseLedgerEngine<
                 return {
                   created: false,
                   event: null,
+                  workChanged: false,
                 };
               }
 
@@ -4357,12 +4377,16 @@ function openDatabaseLedgerEngine<
               return {
                 created: result.created,
                 event: result.event,
+                workChanged: result.workChanged,
               };
             },
           );
 
           if (appended.event !== null) {
             notifySignalObservers([appended.event]);
+          }
+
+          if (appended.workChanged) {
             workChanges.signal.notify();
             worker.stateChanges.notify();
             scheduleDispatchAt(worker, clock.nowMs());
