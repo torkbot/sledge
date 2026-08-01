@@ -5281,7 +5281,11 @@ function openDatabaseLedgerEngine<
       };
 
       activeWorker = worker;
-      worker.workChangeObserverSettled = observeWorkChanges(worker);
+      worker.workChangeObserverSettled = observeWorkChanges(worker).catch(
+        (error: unknown) => {
+          failWorker(worker, error);
+        },
+      );
 
       try {
         await releaseExpiredLeases();

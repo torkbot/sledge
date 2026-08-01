@@ -8,6 +8,7 @@ import test from "node:test";
 import { Type, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 
+import type { RuntimeScheduler } from "../runtime/contracts.ts";
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
   createBetterSqliteLedger as createPublicBetterSqliteLedger,
@@ -1775,6 +1776,78 @@ test("worker supervision reports work-processing failures", async () => {
     }
   } finally {
     await storage.close();
+  }
+});
+
+test("worker supervision reports sibling wake scheduling failures", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const schedulingFailure = new Error("sibling wake scheduling failed");
+  let failNextOneShot = false;
+
+  const scheduler: RuntimeScheduler = {
+    scheduleOnce: (delayMs, task) => {
+      if (failNextOneShot) {
+        failNextOneShot = false;
+        throw schedulingFailure;
+      }
+
+      return runtime.scheduler.scheduleOnce(delayMs, task);
+    },
+    scheduleRepeating: (everyMs, task) =>
+      runtime.scheduler.scheduleRepeating(everyMs, task),
+  };
+  const model = createImmediateJobTestModel(
+    () => undefined,
+  ).withImplementations({
+    indexers: {},
+    queries: {},
+  });
+  const workerLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+  const emitterLedger = createBetterSqliteLedger({
+    databaseUrl,
+    model,
+    timing: {
+      clock: runtime.clock,
+    },
+  });
+
+  try {
+    const workers = await workerLedger.startWorkers({ scheduler });
+    const waitAbortController = new AbortController();
+
+    failNextOneShot = true;
+    await emitterLedger.emit("job.requested", { id: 1 });
+    const waiting = workers.waitForIdle({
+      signal: waitAbortController.signal,
+    });
+    await runtime.flush();
+
+    runtime.scheduler.scheduleOnce(1, () => {
+      waitAbortController.abort(new Error("worker failure was not supervised"));
+    });
+    await runtime.advanceByMs(1);
+
+    await assert.rejects(waiting, (error: unknown) => {
+      assert.equal(error, schedulingFailure);
+      return true;
+    });
+    await emitterLedger.close();
+    await assert.rejects(workerLedger.close(), (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, "failed to close ledger workers");
+      assert.deepEqual(error.errors, [schedulingFailure]);
+      return true;
+    });
+  } finally {
+    await Promise.allSettled([emitterLedger.close(), workerLedger.close()]);
+    await rm(databaseUrl, { force: true });
   }
 });
 

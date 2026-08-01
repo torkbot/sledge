@@ -44,6 +44,8 @@ test("NodeRuntimeScheduler scheduleOnce preserves long delays and cancellation",
   context.mock.timers.enable({
     apis: ["setTimeout"],
   });
+  let nowMs = 1_900_000_000_000;
+  context.mock.method(Date, "now", () => nowMs);
 
   const scheduler = new NodeRuntimeScheduler();
   const maximumTimerDelayMs = 2_147_483_647;
@@ -53,9 +55,11 @@ test("NodeRuntimeScheduler scheduleOnce preserves long delays and cancellation",
     calls += 1;
   });
 
+  nowMs += 1;
   context.mock.timers.tick(1);
   assert.equal(calls, 0);
 
+  nowMs += maximumTimerDelayMs - 1;
   context.mock.timers.tick(maximumTimerDelayMs - 1);
   assert.equal(calls, 0);
 
@@ -66,12 +70,36 @@ test("NodeRuntimeScheduler scheduleOnce preserves long delays and cancellation",
   scheduler.scheduleOnce(maximumTimerDelayMs + 10, () => {
     calls += 1;
   });
+  nowMs += maximumTimerDelayMs;
   context.mock.timers.tick(maximumTimerDelayMs);
   assert.equal(calls, 0);
 
+  nowMs += 9;
   context.mock.timers.tick(9);
   assert.equal(calls, 0);
 
+  nowMs += 1;
   context.mock.timers.tick(1);
+  assert.equal(calls, 1);
+});
+
+test("NodeRuntimeScheduler scheduleOnce does not add a chunk after a late callback", (context) => {
+  context.mock.timers.enable({
+    apis: ["setTimeout"],
+  });
+  const maximumTimerDelayMs = 2_147_483_647;
+  let nowMs = 1_900_000_000_000;
+  context.mock.method(Date, "now", () => nowMs);
+
+  const scheduler = new NodeRuntimeScheduler();
+  let calls = 0;
+
+  scheduler.scheduleOnce(maximumTimerDelayMs + 10, () => {
+    calls += 1;
+  });
+
+  nowMs += maximumTimerDelayMs + 20;
+  context.mock.timers.tick(maximumTimerDelayMs);
+
   assert.equal(calls, 1);
 });
