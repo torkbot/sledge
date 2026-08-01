@@ -5,6 +5,10 @@
 - Add `expireHistory({ through: cursor })` as a durable, monotonic event-stream
   boundary. Tailing omits expired history, resuming an older cursor raises
   `LedgerHistoryExpiredError`, and no event rows are physically deleted.
+  Event streams discover expiration performed by peer runtimes, including
+  while a previously read batch is being consumed. Opening an older database
+  advances its storage protocol so runtimes that ignore the boundary cannot
+  subsequently open it.
 - Add durable queue `control.deferUntil(availableAtMs)` for successful,
   non-retry deferral to an absolute runtime-clock deadline, including clean
   attempt/WorkRef semantics, restart-safe non-idle scheduling, prompt peer

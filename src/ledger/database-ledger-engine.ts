@@ -202,8 +202,9 @@ type StorageRow = LedgerStorageRow;
 const materializationVersionTableName = "sledge_materialization_versions";
 const historyTableName = "sledge_history";
 const storageLayoutTableName = "sledge_storage_layout";
-const storageLayoutVersion = 2;
-const previousStorageLayoutVersion = 1;
+const storageLayoutVersion = 3;
+const queueProvenanceStorageLayoutVersion = 2;
+const composableStorageLayoutVersion = 1;
 const queueProvenanceLeaseProtocolVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
@@ -218,22 +219,26 @@ const HistoryStateRowSchema = Type.Object({
 });
 const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
 const databaseInitializationTails = new Map<string, Promise<void>>();
-type DatabaseWorkChanges = {
+type DatabaseChanges = {
   readonly signal: ChangeSignal;
   references: number;
 };
-const databaseWorkChanges = new Map<string, DatabaseWorkChanges>();
+const databaseEventChanges = new Map<string, DatabaseChanges>();
+const databaseWorkChanges = new Map<string, DatabaseChanges>();
 
-function acquireDatabaseWorkChanges(databaseIdentity: string): {
+function acquireDatabaseChanges(
+  changesByDatabase: Map<string, DatabaseChanges>,
+  databaseIdentity: string,
+): {
   readonly signal: ChangeSignal;
   release(): void;
 } {
-  const changes = databaseWorkChanges.get(databaseIdentity) ?? {
+  const changes = changesByDatabase.get(databaseIdentity) ?? {
     signal: new ChangeSignal(),
     references: 0,
   };
   changes.references += 1;
-  databaseWorkChanges.set(databaseIdentity, changes);
+  changesByDatabase.set(databaseIdentity, changes);
 
   let released = false;
 
@@ -248,7 +253,7 @@ function acquireDatabaseWorkChanges(databaseIdentity: string): {
       changes.references -= 1;
 
       if (changes.references === 0) {
-        databaseWorkChanges.delete(databaseIdentity);
+        changesByDatabase.delete(databaseIdentity);
       }
     },
   };
@@ -1218,8 +1223,14 @@ function openDatabaseLedgerEngine<
   >,
 ): DatabaseLedger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
+  const scheduler = input.timing.scheduler;
   const storage = input.storage;
-  const workChanges = acquireDatabaseWorkChanges(
+  const eventChanges = acquireDatabaseChanges(
+    databaseEventChanges,
+    storage[storageRuntimeIdentityBrand],
+  );
+  const workChanges = acquireDatabaseChanges(
+    databaseWorkChanges,
     storage[storageRuntimeIdentityBrand],
   );
   const runtimeCarrier = input.model as typeof input.model & {
@@ -1253,7 +1264,6 @@ function openDatabaseLedgerEngine<
   let closed = false;
   let closePromise: Promise<void> | null = null;
   let activeWorker: WorkerRuntimeState | null = null;
-  const eventChanges = new ChangeSignal();
   type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
 
@@ -1444,6 +1454,9 @@ function openDatabaseLedgerEngine<
             database,
             startingStorageLayoutVersion,
           );
+        });
+        await storage.write(async (database) => {
+          await ensureHistoryExpirationProtocol(database);
         });
         await storage.write(async (database) => {
           // Deriving the reservation from durable work state keeps claim
@@ -1745,7 +1758,8 @@ function openDatabaseLedgerEngine<
 
         if (
           decoded.version !== storageLayoutVersion &&
-          decoded.version !== previousStorageLayoutVersion
+          decoded.version !== queueProvenanceStorageLayoutVersion &&
+          decoded.version !== composableStorageLayoutVersion
         ) {
           throw new Error(
             `unsupported Sledge storage layout version ${decoded.version}`,
@@ -1784,7 +1798,7 @@ function openDatabaseLedgerEngine<
     database: StorageDatabase,
     startingLayoutVersion: number,
   ): Promise<void> {
-    if (startingLayoutVersion === storageLayoutVersion) {
+    if (startingLayoutVersion >= queueProvenanceStorageLayoutVersion) {
       return;
     }
 
@@ -1805,12 +1819,12 @@ function openDatabaseLedgerEngine<
 
       const layout = Value.Decode(StorageLayoutRowSchema, layoutRow);
 
-      if (layout.version === storageLayoutVersion) {
+      if (layout.version >= queueProvenanceStorageLayoutVersion) {
         await database.exec("COMMIT");
         return;
       }
 
-      if (layout.version !== previousStorageLayoutVersion) {
+      if (layout.version !== composableStorageLayoutVersion) {
         throw new Error(
           `unsupported Sledge storage layout version ${layout.version}`,
         );
@@ -1890,7 +1904,60 @@ function openDatabaseLedgerEngine<
            WHERE singleton = 1
              AND version = ?`,
         )
-        .run(storageLayoutVersion, previousStorageLayoutVersion);
+        .run(
+          queueProvenanceStorageLayoutVersion,
+          composableStorageLayoutVersion,
+        );
+      await database.exec("COMMIT");
+    } catch (error: unknown) {
+      await database.exec("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async function ensureHistoryExpirationProtocol(
+    database: StorageDatabase,
+  ): Promise<void> {
+    await database.exec("BEGIN IMMEDIATE");
+
+    try {
+      const layoutRow = await database
+        .prepare(
+          `SELECT version, module_ids_json
+           FROM ${storageLayoutTableName}
+           WHERE singleton = 1`,
+        )
+        .get();
+
+      if (layoutRow === undefined) {
+        throw new Error("Sledge storage layout marker is missing");
+      }
+
+      const layout = Value.Decode(StorageLayoutRowSchema, layoutRow);
+
+      if (layout.version === storageLayoutVersion) {
+        await database.exec("COMMIT");
+        return;
+      }
+
+      if (layout.version !== queueProvenanceStorageLayoutVersion) {
+        throw new Error(
+          `unsupported Sledge storage layout version ${layout.version}`,
+        );
+      }
+
+      // History expiration changes the meaning of every event-stream read.
+      // Advancing the durable protocol marker prevents an older runtime that
+      // ignores sledge_history from opening the database and exposing expired
+      // events after this runtime has established the boundary.
+      await database
+        .prepare(
+          `UPDATE ${storageLayoutTableName}
+           SET version = ?
+           WHERE singleton = 1
+             AND version = ?`,
+        )
+        .run(storageLayoutVersion, queueProvenanceStorageLayoutVersion);
       await database.exec("COMMIT");
     } catch (error: unknown) {
       await database.exec("ROLLBACK").catch(() => undefined);
@@ -3200,7 +3267,7 @@ function openDatabaseLedgerEngine<
 
     if (result.created) {
       committedEventId = Math.max(committedEventId, result.envelope.eventId);
-      eventChanges.notify();
+      eventChanges.signal.notify();
     }
 
     if (result.workChanged) {
@@ -3800,8 +3867,14 @@ function openDatabaseLedgerEngine<
     };
   }
 
-  function readLatestEventId(): number {
-    return committedEventId;
+  function scheduleStreamStoreDiscovery(): { cancel(): void } {
+    const task = scheduler.scheduleOnce(defaultStorePollMs, () => {
+      eventChanges.signal.notify();
+    });
+
+    return {
+      cancel: () => task.cancel(),
+    };
   }
 
   function createManagedStreamIterator(input: {
@@ -3869,41 +3942,51 @@ function openDatabaseLedgerEngine<
     let currentAfterEventId = input.afterEventId;
     const readLimit = 256;
 
-    while (!closed) {
+    streamLoop: while (!closed) {
       if (input.signal.aborted) {
         return;
       }
 
-      const observedEvents = eventChanges.snapshot();
-      const readResult = await raceWithSignal(
-        readEventsAfter(currentAfterEventId, readLimit),
-        input.signal,
-      );
+      const observedEvents = eventChanges.signal.snapshot();
+      const storeDiscovery = scheduleStreamStoreDiscovery();
 
-      if (readResult.status === "aborted") {
-        return;
-      }
+      try {
+        const readResult = await raceWithSignal(
+          readEventsAfter(currentAfterEventId, readLimit),
+          input.signal,
+        );
 
-      const events = readResult.value;
-
-      if (events.length > 0) {
-        for (const event of events) {
-          if (input.signal.aborted || closed) {
-            return;
-          }
-
-          currentAfterEventId = event.eventId;
-
-          yield {
-            event,
-            cursor: encodeCursor(event.eventId),
-          };
+        if (readResult.status === "aborted") {
+          return;
         }
 
-        continue;
-      }
+        const events = readResult.value;
 
-      await eventChanges.waitForChange(observedEvents, input.signal);
+        if (events.length > 0) {
+          for (const event of events) {
+            if (input.signal.aborted || closed) {
+              return;
+            }
+
+            if (eventChanges.signal.snapshot() !== observedEvents) {
+              continue streamLoop;
+            }
+
+            currentAfterEventId = event.eventId;
+
+            yield {
+              event,
+              cursor: encodeCursor(event.eventId),
+            };
+          }
+
+          continue;
+        }
+
+        await eventChanges.signal.waitForChange(observedEvents, input.signal);
+      } finally {
+        storeDiscovery.cancel();
+      }
     }
   }
 
@@ -4814,7 +4897,7 @@ function openDatabaseLedgerEngine<
           committedEventId,
           emitted.latestDurableEventId,
         );
-        eventChanges.notify();
+        eventChanges.signal.notify();
       }
 
       workChanges.signal.notify();
@@ -4926,7 +5009,7 @@ function openDatabaseLedgerEngine<
 
   async function closeLedger(): Promise<void> {
     closed = true;
-    eventChanges.notify();
+    eventChanges.signal.notify();
 
     const workerToClose = activeWorker;
     const closeResults =
@@ -4951,6 +5034,7 @@ function openDatabaseLedgerEngine<
     } catch (error: unknown) {
       storageFailures.push(error);
     } finally {
+      eventChanges.release();
       workChanges.release();
     }
 
@@ -5227,40 +5311,60 @@ function openDatabaseLedgerEngine<
             return;
           }
 
-          // Capture a follow boundary before reading backlog so we never skip
-          // events appended during tail startup when `last` resolves to no rows.
-          const historyResult = await raceWithSignal(
-            readLastEvents(last),
-            streamSignal,
-          );
+          historyLoop: while (!closed) {
+            const observedEvents = eventChanges.signal.snapshot();
+            const storeDiscovery = scheduleStreamStoreDiscovery();
+            let history: Awaited<ReturnType<typeof readLastEvents>>;
+            let invalidated = false;
+            let lastYieldedEventId: number | null = null;
 
-          if (historyResult.status === "aborted" || closed) {
-            return;
-          }
+            try {
+              // The stored high-water mark is the follow boundary. Appends
+              // after this read are recovered by the following stream read.
+              const historyResult = await raceWithSignal(
+                readLastEvents(last),
+                streamSignal,
+              );
 
-          const history = historyResult.value;
-          let afterEventId = Math.max(
-            readLatestEventId(),
-            history.highWaterMark,
-          );
+              if (historyResult.status === "aborted" || closed) {
+                return;
+              }
 
-          for (const event of history.events) {
-            if (streamSignal.aborted || closed) {
-              return;
+              history = historyResult.value;
+
+              for (const event of history.events) {
+                if (streamSignal.aborted || closed) {
+                  return;
+                }
+
+                if (eventChanges.signal.snapshot() !== observedEvents) {
+                  invalidated = true;
+                  break;
+                }
+
+                lastYieldedEventId = event.eventId;
+
+                yield {
+                  event,
+                  cursor: encodeCursor(event.eventId),
+                };
+              }
+
+              invalidated ||= eventChanges.signal.snapshot() !== observedEvents;
+            } finally {
+              storeDiscovery.cancel();
             }
 
-            afterEventId = Math.max(afterEventId, event.eventId);
+            if (invalidated && lastYieldedEventId === null) {
+              continue historyLoop;
+            }
 
-            yield {
-              event,
-              cursor: encodeCursor(event.eventId),
-            };
+            yield* streamEventsFromAfterEventId({
+              afterEventId: lastYieldedEventId ?? history.highWaterMark,
+              signal: streamSignal,
+            });
+            return;
           }
-
-          yield* streamEventsFromAfterEventId({
-            afterEventId,
-            signal: streamSignal,
-          });
         };
 
         return iterate()[Symbol.asyncIterator]();
@@ -5340,7 +5444,7 @@ function openDatabaseLedgerEngine<
         committedExpiredThroughEventId,
         throughEventId,
       );
-      eventChanges.notify();
+      eventChanges.signal.notify();
     },
     startWorkers: async (options): Promise<LedgerWorkers> => {
       await startup;

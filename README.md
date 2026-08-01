@@ -153,17 +153,19 @@ const usersModel = definedModel.register({
 });
 
 const model = composeLedgerModels(usersModel);
+const runtimeScheduler = new NodeRuntimeScheduler();
 
 await using ledger = createBetterSqliteLedger({
   databaseUrl,
   model,
   timing: {
     clock: new SystemRuntimeClock(),
+    scheduler: runtimeScheduler,
   },
 });
 
 await using workers = await ledger.startWorkers({
-  scheduler: new NodeRuntimeScheduler(),
+  scheduler: runtimeScheduler,
 });
 
 await ledger.emit(usersModel.events["user.created"], {
@@ -870,6 +872,12 @@ cursor causes `resumeEvents(...)` to reject with
 the boundary. Repeating the call with the same or an older cursor is a
 successful no-op, so competing retention owners cannot move the boundary
 backward.
+
+Event streams discover appends and expiration from other handles immediately
+within the same process and poll through the injected `RuntimeScheduler` for
+changes made by another process. Opening a version 2 database upgrades its
+storage protocol to version 3 after establishing the history boundary. Older
+Sledge runtimes then reject the database instead of exposing expired events.
 
 Expiration is a logical stream boundary. It does not delete event rows,
 reclaim storage, or change projections, deduplication, and event-reference

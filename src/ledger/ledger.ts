@@ -1264,6 +1264,7 @@ export interface LedgerWorkers extends AsyncDisposable {
  */
 export type LedgerTiming = {
   readonly clock: RuntimeClock;
+  readonly scheduler: RuntimeScheduler;
 };
 
 export type RegisteredLedgerModel<

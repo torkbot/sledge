@@ -7,6 +7,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { Type } from "typebox";
 
+import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
   createBetterSqliteLedger,
   createBetterSqliteStorageRuntime,
@@ -26,10 +27,10 @@ import {
 } from "./turso-ledger.ts";
 
 const nowMs = 1_900_000_000_000;
+const runtime = new VirtualRuntimeHarness(nowMs);
 const timing = {
-  clock: {
-    nowMs: () => nowMs,
-  },
+  clock: runtime.clock,
+  scheduler: runtime.scheduler,
 };
 const RecordIndexerInputSchema = Type.Object({
   eventId: Type.Number(),
@@ -691,7 +692,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             {
               module_ids_json:
                 '["contract.source","contract.consumer","contract.later","contract.failure"]',
-              version: 2,
+              version: 3,
             },
           );
         });

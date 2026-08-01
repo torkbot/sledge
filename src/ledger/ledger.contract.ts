@@ -3764,7 +3764,40 @@ export function runLedgerContractSuite(input: {
           assert.ok(second !== undefined);
           assert.ok(third !== undefined);
 
-          await harness.ledger.expireHistory({ through: second.cursor });
+          const bufferedAbortController = new AbortController();
+          const bufferedIterator = harness.ledger
+            .tailEvents({
+              last: 3,
+              signal: bufferedAbortController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const bufferedFirst = await bufferedIterator.next();
+            assert.equal(bufferedFirst.done, false);
+
+            if (bufferedFirst.done) {
+              assert.fail("expected buffered historical event");
+            }
+
+            assert.equal(
+              bufferedFirst.value.event.eventId,
+              first.event.eventId,
+            );
+
+            await harness.ledger.expireHistory({ through: second.cursor });
+
+            await assert.rejects(bufferedIterator.next(), (error: unknown) => {
+              assert.ok(error instanceof LedgerHistoryExpiredError);
+              assert.equal(error.requested, first.cursor);
+              assert.equal(error.expiredThrough, second.cursor);
+              return true;
+            });
+          } finally {
+            bufferedAbortController.abort();
+            await bufferedIterator.return?.();
+          }
+
           await harness.ledger.expireHistory({ through: first.cursor });
           await harness.ledger.expireHistory({ through: second.cursor });
           await harness.restart();

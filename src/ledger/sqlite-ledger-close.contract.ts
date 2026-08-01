@@ -8,6 +8,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { Type } from "typebox";
 
+import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
   composeLedgerModels,
   type ComposedLedgerEventTokens,
@@ -35,10 +36,10 @@ const closeContractModule = closeContractShape.register({
   },
 });
 const closeContractModel = composeLedgerModels(closeContractModule);
+const closeContractRuntime = new VirtualRuntimeHarness(1_900_000_000_000);
 const closeContractTiming: LedgerTiming = {
-  clock: {
-    nowMs: () => 1_900_000_000_000,
-  },
+  clock: closeContractRuntime.clock,
+  scheduler: closeContractRuntime.scheduler,
 };
 
 type CloseContractLedger = Ledger<
