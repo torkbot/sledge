@@ -84,6 +84,7 @@ const reservedMaterializationSqliteObjectNames = [
   "idx_work_key",
   "idx_work_partition_order",
   "idx_work_ref",
+  "sledge_history",
   "sledge_materialization_versions",
   "sledge_storage_layout",
   "work",
@@ -1084,6 +1085,32 @@ export type RegisterFunction<
  */
 export type LedgerCursor = string;
 
+export type ExpireHistoryInput = {
+  readonly through: LedgerCursor;
+};
+
+/**
+ * Raised when a durable event consumer resumes before the ledger's retained
+ * history boundary.
+ *
+ * Both cursor values remain opaque. A consumer can persist `expiredThrough`
+ * as its new starting boundary or rebuild its read model from another source.
+ */
+export class LedgerHistoryExpiredError extends Error {
+  readonly requested: LedgerCursor;
+  readonly expiredThrough: LedgerCursor;
+
+  constructor(input: {
+    readonly requested: LedgerCursor;
+    readonly expiredThrough: LedgerCursor;
+  }) {
+    super("the requested cursor precedes the ledger's retained history");
+    this.name = "LedgerHistoryExpiredError";
+    this.requested = input.requested;
+    this.expiredThrough = input.expiredThrough;
+  }
+}
+
 export interface SignalSubscription {
   [Symbol.dispose](): void;
 }
@@ -1201,6 +1228,8 @@ export interface Ledger<
     readonly cursor: LedgerCursor;
     readonly signal: AbortSignal;
   }): AsyncIterable<LedgerStreamEvent<TEvents>>;
+
+  expireHistory(input: ExpireHistoryInput): Promise<void>;
 
   startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
 

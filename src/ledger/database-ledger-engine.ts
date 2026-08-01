@@ -32,6 +32,7 @@ import type {
   EventCausationWork,
   EventEnvelope,
   EventHandlerFunction,
+  ExpireHistoryInput,
   Ledger,
   LedgerCursor,
   LedgerTiming,
@@ -59,7 +60,10 @@ import type {
   QueryWorkInput,
   SignalSubscription,
 } from "./ledger.ts";
-import { WorkOperationTimeoutError } from "./ledger.ts";
+import {
+  LedgerHistoryExpiredError,
+  WorkOperationTimeoutError,
+} from "./ledger.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
@@ -126,6 +130,8 @@ export interface DatabaseLedger<
     readonly cursor: LedgerCursor;
     readonly signal: AbortSignal;
   }): AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>;
+
+  expireHistory(input: ExpireHistoryInput): Promise<void>;
 
   startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
 
@@ -194,6 +200,7 @@ type RuntimeMaterializationModule = RuntimeMaterializationState & {
 type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
+const historyTableName = "sledge_history";
 const storageLayoutTableName = "sledge_storage_layout";
 const storageLayoutVersion = 2;
 const previousStorageLayoutVersion = 1;
@@ -204,6 +211,10 @@ const MaterializationVersionRowSchema = Type.Object({
 const StorageLayoutRowSchema = Type.Object({
   module_ids_json: Type.String(),
   version: Type.Number(),
+});
+const HistoryStateRowSchema = Type.Object({
+  expired_through_event_id: Type.Integer({ minimum: 0 }),
+  latest_event_id: Type.Integer({ minimum: 0 }),
 });
 const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
 const databaseInitializationTails = new Map<string, Promise<void>>();
@@ -1362,6 +1373,7 @@ function openDatabaseLedgerEngine<
   const defaultStorePollMs = 1_000;
 
   let committedEventId = 0;
+  let committedExpiredThroughEventId = 0;
   let activeWriteTransactions = 0;
 
   const startup = (async () => {
@@ -1392,6 +1404,16 @@ function openDatabaseLedgerEngine<
         dedupe_key TEXT UNIQUE,
         signal INTEGER NOT NULL DEFAULT 0
       );
+
+      CREATE TABLE IF NOT EXISTS ${historyTableName} (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        expired_through_event_id INTEGER NOT NULL
+          CHECK(expired_through_event_id >= 0)
+      );
+
+      INSERT INTO ${historyTableName}(singleton, expired_through_event_id)
+      VALUES (1, 0)
+      ON CONFLICT(singleton) DO NOTHING;
 
       ${createWorkTableSql("work")}
 
@@ -1491,8 +1513,8 @@ function openDatabaseLedgerEngine<
         }
       },
     );
-    committedEventId = await storage.read(async (database) => {
-      return await readStoredLatestEventId(database);
+    await storage.read(async (database) => {
+      await readStoredStreamState(database);
     });
   })();
 
@@ -3646,7 +3668,15 @@ function openDatabaseLedgerEngine<
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
     return await storage.read(async (database) => {
-      const highWaterMark = await readCommittedEventId(database);
+      const state = await readStreamState(database);
+
+      if (afterEventId < state.expiredThroughEventId) {
+        throw new LedgerHistoryExpiredError({
+          requested: encodeCursor(afterEventId),
+          expiredThrough: encodeCursor(state.expiredThroughEventId),
+        });
+      }
+
       const rows = await database
         .prepare(
           `SELECT
@@ -3664,7 +3694,7 @@ function openDatabaseLedgerEngine<
            ORDER BY event_id ASC
            LIMIT ?`,
         )
-        .all(afterEventId, highWaterMark, limit);
+        .all(afterEventId, state.latestEventId, limit);
 
       return rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
@@ -3677,7 +3707,7 @@ function openDatabaseLedgerEngine<
     readonly highWaterMark: number;
   }> {
     return await storage.read(async (database) => {
-      const highWaterMark = await readCommittedEventId(database);
+      const state = await readStreamState(database);
       const rows = await database
         .prepare(
           `SELECT
@@ -3690,11 +3720,12 @@ function openDatabaseLedgerEngine<
              dedupe_key
            FROM events
            WHERE signal = 0
+             AND event_id > ?
              AND event_id <= ?
            ORDER BY event_id DESC
            LIMIT ?`,
         )
-        .all(highWaterMark, limit);
+        .all(state.expiredThroughEventId, state.latestEventId, limit);
 
       const envelopes = rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
@@ -3702,41 +3733,71 @@ function openDatabaseLedgerEngine<
 
       return {
         events: envelopes.reverse(),
-        highWaterMark,
+        highWaterMark: state.latestEventId,
       };
     });
   }
 
-  async function readStoredLatestEventId(
-    database: StorageDatabase,
-  ): Promise<number> {
+  function readCommittedStreamState(): {
+    readonly expiredThroughEventId: number;
+    readonly latestEventId: number;
+  } {
+    return {
+      expiredThroughEventId: committedExpiredThroughEventId,
+      latestEventId: committedEventId,
+    };
+  }
+
+  async function readStreamState(database: StorageDatabase): Promise<{
+    readonly expiredThroughEventId: number;
+    readonly latestEventId: number;
+  }> {
+    // A storage adapter may serve reads and writes through one connection.
+    // Reentrant stream reads must not observe either boundary from a write
+    // transaction that can still roll back.
+    if (activeWriteTransactions > 0) {
+      return readCommittedStreamState();
+    }
+
+    return await readStoredStreamState(database);
+  }
+
+  async function readStoredStreamState(database: StorageDatabase): Promise<{
+    readonly expiredThroughEventId: number;
+    readonly latestEventId: number;
+  }> {
     const row = await database
       .prepare(
-        `SELECT event_id
-         FROM events
-         WHERE signal = 0
-         ORDER BY event_id DESC
-         LIMIT 1`,
+        `SELECT
+           expired_through_event_id,
+           MAX(
+             expired_through_event_id,
+             (
+               SELECT COALESCE(MAX(event_id), 0)
+               FROM events
+               WHERE signal = 0
+             )
+           ) AS latest_event_id
+         FROM ${historyTableName}
+         WHERE singleton = 1`,
       )
       .get();
 
     if (row === undefined) {
-      return 0;
+      throw new Error("ledger history state is missing");
     }
 
-    return decodeRow(row, EventIdRowSchema).event_id;
-  }
+    const state = decodeRow(row, HistoryStateRowSchema);
+    committedExpiredThroughEventId = Math.max(
+      committedExpiredThroughEventId,
+      state.expired_through_event_id,
+    );
+    committedEventId = Math.max(committedEventId, state.latest_event_id);
 
-  async function readCommittedEventId(
-    database: StorageDatabase,
-  ): Promise<number> {
-    if (activeWriteTransactions > 0) {
-      return committedEventId;
-    }
-
-    const storedLatestEventId = await readStoredLatestEventId(database);
-    committedEventId = Math.max(committedEventId, storedLatestEventId);
-    return committedEventId;
+    return {
+      expiredThroughEventId: committedExpiredThroughEventId,
+      latestEventId: committedEventId,
+    };
   }
 
   function readLatestEventId(): number {
@@ -5236,6 +5297,50 @@ function openDatabaseLedgerEngine<
           });
         },
       };
+    },
+    expireHistory: async ({ through }) => {
+      const throughEventId = decodeCursor(through);
+
+      await startup;
+
+      await runInTransaction(async (database) => {
+        const state = await readStoredStreamState(database);
+
+        if (throughEventId <= state.expiredThroughEventId) {
+          return;
+        }
+
+        if (throughEventId > state.latestEventId) {
+          throw new Error("history cannot expire beyond the latest event");
+        }
+
+        const update = await database
+          .prepare(
+            `UPDATE ${historyTableName}
+             SET expired_through_event_id = ?
+             WHERE singleton = 1
+               AND expired_through_event_id < ?
+               AND EXISTS (
+                 SELECT 1
+                 FROM events
+                 WHERE event_id = ?
+                   AND signal = 0
+               )`,
+          )
+          .run(throughEventId, throughEventId, throughEventId);
+
+        if (update.changes !== 1) {
+          throw new Error(
+            "history expiration cursor does not identify a durable event",
+          );
+        }
+      });
+
+      committedExpiredThroughEventId = Math.max(
+        committedExpiredThroughEventId,
+        throughEventId,
+      );
+      eventChanges.notify();
     },
     startWorkers: async (options): Promise<LedgerWorkers> => {
       await startup;

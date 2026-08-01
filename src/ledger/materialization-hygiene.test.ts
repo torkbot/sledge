@@ -709,6 +709,16 @@ function createStorageStatement(
         };
       }
 
+      if (
+        sql.includes("AS latest_event_id") &&
+        sql.includes("FROM sledge_history")
+      ) {
+        return {
+          expired_through_event_id: 0,
+          latest_event_id: 0,
+        };
+      }
+
       return undefined;
     },
     run: async (...params) => {

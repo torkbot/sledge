@@ -559,6 +559,7 @@ The opened ledger exposes:
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`
 - `tailEvents({ last, signal })`
 - `resumeEvents({ cursor, signal })`
+- `expireHistory({ through })`
 - `onSignal(signalToken, observer)`
 - `startWorkers(options)`
 - `close()`
@@ -861,6 +862,19 @@ for await (const item of ledger.resumeEvents({
 ```
 
 Cursor values are opaque. Persist and reuse them as-is.
+
+`expireHistory({ through: cursor })` durably advances the earliest stream
+position Sledge will serve. The cursor itself remains resumable; an earlier
+cursor causes `resumeEvents(...)` to reject with
+`LedgerHistoryExpiredError`, and `tailEvents(...)` omits events at or before
+the boundary. Repeating the call with the same or an older cursor is a
+successful no-op, so competing retention owners cannot move the boundary
+backward.
+
+Expiration is a logical stream boundary. It does not delete event rows,
+reclaim storage, or change projections, deduplication, and event-reference
+reads. Those physical retention policies can build on this durable boundary
+without being embedded in event consumption.
 
 ## Package Exports
 

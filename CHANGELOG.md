@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `expireHistory({ through: cursor })` as a durable, monotonic event-stream
+  boundary. Tailing omits expired history, resuming an older cursor raises
+  `LedgerHistoryExpiredError`, and no event rows are physically deleted.
 - Add durable queue `control.deferUntil(availableAtMs)` for successful,
   non-retry deferral to an absolute runtime-clock deadline, including clean
   attempt/WorkRef semantics, restart-safe non-idle scheduling, prompt peer
