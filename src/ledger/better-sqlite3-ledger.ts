@@ -120,13 +120,11 @@ export function createBetterSqliteStorageRuntime(
       }
     },
     write: async (run) => {
-      const operation = writeTail.then(async () => {
-        if (closed) {
-          throw new Error("storage runtime is closed");
-        }
+      if (closed) {
+        throw new Error("storage runtime is closed");
+      }
 
-        return await run(writerStorage);
-      });
+      const operation = writeTail.then(async () => await run(writerStorage));
       writeTail = operation.then(
         () => undefined,
         () => undefined,

@@ -568,7 +568,31 @@ test("turso runtime close waits for in-flight reads", async () => {
 });
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
-  test(`${driver} runtime close waits for in-flight writes`, async () => {
+  test(`${driver} runtime close finishes reads accepted before close`, async () => {
+    const databaseUrl = createTempDatabasePath();
+    const storage =
+      driver === "better-sqlite3"
+        ? createBetterSqliteStorageRuntime(databaseUrl)
+        : await createTursoStorageRuntime(databaseUrl);
+
+    try {
+      const read = storage.read(async (database) => {
+        const row = await database.prepare("SELECT 42 AS value").get();
+        return row?.value;
+      });
+      const closing = storage.close();
+
+      assert.equal(await read, 42);
+      await closing;
+    } finally {
+      await storage.close();
+      await rm(databaseUrl, { force: true });
+      await rm(`${databaseUrl}-wal`, { force: true });
+      await rm(`${databaseUrl}-shm`, { force: true });
+    }
+  });
+
+  test(`${driver} runtime close finishes writes accepted before close`, async () => {
     const databaseUrl = createTempDatabasePath();
     const storage =
       driver === "better-sqlite3"
@@ -586,6 +610,9 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         await releaseWrite.promise;
         await database.prepare("INSERT INTO close_write (id) VALUES (1)").run();
       });
+      const queuedWrite = storage.write(async (database) => {
+        await database.prepare("INSERT INTO close_write (id) VALUES (2)").run();
+      });
 
       await writeStarted.promise;
 
@@ -594,13 +621,14 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 
       releaseWrite.resolve();
       await write;
+      await queuedWrite;
       await closing;
 
       const inspector = new Database(databaseUrl, { readonly: true });
       try {
         assert.equal(
           inspector.prepare("SELECT COUNT(*) FROM close_write").pluck().get(),
-          1,
+          2,
         );
       } finally {
         inspector.close();
