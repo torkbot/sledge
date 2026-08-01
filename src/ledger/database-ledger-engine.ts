@@ -136,6 +136,7 @@ type PersistedWorkLease = {
   readonly workId: number;
   readonly queueName: string;
   readonly workKey: string | null;
+  readonly coalescingKey: string | null;
   readonly payloadJson: string;
   readonly sourceEventId: number;
   readonly attempt: number;
@@ -849,6 +850,14 @@ class DeadLetterRequested {
   }
 }
 
+class DeferRequested {
+  readonly availableAtMs: number;
+
+  constructor(availableAtMs: number) {
+    this.availableAtMs = availableAtMs;
+  }
+}
+
 const maxRuntimeTimeoutMs = 2_147_483_647;
 
 async function runWorkOperationWithTimeout<TResult>(input: {
@@ -917,6 +926,7 @@ async function runWorkOperationWithTimeout<TResult>(input: {
 
 type HandlerDisposition =
   | { readonly kind: "ack" }
+  | { readonly kind: "defer"; readonly availableAtMs: number }
   | {
       readonly kind: "retry";
       readonly error: string;
@@ -1022,6 +1032,11 @@ const CoalescedWorkRowSchema = Type.Object({
   work_id: Type.Number(),
 });
 
+const DeferredSuccessorRowSchema = Type.Object({
+  available_at_ms: Type.Number(),
+  work_id: Type.Number(),
+});
+
 const CoalescingKeySchema = Type.String({ minLength: 1 });
 const PartitionKeySchema = Type.String({ minLength: 1 });
 const WorkRefSchema = Type.String({
@@ -1051,6 +1066,7 @@ const ClaimedWorkRowSchema = Type.Object({
   work_id: Type.Number(),
   queue_name: Type.String(),
   work_key: Type.Union([Type.Null(), Type.String()]),
+  coalescing_key: Type.Union([Type.Null(), Type.String()]),
   payload_json: Type.String(),
   source_event_id: Type.Number(),
   signal: Type.Number(),
@@ -3738,15 +3754,14 @@ function openDatabaseLedgerEngine<
       const leaseId = randomUUID();
       const leaseExpiresAtMs = nowMs + worker.leaseMs;
 
-      // The coalescing key reserves only an unattempted generation. Releasing
-      // it in the claim transaction lets later events create one successor
-      // without mutating this attempt or its backoff.
+      // The partial unique index reserves only an unattempted generation.
+      // Retaining the key on this attempt preserves its identity for a defer
+      // disposition while later events can still create one successor.
       const updateResult = await database
         .prepare(
           `UPDATE work
            SET
              attempt = attempt + 1,
-             coalescing_key = NULL,
              lease_id = ?,
              lease_acquired_at_ms = ?,
              lease_expires_at_ms = ?,
@@ -3774,6 +3789,7 @@ function openDatabaseLedgerEngine<
             work_id,
             queue_name,
             work_key,
+            coalescing_key,
             payload_json,
             source_event_id,
             signal,
@@ -3810,6 +3826,7 @@ function openDatabaseLedgerEngine<
         workId: decodedClaimed.work_id,
         queueName: decodedClaimed.queue_name,
         workKey: decodedClaimed.work_key,
+        coalescingKey: decodedClaimed.coalescing_key,
         payloadJson: decodedClaimed.payload_json,
         sourceEventId: decodedClaimed.source_event_id,
         signal: decodedClaimed.signal === 1,
@@ -4289,6 +4306,15 @@ function openDatabaseLedgerEngine<
 
       const queueControl: QueueHandlerControl = {
         withTimeout,
+        deferUntil: (availableAtMs) => {
+          if (!Number.isFinite(availableAtMs)) {
+            throw new Error(
+              `availableAtMs must be a finite number, received ${String(availableAtMs)}`,
+            );
+          }
+
+          throw new DeferRequested(availableAtMs);
+        },
         retry: (error, options) => {
           throw new RetryRequested(error, options?.retryAtMs);
         },
@@ -4334,7 +4360,12 @@ function openDatabaseLedgerEngine<
           });
         }
       } catch (error: unknown) {
-        if (error instanceof RetryRequested) {
+        if (error instanceof DeferRequested) {
+          disposition = {
+            kind: "defer",
+            availableAtMs: error.availableAtMs,
+          };
+        } else if (error instanceof RetryRequested) {
           disposition = {
             kind: "retry",
             error: error.error,
@@ -4436,6 +4467,85 @@ function openDatabaseLedgerEngine<
               }
             }
             break;
+
+          case "defer": {
+            if (claimed.coalescingKey !== null) {
+              const existingSuccessor = await database
+                .prepare(
+                  `SELECT work_id, available_at_ms
+                   FROM work
+                   WHERE queue_name = ?
+                     AND CASE
+                       WHEN attempt = 0
+                         AND lease_id IS NULL
+                         AND dead = 0
+                         AND cancelled = 0
+                       THEN coalescing_key
+                       ELSE NULL
+                     END = ?`,
+                )
+                .get(claimed.queueName, claimed.coalescingKey);
+
+              if (existingSuccessor !== undefined) {
+                const successor = decodeRow(
+                  existingSuccessor,
+                  DeferredSuccessorRowSchema,
+                );
+
+                if (disposition.availableAtMs < successor.available_at_ms) {
+                  await database
+                    .prepare(
+                      `UPDATE work
+                       SET available_at_ms = ?
+                       WHERE work_id = ?
+                         AND attempt = 0
+                         AND lease_id IS NULL
+                         AND dead = 0
+                         AND cancelled = 0`,
+                    )
+                    .run(disposition.availableAtMs, successor.work_id);
+                }
+
+                await database
+                  .prepare(
+                    `DELETE FROM work
+                     WHERE work_id = ?
+                       AND lease_id = ?
+                       AND dead = 0
+                       AND cancelled = 0`,
+                  )
+                  .run(claimed.workId, claimed.leaseId);
+                break;
+              }
+            }
+
+            await database
+              .prepare(
+                `UPDATE work
+                 SET
+                   work_ref = ?,
+                   attempt = 0,
+                   available_at_ms = ?,
+                   lease_id = NULL,
+                   lease_acquired_at_ms = NULL,
+                   lease_expires_at_ms = NULL,
+                   lease_protocol_version = 0,
+                   last_error = NULL
+                 WHERE work_id = ?
+                   AND lease_id = ?
+                   AND dead = 0
+                   AND cancelled = 0`,
+              )
+              .run(
+                claimed.workKey === null && claimed.coalescingKey === null
+                  ? null
+                  : createWorkRef(),
+                disposition.availableAtMs,
+                claimed.workId,
+                claimed.leaseId,
+              );
+            break;
+          }
 
           case "retry":
             await database

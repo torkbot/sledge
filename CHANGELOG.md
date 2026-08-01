@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add durable queue `control.deferUntil(availableAtMs)` for successful,
+  non-retry deferral to an absolute runtime-clock deadline, including clean
+  attempt/WorkRef semantics, restart-safe non-idle scheduling, and atomic
+  composition with coalesced and partitioned successors.
 - Make clean ledger shutdown drain adapter-owned operations, checkpoint committed
   WAL frames into the main SQLite file, truncate the WAL, and release the writer.
   A busy external connection now produces a truthful close error without leaking

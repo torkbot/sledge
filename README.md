@@ -587,6 +587,8 @@ Queue and signal queue handlers implicitly ack on normal return.
 
 - Return or resolve: ack
 - Throw: retry using the default retry delay
+- `control.deferUntil(availableAtMs)`: successful durable deferral to an
+  absolute runtime-clock timestamp
 - `control.retry(error, { retryAtMs? })`: explicit retry timing
 - `control.deadLetter(error)`: terminal durable queue failure
 - `control.withTimeout(timeoutMs, operation)`: run an operation under a
@@ -633,10 +635,11 @@ const decisions = decisionsShape.register({
 `ledger.emit(...)` commits before its promise resolves, so the handler can use a
 result-bearing event outcome or query its updated projection before continuing.
 By contrast, `actions.emit(...)` remains staged until the handler settles, then
-commits atomically with the resulting acknowledgement, retry, or dead-letter
-disposition while the attempt still owns its lease. Staged events describe the
-attempt; they are not a success-only rollback buffer. The scoped port does not
-expose worker control, storage access, or undeclared module capabilities.
+commits atomically with the resulting acknowledgement, deferral, retry, or
+dead-letter disposition while the attempt still owns its lease. Staged events
+describe the attempt; they are not a success-only rollback buffer. The scoped
+port does not expose worker control, storage access, or undeclared module
+capabilities.
 
 Events emitted through either queue port carry engine-authored
 `causationWork` metadata containing the source module ID, local queue name,
@@ -685,6 +688,47 @@ sandbox: the operation retains anything captured by its closure. Pass only the
 capabilities it should retain, propagate the signal, and use application-level
 idempotency for external side effects.
 
+### Deferred Work
+
+Use `control.deferUntil(...)` when a durable queue handler has run successfully
+but the same logical work should become eligible again at an absolute deadline:
+
+```ts
+queues: {
+  "agent-lane.wake": async ({ work, control }) => {
+    const pending = await readPendingStimuli(work.payload.laneId);
+
+    if (pending.length < 20) {
+      return control.deferUntil(pending[0].receivedAtMs + 5_000);
+    }
+
+    await runAgentTurn(pending);
+  },
+},
+```
+
+The timestamp uses the ledger's injected `RuntimeClock`; it must be finite, and
+a timestamp at or before the current clock time is immediately eligible. Sledge
+stores the deadline durably and schedules dispatch through the worker's
+`RuntimeScheduler`, so restart preserves the remaining delay and virtual-time
+tests can advance directly to it. Deferred and partition-blocked work remains
+non-idle.
+
+Deferral is not retry. The claimed attempt completes successfully, its staged
+events commit with that attempt's authenticated provenance, and the durable row
+becomes a clean successor with `attempt: 0`, `lastError: null`, and a handler
+attempt of `1` when next claimed. Without an already-pending coalesced
+successor, the row keeps its physical work ID, payload, source event, and
+partition position. Addressable work receives a fresh `WorkRef`, retiring the
+claimed generation's ref; unaddressable work remains without one.
+
+If an event created a same-key coalesced successor while the handler was active,
+that newer row wins: Sledge preserves its work ID, payload, source event, and
+`WorkRef`, sets its availability to the earlier of its existing timestamp and
+the deferred timestamp, and removes the old partition head. Cancelling the
+claimed generation fences a later deferral disposition without cancelling the
+successor.
+
 ### Coalesced Work
 
 Use `coalescingKey` when many durable events request the same logical work and
@@ -716,7 +760,9 @@ requested times. A request with a different decoded payload or
 Claiming work ends that coalescing generation. Requests arriving after claim
 create or promote one unattempted successor instead of changing the active
 attempt or its retry backoff. Give both generations the same `partitionKey`
-when they must not execute concurrently.
+when they must not execute concurrently. If the active handler defers, its
+deadline composes with that successor as described above; an already-earlier
+successor is never delayed.
 
 `coalescingKey` is available only to durable event `actions.enqueue(...)`.
 It is mutually exclusive with `workKey`; coalesced work already receives a
