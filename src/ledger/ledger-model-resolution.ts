@@ -55,6 +55,8 @@ export async function resolveLedgerModelSource<
   }
 
   const owner = {};
+  let resolutionOpen = true;
+  const inFlightResolutionOperations = new Set<Promise<unknown>>();
   const borrowedStorage: StorageRuntime = {
     [storageRuntimeIdentityBrand]: input.storage[storageRuntimeIdentityBrand],
     read: async (run) => await input.storage.read(run),
@@ -63,6 +65,32 @@ export async function resolveLedgerModelSource<
   };
 
   await using preparedLedgers = new AsyncDisposableStack();
+
+  const runResolutionOperation = <T>(
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    if (!resolutionOpen) {
+      return Promise.reject(
+        new Error("ledger model resolution has already completed"),
+      );
+    }
+
+    let result: Promise<T>;
+
+    try {
+      result = operation();
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+
+    inFlightResolutionOperations.add(result);
+    void result.then(
+      () => inFlightResolutionOperations.delete(result),
+      () => inFlightResolutionOperations.delete(result),
+    );
+
+    return result;
+  };
 
   const prepareModules = async (
     modules: readonly [
@@ -88,9 +116,13 @@ export async function resolveLedgerModelSource<
 
     preparedLedgers.use(ledger);
 
-    const prepared = {
-      query: ledger.query.bind(ledger),
-    } as unknown as AnyPreparedLedgerModel;
+    const query: AnyPreparedLedgerModel["query"] = (queryToken, params) =>
+      runResolutionOperation(
+        async () => await ledger.query(queryToken, params),
+      );
+    // The public brand carries the module tuple only in the type system. The
+    // weak state attached below supplies runtime ownership and graph identity.
+    const prepared = { query } as AnyPreparedLedgerModel;
 
     return attachPreparedLedgerModelState(prepared, {
       owner,
@@ -121,23 +153,33 @@ export async function resolveLedgerModelSource<
     prepare: async (
       first: AnyRegisteredLedgerModule,
       ...rest: readonly AnyRegisteredLedgerModule[]
-    ) => await prepareModules([first, ...rest]),
+    ) =>
+      await runResolutionOperation(
+        async () => await prepareModules([first, ...rest]),
+      ),
     extend: async (
       prepared: AnyPreparedLedgerModel,
       first: AnyRegisteredLedgerModule,
       ...rest: readonly AnyRegisteredLedgerModule[]
-    ) => {
-      const state = readPreparedState(prepared);
-      return await prepareModules([
-        state.modules[0],
-        ...state.modules.slice(1),
-        first,
-        ...rest,
-      ]);
-    },
+    ) =>
+      await runResolutionOperation(async () => {
+        const state = readPreparedState(prepared);
+        return await prepareModules([
+          state.modules[0],
+          ...state.modules.slice(1),
+          first,
+          ...rest,
+        ]);
+      }),
   } as LedgerModelResolutionPorts;
 
-  const prepared = await resolver(phases);
+  const prepared = await resolver(phases).finally(async () => {
+    // Values and ports may escape through application closures. Revoke them
+    // before the final ledger opens, then drain work that began legitimately
+    // during resolution so it cannot overlap the owning runtime.
+    resolutionOpen = false;
+    await Promise.allSettled([...inFlightResolutionOperations]);
+  });
   const model = readPreparedState(prepared).model;
 
   return model as ComposedLedgerModelFor<TSource>;

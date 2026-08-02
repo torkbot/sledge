@@ -608,6 +608,8 @@ The resolver receives methods scoped to that one open operation:
 
 A prepared value exposes `query(...)` only. It cannot append events, start
 workers, tail events, publish signals, or re-enter the public ledger API.
+Prepared values and resolver methods are revoked when the resolver returns;
+retaining one in an application closure does not extend its storage access.
 Preparation may install or migrate the selected modules' storage-local
 materializations so their queries are valid, but application callbacks still
 receive only the ordinary typed read facade.

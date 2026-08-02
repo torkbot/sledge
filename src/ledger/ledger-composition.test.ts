@@ -863,8 +863,16 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         await seed.close();
       }
 
+      let queryAfterResolution:
+        | (() => Promise<readonly string[] | null>)
+        | undefined;
+      let prepareAfterResolution: (() => Promise<unknown>) | undefined;
       const definition = defineLedgerModel(async ({ prepare, extend }) => {
         const registryModel = await prepare(registry);
+
+        queryAfterResolution = async () =>
+          await registryModel.query(registry.queries.configuredModuleIds, {});
+        prepareAfterResolution = async () => await prepare(registry);
 
         if (false) {
           // @ts-expect-error Preparation deliberately has no append capability.
@@ -901,6 +909,17 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             });
 
       try {
+        assert.ok(queryAfterResolution);
+        await assert.rejects(
+          queryAfterResolution(),
+          /ledger model resolution has already completed/,
+        );
+        assert.ok(prepareAfterResolution);
+        await assert.rejects(
+          prepareAfterResolution(),
+          /ledger model resolution has already completed/,
+        );
+
         const configuredModuleIds = await ledger.query(
           registry.queries.configuredModuleIds,
           {},
