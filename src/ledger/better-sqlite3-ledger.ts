@@ -3,12 +3,13 @@ import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 
 import type {
-  AnyComposedLedgerModel,
   ComposedLedgerEventTokens,
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
   Ledger,
+  LedgerModelSource,
   LedgerTiming,
+  ComposedLedgerModelFor,
 } from "./ledger.ts";
 import {
   createComposedDatabaseLedger,
@@ -16,6 +17,7 @@ import {
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
+import { resolveLedgerModelSource } from "./ledger-model-resolution.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 import { assertWalCheckpointTruncated } from "./sqlite-wal-checkpoint.ts";
 
@@ -23,27 +25,75 @@ const connectionOptions = {
   timeout: 0,
 } satisfies Database.Options;
 
-type CreateBetterSqliteLedgerInput<TModel extends AnyComposedLedgerModel> = {
+type CreateBetterSqliteLedgerInput<TSource extends LedgerModelSource> = {
   readonly databaseUrl: string;
-  readonly model: TModel;
+  readonly model: TSource;
   readonly timing: LedgerTiming;
 };
 
-export function createBetterSqliteLedger<
-  const TModel extends AnyComposedLedgerModel,
+export async function createBetterSqliteLedger<
+  const TSource extends LedgerModelSource,
 >(
-  input: CreateBetterSqliteLedgerInput<TModel>,
-): Ledger<
-  ComposedLedgerEventTokens<TModel>,
-  ComposedLedgerQueryTokens<TModel>,
-  ComposedLedgerSignalTokens<TModel>
+  input: CreateBetterSqliteLedgerInput<TSource>,
+): Promise<
+  Ledger<
+    ComposedLedgerEventTokens<ComposedLedgerModelFor<TSource>>,
+    ComposedLedgerQueryTokens<ComposedLedgerModelFor<TSource>>,
+    ComposedLedgerSignalTokens<ComposedLedgerModelFor<TSource>>
+  >
 > {
-  return createComposedDatabaseLedger({
-    storage: createBetterSqliteStorageRuntime(input.databaseUrl),
-    model: input.model,
-    projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
-    timing: input.timing,
-  });
+  const storage = createBetterSqliteStorageRuntime(input.databaseUrl);
+  const projectionCompiler =
+    createRuntimeKyselySqliteProjectionStatementCompiler();
+  let storageTransferred = false;
+
+  try {
+    const model = await resolveLedgerModelSource({
+      source: input.model,
+      storage,
+      projectionCompiler,
+      timing: input.timing,
+    });
+
+    const ledger = createComposedDatabaseLedger({
+      storage,
+      model,
+      projectionCompiler,
+      timing: input.timing,
+    });
+    storageTransferred = true;
+
+    try {
+      await ledger.ready();
+      return ledger;
+    } catch (error: unknown) {
+      try {
+        await ledger.abortOpen();
+      } catch (closeError: unknown) {
+        throw new AggregateError(
+          [error, closeError],
+          "failed to open ledger and close storage",
+        );
+      }
+
+      throw error;
+    }
+  } catch (error: unknown) {
+    if (storageTransferred) {
+      throw error;
+    }
+
+    try {
+      await storage.close();
+    } catch (closeError: unknown) {
+      throw new AggregateError(
+        [error, closeError],
+        "failed to resolve ledger model and close storage",
+      );
+    }
+
+    throw error;
+  }
 }
 
 export function createBetterSqliteStorageRuntime(

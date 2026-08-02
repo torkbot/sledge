@@ -12,6 +12,7 @@ handles to indexer and query callbacks.
 - Durable event append with producer idempotency through `dedupeKey`
 - Event -> materialization -> work in one transaction
 - Typed materialization schema, event refs, indexers, and queries
+- Immutable module phases with optional query-backed model resolution
 - Durable queue work with leases, retries, dead-letter outcomes, and restart
   recovery
 - Durable event streams through `tailEvents(...)` and `resumeEvents(...)`
@@ -24,10 +25,10 @@ import { Type } from "typebox";
 
 import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
-  composeLedgerModels,
-  defineLedgerShape,
+  composeLedgerModules,
+  declareLedgerModule,
   defineMaterialization,
-  withMaterializations,
+  linkLedgerModule,
 } from "@torkbot/sledge/ledger";
 import {
   NodeRuntimeScheduler,
@@ -36,7 +37,7 @@ import {
 
 const databaseUrl = "./app.sqlite";
 
-const ledgerShape = defineLedgerShape({
+const usersDeclaration = declareLedgerModule({
   moduleId: "app.users",
   events: {
     "user.created": Type.Object({
@@ -52,7 +53,7 @@ const ledgerShape = defineLedgerShape({
   },
 });
 
-const materializations = defineMaterialization(ledgerShape, {
+const materializations = defineMaterialization(usersDeclaration, {
   namespace: "app",
 })
   .version(1, "create app tables", (s) =>
@@ -90,9 +91,9 @@ const materializations = defineMaterialization(ledgerShape, {
     },
   });
 
-const definedModel = withMaterializations(ledgerShape, materializations);
+const linkedUsers = linkLedgerModule(usersDeclaration, materializations);
 
-const usersModel = definedModel.register({
+const usersModule = linkedUsers.register({
   indexers: {
     upsertUser: async ({ input, event, db }) => {
       await db
@@ -152,10 +153,10 @@ const usersModel = definedModel.register({
   },
 });
 
-const model = composeLedgerModels(usersModel);
+const model = composeLedgerModules(usersModule);
 const runtimeScheduler = new NodeRuntimeScheduler();
 
-await using ledger = createBetterSqliteLedger({
+await using ledger = await createBetterSqliteLedger({
   databaseUrl,
   model,
   timing: {
@@ -168,22 +169,53 @@ await using workers = await ledger.startWorkers({
   scheduler: runtimeScheduler,
 });
 
-await ledger.emit(usersModel.events["user.created"], {
+await ledger.emit(usersModule.events["user.created"], {
   userId: "u_123",
   email: "alice@example.com",
 });
 
-const user = await ledger.query(usersModel.queries.userById, {
+const user = await ledger.query(usersModule.queries.userById, {
   userId: "u_123",
 });
 console.log(user);
 ```
 
-## Lifecycle
+## Module and Model Phases
 
-### 1. Define the Ledger Shape
+Sledge separates module construction from ledger runtime construction. Each
+transition returns a new value with the capabilities that are valid in that
+phase; construction never activates an existing value in place.
 
-`defineLedgerShape(...)` requires a stable `moduleId` and defines durable
+This separation serves two distinct model-building paths:
+
+- A statically known application composes its registered modules without
+  opening storage.
+- An application whose module set is stored in the ledger prepares a closed
+  subset, queries it, and returns a new prepared value extended with the
+  discovered modules.
+
+Sledge does not define plugins, plugin manifests, or module loading policy. A
+userspace registry may store plugin descriptors, package ids, feature flags, or
+any other configuration. Sledge only supplies the phase boundaries needed to
+query that registry and build one final ledger model safely.
+
+| Value                    | Produced by                                                             | Capability added                                              |
+| ------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `DeclaredLedgerModule`   | `declareLedgerModule(...)`                                              | Durable contract tokens and a typed logical shape             |
+| `LinkedLedgerModule`     | `linkLedgerModule(...)`                                                 | A materialization contract and registration capability        |
+| `RegisteredLedgerModule` | `linked.register(...)`                                                  | Implementations and handlers; ready for model construction    |
+| `ComposedLedgerModel`    | `composeLedgerModules(...)`                                             | A closed, storage-independent static module graph             |
+| `PreparedLedgerModel`    | resolver `prepare(...)` / `extend(...)`                                 | Storage-backed query capability for the modules in that value |
+| `Ledger`                 | `await createBetterSqliteLedger(...)` or `await createTursoLedger(...)` | Append, query, streams, signals, history, and worker startup  |
+
+A composed model is not a dormant ledger. It owns no connection or mutable
+runtime state; it is a reusable, adapter-independent graph description. The
+dynamic path does not add a separate public "sealed" value: returning the final
+prepared value completes resolution, and the adapter opens that exact graph.
+
+### 1. Declare Durable Contracts
+
+`declareLedgerModule(...)` requires a stable `moduleId` and declares durable
 boundary contracts with TypeBox:
 
 - `events`: facts appended to the event stream
@@ -194,13 +226,13 @@ boundary contracts with TypeBox:
 `events` is required. Omit `queues`, `signals`, or `signalQueues` when the
 module does not define contracts in that category. Plain event definitions
 create contracts owned by that module and produce opaque event tokens such as
-`ledgerShape.events["user.created"]`. Runtime APIs accept these tokens instead
-of string names.
+`usersDeclaration.events["user.created"]`. Runtime APIs accept these tokens
+instead of string names.
 
 An event may declare a durable result alongside its payload:
 
 ```ts
-const decisionsShape = defineLedgerShape({
+const decisionsShape = declareLedgerModule({
   moduleId: "decisions",
   events: {
     recorded: {
@@ -230,9 +262,9 @@ the event. `ledger.emit(...)` then returns the ordinary durable event envelope
 plus its typed `outcome`. A deduplicated emission returns the original event,
 payload, and outcome rather than evaluating the handler again.
 
-### 2. Define Materializations From Migrations
+### 2. Link Storage Materializations
 
-Call `defineMaterialization(ledgerShape, { namespace })` to define one
+Call `defineMaterialization(declaration, { namespace })` to define one
 materialization namespace. The table schema is the outcome of the ordered
 version chain; there is no separate current-schema DDL to keep in sync.
 
@@ -240,7 +272,7 @@ Each `.version(...)` callback receives a typed migration chain. Operations
 append metadata and advance the schema type visible to later operations:
 
 ```ts
-const materializations = defineMaterialization(ledgerShape, {
+const materializations = defineMaterialization(usersDeclaration, {
   namespace: "app",
 })
   .version(1, "create users", (s) =>
@@ -342,35 +374,42 @@ import type {
 type AppSchema = MaterializationSchemaFor<typeof materializations>;
 type AppReadDb = MaterializationReadDatabaseFor<
   typeof materializations,
-  typeof ledgerShape.shape.events
+  typeof usersDeclaration.shape.events
 >;
 type AppWriteDb = MaterializationWriteDatabaseFor<typeof materializations>;
 type AppDb = MaterializationDatabaseFor<
   typeof materializations,
-  typeof ledgerShape.shape.events
+  typeof usersDeclaration.shape.events
 >;
 type AppMigrationDb = MaterializationMigrationDatabaseFor<
   typeof materializations,
-  typeof ledgerShape.shape.events
+  typeof usersDeclaration.shape.events
 >;
 type AppImplementations = MaterializationImplementationRegistrationFor<
   typeof materializations,
-  typeof ledgerShape.shape.events
+  typeof usersDeclaration.shape.events
 >;
 ```
 
-Attach materializations to the ledger shape with `withMaterializations(...)`:
+Link the declaration to its materializations with `linkLedgerModule(...)`:
 
 ```ts
-const definedModel = withMaterializations(ledgerShape, materializations);
+const linkedUsers = linkLedgerModule(usersDeclaration, materializations);
 ```
 
-Ledgers without materialization tables can skip this step and call
-`defineLedgerShape(...).register(...)` directly.
+The link phase is explicit even when a module owns no projection:
+
+```ts
+const linkedNotifications = linkLedgerModule(notificationsDeclaration, null);
+```
+
+`null` means the module intentionally has no materialization history. A
+declaration cannot register handlers or participate in a model until it has
+been linked.
 
 ### 3. Register Orchestration
 
-Call `definedModel.register(...)` to attach indexer implementations, query
+Call `linked.register(...)` to attach indexer implementations, query
 implementations, event handlers, queue handlers, signal handlers, and
 signal-queue handlers.
 
@@ -458,21 +497,28 @@ and `query`.
 The low-level database engine and storage scope are internal implementation
 details, not package exports.
 
-Registration returns the model passed to a storage adapter. There is no
-separate bind step.
+Registration returns an inert `RegisteredLedgerModule`. It exposes the exact
+event, query, and signal tokens that consumers use, but it cannot touch storage
+or start work.
 
-### 4. Compose the Root Model
+### 4. Construct the Model
 
-Every runtime receives one explicitly composed root model:
+When the complete module set is known in code, compose it without opening
+storage:
 
 ```ts
-const model = composeLedgerModels(usersModel, auditModel, deliveryModel);
+const model = composeLedgerModules(usersModule, auditModule, deliveryModule);
 ```
+
+`composeLedgerModules(...)` validates unique module ids and exact owners for
+every imported event and query token. The returned `ComposedLedgerModel` is a
+pure graph description: it can be inspected, reused for multiple handles, or
+passed to either storage adapter. It is not an open or stateful ledger.
 
 Registered modules retain the exact event, query, and signal token maps created
 during definition. A module factory can therefore return its registered module
 directly: consumers use its public tokens as capabilities, while the
-composition root passes the same value to `composeLedgerModels(...)`.
+composition root passes the same value to `composeLedgerModules(...)`.
 Generic module factories preserve those aliased event payload and query types
 without widening the referenced module's identity.
 
@@ -481,22 +527,22 @@ as the definition value. The alias is a code-level name for the exact same
 persisted event:
 
 ```ts
-const auditShape = defineLedgerShape({
+const auditDeclaration = declareLedgerModule({
   moduleId: "app.audit",
   events: {
-    userCreated: usersModel.events["user.created"],
+    userCreated: usersModule.events["user.created"],
   },
 });
 ```
 
 Query definitions work the same way: supplying
-`usersModel.queries.userById` in another module's materialization query
+`usersModule.queries.userById` in another module's materialization query
 definitions creates a local alias that routes to the owning module's query
 implementation. The consuming module does not implement that alias.
 
 Event and query references establish contract availability, not execution
 order. For one append, Sledge runs contributions in
-`composeLedgerModels(...)` order, left to right, inside the existing atomic
+`composeLedgerModules(...)` order, left to right, inside the existing atomic
 transaction. A query invoked during indexing sees committed state plus writes
 performed earlier in that append, but never writes from later contributions.
 Any failure rolls back the persisted event, projection writes, and queued work
@@ -506,6 +552,89 @@ Indexer definitions, durable queue definitions, projection tables and indexes,
 and materialization histories remain owned by their defining module. Consumers
 reference source event tokens and define their own indexers or queues; queues
 and indexers cannot be aliased across modules.
+
+#### Resolve a Model From Ledger Queries
+
+Sometimes the ledger itself stores which modules should participate in its
+model. `defineLedgerModel(...)` lets the storage adapter resolve that graph
+before it opens the runtime:
+
+```ts
+import {
+  defineLedgerModel,
+  type AnyRegisteredLedgerModule,
+} from "@torkbot/sledge/ledger";
+
+type ModuleDescriptor = {
+  readonly specifier: string;
+};
+
+declare function loadConfiguredModules(
+  descriptors: readonly ModuleDescriptor[],
+): Promise<
+  readonly [AnyRegisteredLedgerModule, ...AnyRegisteredLedgerModule[]]
+>;
+
+const model = defineLedgerModel(async ({ prepare, extend }) => {
+  const registry = await prepare(moduleRegistry);
+  const descriptors = await registry.query(
+    moduleRegistry.queries.configuredModules,
+    {},
+  );
+
+  if (descriptors.length === 0) {
+    return registry;
+  }
+
+  const [first, ...rest] = await loadConfiguredModules(descriptors);
+  return await extend(registry, first, ...rest);
+});
+
+await using ledger = await createBetterSqliteLedger({
+  databaseUrl,
+  model,
+  timing,
+});
+```
+
+The resolver receives methods scoped to that one open operation:
+
+- `prepare(first, ...rest)` creates a query-only prepared value for one closed
+  set of registered modules.
+- `extend(prepared, first, ...rest)` returns a different prepared value whose
+  query capability includes the added modules. It never mutates the input.
+- Returning a prepared value ends model resolution. The adapter then opens
+  that exact graph; there is no separate activation or sealing call.
+
+A prepared value exposes `query(...)` only. It cannot append events, start
+workers, tail events, publish signals, or re-enter the public ledger API.
+Prepared values and resolver methods are revoked when the resolver returns;
+retaining one in an application closure does not extend its storage access.
+Preparation may install or migrate the selected modules' storage-local
+materializations so their queries are valid, but application callbacks still
+receive only the ordinary typed read facade.
+
+Discovery happens in explicit application-controlled waves. A resolver may
+query one prepared value, extend it, query the returned value, and extend again.
+Sledge does not search for modules, run an automatic fixed point, or interpret
+the query result. This keeps loading, trust, authorization, and termination
+policy in userspace.
+
+On an existing database, every prepared module list must be an ordered prefix
+of the stored composed root. This permits a registry module to be queried
+before later modules are loaded without allowing an unrelated graph to run
+migrations. The final opened model must still match the stored root exactly.
+Changing the configured module set or its order is therefore a durable model
+change that requires an intentional compatibility, migration, or reset policy;
+it is not runtime hot-plugging.
+
+A fresh database contains neither ledger facts nor a durable root to discover.
+Its first boot must compose the complete initial module set from code or an
+external bootstrap input and open that static model. Later boots can use ledger
+queries to reconstruct the same root. Prepared resolution rejects an unowned
+database rather than running migrations before the durable root is known.
+Sledge deliberately does not invent a bootstrap or root-evolution policy at
+this boundary.
 
 ### 5. Run Database Hygiene
 
@@ -525,16 +654,21 @@ modules can use the same local names without physical collisions.
 
 The first open records the composed root's ordered module ids. Every later
 runtime opening that database must supply the exact same modules in the same
-composition order. Sledge rejects mismatched roots before schema mutation or
-work dispatch so rolling processes cannot apply different handler
+composition order. Static models are checked before schema mutation or work
+dispatch. During query-backed resolution, each prepared prefix is checked
+before its module migrations and the completed graph is checked exactly before
+the runtime opens. Rolling processes therefore cannot apply different handler
 contributions to one logical ledger.
 
 ### 6. Open a Runtime
 
-Use one adapter to open the ledger:
+Await one adapter to open the ledger:
 
 - `createBetterSqliteLedger(...)`
 - `createTursoLedger(...)`
+
+Both functions are asynchronous because a `LedgerModelDefinition` may need to
+prepare and query storage before the runtime model is known.
 
 Adapters take a `databaseUrl` filesystem path and Sledge owns the database
 connections it opens. SQLite in-memory URLs (`:memory:` and `file:...mode=memory`
@@ -600,7 +734,8 @@ immediately emit event tokens and run query tokens referenced by the handler's
 module:
 
 ```ts
-const decisions = decisionsShape.register({
+const linkedDecisions = linkLedgerModule(decisionsShape, null);
+const decisions = linkedDecisions.register({
   events: {
     recorded: () => {
       return {

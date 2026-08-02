@@ -12,6 +12,8 @@ const registeredLedgerProjectionCompilerFactoryBrand: unique symbol = Symbol(
 const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
   "sledge.registeredLedgerProjectionSchemas",
 );
+const ledgerModelResolvers = new WeakMap<object, unknown>();
+const preparedLedgerModelStates = new WeakMap<object, unknown>();
 export const registeredLedgerContractsBrand: unique symbol = Symbol(
   "sledge.registeredLedgerContracts",
 );
@@ -24,6 +26,43 @@ export const registeredLedgerRuntimeBrand: unique symbol = Symbol(
 export const storageRuntimeIdentityBrand: unique symbol = Symbol(
   "sledge.storageRuntimeIdentity",
 );
+
+/**
+ * Keeps model-resolution behavior out of the public definition value. The
+ * weak association also makes definitions opaque and non-serializable: they
+ * are process-local construction plans, never durable ledger state.
+ */
+export function attachLedgerModelResolver<
+  TDefinition extends object,
+  TResolver,
+>(definition: TDefinition, resolver: TResolver): TDefinition {
+  ledgerModelResolvers.set(definition, resolver);
+  return definition;
+}
+
+export function readLedgerModelResolver<TResolver>(
+  definition: object,
+): TResolver | undefined {
+  return ledgerModelResolvers.get(definition) as TResolver | undefined;
+}
+
+/**
+ * Associates a prepared model capability with the adapter-owned runtime that
+ * produced it. Resolution ports reject values from another resolution run.
+ */
+export function attachPreparedLedgerModelState<
+  TPrepared extends object,
+  TState,
+>(prepared: TPrepared, state: TState): TPrepared {
+  preparedLedgerModelStates.set(prepared, state);
+  return prepared;
+}
+
+export function readPreparedLedgerModelState<TState>(
+  prepared: object,
+): TState | undefined {
+  return preparedLedgerModelStates.get(prepared) as TState | undefined;
+}
 
 export type LedgerStorageRow = Record<string, unknown>;
 

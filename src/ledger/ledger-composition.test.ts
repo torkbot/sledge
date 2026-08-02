@@ -14,12 +14,13 @@ import {
 } from "./better-sqlite3-ledger.ts";
 import {
   type AnyComposedLedgerModel,
-  composeLedgerModels,
+  composeLedgerModules,
   createEventRef,
-  defineLedgerShape,
+  defineLedgerModel,
+  declareLedgerModule,
   defineMaterialization,
   type WorkRef,
-  withMaterializations,
+  linkLedgerModule,
 } from "./ledger.ts";
 import {
   createTursoLedger,
@@ -41,7 +42,7 @@ const CountQueryResultSchema = Type.Number();
 function defineGenericSourceModule<const TModuleId extends string>(
   moduleId: TModuleId,
 ) {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId,
     events: {
       created: Type.Object({
@@ -67,7 +68,7 @@ function defineGenericSourceModule<const TModuleId extends string>(
       },
     });
 
-  return withMaterializations(shape, materialization).register({
+  return linkLedgerModule(shape, materialization).register({
     queries: {
       byId: async ({ params }) => {
         return params;
@@ -85,7 +86,7 @@ function defineGenericConsumerModule<
     typeof defineGenericSourceModule<TSourceModuleId>
   >;
 }) {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: input.moduleId,
     events: {
       sourceCreated: input.source.events.created,
@@ -102,7 +103,7 @@ function defineGenericConsumerModule<
       },
     });
 
-  return withMaterializations(shape, materialization).register({
+  return linkLedgerModule(shape, materialization).register({
     events: {
       sourceCreated: async ({ event, actions }) => {
         const source = await actions.query("sourceById", {
@@ -113,6 +114,107 @@ function defineGenericConsumerModule<
       },
     },
   });
+}
+
+function defineModelRegistryModule() {
+  const declaration = declareLedgerModule({
+    moduleId: "contract.model-registry",
+    events: {
+      configured: Type.Object({
+        moduleIds: Type.Array(Type.String()),
+      }),
+    },
+  });
+  const materialization = defineMaterialization(declaration, {
+    namespace: "registry",
+  })
+    .version(1, "create model registry", (schema) =>
+      schema.createTable("configuration", (table) =>
+        table
+          .columns({
+            singleton: table.integer().notNull(),
+            moduleIds: table.json<string[]>().notNull(),
+          })
+          .primaryKey(["singleton"]),
+      ),
+    )
+    .define({
+      indexers: {
+        storeConfiguration: {
+          sourceEvent: "configured",
+          input: Type.Object({
+            moduleIds: Type.Array(Type.String()),
+          }),
+        },
+      },
+      queries: {
+        configuredModuleIds: {
+          params: Type.Object({}),
+          result: Type.Union([Type.Null(), Type.Array(Type.String())]),
+        },
+      },
+    });
+
+  return linkLedgerModule(declaration, materialization).register({
+    events: {
+      configured: async ({ event, actions }) => {
+        await actions.index("storeConfiguration", event.payload);
+      },
+    },
+    indexers: {
+      storeConfiguration: async ({ input, db }) => {
+        await db
+          .insertInto("configuration")
+          .values({
+            singleton: 1,
+            moduleIds: input.moduleIds,
+          })
+          .onConflict(["singleton"])
+          .doUpdateSet({ moduleIds: input.moduleIds })
+          .execute();
+      },
+    },
+    queries: {
+      configuredModuleIds: async ({ db }) => {
+        const configured = await db
+          .selectFrom("configuration")
+          .select(["moduleIds"])
+          .where("singleton", "=", 1)
+          .executeTakeFirst();
+
+        return configured?.moduleIds ?? null;
+      },
+    },
+  });
+}
+
+function defineDiscoveredModule() {
+  const declaration = declareLedgerModule({
+    moduleId: "contract.discovered",
+    events: {
+      invoked: Type.Object({ value: Type.String() }),
+    },
+  });
+
+  return linkLedgerModule(declaration, null).register({});
+}
+
+function defineUnexpectedModule() {
+  const declaration = declareLedgerModule({
+    moduleId: "contract.unexpected",
+    events: {},
+  });
+  const materialization = defineMaterialization(declaration, {
+    namespace: "unexpected",
+  })
+    .version(1, "create unexpected state", (schema) =>
+      schema.createTable("unexpectedState", (table) =>
+        table.columns({ id: table.integer().notNull() }).primaryKey(["id"]),
+      ),
+    )
+    .define({ indexers: {}, queries: {} });
+
+  return linkLedgerModule(declaration, materialization).register({});
 }
 
 if (false) {
@@ -130,7 +232,7 @@ if (false) {
     .sourceCreated satisfies typeof genericSource.events.created;
   genericConsumer.queries
     .sourceById satisfies typeof genericSource.queries.byId;
-  composeLedgerModels(genericSource, genericConsumer);
+  composeLedgerModules(genericSource, genericConsumer);
 }
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
@@ -145,7 +247,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     let phase = "define models";
 
     try {
-      const sourceShape = defineLedgerShape({
+      const sourceShape = declareLedgerModule({
         moduleId: "contract.source",
         events: {
           created: Type.Object({
@@ -191,7 +293,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             },
           },
         });
-      const sourceDefinition = withMaterializations(
+      const sourceDefinition = linkLedgerModule(
         sourceShape,
         sourceMaterializations,
       );
@@ -250,7 +352,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       assert.equal(source.queries, sourceDefinition.queries);
       assert.equal(source.signals, sourceDefinition.signals);
 
-      const laterShape = defineLedgerShape({
+      const laterShape = declareLedgerModule({
         moduleId: "contract.later",
         events: {
           sourceCreated: source.events.created,
@@ -286,7 +388,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             },
           },
         });
-      const laterDefinition = withMaterializations(
+      const laterDefinition = linkLedgerModule(
         laterShape,
         laterMaterializations,
       );
@@ -322,7 +424,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         },
       });
 
-      const consumerShape = defineLedgerShape({
+      const consumerShape = declareLedgerModule({
         moduleId: "contract.consumer",
         events: {
           sourceCreated: source.events.created,
@@ -364,7 +466,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             },
           },
         });
-      const consumerDefinition = withMaterializations(
+      const consumerDefinition = linkLedgerModule(
         consumerShape,
         consumerMaterializations,
       );
@@ -425,7 +527,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         });
       }
 
-      const failureShape = defineLedgerShape({
+      const failureShape = declareLedgerModule({
         moduleId: "contract.failure",
         events: {
           sourceCreated: source.events.created,
@@ -434,7 +536,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         signals: {},
         signalQueues: {},
       });
-      const failure = failureShape.register({
+      const failure = linkLedgerModule(failureShape, null).register({
         events: {
           sourceCreated: () => {
             contributions.push("failure");
@@ -445,7 +547,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           },
         },
       });
-      const model = composeLedgerModels(source, consumer, later, failure);
+      const model = composeLedgerModules(source, consumer, later, failure);
       const openLedger = async () => {
         if (driver === "better-sqlite3") {
           return createBetterSqliteLedger({
@@ -707,19 +809,214 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     }
   });
 
+  test(`${driver} resolves a model from prepared ledger queries`, async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), `sledge-model-resolution-${driver}-`),
+    );
+    const databaseUrl = join(directory, "ledger.sqlite");
+    const registry = defineModelRegistryModule();
+    const discovered = defineDiscoveredModule();
+    const unexpected = defineUnexpectedModule();
+
+    const openLedger = async (model: AnyComposedLedgerModel) => {
+      if (driver === "better-sqlite3") {
+        return await createBetterSqliteLedger({
+          databaseUrl,
+          model,
+          timing,
+        });
+      }
+
+      return await createTursoLedger({
+        databaseUrl,
+        model,
+        timing,
+      });
+    };
+
+    try {
+      const unownedDefinition = defineLedgerModel(async ({ prepare }) => {
+        return await prepare(registry);
+      });
+      const unownedOpen =
+        driver === "better-sqlite3"
+          ? createBetterSqliteLedger({
+              databaseUrl,
+              model: unownedDefinition,
+              timing,
+            })
+          : createTursoLedger({
+              databaseUrl,
+              model: unownedDefinition,
+              timing,
+            });
+
+      await assert.rejects(unownedOpen, /cannot prepare an unowned database/);
+
+      const seed = await openLedger(composeLedgerModules(registry, discovered));
+
+      try {
+        await seed.emit(registry.events.configured, {
+          moduleIds: [discovered.moduleId],
+        });
+      } finally {
+        await seed.close();
+      }
+
+      let queryAfterResolution:
+        | (() => Promise<readonly string[] | null>)
+        | undefined;
+      let prepareAfterResolution: (() => Promise<unknown>) | undefined;
+      const definition = defineLedgerModel(async ({ prepare, extend }) => {
+        const registryModel = await prepare(registry);
+
+        queryAfterResolution = async () =>
+          await registryModel.query(registry.queries.configuredModuleIds, {});
+        prepareAfterResolution = async () => await prepare(registry);
+
+        if (false) {
+          // @ts-expect-error Preparation deliberately has no append capability.
+          await registryModel.emit(registry.events.configured, {
+            moduleIds: [],
+          });
+          // @ts-expect-error Workers only exist on an opened ledger.
+          await registryModel.startWorkers({ scheduler: runtime.scheduler });
+        }
+
+        const configuredModuleIds = await registryModel.query(
+          registry.queries.configuredModuleIds,
+          {},
+        );
+
+        assert.deepEqual(configuredModuleIds, [discovered.moduleId]);
+
+        const expanded = await extend(registryModel, discovered);
+        assert.notEqual(expanded, registryModel);
+
+        return expanded;
+      });
+      const ledger =
+        driver === "better-sqlite3"
+          ? await createBetterSqliteLedger({
+              databaseUrl,
+              model: definition,
+              timing,
+            })
+          : await createTursoLedger({
+              databaseUrl,
+              model: definition,
+              timing,
+            });
+
+      try {
+        assert.ok(queryAfterResolution);
+        await assert.rejects(
+          queryAfterResolution(),
+          /ledger model resolution has already completed/,
+        );
+        assert.ok(prepareAfterResolution);
+        await assert.rejects(
+          prepareAfterResolution(),
+          /ledger model resolution has already completed/,
+        );
+
+        const configuredModuleIds = await ledger.query(
+          registry.queries.configuredModuleIds,
+          {},
+        );
+        assert.deepEqual(configuredModuleIds, [discovered.moduleId]);
+
+        const invoked = await ledger.emit(discovered.events.invoked, {
+          value: "resolved",
+        });
+        assert.equal(invoked.payload.value, "resolved");
+      } finally {
+        await ledger.close();
+      }
+
+      const incompleteDefinition = defineLedgerModel(async ({ prepare }) => {
+        return await prepare(registry);
+      });
+      const incompleteOpen =
+        driver === "better-sqlite3"
+          ? createBetterSqliteLedger({
+              databaseUrl,
+              model: incompleteDefinition,
+              timing,
+            })
+          : createTursoLedger({
+              databaseUrl,
+              model: incompleteDefinition,
+              timing,
+            });
+
+      await assert.rejects(incompleteOpen, (error: unknown) =>
+        errorTreeIncludesMessage(error, 'received ["contract.model-registry"]'),
+      );
+
+      const invalidDefinition = defineLedgerModel(async ({ prepare }) => {
+        return await prepare(unexpected);
+      });
+      const invalidOpen =
+        driver === "better-sqlite3"
+          ? createBetterSqliteLedger({
+              databaseUrl,
+              model: invalidDefinition,
+              timing,
+            })
+          : createTursoLedger({
+              databaseUrl,
+              model: invalidDefinition,
+              timing,
+            });
+
+      await assert.rejects(invalidOpen, (error: unknown) =>
+        errorTreeIncludesMessage(
+          error,
+          "prepared modules must be an ordered prefix",
+        ),
+      );
+
+      const inspectionStorage =
+        driver === "better-sqlite3"
+          ? createBetterSqliteStorageRuntime(databaseUrl)
+          : await createTursoStorageRuntime(databaseUrl);
+
+      try {
+        const unexpectedTable = await inspectionStorage.read(
+          async (database) =>
+            await database
+              .prepare(
+                `SELECT name
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = ?`,
+              )
+              .get("sledge::contract.unexpected::table::unexpectedState"),
+        );
+        assert.equal(unexpectedTable, undefined);
+      } finally {
+        await inspectionStorage.close();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   test(`${driver} rejects a different composed root for an existing database`, async () => {
     const directory = await mkdtemp(
       join(tmpdir(), `sledge-root-identity-${driver}-`),
     );
     const databaseUrl = join(directory, "ledger.sqlite");
-    const first = defineLedgerShape({
+    const firstShape = declareLedgerModule({
       moduleId: "contract.root-first",
       events: {},
-    }).register({});
-    const second = defineLedgerShape({
+    });
+    const first = linkLedgerModule(firstShape, null).register({});
+    const secondShape = declareLedgerModule({
       moduleId: "contract.root-second",
       events: {},
-    }).register({});
+    });
+    const second = linkLedgerModule(secondShape, null).register({});
     const openLedger = async (model: AnyComposedLedgerModel) => {
       if (driver === "better-sqlite3") {
         return createBetterSqliteLedger({
@@ -737,22 +1034,22 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     };
 
     try {
-      const owningLedger = await openLedger(composeLedgerModels(first, second));
+      const owningLedger = await openLedger(
+        composeLedgerModules(first, second),
+      );
       await owningLedger.listWork();
       await owningLedger.close();
 
       for (const mismatchedModel of [
-        composeLedgerModels(second, first),
-        composeLedgerModels(first),
+        composeLedgerModules(second, first),
+        composeLedgerModules(first),
       ]) {
-        const mismatchedLedger = await openLedger(mismatchedModel);
-
-        await assert.rejects(mismatchedLedger.close(), (error: unknown) => {
-          return errorTreeIncludesMessage(
+        await assert.rejects(openLedger(mismatchedModel), (error: unknown) =>
+          errorTreeIncludesMessage(
             error,
             "database belongs to composed ledger root",
-          );
-        });
+          ),
+        );
       }
     } finally {
       await rm(directory, { force: true, recursive: true });
@@ -764,19 +1061,22 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       join(tmpdir(), `sledge-dedupe-identity-${driver}-`),
     );
     const databaseUrl = join(directory, "ledger.sqlite");
-    const first = defineLedgerShape({
+    const first = declareLedgerModule({
       moduleId: "contract.dedupe-first",
       events: {
         created: Type.Object({}),
       },
     });
-    const second = defineLedgerShape({
+    const second = declareLedgerModule({
       moduleId: "contract.dedupe-second",
       events: {
         updated: Type.Object({}),
       },
     });
-    const model = composeLedgerModels(first.register({}), second.register({}));
+    const model = composeLedgerModules(
+      linkLedgerModule(first, null).register({}),
+      linkLedgerModule(second, null).register({}),
+    );
     const openLedger = async () => {
       if (driver === "better-sqlite3") {
         return createBetterSqliteLedger({
@@ -818,7 +1118,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 }
 
 test("composition requires unique module ids and exact contract owners", () => {
-  const sourceShape = defineLedgerShape({
+  const sourceShape = declareLedgerModule({
     moduleId: "contract.owner",
     events: {
       created: Type.Object({}),
@@ -829,8 +1129,8 @@ test("composition requires unique module ids and exact contract owners", () => {
     signals: {},
     signalQueues: {},
   });
-  const source = sourceShape.register({});
-  const consumerShape = defineLedgerShape({
+  const source = linkLedgerModule(sourceShape, null).register({});
+  const consumerShape = declareLedgerModule({
     moduleId: "contract.consumer",
     events: {
       sourceCreated: sourceShape.events.created,
@@ -839,20 +1139,20 @@ test("composition requires unique module ids and exact contract owners", () => {
     signals: {},
     signalQueues: {},
   });
-  const consumer = consumerShape.register({});
+  const consumer = linkLedgerModule(consumerShape, null).register({});
 
   assert.throws(
-    () => composeLedgerModels(source, source),
+    () => composeLedgerModules(source, source),
     /duplicate ledger module id contract\.owner/,
   );
 
   if (false) {
-    const root = composeLedgerModels(source, consumer);
+    const root = composeLedgerModules(source, consumer);
     // @ts-expect-error Composition is defined once at the root.
-    composeLedgerModels(root);
+    composeLedgerModules(root);
   }
 
-  const imposterShape = defineLedgerShape({
+  const imposterShape = declareLedgerModule({
     moduleId: "contract.owner",
     events: {
       other: Type.Object({}),
@@ -863,11 +1163,15 @@ test("composition requires unique module ids and exact contract owners", () => {
   });
 
   assert.throws(
-    () => composeLedgerModels(imposterShape.register({}), consumer),
+    () =>
+      composeLedgerModules(
+        linkLedgerModule(imposterShape, null).register({}),
+        consumer,
+      ),
     /references unavailable event contract\.owner\.created/,
   );
 
-  const queryOwnerShape = defineLedgerShape({
+  const queryOwnerShape = declareLedgerModule({
     moduleId: "contract.query-owner",
     events: {},
     queues: {},
@@ -895,11 +1199,11 @@ test("composition requires unique module ids and exact contract owners", () => {
         },
       },
     });
-  const queryOwnerDefinition = withMaterializations(
+  const queryOwnerDefinition = linkLedgerModule(
     queryOwnerShape,
     queryOwnerMaterializations,
   );
-  const queryConsumerShape = defineLedgerShape({
+  const queryConsumerShape = declareLedgerModule({
     moduleId: "contract.query-consumer",
     events: {},
     queues: {},
@@ -927,11 +1231,11 @@ test("composition requires unique module ids and exact contract owners", () => {
         sourceCount: queryOwnerDefinition.queries.count,
       },
     });
-  const queryConsumer = withMaterializations(
+  const queryConsumer = linkLedgerModule(
     queryConsumerShape,
     queryConsumerMaterializations,
   ).register({});
-  const queryImposterShape = defineLedgerShape({
+  const queryImposterShape = declareLedgerModule({
     moduleId: "contract.query-owner",
     events: {},
     queues: {},
@@ -940,11 +1244,15 @@ test("composition requires unique module ids and exact contract owners", () => {
   });
 
   assert.throws(
-    () => composeLedgerModels(queryImposterShape.register({}), queryConsumer),
+    () =>
+      composeLedgerModules(
+        linkLedgerModule(queryImposterShape, null).register({}),
+        queryConsumer,
+      ),
     /references unavailable query contract\.query-owner\.count/,
   );
 
-  const caseCollidingShape = defineLedgerShape({
+  const caseCollidingShape = declareLedgerModule({
     moduleId: "Contract.Owner",
     events: {},
     queues: {},
@@ -953,12 +1261,16 @@ test("composition requires unique module ids and exact contract owners", () => {
   });
 
   assert.throws(
-    () => composeLedgerModels(source, caseCollidingShape.register({})),
+    () =>
+      composeLedgerModules(
+        source,
+        linkLedgerModule(caseCollidingShape, null).register({}),
+      ),
     /duplicate ledger module id Contract\.Owner/,
   );
 
   if (false) {
-    defineLedgerShape({
+    declareLedgerModule({
       moduleId: "contract.invalid-queue-consumer",
       events: {},
       queues: {
@@ -972,7 +1284,7 @@ test("composition requires unique module ids and exact contract owners", () => {
 });
 
 test("unused queue and signal definitions may be omitted", () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "contract.minimal",
     events: {
       created: Type.Object({}),
@@ -982,11 +1294,13 @@ test("unused queue and signal definitions may be omitted", () => {
   assert.deepEqual(shape.shape.queues, {});
   assert.deepEqual(shape.shape.signals, {});
   assert.deepEqual(shape.shape.signalQueues, {});
-  assert.doesNotThrow(() => composeLedgerModels(shape.register({})));
+  assert.doesNotThrow(() =>
+    composeLedgerModules(linkLedgerModule(shape, null).register({})),
+  );
 });
 
 test("result-bearing events require an owning handler at registration", () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "contract.result-handler",
     events: {
       recorded: {
@@ -999,21 +1313,22 @@ test("result-bearing events require an owning handler at registration", () => {
       },
     },
   });
+  const linked = linkLedgerModule(shape, null);
 
   if (false) {
     // @ts-expect-error A result-bearing event is unusable without its owner.
-    shape.register({});
+    linked.register({});
   }
 
   assert.throws(
-    () => Reflect.apply(shape.register, shape, [{}]),
+    () => Reflect.apply(linked.register, linked, [{}]),
     /result-bearing event contract\.result-handler\.recorded requires an owning handler/,
   );
 });
 
 test("contract maps preserve names inherited by Object.prototype", () => {
   const inheritedName = "__proto__" as const;
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "contract.prototype-name",
     events: {
       [inheritedName]: Type.Object({}),
@@ -1049,7 +1364,7 @@ test("contract maps preserve names inherited by Object.prototype", () => {
         },
       },
     });
-  const definition = withMaterializations(shape, materializations);
+  const definition = linkLedgerModule(shape, materializations);
 
   assert.equal(Object.hasOwn(shape.events, inheritedName), true);
   assert.equal(Object.hasOwn(shape.signals, inheritedName), true);
@@ -1059,7 +1374,7 @@ test("contract maps preserve names inherited by Object.prototype", () => {
   assert.equal(Object.hasOwn(shape.shape.signalQueues, inheritedName), true);
   assert.equal(Object.hasOwn(definition.queries, inheritedName), true);
   assert.doesNotThrow(() =>
-    composeLedgerModels(
+    composeLedgerModules(
       definition.register({
         queries: {
           [inheritedName]: () => 0,

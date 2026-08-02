@@ -21,7 +21,7 @@ import type {
   MaterializationWriteDatabaseFor,
   ProjectionEventScanBuilder,
   QuerySchema,
-  RegisteredLedgerModel,
+  RegisteredLedgerModule,
 } from "./ledger.ts";
 import type {
   AnyProjectionSchema,
@@ -35,9 +35,9 @@ import {
 } from "./projection-sql-compiler.ts";
 import {
   createEventRef,
-  defineLedgerShape,
+  declareLedgerModule,
   defineMaterialization,
-  withMaterializations,
+  linkLedgerModule,
 } from "./ledger.ts";
 
 const UserCreatedSchema = Type.Object({
@@ -51,7 +51,7 @@ const RunStreamFrameSchema = Type.Object({
   sequence: Type.Number(),
 });
 
-const shape = defineLedgerShape({
+const shape = declareLedgerModule({
   moduleId: "projection.tests",
   events: {
     "user.created": UserCreatedSchema,
@@ -107,7 +107,7 @@ const materializations = defineMaterialization(shape, {
 const schema = materializations.history.current;
 const history = materializations.history;
 
-const definedModel = withMaterializations(shape, materializations);
+const linkedModel = linkLedgerModule(shape, materializations);
 
 const implementations = {
   indexers: {
@@ -141,7 +141,7 @@ const implementations = {
   typeof shape.shape.events
 >;
 
-const registeredModelWithoutHandlers = definedModel.register({
+const registeredModelWithoutHandlers = linkedModel.register({
   indexers: implementations.indexers,
   queries: implementations.queries,
 });
@@ -368,7 +368,7 @@ function readTestLedgerImplementations<
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TQueryDefinitions extends ProjectionQueryDefinitions,
 >(
-  model: RegisteredLedgerModel<
+  model: RegisteredLedgerModule<
     TEvents,
     TQueues,
     TIndexers,
@@ -597,10 +597,7 @@ test("projection access batches typed insert values into one statement", async (
       },
       queries: {},
     });
-  const batchModel = withMaterializations(
-    shape,
-    batchMaterializations,
-  ).register({
+  const batchModel = linkLedgerModule(shape, batchMaterializations).register({
     indexers: {
       seedUsers: async ({ input, event, db }) => {
         await db
@@ -693,7 +690,7 @@ test("projection access supports typed integer increments without raw SQL", asyn
       },
       queries: {},
     });
-  const counterModel = withMaterializations(
+  const counterModel = linkLedgerModule(
     shape,
     counterMaterializations,
   ).register({
@@ -763,7 +760,7 @@ test("projection access tracks unawaited executeExpectingOne assertions", async 
       },
       queries: {},
     });
-  const counterModel = withMaterializations(
+  const counterModel = linkLedgerModule(
     shape,
     counterMaterializations,
   ).register({
@@ -835,10 +832,7 @@ test("projection access supports bounded integer decrements without raw SQL", as
       },
       queries: {},
     });
-  const grantModel = withMaterializations(
-    shape,
-    grantMaterializations,
-  ).register({
+  const grantModel = linkLedgerModule(shape, grantMaterializations).register({
     indexers: {
       consumeGrant: async ({ input, db }) => {
         await db
@@ -978,23 +972,21 @@ test("registered projection implementations use the adapter-supplied statement c
 });
 
 test("projection access waits for unawaited writes before completing indexers", async () => {
-  const unawaitedModel = withMaterializations(shape, materializations).register(
-    {
-      indexers: {
-        upsertUser: ({ input, event, db }) => {
-          void db
-            .insertInto("users")
-            .values({
-              userId: input.userId,
-              email: input.email,
-              source: event.ref,
-            })
-            .execute();
-        },
+  const unawaitedModel = linkLedgerModule(shape, materializations).register({
+    indexers: {
+      upsertUser: ({ input, event, db }) => {
+        void db
+          .insertInto("users")
+          .values({
+            userId: input.userId,
+            email: input.email,
+            source: event.ref,
+          })
+          .execute();
       },
-      queries: implementations.queries,
     },
-  );
+    queries: implementations.queries,
+  });
   const indexer =
     readTestLedgerImplementations(unawaitedModel).indexers?.upsertUser;
 
@@ -1079,25 +1071,23 @@ test("projection access rejects writes started after indexer completion", async 
   const lateWrite = {
     current: null as (() => Promise<unknown>) | null,
   };
-  const lateWriteModel = withMaterializations(shape, materializations).register(
-    {
-      indexers: {
-        upsertUser: ({ input, event, db }) => {
-          lateWrite.current = async () => {
-            return await db
-              .insertInto("users")
-              .values({
-                userId: input.userId,
-                email: input.email,
-                source: event.ref,
-              })
-              .execute();
-          };
-        },
+  const lateWriteModel = linkLedgerModule(shape, materializations).register({
+    indexers: {
+      upsertUser: ({ input, event, db }) => {
+        lateWrite.current = async () => {
+          return await db
+            .insertInto("users")
+            .values({
+              userId: input.userId,
+              email: input.email,
+              source: event.ref,
+            })
+            .execute();
+        };
       },
-      queries: implementations.queries,
     },
-  );
+    queries: implementations.queries,
+  });
   const indexer =
     readTestLedgerImplementations(lateWriteModel).indexers?.upsertUser;
 
@@ -1184,7 +1174,7 @@ test("projection access rejects non-serializable JSON values before storage", as
         },
       },
     });
-  const registeredJsonModel = withMaterializations(
+  const registeredJsonModel = linkLedgerModule(
     shape,
     jsonMaterializations,
   ).register({
@@ -1469,7 +1459,7 @@ test("projection access distinguishes SQL null from JSON literal null", async ()
         },
       },
     });
-  const jsonNullModel = withMaterializations(
+  const jsonNullModel = linkLedgerModule(
     shape,
     jsonNullMaterializations,
   ).register({
@@ -1660,10 +1650,7 @@ test("projection access supports stateful indexers and ordered range queries", a
         },
       },
     });
-  const stateModel = withMaterializations(
-    shape,
-    stateMaterializations,
-  ).register({
+  const stateModel = linkLedgerModule(shape, stateMaterializations).register({
     indexers: {
       checkpoint: async ({ input, db }) => {
         const current = await db
@@ -1836,7 +1823,7 @@ test("projection access supports typed application-defined ordering", async () =
         },
       },
     });
-  const profileModel = withMaterializations(
+  const profileModel = linkLedgerModule(
     shape,
     profileMaterializations,
   ).register({
@@ -1940,7 +1927,7 @@ test("projection access supports typed disjunction predicate groups", async () =
         },
       },
     });
-  const followupModel = withMaterializations(
+  const followupModel = linkLedgerModule(
     shape,
     followupMaterializations,
   ).register({
@@ -2147,10 +2134,7 @@ test("projection access executeTakeFirst honors explicit zero limits", async () 
         },
       },
     });
-  const limitModel = withMaterializations(
-    shape,
-    limitMaterializations,
-  ).register({
+  const limitModel = linkLedgerModule(shape, limitMaterializations).register({
     queries: {
       checkLimitZero: async ({ db }) => {
         const selected = await db
@@ -2263,7 +2247,7 @@ test("projection access supports typed union candidate reads", async () => {
         },
       },
     });
-  const decisionModel = withMaterializations(
+  const decisionModel = linkLedgerModule(
     shape,
     decisionMaterializations,
   ).register({
@@ -2443,10 +2427,7 @@ test("projection access decodes boolean and nullable union literals", async () =
         },
       },
     });
-  const unionModel = withMaterializations(
-    shape,
-    unionMaterializations,
-  ).register({
+  const unionModel = linkLedgerModule(shape, unionMaterializations).register({
     queries: {
       checkUnion: async ({ db }) => {
         return await db
@@ -2522,10 +2503,7 @@ test("projection access rejects non-integer union literals for integer aliases",
         },
       },
     });
-  const rankedModel = withMaterializations(
-    shape,
-    rankedMaterializations,
-  ).register({
+  const rankedModel = linkLedgerModule(shape, rankedMaterializations).register({
     queries: {
       invalidRankUnion: async ({ db, params }) => {
         await db
@@ -2618,7 +2596,7 @@ test("projection access supports typed inner joins between materialization table
         },
       },
     });
-  const networkModel = withMaterializations(
+  const networkModel = linkLedgerModule(
     shape,
     networkMaterializations,
   ).register({
@@ -2744,7 +2722,7 @@ test("projection access supports typed anti-join predicates", async () => {
         },
       },
     });
-  const networkModel = withMaterializations(
+  const networkModel = linkLedgerModule(
     shape,
     networkMaterializations,
   ).register({
@@ -2841,7 +2819,7 @@ test("projection access supports left-joined optional rows", async () => {
         },
       },
     });
-  const operationModel = withMaterializations(
+  const operationModel = linkLedgerModule(
     shape,
     operationMaterializations,
   ).register({
@@ -2922,7 +2900,7 @@ test("projection access rejects unsafe predicate and self-join shapes", async ()
         },
       },
     });
-  const nodeModel = withMaterializations(shape, nodeMaterializations).register({
+  const nodeModel = linkLedgerModule(shape, nodeMaterializations).register({
     queries: {
       nullComparison: async ({ db }) => {
         await db
@@ -3042,7 +3020,7 @@ test("projection access supports typed aggregate reads", async () => {
         },
       },
     });
-  const toolModel = withMaterializations(shape, toolMaterializations).register({
+  const toolModel = linkLedgerModule(shape, toolMaterializations).register({
     queries: {
       duplicateAlias: async ({ db }) => {
         return await db
@@ -3159,10 +3137,7 @@ test("projection access hydrates semantic event references without exposing even
         },
       },
     });
-  const eventModel = withMaterializations(
-    shape,
-    eventMaterializations,
-  ).register({
+  const eventModel = linkLedgerModule(shape, eventMaterializations).register({
     queries: {
       sourceEvent: async ({ params, db }) => {
         const event = await db.readEvent(
@@ -3452,10 +3427,7 @@ test("projection access selects referenced events in one ordered storage query",
         },
       },
     });
-  const eventModel = withMaterializations(
-    shape,
-    eventMaterializations,
-  ).register({
+  const eventModel = linkLedgerModule(shape, eventMaterializations).register({
     queries: {
       pendingInputEvents: async ({ db }) => {
         const events = await db
@@ -3592,7 +3564,7 @@ test("projection access selects referenced events in one ordered storage query",
 });
 
 test("projection access scans semantic signals without exposing events table", async () => {
-  const signalShape = defineLedgerShape({
+  const signalShape = declareLedgerModule({
     moduleId: "projection.signal-tests",
     events: {
       "user.created": UserCreatedSchema,
@@ -3640,7 +3612,7 @@ test("projection access scans semantic signals without exposing events table", a
         },
       },
     });
-  const signalModel = withMaterializations(
+  const signalModel = linkLedgerModule(
     signalShape,
     signalMaterializations,
   ).register({
@@ -3763,7 +3735,7 @@ test("projection facade supports TorkBot-style surface operation materialization
     "surface.operation.failed": SurfaceOperationFailedSchema,
     "surface.operation.requested": SurfaceOperationRequestedSchema,
   };
-  const surfaceShape = defineLedgerShape({
+  const surfaceShape = declareLedgerModule({
     moduleId: "projection.surface-tests",
     events: surfaceEvents,
     queues: {},
@@ -3827,7 +3799,7 @@ test("projection facade supports TorkBot-style surface operation materialization
         },
       },
     });
-  const surfaceModel = withMaterializations(
+  const surfaceModel = linkLedgerModule(
     surfaceShape,
     surfaceMaterializations,
   ).register({
@@ -4211,7 +4183,7 @@ test("projection facade supports TorkBot-style surface operation materialization
 });
 
 test("ledger projection construction feeds generated contracts and implementations into the current runtime model", () => {
-  const registeredModel = definedModel.register({
+  const registeredModel = linkedModel.register({
     indexers: implementations.indexers,
     queries: implementations.queries,
     events: {
@@ -4230,17 +4202,17 @@ test("ledger projection construction feeds generated contracts and implementatio
   );
   assert.equal(
     Object.values(registeredModel.model.indexers)[0],
-    definedModel.model.indexers.upsertUser,
+    linkedModel.model.indexers.upsertUser,
   );
   assert.equal(
     Object.values(registeredModel.model.queries)[0],
-    definedModel.model.queries.userById,
+    linkedModel.model.queries.userById,
   );
   assert.equal(
     typeof readTestLedgerImplementations(registeredModel).indexers?.upsertUser,
     "function",
   );
-  assert.equal(definedModel.materializationHistory, history);
+  assert.equal(linkedModel.materializationHistory, history);
   assert.equal(registeredModel.materializationHistory?.namespace, "test");
   assert.equal(
     registeredModel.projections.metadata.tables.users?.name,
@@ -4248,8 +4220,8 @@ test("ledger projection construction feeds generated contracts and implementatio
   );
 });
 
-test("ledger shape can register without projections", () => {
-  const registeredModel = shape.register({
+test("linked module can register without materializations", () => {
+  const registeredModel = linkLedgerModule(shape, null).register({
     events: {
       "user.created": ({ event }) => {
         void event.payload.userId;
@@ -4299,7 +4271,7 @@ test("ledger materialization migrations apply relations over inferred tables", (
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, relationMaterializations);
+  const model = linkLedgerModule(shape, relationMaterializations);
 
   assert.deepEqual(model.projections.metadata.relations, {
     sessionUser: {
@@ -5049,7 +5021,7 @@ test("materialization migrations reject event refs outside the ledger shape", ()
   }, /references unknown event session\.created/);
 });
 
-test("withMaterializations rejects unchecked indexer source events outside the ledger shape", () => {
+test("linkLedgerModule rejects unchecked indexer source events outside the ledger shape", () => {
   const invalidIndexerMaterializations = defineMaterialization(shape, {
     namespace: "invalid-indexer-source",
   })
@@ -5074,12 +5046,12 @@ test("withMaterializations rejects unchecked indexer source events outside the l
 
   assert.throws(() => {
     // @ts-expect-error runtime validation protects unchecked callers too.
-    withMaterializations(shape, invalidIndexerMaterializations);
+    linkLedgerModule(shape, invalidIndexerMaterializations);
   }, /references unknown source event session\.created/);
 });
 
 async function assertLedgerProjectionTypes(): Promise<void> {
-  const multiEventShape = defineLedgerShape({
+  const multiEventShape = declareLedgerModule({
     moduleId: "projection.source-event-tests",
     events: {
       "session.created": Type.Object({
@@ -5114,7 +5086,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
       },
       queries: {},
     });
-  const multiEventModel = withMaterializations(
+  const multiEventModel = linkLedgerModule(
     multiEventShape,
     multiEventMaterializations,
   );
@@ -5343,7 +5315,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     });
 
   // @ts-expect-error indexer source events must come from the ledger shape.
-  withMaterializations(shape, invalidSource);
+  linkLedgerModule(shape, invalidSource);
 
   const joinMaterializations = defineMaterialization(shape, {
     namespace: "join-types",
@@ -5378,7 +5350,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
       },
     });
 
-  withMaterializations(shape, joinMaterializations).register({
+  linkLedgerModule(shape, joinMaterializations).register({
     queries: {
       joined: async ({ db }) => {
         db.selectFrom("children")
@@ -5889,7 +5861,7 @@ async function assertLedgerProjectionTypes(): Promise<void> {
     typeof shape.shape.events
   >;
 
-  const typedSignalShape = defineLedgerShape({
+  const typedSignalShape = declareLedgerModule({
     moduleId: "projection.signal-type-tests",
     events: {
       "user.created": UserCreatedSchema,

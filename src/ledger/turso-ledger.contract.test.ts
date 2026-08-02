@@ -16,7 +16,7 @@ import {
   type LedgerContractDecisionMode,
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
-import { composeLedgerModels, type LedgerWorkers } from "./ledger.ts";
+import { composeLedgerModules, type LedgerWorkers } from "./ledger.ts";
 import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
 
 runSqliteLedgerCloseContract({
@@ -61,7 +61,7 @@ runLedgerContractSuite({
       });
       const ledger = await createTursoLedger({
         databaseUrl,
-        model: composeLedgerModels(model),
+        model: composeLedgerModules(model),
         timing: {
           clock: runtime.clock,
           scheduler: runtime.scheduler,

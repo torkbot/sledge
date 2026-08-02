@@ -16,7 +16,7 @@ import {
   type LedgerContractDecisionMode,
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
-import { composeLedgerModels, type LedgerWorkers } from "./ledger.ts";
+import { composeLedgerModules, type LedgerWorkers } from "./ledger.ts";
 import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
 
 runSqliteLedgerCloseContract({
@@ -49,7 +49,7 @@ runLedgerContractSuite({
     const controlledWork = createLedgerContractControlledWork();
     const timedWork = createLedgerContractTimedWork();
 
-    const createRuntimeLedger = () => {
+    const createRuntimeLedger = async () => {
       const model = createLedgerContractModel({
         readDecisionMode: () => decisionMode,
         readMaterializationFailureText: () => materializationFailureText,
@@ -59,9 +59,9 @@ runLedgerContractSuite({
         runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
           timedWork.run(workKey, timeoutMs, leaseSignal, control),
       });
-      const ledger = createBetterSqliteLedger({
+      const ledger = await createBetterSqliteLedger({
         databaseUrl,
-        model: composeLedgerModels(model),
+        model: composeLedgerModules(model),
         timing: {
           clock: runtime.clock,
           scheduler: runtime.scheduler,
@@ -71,7 +71,7 @@ runLedgerContractSuite({
       return createLedgerContractHarnessLedger(ledger);
     };
 
-    let ledger = createRuntimeLedger();
+    let ledger = await createRuntimeLedger();
     let primaryMaxInFlight = 16;
     let primaryScheduler = new LedgerContractPausableScheduler(
       runtime.scheduler,
@@ -112,7 +112,7 @@ runLedgerContractSuite({
         await stopCompetingWorkers();
         await workers.close();
         await ledger.close();
-        ledger = createRuntimeLedger();
+        ledger = await createRuntimeLedger();
         primaryScheduler = new LedgerContractPausableScheduler(
           runtime.scheduler,
         );
@@ -137,7 +137,7 @@ runLedgerContractSuite({
         });
       },
       startCompetingWorkers: async ({ maxInFlight }) => {
-        const competingLedger = createRuntimeLedger();
+        const competingLedger = await createRuntimeLedger();
         const competingWorkers = await competingLedger.startWorkers({
           scheduler: runtime.scheduler,
           leaseMs: 1_000,
@@ -151,7 +151,7 @@ runLedgerContractSuite({
         });
       },
       emitCoalescedFromPeer: async (input) => {
-        const peerLedger = createRuntimeLedger();
+        const peerLedger = await createRuntimeLedger();
 
         try {
           return await peerLedger.emit("coalesced-work.requested", input);
