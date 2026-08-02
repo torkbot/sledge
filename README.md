@@ -153,17 +153,19 @@ const usersModel = definedModel.register({
 });
 
 const model = composeLedgerModels(usersModel);
+const runtimeScheduler = new NodeRuntimeScheduler();
 
 await using ledger = createBetterSqliteLedger({
   databaseUrl,
   model,
   timing: {
     clock: new SystemRuntimeClock(),
+    scheduler: runtimeScheduler,
   },
 });
 
 await using workers = await ledger.startWorkers({
-  scheduler: new NodeRuntimeScheduler(),
+  scheduler: runtimeScheduler,
 });
 
 await ledger.emit(usersModel.events["user.created"], {
@@ -527,11 +529,6 @@ composition order. Sledge rejects mismatched roots before schema mutation or
 work dispatch so rolling processes cannot apply different handler
 contributions to one logical ledger.
 
-Composable models use a new canonical storage layout. Opening a database
-created by a pre-composition Sledge release fails before any schema mutation.
-Reset the database before adopting this API; this release intentionally does
-not include a legacy migration or compatibility mode.
-
 ### 6. Open a Runtime
 
 Use one adapter to open the ledger:
@@ -559,6 +556,7 @@ The opened ledger exposes:
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`
 - `tailEvents({ last, signal })`
 - `resumeEvents({ cursor, signal })`
+- `expireHistory({ through })`
 - `onSignal(signalToken, observer)`
 - `startWorkers(options)`
 - `close()`
@@ -861,6 +859,23 @@ for await (const item of ledger.resumeEvents({
 ```
 
 Cursor values are opaque. Persist and reuse them as-is.
+
+`expireHistory({ through: cursor })` durably advances the earliest stream
+position Sledge will serve. The cursor itself remains resumable; an earlier
+cursor causes `resumeEvents(...)` to reject with
+`LedgerHistoryExpiredError`, and `tailEvents(...)` omits events at or before
+the boundary. Repeating the call with the same or an older cursor is a
+successful no-op, so competing retention owners cannot move the boundary
+backward.
+
+Event streams discover appends and expiration from other handles immediately
+within the same process and poll through the injected `RuntimeScheduler` for
+changes made by another process.
+
+Expiration is a logical stream boundary. It does not delete event rows,
+reclaim storage, or change projections, deduplication, and event-reference
+reads. Those physical retention policies can build on this durable boundary
+without being embedded in event consumption.
 
 ## Package Exports
 

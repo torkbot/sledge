@@ -64,6 +64,7 @@ runLedgerContractSuite({
         model: composeLedgerModels(model),
         timing: {
           clock: runtime.clock,
+          scheduler: runtime.scheduler,
         },
       });
 

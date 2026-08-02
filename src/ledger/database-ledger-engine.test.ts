@@ -28,6 +28,7 @@ import {
 import {
   composeLedgerModels,
   defineLedgerShape,
+  LedgerHistoryExpiredError,
   type EnqueueOptions,
   type LedgerTiming,
   type RegisteredLedgerModel,
@@ -307,6 +308,18 @@ function wrapBetterSqliteDatabase(
 
 function createTempDatabasePath(): string {
   return join(tmpdir(), `sledge-${randomUUID()}.sqlite`);
+}
+
+function isolateStorageRuntimeIdentity(
+  storage: StorageRuntime,
+  identity: string,
+): StorageRuntime {
+  return {
+    [storageRuntimeIdentityBrand]: identity,
+    read: async (run) => await storage.read(run),
+    write: async (run) => await storage.write(run),
+    close: async () => await storage.close(),
+  };
 }
 
 function createImmediateJobTestModel(queueHandler: () => void | Promise<void>) {
@@ -717,6 +730,7 @@ test("ledger queries do not block external write transactions", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -793,6 +807,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -859,6 +874,7 @@ test("event-handler queries remain reentrant inside append transactions", async 
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -919,6 +935,7 @@ test("event-handler query actions expire after handler completion", async () => 
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1015,6 +1032,7 @@ test("unawaited event-handler queries settle before rollback", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1087,6 +1105,7 @@ test("ledger construction and emit do not start queue workers", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1177,6 +1196,7 @@ test("closing workers during a pending claim releases the claimed work", async (
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1252,6 +1272,7 @@ test("idle workers wake promptly for sibling-runtime commits", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   const emitterLedger = createBetterSqliteLedger({
@@ -1262,6 +1283,7 @@ test("idle workers wake promptly for sibling-runtime commits", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
@@ -1326,6 +1348,7 @@ test("event-only sibling commits do not wake queue workers", async () => {
     model,
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   const emitterLedger = createBetterSqliteLedger({
@@ -1333,6 +1356,7 @@ test("event-only sibling commits do not wake queue workers", async () => {
     model,
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
@@ -1404,6 +1428,7 @@ test("store discovery remains independent of a known durable deadline", async ()
     model,
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   let workers: Awaited<ReturnType<typeof workerLedger.startWorkers>> | null =
@@ -1519,6 +1544,7 @@ test("ledger close waits for startup before closing storage", async () => {
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
 
@@ -1583,6 +1609,7 @@ test("ledger startup initialization is isolated per database", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   const secondLedger = createDatabaseLedger({
@@ -1594,6 +1621,7 @@ test("ledger startup initialization is isolated per database", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1645,6 +1673,7 @@ test("ledger close closes storage after startup failure", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1708,6 +1737,7 @@ test("worker failures preserve arbitrary rejection reasons", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1793,6 +1823,7 @@ test("worker supervision reports work-processing failures", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1867,6 +1898,7 @@ test("worker supervision reports sibling wake scheduling failures", async () => 
     model,
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   const emitterLedger = createBetterSqliteLedger({
@@ -1874,6 +1906,7 @@ test("worker supervision reports sibling wake scheduling failures", async () => 
     model,
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1939,6 +1972,7 @@ test("startWorkers rejects while workers are already running", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -1994,6 +2028,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -2072,6 +2107,7 @@ test("waitForIdle waits for work and supports cancellation", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -2181,6 +2217,7 @@ test("waitForIdle aborts while its durable-state read is still pending", async (
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -2275,6 +2312,7 @@ test("waitForIdle exits a pending durable-state read when workers close or fail"
         }),
         timing: {
           clock: runtime.clock,
+          scheduler: runtime.scheduler,
         },
       });
 
@@ -2375,6 +2413,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -2471,6 +2510,7 @@ test("deduped emit does not replay projections or materialization", async () => 
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
     await using workers = await ledger.startWorkers({
@@ -2578,6 +2618,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -2708,6 +2749,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -2848,7 +2890,7 @@ test("queue emissions require an unexpired authenticated lease", async () => {
   await using ledger = createPublicBetterSqliteLedger({
     databaseUrl,
     model: composeLedgerModels(module),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
   await using workers = await ledger.startWorkers({
     scheduler: runtime.scheduler,
@@ -2946,6 +2988,7 @@ test("queue handlers publish signals immediately before handler completion", asy
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -3066,6 +3109,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -3162,6 +3206,7 @@ test("event consumers abort while a storage read is still pending", async () => 
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3210,6 +3255,7 @@ test("emit fails fast when busy retries are disabled", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3291,6 +3337,7 @@ test("tailEvents does not expose rolled back in-flight events", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3370,6 +3417,7 @@ test("tailEvents does not expose rolled back events from a shared read/write sco
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
 
@@ -3433,6 +3481,7 @@ test("tailEvents yields last N events then follows new events", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3512,6 +3561,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
 
@@ -3523,6 +3573,7 @@ test("tailEvents reads durable events committed by another handle", async () => 
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
 
@@ -3588,6 +3639,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
 
@@ -3599,6 +3651,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
       }),
       timing: {
         clock: runtime.clock,
+        scheduler: runtime.scheduler,
       },
     });
 
@@ -3615,7 +3668,7 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
     const next = nextWithTimeout(iterator);
     assert.equal(await settlesWithin(next, 10), false);
 
-    await firstLedger.emit("message.received", { id: 2 });
+    await secondLedger.emit("message.received", { id: 2 });
 
     const followed = await next;
     assert.equal(followed.done, false);
@@ -3637,6 +3690,144 @@ test("tailEvents last 0 follows after another handle's current boundary", async 
       force: true,
     });
   }
+});
+
+test("event streams discover peer expiration during an independent local write", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const localWriteStarted = Promise.withResolvers<void>();
+  const releaseLocalWrite = Promise.withResolvers<void>();
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "message.received": Type.Object({
+        id: Type.Number(),
+      }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "message.received": async ({ event }) => {
+          if (event.payload.id !== 3) {
+            return;
+          }
+
+          localWriteStarted.resolve();
+          await releaseLocalWrite.promise;
+        },
+      },
+    },
+  });
+  const registeredModel = model.withImplementations({
+    indexers: {},
+    queries: {},
+  });
+
+  await using consumerLedger = createDatabaseLedger({
+    projectionCompiler,
+    storage: createBetterSqliteStorageRuntime(databaseUrl),
+    model: registeredModel,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  await consumerLedger.emit("message.received", { id: 1 });
+
+  const cursorAbortController = new AbortController();
+  const cursorIterator = consumerLedger
+    .tailEvents({
+      last: 1,
+      signal: cursorAbortController.signal,
+    })
+    [Symbol.asyncIterator]();
+  const first = await nextWithTimeout(cursorIterator);
+
+  assert.equal(first.done, false);
+
+  if (first.done) {
+    assert.fail("expected initial event cursor");
+  }
+
+  cursorAbortController.abort();
+  await cursorIterator.return?.();
+
+  const peerStorage = createBetterSqliteStorageRuntime(databaseUrl);
+  await using peerLedger = createDatabaseLedger({
+    projectionCompiler,
+    storage: isolateStorageRuntimeIdentity(
+      peerStorage,
+      `${peerStorage[storageRuntimeIdentityBrand]}:isolated-process`,
+    ),
+    model: registeredModel,
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  const resumeAbortController = new AbortController();
+  const resumeIterator = consumerLedger
+    .resumeEvents({
+      cursor: first.value.cursor,
+      signal: resumeAbortController.signal,
+    })
+    [Symbol.asyncIterator]();
+  const next = resumeIterator.next();
+  let expiredThrough = first.value.cursor;
+  const rejectsAfterDiscovery = assert.rejects(next, (error: unknown) => {
+    assert.ok(error instanceof LedgerHistoryExpiredError);
+    assert.equal(error.requested, first.value.cursor);
+    assert.equal(error.expiredThrough, expiredThrough);
+    return true;
+  });
+
+  assert.equal(await settlesWithin(rejectsAfterDiscovery, 10), false);
+
+  await peerLedger.emit("message.received", { id: 2 });
+
+  const peerTailAbortController = new AbortController();
+  const peerTailIterator = peerLedger
+    .tailEvents({
+      last: 1,
+      signal: peerTailAbortController.signal,
+    })
+    [Symbol.asyncIterator]();
+  const peerEvent = await nextWithTimeout(peerTailIterator);
+
+  assert.equal(peerEvent.done, false);
+
+  if (peerEvent.done) {
+    assert.fail("expected peer event cursor");
+  }
+
+  expiredThrough = peerEvent.value.cursor;
+  peerTailAbortController.abort();
+  await peerTailIterator.return?.();
+
+  await peerLedger.expireHistory({ through: expiredThrough });
+
+  await runtime.advanceByMs(999);
+  assert.equal(await settlesWithin(rejectsAfterDiscovery, 10), false);
+
+  const localWrite = consumerLedger.emit("message.received", { id: 3 });
+
+  try {
+    await localWriteStarted.promise;
+    await runtime.advanceByMs(1);
+
+    assert.equal(await settlesWithin(rejectsAfterDiscovery, 10), true);
+    await rejectsAfterDiscovery;
+  } finally {
+    releaseLocalWrite.resolve();
+    await localWrite;
+  }
+
+  resumeAbortController.abort();
+  await resumeIterator.return?.();
 });
 
 test("resumeEvents continues from opaque cursor", async () => {
@@ -3664,6 +3855,7 @@ test("resumeEvents continues from opaque cursor", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3758,6 +3950,7 @@ test("tail iterator return stops stream without external abort", async () => {
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3831,6 +4024,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -3930,6 +4124,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
   await using workers = await ledger.startWorkers({
@@ -4003,6 +4198,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
     }),
     timing: {
       clock: runtime.clock,
+      scheduler: runtime.scheduler,
     },
   });
 
@@ -4082,7 +4278,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   await ledger.emit("job.requested", { id: 1 });
@@ -4141,7 +4337,7 @@ test("listWork applies state filters before limit", async () => {
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   await ledger.emit("job.requested", { id: 1, delayMs: 0 });
@@ -4193,7 +4389,7 @@ test("work queries do not wait for in-flight event projection transactions", asy
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   const emitPromise = ledger.emit("job.requested", { id: 1 });
@@ -4205,192 +4401,6 @@ test("work queries do not wait for in-flight event projection transactions", asy
 
   releaseHandler.resolve();
   await assert.rejects(async () => await emitPromise, /rollback append/);
-});
-
-test("storage metadata migration adds event and work columns before indexes", async () => {
-  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
-  const databaseUrl = createTempDatabasePath();
-  const database = new Database(databaseUrl);
-
-  database.exec(`
-    CREATE TABLE sledge_storage_layout (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      version INTEGER NOT NULL,
-      module_ids_json TEXT NOT NULL
-    );
-
-    INSERT INTO sledge_storage_layout (singleton, version, module_ids_json)
-    VALUES (1, 1, '["engine.fixture"]');
-
-    CREATE TABLE events (
-      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts_ms INTEGER NOT NULL,
-      event_name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      causation_event_id INTEGER,
-      dedupe_key TEXT UNIQUE,
-      signal INTEGER NOT NULL DEFAULT 0
-    );
-
-    INSERT INTO events (
-      ts_ms,
-      event_name,
-      payload_json,
-      causation_event_id,
-      dedupe_key,
-      signal
-    ) VALUES (
-      1899999999999,
-      'job.requested',
-      '{"id":0}',
-      NULL,
-      'legacy-event',
-      0
-    );
-
-    CREATE TABLE work (
-      work_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      queue_name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      source_event_id INTEGER NOT NULL,
-      signal INTEGER NOT NULL DEFAULT 0,
-      attempt INTEGER NOT NULL DEFAULT 0,
-      available_at_ms INTEGER NOT NULL,
-      dead INTEGER NOT NULL DEFAULT 0,
-      lease_id TEXT,
-      lease_acquired_at_ms INTEGER,
-      lease_expires_at_ms INTEGER,
-      last_error TEXT,
-      cancelled INTEGER NOT NULL DEFAULT 0,
-      cancel_requested_at_ms INTEGER,
-      cancel_reason TEXT,
-      terminal_at_ms INTEGER
-    );
-
-    INSERT INTO work (
-      queue_name,
-      payload_json,
-      source_event_id,
-      signal,
-      attempt,
-      available_at_ms,
-      dead,
-      lease_id,
-      lease_acquired_at_ms,
-      lease_expires_at_ms,
-      last_error
-    ) VALUES (
-      'legacy.run',
-      '{}',
-      1,
-      0,
-      1,
-      1899999999999,
-      0,
-      'legacy-lease',
-      1899999999999,
-      1900000001000,
-      NULL
-    );
-  `);
-
-  const model = defineEngineFixtureModel({
-    events: {
-      "job.requested": Type.Object({ id: Type.Number() }),
-    },
-    queues: {},
-    indexers: {},
-    queries: {},
-    register: {},
-  });
-
-  await using ledger = createBetterSqliteLedger({
-    databaseUrl,
-    model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
-  });
-
-  await ledger.emit("job.requested", { id: 1 });
-
-  const eventColumns = database.prepare("PRAGMA table_info(events)").all();
-  const eventColumnNames = eventColumns.map((row) => {
-    return (row as { readonly name?: unknown }).name;
-  });
-
-  assert.ok(eventColumnNames.includes("causation_work_json"));
-  assert.equal(
-    (
-      database
-        .prepare(
-          `SELECT causation_work_json
-           FROM events
-           WHERE dedupe_key = ?`,
-        )
-        .get("legacy-event") as
-        | { readonly causation_work_json?: unknown }
-        | undefined
-    )?.causation_work_json,
-    null,
-  );
-
-  const columns = database.prepare("PRAGMA table_info(work)").all();
-  const columnNames = columns.map((row) => {
-    return (row as { readonly name?: unknown }).name;
-  });
-
-  assert.ok(columnNames.includes("work_ref"));
-  assert.ok(columnNames.includes("work_key"));
-  assert.ok(columnNames.includes("coalescing_key"));
-  assert.ok(columnNames.includes("partition_key"));
-  assert.ok(columnNames.includes("lease_protocol_version"));
-
-  assert.deepEqual(
-    database
-      .prepare(
-        `SELECT lease_id, lease_protocol_version
-         FROM work
-         WHERE queue_name = 'legacy.run'`,
-      )
-      .get(),
-    {
-      lease_id: null,
-      lease_protocol_version: 0,
-    },
-  );
-  assert.deepEqual(
-    database
-      .prepare(
-        `SELECT version
-         FROM sledge_storage_layout
-         WHERE singleton = 1`,
-      )
-      .get(),
-    {
-      version: 2,
-    },
-  );
-  assert.throws(() => {
-    database
-      .prepare(
-        `UPDATE work
-           SET
-             lease_id = 'legacy-reclaim',
-             lease_acquired_at_ms = 1900000000000,
-             lease_expires_at_ms = 1900000001000
-           WHERE queue_name = 'legacy.run'`,
-      )
-      .run();
-  }, /sledge_authenticated_queue_lease/);
-
-  const indexes = database.prepare("PRAGMA index_list(work)").all();
-  const indexNames = indexes.map((row) => {
-    return (row as { readonly name?: unknown }).name;
-  });
-
-  assert.ok(indexNames.includes("idx_work_ref"));
-  assert.ok(indexNames.includes("idx_work_key"));
-  assert.ok(indexNames.includes("idx_work_coalescing_pending"));
-  assert.ok(indexNames.includes("idx_work_partition_order"));
 });
 
 test("storage derives coalescing reservations from authenticated claim state", async () => {
@@ -4426,7 +4436,7 @@ test("storage derives coalescing reservations from authenticated claim state", a
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   const firstEvent = await ledger.emit("job.requested", {
@@ -4526,7 +4536,7 @@ test("turso storage derives coalescing reservations from authenticated claim sta
     storage,
     model: model.withImplementations({ indexers: {}, queries: {} }),
     projectionCompiler,
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   const firstEvent = await ledger.emit("job.requested", {
@@ -4612,7 +4622,7 @@ test("enqueue rejects empty work keys", async () => {
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   await assert.rejects(
@@ -4655,7 +4665,7 @@ test("durable coalescing has one unambiguous enqueue identity", async () => {
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
 
   await assert.rejects(
@@ -4721,7 +4731,7 @@ test("signal enqueue rejects coalescing options from untyped callers", async () 
   await using ledger = createBetterSqliteLedger({
     databaseUrl,
     model: model.withImplementations({ indexers: {}, queries: {} }),
-    timing: { clock: runtime.clock },
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
   await using workers = await ledger.startWorkers({
     scheduler: runtime.scheduler,

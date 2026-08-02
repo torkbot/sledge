@@ -32,6 +32,7 @@ import type {
   EventCausationWork,
   EventEnvelope,
   EventHandlerFunction,
+  ExpireHistoryInput,
   Ledger,
   LedgerCursor,
   LedgerTiming,
@@ -59,7 +60,10 @@ import type {
   QueryWorkInput,
   SignalSubscription,
 } from "./ledger.ts";
-import { WorkOperationTimeoutError } from "./ledger.ts";
+import {
+  LedgerHistoryExpiredError,
+  WorkOperationTimeoutError,
+} from "./ledger.ts";
 import type {
   AnyProjectionSchema,
   ProjectionIndexerDefinitions,
@@ -126,6 +130,8 @@ export interface DatabaseLedger<
     readonly cursor: LedgerCursor;
     readonly signal: AbortSignal;
   }): AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>;
+
+  expireHistory(input: ExpireHistoryInput): Promise<void>;
 
   startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
 
@@ -194,35 +200,41 @@ type RuntimeMaterializationModule = RuntimeMaterializationState & {
 type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
-const storageLayoutTableName = "sledge_storage_layout";
-const storageLayoutVersion = 2;
-const previousStorageLayoutVersion = 1;
+const historyTableName = "sledge_history";
+const ledgerRootTableName = "sledge_ledger_root";
 const queueProvenanceLeaseProtocolVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
-const StorageLayoutRowSchema = Type.Object({
+const LedgerRootRowSchema = Type.Object({
   module_ids_json: Type.String(),
-  version: Type.Number(),
+});
+const HistoryStateRowSchema = Type.Object({
+  expired_through_event_id: Type.Integer({ minimum: 0 }),
+  latest_event_id: Type.Integer({ minimum: 0 }),
 });
 const ComposedModuleIdsSchema = Type.Array(Type.String(), { minItems: 1 });
 const databaseInitializationTails = new Map<string, Promise<void>>();
-type DatabaseWorkChanges = {
+type DatabaseChanges = {
   readonly signal: ChangeSignal;
   references: number;
 };
-const databaseWorkChanges = new Map<string, DatabaseWorkChanges>();
+const databaseEventChanges = new Map<string, DatabaseChanges>();
+const databaseWorkChanges = new Map<string, DatabaseChanges>();
 
-function acquireDatabaseWorkChanges(databaseIdentity: string): {
+function acquireDatabaseChanges(
+  changesByDatabase: Map<string, DatabaseChanges>,
+  databaseIdentity: string,
+): {
   readonly signal: ChangeSignal;
   release(): void;
 } {
-  const changes = databaseWorkChanges.get(databaseIdentity) ?? {
+  const changes = changesByDatabase.get(databaseIdentity) ?? {
     signal: new ChangeSignal(),
     references: 0,
   };
   changes.references += 1;
-  databaseWorkChanges.set(databaseIdentity, changes);
+  changesByDatabase.set(databaseIdentity, changes);
 
   let released = false;
 
@@ -237,49 +249,10 @@ function acquireDatabaseWorkChanges(databaseIdentity: string): {
       changes.references -= 1;
 
       if (changes.references === 0) {
-        databaseWorkChanges.delete(databaseIdentity);
+        changesByDatabase.delete(databaseIdentity);
       }
     },
   };
-}
-
-function createWorkTableSql(
-  tableName: "work" | "work_pre_queue_provenance",
-): string {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      work_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      work_ref TEXT,
-      queue_name TEXT NOT NULL,
-      work_key TEXT,
-      coalescing_key TEXT,
-      deferred_generation INTEGER NOT NULL DEFAULT 0,
-      partition_key TEXT,
-      payload_json TEXT NOT NULL,
-      source_event_id INTEGER NOT NULL,
-      signal INTEGER NOT NULL DEFAULT 0,
-      attempt INTEGER NOT NULL DEFAULT 0,
-      available_at_ms INTEGER NOT NULL,
-      dead INTEGER NOT NULL DEFAULT 0,
-      lease_id TEXT,
-      lease_acquired_at_ms INTEGER,
-      lease_expires_at_ms INTEGER,
-      lease_protocol_version INTEGER NOT NULL DEFAULT 0,
-      last_error TEXT,
-      cancelled INTEGER NOT NULL DEFAULT 0,
-      cancel_requested_at_ms INTEGER,
-      cancel_reason TEXT,
-      terminal_at_ms INTEGER,
-      CONSTRAINT sledge_authenticated_queue_lease CHECK (
-        (lease_id IS NULL AND lease_protocol_version = 0)
-        OR
-        (
-          lease_id IS NOT NULL
-          AND lease_protocol_version = ${queueProvenanceLeaseProtocolVersion}
-        )
-      )
-    );
-  `;
 }
 
 async function serializeDatabaseInitialization<T>(
@@ -1049,10 +1022,6 @@ const EventIdRowSchema = Type.Object({
   event_id: Type.Number(),
 });
 
-const TableInfoRowSchema = Type.Object({
-  name: Type.String(),
-});
-
 const AvailableAtRowSchema = Type.Object({
   available_at_ms: Type.Number(),
 });
@@ -1207,8 +1176,14 @@ function openDatabaseLedgerEngine<
   >,
 ): DatabaseLedger<TEvents, TQueries, TSignals> {
   const clock = input.timing.clock;
+  const scheduler = input.timing.scheduler;
   const storage = input.storage;
-  const workChanges = acquireDatabaseWorkChanges(
+  const eventChanges = acquireDatabaseChanges(
+    databaseEventChanges,
+    storage[storageRuntimeIdentityBrand],
+  );
+  const workChanges = acquireDatabaseChanges(
+    databaseWorkChanges,
     storage[storageRuntimeIdentityBrand],
   );
   const runtimeCarrier = input.model as typeof input.model & {
@@ -1242,7 +1217,6 @@ function openDatabaseLedgerEngine<
   let closed = false;
   let closePromise: Promise<void> | null = null;
   let activeWorker: WorkerRuntimeState | null = null;
-  const eventChanges = new ChangeSignal();
   type SignalObserver = SignalObserverFunction<TSignals, keyof TSignals>;
   const signalObserversByName = new Map<string, Set<SignalObserver>>();
 
@@ -1362,7 +1336,8 @@ function openDatabaseLedgerEngine<
   const defaultStorePollMs = 1_000;
 
   let committedEventId = 0;
-  let activeWriteTransactions = 0;
+  let committedExpiredThroughEventId = 0;
+  const activeTransactionScopes = new Set<StorageDatabase>();
 
   const startup = (async () => {
     // The SQLite drivers fail fast when concurrent handles overlap startup DDL.
@@ -1371,14 +1346,10 @@ function openDatabaseLedgerEngine<
     await serializeDatabaseInitialization(
       storage[storageRuntimeIdentityBrand],
       async () => {
-        let startingStorageLayoutVersion = storageLayoutVersion;
-
         await storage.write(async (database) => {
-          startingStorageLayoutVersion = await ensureStorageLayout(
-            database,
-            moduleIds,
-          );
+          await ensureLedgerRoot(database, moduleIds);
         });
+
         await storage.write(async (database) => {
           await database.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -1393,35 +1364,52 @@ function openDatabaseLedgerEngine<
         signal INTEGER NOT NULL DEFAULT 0
       );
 
-      ${createWorkTableSql("work")}
+      CREATE TABLE IF NOT EXISTS ${historyTableName} (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        expired_through_event_id INTEGER NOT NULL
+          CHECK(expired_through_event_id >= 0)
+      );
+
+      INSERT INTO ${historyTableName}(singleton, expired_through_event_id)
+      VALUES (1, 0)
+      ON CONFLICT(singleton) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS work (
+        work_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_ref TEXT,
+        queue_name TEXT NOT NULL,
+        work_key TEXT,
+        coalescing_key TEXT,
+        deferred_generation INTEGER NOT NULL DEFAULT 0,
+        partition_key TEXT,
+        payload_json TEXT NOT NULL,
+        source_event_id INTEGER NOT NULL,
+        signal INTEGER NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        available_at_ms INTEGER NOT NULL,
+        dead INTEGER NOT NULL DEFAULT 0,
+        lease_id TEXT,
+        lease_acquired_at_ms INTEGER,
+        lease_expires_at_ms INTEGER,
+        lease_protocol_version INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        cancelled INTEGER NOT NULL DEFAULT 0,
+        cancel_requested_at_ms INTEGER,
+        cancel_reason TEXT,
+        terminal_at_ms INTEGER,
+        CONSTRAINT sledge_authenticated_queue_lease CHECK (
+          (lease_id IS NULL AND lease_protocol_version = 0)
+          OR
+          (
+            lease_id IS NOT NULL
+            AND lease_protocol_version = ${queueProvenanceLeaseProtocolVersion}
+          )
+        )
+      );
 
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
     `);
-        });
-
-        await ensureColumn("events", "signal", "INTEGER NOT NULL DEFAULT 0");
-        await ensureColumn("events", "outcome_json", "TEXT");
-        await ensureColumn("events", "causation_work_json", "TEXT");
-        await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
-        await ensureColumn("work", "work_ref", "TEXT");
-        await ensureColumn("work", "work_key", "TEXT");
-        await ensureColumn("work", "coalescing_key", "TEXT");
-        await ensureColumn(
-          "work",
-          "deferred_generation",
-          "INTEGER NOT NULL DEFAULT 0",
-        );
-        await ensureColumn("work", "partition_key", "TEXT");
-        await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
-        await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
-        await ensureColumn("work", "cancel_reason", "TEXT");
-        await ensureColumn("work", "terminal_at_ms", "INTEGER");
-        await storage.write(async (database) => {
-          await ensureQueueProvenanceProtocol(
-            database,
-            startingStorageLayoutVersion,
-          );
         });
         await storage.write(async (database) => {
           // Deriving the reservation from durable work state keeps claim
@@ -1491,8 +1479,8 @@ function openDatabaseLedgerEngine<
         }
       },
     );
-    committedEventId = await storage.read(async (database) => {
-      return await readStoredLatestEventId(database);
+    await storage.read(async (database) => {
+      await readStoredStreamState(database);
     });
   })();
 
@@ -1654,257 +1642,60 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  async function ensureStorageLayout(
+  async function ensureLedgerRoot(
     database: StorageDatabase,
     moduleIds: readonly string[],
-  ): Promise<number> {
-    let verifiedVersion = storageLayoutVersion;
-
-    await database.exec("BEGIN IMMEDIATE");
-
-    try {
-      const layoutTable = await database
-        .prepare(
-          `SELECT name
-           FROM sqlite_schema
-           WHERE type = 'table'
-             AND name = ?`,
-        )
-        .get(storageLayoutTableName);
-
-      if (layoutTable === undefined) {
-        const legacyTable = await database
-          .prepare(
-            `SELECT name
-             FROM sqlite_schema
-             WHERE type = 'table'
-               AND name IN (?, ?, ?)
-             LIMIT 1`,
-          )
-          .get("events", "work", materializationVersionTableName);
-
-        if (legacyTable !== undefined) {
-          throw new Error(
-            "database uses the pre-composition Sledge storage layout; reset the database before opening it with composable ledger models",
-          );
-        }
-
-        await database.exec(`
-          CREATE TABLE ${storageLayoutTableName} (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            version INTEGER NOT NULL,
-            module_ids_json TEXT NOT NULL
-          );
-        `);
-        await database
-          .prepare(
-            `INSERT INTO ${storageLayoutTableName} (
-               singleton,
-               version,
-               module_ids_json
-             ) VALUES (1, ?, ?)`,
-          )
-          .run(storageLayoutVersion, JSON.stringify(moduleIds));
-      } else {
-        const row = await database
-          .prepare(
-            `SELECT version, module_ids_json
-             FROM ${storageLayoutTableName}
-             WHERE singleton = 1`,
-          )
-          .get();
-
-        if (row === undefined) {
-          throw new Error("Sledge storage layout marker is missing");
-        }
-
-        const decoded = Value.Decode(StorageLayoutRowSchema, row);
-        verifiedVersion = decoded.version;
-
-        if (
-          decoded.version !== storageLayoutVersion &&
-          decoded.version !== previousStorageLayoutVersion
-        ) {
-          throw new Error(
-            `unsupported Sledge storage layout version ${decoded.version}`,
-          );
-        }
-
-        const storedModuleIds = decodeValue(
-          ComposedModuleIdsSchema,
-          parseJson<unknown>(
-            decoded.module_ids_json,
-            "composed ledger root identity",
-          ),
-        );
-
-        if (
-          storedModuleIds.length !== moduleIds.length ||
-          storedModuleIds.some(
-            (moduleId, index) => moduleId !== moduleIds[index],
-          )
-        ) {
-          throw new Error(
-            `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
-          );
-        }
-      }
-
-      await database.exec("COMMIT");
-      return verifiedVersion;
-    } catch (error: unknown) {
-      await database.exec("ROLLBACK").catch(() => undefined);
-      throw error;
-    }
-  }
-
-  async function ensureQueueProvenanceProtocol(
-    database: StorageDatabase,
-    startingLayoutVersion: number,
   ): Promise<void> {
-    if (startingLayoutVersion === storageLayoutVersion) {
-      return;
-    }
-
     await database.exec("BEGIN IMMEDIATE");
 
     try {
-      const layoutRow = await database
+      await database.exec(`
+        CREATE TABLE IF NOT EXISTS ${ledgerRootTableName} (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          module_ids_json TEXT NOT NULL
+        );
+      `);
+      await database
         .prepare(
-          `SELECT version, module_ids_json
-           FROM ${storageLayoutTableName}
+          `INSERT INTO ${ledgerRootTableName} (singleton, module_ids_json)
+           VALUES (1, ?)
+           ON CONFLICT(singleton) DO NOTHING`,
+        )
+        .run(JSON.stringify(moduleIds));
+
+      const row = await database
+        .prepare(
+          `SELECT module_ids_json
+           FROM ${ledgerRootTableName}
            WHERE singleton = 1`,
         )
         .get();
 
-      if (layoutRow === undefined) {
-        throw new Error("Sledge storage layout marker is missing");
+      if (row === undefined) {
+        throw new Error("composed ledger root identity is missing");
       }
 
-      const layout = Value.Decode(StorageLayoutRowSchema, layoutRow);
+      const decoded = Value.Decode(LedgerRootRowSchema, row);
+      const storedModuleIds = decodeValue(
+        ComposedModuleIdsSchema,
+        parseJson<unknown>(
+          decoded.module_ids_json,
+          "composed ledger root identity",
+        ),
+      );
 
-      if (layout.version === storageLayoutVersion) {
-        await database.exec("COMMIT");
-        return;
-      }
-
-      if (layout.version !== previousStorageLayoutVersion) {
+      if (
+        storedModuleIds.length !== moduleIds.length ||
+        storedModuleIds.some((moduleId, index) => moduleId !== moduleIds[index])
+      ) {
         throw new Error(
-          `unsupported Sledge storage layout version ${layout.version}`,
+          `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
         );
       }
 
-      // A worker predating authenticated queue provenance does not populate
-      // lease_protocol_version. Rebuilding the table installs a storage-level
-      // claim invariant that those workers cannot satisfy. Clearing legacy
-      // leases also fences handlers that were already running at cutover.
-      await database.exec(`
-        ALTER TABLE work RENAME TO work_pre_queue_provenance;
-        ${createWorkTableSql("work")}
-      `);
-      await database
-        .prepare(
-          `INSERT INTO work (
-             work_id,
-             work_ref,
-             queue_name,
-             work_key,
-             coalescing_key,
-             partition_key,
-             payload_json,
-             source_event_id,
-             signal,
-             attempt,
-             available_at_ms,
-             dead,
-             lease_id,
-             lease_acquired_at_ms,
-             lease_expires_at_ms,
-             lease_protocol_version,
-             last_error,
-             cancelled,
-             cancel_requested_at_ms,
-             cancel_reason,
-             terminal_at_ms
-           )
-           SELECT
-             work_id,
-             work_ref,
-             queue_name,
-             work_key,
-             coalescing_key,
-             partition_key,
-             payload_json,
-             source_event_id,
-             signal,
-             attempt,
-             CASE
-               WHEN lease_id IS NULL THEN available_at_ms
-               ELSE ?
-             END,
-             dead,
-             NULL,
-             NULL,
-             NULL,
-             0,
-             last_error,
-             cancelled,
-             cancel_requested_at_ms,
-             cancel_reason,
-             terminal_at_ms
-           FROM work_pre_queue_provenance`,
-        )
-        .run(clock.nowMs());
-      await database.exec(`
-        DROP TABLE work_pre_queue_provenance;
-
-        CREATE INDEX IF NOT EXISTS idx_work_due
-          ON work(dead, lease_id, available_at_ms, work_id);
-      `);
-      await database
-        .prepare(
-          `UPDATE ${storageLayoutTableName}
-           SET version = ?
-           WHERE singleton = 1
-             AND version = ?`,
-        )
-        .run(storageLayoutVersion, previousStorageLayoutVersion);
       await database.exec("COMMIT");
     } catch (error: unknown) {
       await database.exec("ROLLBACK").catch(() => undefined);
-      throw error;
-    }
-  }
-
-  async function ensureColumn(
-    tableName: "events" | "work",
-    columnName: string,
-    definition: string,
-  ): Promise<void> {
-    let rows: readonly StorageRow[] = [];
-    await storage.read(async (database) => {
-      rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
-    });
-
-    const hasColumn = rows.some((row) => {
-      return decodeRow(row, TableInfoRowSchema).name === columnName;
-    });
-
-    if (hasColumn) {
-      return;
-    }
-
-    try {
-      await storage.write(async (database) => {
-        await database.exec(
-          `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
-        );
-      });
-    } catch (error: unknown) {
-      if (isDuplicateColumnError(error)) {
-        return;
-      }
-
       throw error;
     }
   }
@@ -2459,11 +2250,11 @@ function openDatabaseLedgerEngine<
       try {
         await database.exec("BEGIN IMMEDIATE");
         began = true;
-        activeWriteTransactions += 1;
+        activeTransactionScopes.add(database);
 
         const result = await run(database, createTransactionScope(database));
         await database.exec("COMMIT");
-        activeWriteTransactions -= 1;
+        activeTransactionScopes.delete(database);
         began = false;
 
         return result;
@@ -2474,7 +2265,7 @@ function openDatabaseLedgerEngine<
           } catch {
             // Suppress rollback failures to preserve the root cause.
           } finally {
-            activeWriteTransactions -= 1;
+            activeTransactionScopes.delete(database);
           }
         }
 
@@ -3178,7 +2969,7 @@ function openDatabaseLedgerEngine<
 
     if (result.created) {
       committedEventId = Math.max(committedEventId, result.envelope.eventId);
-      eventChanges.notify();
+      eventChanges.signal.notify();
     }
 
     if (result.workChanged) {
@@ -3646,7 +3437,15 @@ function openDatabaseLedgerEngine<
     limit: number,
   ): Promise<readonly EventEnvelope<TEvents, keyof TEvents>[]> {
     return await storage.read(async (database) => {
-      const highWaterMark = await readCommittedEventId(database);
+      const state = await readStreamState(database);
+
+      if (afterEventId < state.expiredThroughEventId) {
+        throw new LedgerHistoryExpiredError({
+          requested: encodeCursor(afterEventId),
+          expiredThrough: encodeCursor(state.expiredThroughEventId),
+        });
+      }
+
       const rows = await database
         .prepare(
           `SELECT
@@ -3664,7 +3463,7 @@ function openDatabaseLedgerEngine<
            ORDER BY event_id ASC
            LIMIT ?`,
         )
-        .all(afterEventId, highWaterMark, limit);
+        .all(afterEventId, state.latestEventId, limit);
 
       return rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
@@ -3677,7 +3476,7 @@ function openDatabaseLedgerEngine<
     readonly highWaterMark: number;
   }> {
     return await storage.read(async (database) => {
-      const highWaterMark = await readCommittedEventId(database);
+      const state = await readStreamState(database);
       const rows = await database
         .prepare(
           `SELECT
@@ -3690,11 +3489,12 @@ function openDatabaseLedgerEngine<
              dedupe_key
            FROM events
            WHERE signal = 0
+             AND event_id > ?
              AND event_id <= ?
            ORDER BY event_id DESC
            LIMIT ?`,
         )
-        .all(highWaterMark, limit);
+        .all(state.expiredThroughEventId, state.latestEventId, limit);
 
       const envelopes = rows.map((row) => {
         return readEventEnvelopeFromRow(row, model);
@@ -3702,45 +3502,82 @@ function openDatabaseLedgerEngine<
 
       return {
         events: envelopes.reverse(),
-        highWaterMark,
+        highWaterMark: state.latestEventId,
       };
     });
   }
 
-  async function readStoredLatestEventId(
-    database: StorageDatabase,
-  ): Promise<number> {
+  function readCommittedStreamState(): {
+    readonly expiredThroughEventId: number;
+    readonly latestEventId: number;
+  } {
+    return {
+      expiredThroughEventId: committedExpiredThroughEventId,
+      latestEventId: committedEventId,
+    };
+  }
+
+  async function readStreamState(database: StorageDatabase): Promise<{
+    readonly expiredThroughEventId: number;
+    readonly latestEventId: number;
+  }> {
+    // A storage adapter may serve reads and writes through one scope. Reentrant
+    // stream reads on that exact scope must not observe a transaction that can
+    // still roll back. Independent WAL readers remain free to discover durable
+    // changes committed by peer handles while a local write is in flight.
+    if (activeTransactionScopes.has(database)) {
+      return readCommittedStreamState();
+    }
+
+    return await readStoredStreamState(database);
+  }
+
+  async function readStoredStreamState(database: StorageDatabase): Promise<{
+    readonly expiredThroughEventId: number;
+    readonly latestEventId: number;
+  }> {
     const row = await database
       .prepare(
-        `SELECT event_id
-         FROM events
-         WHERE signal = 0
-         ORDER BY event_id DESC
-         LIMIT 1`,
+        `SELECT
+           expired_through_event_id,
+           MAX(
+             expired_through_event_id,
+             (
+               SELECT COALESCE(MAX(event_id), 0)
+               FROM events
+               WHERE signal = 0
+             )
+           ) AS latest_event_id
+         FROM ${historyTableName}
+         WHERE singleton = 1`,
       )
       .get();
 
     if (row === undefined) {
-      return 0;
+      throw new Error("ledger history state is missing");
     }
 
-    return decodeRow(row, EventIdRowSchema).event_id;
+    const state = decodeRow(row, HistoryStateRowSchema);
+    committedExpiredThroughEventId = Math.max(
+      committedExpiredThroughEventId,
+      state.expired_through_event_id,
+    );
+    committedEventId = Math.max(committedEventId, state.latest_event_id);
+
+    return {
+      expiredThroughEventId: committedExpiredThroughEventId,
+      latestEventId: committedEventId,
+    };
   }
 
-  async function readCommittedEventId(
-    database: StorageDatabase,
-  ): Promise<number> {
-    if (activeWriteTransactions > 0) {
-      return committedEventId;
-    }
+  function scheduleStreamStoreDiscovery(): { cancel(): void } {
+    const task = scheduler.scheduleOnce(defaultStorePollMs, () => {
+      eventChanges.signal.notify();
+    });
 
-    const storedLatestEventId = await readStoredLatestEventId(database);
-    committedEventId = Math.max(committedEventId, storedLatestEventId);
-    return committedEventId;
-  }
-
-  function readLatestEventId(): number {
-    return committedEventId;
+    return {
+      cancel: () => task.cancel(),
+    };
   }
 
   function createManagedStreamIterator(input: {
@@ -3808,41 +3645,51 @@ function openDatabaseLedgerEngine<
     let currentAfterEventId = input.afterEventId;
     const readLimit = 256;
 
-    while (!closed) {
+    streamLoop: while (!closed) {
       if (input.signal.aborted) {
         return;
       }
 
-      const observedEvents = eventChanges.snapshot();
-      const readResult = await raceWithSignal(
-        readEventsAfter(currentAfterEventId, readLimit),
-        input.signal,
-      );
+      const observedEvents = eventChanges.signal.snapshot();
+      const storeDiscovery = scheduleStreamStoreDiscovery();
 
-      if (readResult.status === "aborted") {
-        return;
-      }
+      try {
+        const readResult = await raceWithSignal(
+          readEventsAfter(currentAfterEventId, readLimit),
+          input.signal,
+        );
 
-      const events = readResult.value;
-
-      if (events.length > 0) {
-        for (const event of events) {
-          if (input.signal.aborted || closed) {
-            return;
-          }
-
-          currentAfterEventId = event.eventId;
-
-          yield {
-            event,
-            cursor: encodeCursor(event.eventId),
-          };
+        if (readResult.status === "aborted") {
+          return;
         }
 
-        continue;
-      }
+        const events = readResult.value;
 
-      await eventChanges.waitForChange(observedEvents, input.signal);
+        if (events.length > 0) {
+          for (const event of events) {
+            if (input.signal.aborted || closed) {
+              return;
+            }
+
+            if (eventChanges.signal.snapshot() !== observedEvents) {
+              continue streamLoop;
+            }
+
+            currentAfterEventId = event.eventId;
+
+            yield {
+              event,
+              cursor: encodeCursor(event.eventId),
+            };
+          }
+
+          continue;
+        }
+
+        await eventChanges.signal.waitForChange(observedEvents, input.signal);
+      } finally {
+        storeDiscovery.cancel();
+      }
     }
   }
 
@@ -4753,7 +4600,7 @@ function openDatabaseLedgerEngine<
           committedEventId,
           emitted.latestDurableEventId,
         );
-        eventChanges.notify();
+        eventChanges.signal.notify();
       }
 
       workChanges.signal.notify();
@@ -4865,7 +4712,7 @@ function openDatabaseLedgerEngine<
 
   async function closeLedger(): Promise<void> {
     closed = true;
-    eventChanges.notify();
+    eventChanges.signal.notify();
 
     const workerToClose = activeWorker;
     const closeResults =
@@ -4890,6 +4737,7 @@ function openDatabaseLedgerEngine<
     } catch (error: unknown) {
       storageFailures.push(error);
     } finally {
+      eventChanges.release();
       workChanges.release();
     }
 
@@ -5166,40 +5014,60 @@ function openDatabaseLedgerEngine<
             return;
           }
 
-          // Capture a follow boundary before reading backlog so we never skip
-          // events appended during tail startup when `last` resolves to no rows.
-          const historyResult = await raceWithSignal(
-            readLastEvents(last),
-            streamSignal,
-          );
+          historyLoop: while (!closed) {
+            const observedEvents = eventChanges.signal.snapshot();
+            const storeDiscovery = scheduleStreamStoreDiscovery();
+            let history: Awaited<ReturnType<typeof readLastEvents>>;
+            let invalidated = false;
+            let lastYieldedEventId: number | null = null;
 
-          if (historyResult.status === "aborted" || closed) {
-            return;
-          }
+            try {
+              // The stored high-water mark is the follow boundary. Appends
+              // after this read are recovered by the following stream read.
+              const historyResult = await raceWithSignal(
+                readLastEvents(last),
+                streamSignal,
+              );
 
-          const history = historyResult.value;
-          let afterEventId = Math.max(
-            readLatestEventId(),
-            history.highWaterMark,
-          );
+              if (historyResult.status === "aborted" || closed) {
+                return;
+              }
 
-          for (const event of history.events) {
-            if (streamSignal.aborted || closed) {
-              return;
+              history = historyResult.value;
+
+              for (const event of history.events) {
+                if (streamSignal.aborted || closed) {
+                  return;
+                }
+
+                if (eventChanges.signal.snapshot() !== observedEvents) {
+                  invalidated = true;
+                  break;
+                }
+
+                lastYieldedEventId = event.eventId;
+
+                yield {
+                  event,
+                  cursor: encodeCursor(event.eventId),
+                };
+              }
+
+              invalidated ||= eventChanges.signal.snapshot() !== observedEvents;
+            } finally {
+              storeDiscovery.cancel();
             }
 
-            afterEventId = Math.max(afterEventId, event.eventId);
+            if (invalidated && lastYieldedEventId === null) {
+              continue historyLoop;
+            }
 
-            yield {
-              event,
-              cursor: encodeCursor(event.eventId),
-            };
+            yield* streamEventsFromAfterEventId({
+              afterEventId: lastYieldedEventId ?? history.highWaterMark,
+              signal: streamSignal,
+            });
+            return;
           }
-
-          yield* streamEventsFromAfterEventId({
-            afterEventId,
-            signal: streamSignal,
-          });
         };
 
         return iterate()[Symbol.asyncIterator]();
@@ -5236,6 +5104,50 @@ function openDatabaseLedgerEngine<
           });
         },
       };
+    },
+    expireHistory: async ({ through }) => {
+      const throughEventId = decodeCursor(through);
+
+      await startup;
+
+      await runInTransaction(async (database) => {
+        const state = await readStoredStreamState(database);
+
+        if (throughEventId <= state.expiredThroughEventId) {
+          return;
+        }
+
+        if (throughEventId > state.latestEventId) {
+          throw new Error("history cannot expire beyond the latest event");
+        }
+
+        const update = await database
+          .prepare(
+            `UPDATE ${historyTableName}
+             SET expired_through_event_id = ?
+             WHERE singleton = 1
+               AND expired_through_event_id < ?
+               AND EXISTS (
+                 SELECT 1
+                 FROM events
+                 WHERE event_id = ?
+                   AND signal = 0
+               )`,
+          )
+          .run(throughEventId, throughEventId, throughEventId);
+
+        if (update.changes !== 1) {
+          throw new Error(
+            "history expiration cursor does not identify a durable event",
+          );
+        }
+      });
+
+      committedExpiredThroughEventId = Math.max(
+        committedExpiredThroughEventId,
+        throughEventId,
+      );
+      eventChanges.signal.notify();
     },
     startWorkers: async (options): Promise<LedgerWorkers> => {
       await startup;

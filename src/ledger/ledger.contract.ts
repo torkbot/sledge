@@ -19,6 +19,7 @@ import {
   createEventRef,
   defineLedgerShape,
   defineMaterialization,
+  LedgerHistoryExpiredError,
   WorkOperationTimeoutError,
   withMaterializations,
 } from "./ledger.ts";
@@ -3714,6 +3715,150 @@ export function runLedgerContractSuite(input: {
             },
           );
           assert.equal(duplicate.payload.attempt, 3);
+        });
+      },
+    );
+
+    await t.test(
+      "history expiration advances durably and rejects older stream cursors",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          for (let attempt = 1; attempt <= 3; attempt += 1) {
+            await harness.ledger.emit("decision.recorded", {
+              type: "decision.attempted",
+              sourceEventId: 100 + attempt,
+              attempt,
+            });
+          }
+
+          const historyAbortController = new AbortController();
+          const historyIterator = harness.ledger
+            .tailEvents({
+              last: 3,
+              signal: historyAbortController.signal,
+            })
+            [Symbol.asyncIterator]();
+          const history = [];
+
+          try {
+            for (let index = 0; index < 3; index += 1) {
+              const item = await historyIterator.next();
+              assert.equal(item.done, false);
+
+              if (item.done) {
+                assert.fail("expected historical event");
+              }
+
+              history.push(item.value);
+            }
+          } finally {
+            historyAbortController.abort();
+            await historyIterator.return?.();
+          }
+
+          const first = history[0];
+          const second = history[1];
+          const third = history[2];
+
+          assert.ok(first !== undefined);
+          assert.ok(second !== undefined);
+          assert.ok(third !== undefined);
+
+          const bufferedAbortController = new AbortController();
+          const bufferedIterator = harness.ledger
+            .tailEvents({
+              last: 3,
+              signal: bufferedAbortController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const bufferedFirst = await bufferedIterator.next();
+            assert.equal(bufferedFirst.done, false);
+
+            if (bufferedFirst.done) {
+              assert.fail("expected buffered historical event");
+            }
+
+            assert.equal(
+              bufferedFirst.value.event.eventId,
+              first.event.eventId,
+            );
+
+            await harness.ledger.expireHistory({ through: second.cursor });
+
+            await assert.rejects(bufferedIterator.next(), (error: unknown) => {
+              assert.ok(error instanceof LedgerHistoryExpiredError);
+              assert.equal(error.requested, first.cursor);
+              assert.equal(error.expiredThrough, second.cursor);
+              return true;
+            });
+          } finally {
+            bufferedAbortController.abort();
+            await bufferedIterator.return?.();
+          }
+
+          await harness.ledger.expireHistory({ through: first.cursor });
+          await harness.ledger.expireHistory({ through: second.cursor });
+          await harness.restart();
+
+          const tailAbortController = new AbortController();
+          const tailIterator = harness.ledger
+            .tailEvents({
+              last: 10,
+              signal: tailAbortController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const item = await tailIterator.next();
+            assert.equal(item.done, false);
+
+            if (item.done) {
+              assert.fail("expected unexpired historical event");
+            }
+
+            assert.equal(item.value.event.eventId, third.event.eventId);
+          } finally {
+            tailAbortController.abort();
+            await tailIterator.return?.();
+          }
+
+          const resumeAbortController = new AbortController();
+          const resumeIterator = harness.ledger
+            .resumeEvents({
+              cursor: second.cursor,
+              signal: resumeAbortController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const item = await resumeIterator.next();
+            assert.equal(item.done, false);
+
+            if (item.done) {
+              assert.fail("expected event after expiration cursor");
+            }
+
+            assert.equal(item.value.event.eventId, third.event.eventId);
+          } finally {
+            resumeAbortController.abort();
+            await resumeIterator.return?.();
+          }
+
+          const expiredIterator = harness.ledger
+            .resumeEvents({
+              cursor: first.cursor,
+              signal: AbortSignal.timeout(2_000),
+            })
+            [Symbol.asyncIterator]();
+
+          await assert.rejects(expiredIterator.next(), (error: unknown) => {
+            assert.ok(error instanceof LedgerHistoryExpiredError);
+            assert.equal(error.requested, first.cursor);
+            assert.equal(error.expiredThrough, second.cursor);
+            return true;
+          });
         });
       },
     );

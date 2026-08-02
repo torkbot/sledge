@@ -7,6 +7,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 import { Type } from "typebox";
 
+import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
   createBetterSqliteLedger,
   createBetterSqliteStorageRuntime,
@@ -26,10 +27,10 @@ import {
 } from "./turso-ledger.ts";
 
 const nowMs = 1_900_000_000_000;
+const runtime = new VirtualRuntimeHarness(nowMs);
 const timing = {
-  clock: {
-    nowMs: () => nowMs,
-  },
+  clock: runtime.clock,
+  scheduler: runtime.scheduler,
 };
 const RecordIndexerInputSchema = Type.Object({
   eventId: Type.Number(),
@@ -683,15 +684,14 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           assert.deepEqual(
             await database
               .prepare(
-                `SELECT version, module_ids_json
-                 FROM sledge_storage_layout
+                `SELECT module_ids_json
+                 FROM sledge_ledger_root
                  WHERE singleton = 1`,
               )
               .get(),
             {
               module_ids_json:
                 '["contract.source","contract.consumer","contract.later","contract.failure"]',
-              version: 2,
             },
           );
         });
@@ -702,83 +702,6 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       throw new Error(`${driver} composition failed during ${phase}`, {
         cause: error,
       });
-    } finally {
-      await rm(directory, { force: true, recursive: true });
-    }
-  });
-
-  test(`${driver} rejects a pre-composition database before mutation`, async () => {
-    const directory = await mkdtemp(
-      join(tmpdir(), `sledge-legacy-layout-${driver}-`),
-    );
-    const databaseUrl = join(directory, "ledger.sqlite");
-
-    try {
-      const database = new Database(databaseUrl);
-      database.exec(`
-        CREATE TABLE events (
-          event_id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
-      `);
-      database.close();
-
-      const shape = defineLedgerShape({
-        moduleId: "contract.layout",
-        events: {
-          pinged: Type.Object({}),
-        },
-        queues: {},
-        signals: {},
-        signalQueues: {},
-      });
-      const model = composeLedgerModels(shape.register({}));
-      const openLedger = async () => {
-        if (driver === "better-sqlite3") {
-          return createBetterSqliteLedger({
-            databaseUrl,
-            model,
-            timing,
-          });
-        }
-
-        return await createTursoLedger({
-          databaseUrl,
-          model,
-          timing,
-        });
-      };
-      const ledger = await openLedger();
-
-      await assert.rejects(
-        async () => {
-          await ledger.close();
-        },
-        (error: unknown) => {
-          return errorTreeIncludesMessage(
-            error,
-            "database uses the pre-composition Sledge storage layout",
-          );
-        },
-      );
-
-      const inspection = new Database(databaseUrl, {
-        readonly: true,
-      });
-      try {
-        const names = inspection
-          .prepare(
-            `SELECT name
-             FROM sqlite_schema
-             WHERE type = 'table'
-             ORDER BY name`,
-          )
-          .all()
-          .map((row) => readStringColumn(row, "name"));
-
-        assert.deepEqual(names, ["events", "sqlite_sequence"]);
-      } finally {
-        inspection.close();
-      }
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

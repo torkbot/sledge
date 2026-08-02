@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `expireHistory({ through: cursor })` as a durable, monotonic event-stream
+  boundary. Tailing omits expired history, resuming an older cursor raises
+  `LedgerHistoryExpiredError`, and no event rows are physically deleted.
+  Event streams discover expiration performed by peer runtimes, including
+  while a previously read batch is being consumed.
 - Add durable queue `control.deferUntil(availableAtMs)` for successful,
   non-retry deferral to an absolute runtime-clock deadline, including clean
   attempt/WorkRef semantics, restart-safe non-idle scheduling, prompt peer
@@ -17,8 +22,7 @@
 - Add engine-authored `causationWork` metadata to durable event envelopes so
   projections and replay consumers can authenticate the exact module, queue,
   work item, and attempt that emitted a fact. Existing and public emissions
-  carry `null`. Opening an older database upgrades its storage protocol and
-  fences pre-provenance workers before new queue facts are accepted.
+  carry `null`.
 - Add result-bearing events whose owning handler returns a validated durable
   outcome from `ledger.emit(...)`, including stable outcomes for deduplicated
   emissions.
@@ -62,9 +66,6 @@
 - Namespace projection tables and indexes, durable queues, and materialization
   histories by module identity so independently defined modules can safely
   reuse local names.
-- Adopt a new canonical composable storage layout. Databases created by
-  pre-composition releases are rejected before mutation and must be reset;
-  there is no legacy migration or compatibility mode.
 
 ## 0.13.0 - 2026-07-27
 

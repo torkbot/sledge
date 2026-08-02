@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { Type } from "typebox";
 
+import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
   storageRuntimeIdentityBrand,
   type LedgerStorageRow,
@@ -13,6 +14,7 @@ import {
 import {
   defineLedgerShape,
   defineMaterialization,
+  type LedgerTiming,
   withMaterializations,
 } from "./ledger.ts";
 import {
@@ -25,6 +27,12 @@ type StorageCall = {
   readonly method: "all" | "exec" | "get" | "run";
   readonly params: readonly unknown[];
   readonly sql: string;
+};
+
+const materializationHygieneRuntime = new VirtualRuntimeHarness(12_345);
+const materializationHygieneTiming: LedgerTiming = {
+  clock: materializationHygieneRuntime.clock,
+  scheduler: materializationHygieneRuntime.scheduler,
 };
 
 function physicalName(
@@ -81,11 +89,7 @@ test("database ledger startup applies materialization history hygiene", async ()
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await ledger.close();
@@ -159,11 +163,7 @@ test("database ledger startup replays fresh materializations in migration order"
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await ledger.close();
@@ -236,11 +236,7 @@ test("database ledger startup re-reads materialization version under the migrati
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await ledger.close();
@@ -326,11 +322,7 @@ test("database ledger startup creates indexes for incremental create-table migra
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await ledger.close();
@@ -429,11 +421,7 @@ test("database ledger startup preserves foreign keys for incrementally created t
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await ledger.close();
@@ -507,11 +495,7 @@ test("database ledger startup rejects foreign keys that depend on same-migration
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await assert.rejects(
@@ -587,11 +571,7 @@ test("database ledger startup runs data migrations against replayed schema state
     model,
     projectionCompiler: createSqliteProjectionStatementCompiler(),
     storage: storage.runtime,
-    timing: {
-      clock: {
-        nowMs: () => 12_345,
-      },
-    },
+    timing: materializationHygieneTiming,
   });
 
   await assert.rejects(
@@ -612,6 +592,11 @@ function createMaterializationHygieneStorage(input?: {
 } {
   const calls: StorageCall[] = [];
   const materializationVersions = [...(input?.materializationVersions ?? [])];
+  const state: {
+    ledgerRootModuleIdsJson: string | null;
+  } = {
+    ledgerRootModuleIdsJson: null,
+  };
   const scope: LedgerStorageScope = {
     exec: async (sql) => {
       calls.push({
@@ -621,7 +606,7 @@ function createMaterializationHygieneStorage(input?: {
       });
     },
     prepare: (sql) => {
-      return createStorageStatement(calls, sql, materializationVersions);
+      return createStorageStatement(calls, sql, materializationVersions, state);
     },
   };
 
@@ -640,6 +625,9 @@ function createStorageStatement(
   calls: StorageCall[],
   sql: string,
   materializationVersions: (number | undefined)[],
+  state: {
+    ledgerRootModuleIdsJson: string | null;
+  },
 ): LedgerStorageStatement {
   return {
     all: async (...params) => {
@@ -709,6 +697,25 @@ function createStorageStatement(
         };
       }
 
+      if (
+        sql.includes("FROM sledge_ledger_root") &&
+        state.ledgerRootModuleIdsJson !== null
+      ) {
+        return {
+          module_ids_json: state.ledgerRootModuleIdsJson,
+        };
+      }
+
+      if (
+        sql.includes("AS latest_event_id") &&
+        sql.includes("FROM sledge_history")
+      ) {
+        return {
+          expired_through_event_id: 0,
+          latest_event_id: 0,
+        };
+      }
+
       return undefined;
     },
     run: async (...params) => {
@@ -717,6 +724,19 @@ function createStorageStatement(
         params,
         sql,
       });
+
+      if (
+        sql.includes("INSERT INTO sledge_ledger_root") &&
+        state.ledgerRootModuleIdsJson === null
+      ) {
+        const [moduleIdsJson] = params;
+
+        if (typeof moduleIdsJson !== "string") {
+          throw new Error("invalid composed ledger root identity");
+        }
+
+        state.ledgerRootModuleIdsJson = moduleIdsJson;
+      }
 
       return {
         changes: 1,
