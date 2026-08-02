@@ -85,8 +85,8 @@ const reservedMaterializationSqliteObjectNames = [
   "idx_work_partition_order",
   "idx_work_ref",
   "sledge_history",
+  "sledge_ledger_root",
   "sledge_materialization_versions",
-  "sledge_storage_layout",
   "work",
 ] as const;
 const sqliteInternalMaterializationNamePrefix = "sqlite_";

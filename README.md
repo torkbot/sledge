@@ -529,11 +529,6 @@ composition order. Sledge rejects mismatched roots before schema mutation or
 work dispatch so rolling processes cannot apply different handler
 contributions to one logical ledger.
 
-Composable models use a new canonical storage layout. Opening a database
-created by a pre-composition Sledge release fails before any schema mutation.
-Reset the database before adopting this API; this release intentionally does
-not include a legacy migration or compatibility mode.
-
 ### 6. Open a Runtime
 
 Use one adapter to open the ledger:
@@ -875,9 +870,7 @@ backward.
 
 Event streams discover appends and expiration from other handles immediately
 within the same process and poll through the injected `RuntimeScheduler` for
-changes made by another process. The history boundary is part of a new storage
-layout. Sledge rejects databases created with an older layout before mutation;
-reset the database before adopting this release.
+changes made by another process.
 
 Expiration is a logical stream boundary. It does not delete event rows,
 reclaim storage, or change projections, deduplication, and event-reference

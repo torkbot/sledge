@@ -6,9 +6,7 @@
   boundary. Tailing omits expired history, resuming an older cursor raises
   `LedgerHistoryExpiredError`, and no event rows are physically deleted.
   Event streams discover expiration performed by peer runtimes, including
-  while a previously read batch is being consumed. This release establishes a
-  new storage layout; Sledge rejects older layouts before mutation rather than
-  migrating them.
+  while a previously read batch is being consumed.
 - Add durable queue `control.deferUntil(availableAtMs)` for successful,
   non-retry deferral to an absolute runtime-clock deadline, including clean
   attempt/WorkRef semantics, restart-safe non-idle scheduling, prompt peer
@@ -68,9 +66,6 @@
 - Namespace projection tables and indexes, durable queues, and materialization
   histories by module identity so independently defined modules can safely
   reuse local names.
-- Adopt a new canonical composable storage layout. Databases created by
-  pre-composition releases are rejected before mutation and must be reset;
-  there is no legacy migration or compatibility mode.
 
 ## 0.13.0 - 2026-07-27
 

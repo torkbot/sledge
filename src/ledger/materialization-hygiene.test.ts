@@ -593,9 +593,9 @@ function createMaterializationHygieneStorage(input?: {
   const calls: StorageCall[] = [];
   const materializationVersions = [...(input?.materializationVersions ?? [])];
   const state: {
-    storageLayout: { moduleIdsJson: string; version: number } | null;
+    ledgerRootModuleIdsJson: string | null;
   } = {
-    storageLayout: null,
+    ledgerRootModuleIdsJson: null,
   };
   const scope: LedgerStorageScope = {
     exec: async (sql) => {
@@ -626,7 +626,7 @@ function createStorageStatement(
   sql: string,
   materializationVersions: (number | undefined)[],
   state: {
-    storageLayout: { moduleIdsJson: string; version: number } | null;
+    ledgerRootModuleIdsJson: string | null;
   },
 ): LedgerStorageStatement {
   return {
@@ -698,12 +698,11 @@ function createStorageStatement(
       }
 
       if (
-        sql.includes("FROM sledge_storage_layout") &&
-        state.storageLayout !== null
+        sql.includes("FROM sledge_ledger_root") &&
+        state.ledgerRootModuleIdsJson !== null
       ) {
         return {
-          module_ids_json: state.storageLayout.moduleIdsJson,
-          version: state.storageLayout.version,
+          module_ids_json: state.ledgerRootModuleIdsJson,
         };
       }
 
@@ -726,17 +725,17 @@ function createStorageStatement(
         sql,
       });
 
-      if (sql.includes("INSERT INTO sledge_storage_layout")) {
-        const [version, moduleIdsJson] = params;
+      if (
+        sql.includes("INSERT INTO sledge_ledger_root") &&
+        state.ledgerRootModuleIdsJson === null
+      ) {
+        const [moduleIdsJson] = params;
 
-        if (typeof version !== "number" || typeof moduleIdsJson !== "string") {
-          throw new Error("invalid storage layout marker");
+        if (typeof moduleIdsJson !== "string") {
+          throw new Error("invalid composed ledger root identity");
         }
 
-        state.storageLayout = {
-          moduleIdsJson,
-          version,
-        };
+        state.ledgerRootModuleIdsJson = moduleIdsJson;
       }
 
       return {

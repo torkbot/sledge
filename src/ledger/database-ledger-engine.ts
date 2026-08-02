@@ -201,15 +201,13 @@ type StorageRow = LedgerStorageRow;
 
 const materializationVersionTableName = "sledge_materialization_versions";
 const historyTableName = "sledge_history";
-const storageLayoutTableName = "sledge_storage_layout";
-const storageLayoutVersion = 3;
+const ledgerRootTableName = "sledge_ledger_root";
 const queueProvenanceLeaseProtocolVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
 });
-const StorageLayoutRowSchema = Type.Object({
+const LedgerRootRowSchema = Type.Object({
   module_ids_json: Type.String(),
-  version: Type.Number(),
 });
 const HistoryStateRowSchema = Type.Object({
   expired_through_event_id: Type.Integer({ minimum: 0 }),
@@ -1349,7 +1347,7 @@ function openDatabaseLedgerEngine<
       storage[storageRuntimeIdentityBrand],
       async () => {
         await storage.write(async (database) => {
-          await ensureStorageLayout(database, moduleIds);
+          await ensureLedgerRoot(database, moduleIds);
         });
 
         await storage.write(async (database) => {
@@ -1644,99 +1642,55 @@ function openDatabaseLedgerEngine<
     });
   }
 
-  async function ensureStorageLayout(
+  async function ensureLedgerRoot(
     database: StorageDatabase,
     moduleIds: readonly string[],
   ): Promise<void> {
     await database.exec("BEGIN IMMEDIATE");
 
     try {
-      const layoutTable = await database
-        .prepare(
-          `SELECT name
-           FROM sqlite_schema
-           WHERE type = 'table'
-             AND name = ?`,
-        )
-        .get(storageLayoutTableName);
-
-      if (layoutTable === undefined) {
-        const existingSledgeTable = await database
-          .prepare(
-            `SELECT name
-             FROM sqlite_schema
-             WHERE type = 'table'
-               AND name IN (?, ?, ?, ?)
-             LIMIT 1`,
-          )
-          .get(
-            "events",
-            "work",
-            historyTableName,
-            materializationVersionTableName,
-          );
-
-        if (existingSledgeTable !== undefined) {
-          throw new Error(
-            "database uses an unsupported Sledge storage layout; reset the database before opening it",
-          );
-        }
-
-        await database.exec(`
-          CREATE TABLE ${storageLayoutTableName} (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            version INTEGER NOT NULL,
-            module_ids_json TEXT NOT NULL
-          );
-        `);
-        await database
-          .prepare(
-            `INSERT INTO ${storageLayoutTableName} (
-               singleton,
-               version,
-               module_ids_json
-             ) VALUES (1, ?, ?)`,
-          )
-          .run(storageLayoutVersion, JSON.stringify(moduleIds));
-      } else {
-        const row = await database
-          .prepare(
-            `SELECT version, module_ids_json
-             FROM ${storageLayoutTableName}
-             WHERE singleton = 1`,
-          )
-          .get();
-
-        if (row === undefined) {
-          throw new Error("Sledge storage layout marker is missing");
-        }
-
-        const decoded = Value.Decode(StorageLayoutRowSchema, row);
-
-        if (decoded.version !== storageLayoutVersion) {
-          throw new Error(
-            `unsupported Sledge storage layout version ${decoded.version}`,
-          );
-        }
-
-        const storedModuleIds = decodeValue(
-          ComposedModuleIdsSchema,
-          parseJson<unknown>(
-            decoded.module_ids_json,
-            "composed ledger root identity",
-          ),
+      await database.exec(`
+        CREATE TABLE IF NOT EXISTS ${ledgerRootTableName} (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          module_ids_json TEXT NOT NULL
         );
+      `);
+      await database
+        .prepare(
+          `INSERT INTO ${ledgerRootTableName} (singleton, module_ids_json)
+           VALUES (1, ?)
+           ON CONFLICT(singleton) DO NOTHING`,
+        )
+        .run(JSON.stringify(moduleIds));
 
-        if (
-          storedModuleIds.length !== moduleIds.length ||
-          storedModuleIds.some(
-            (moduleId, index) => moduleId !== moduleIds[index],
-          )
-        ) {
-          throw new Error(
-            `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
-          );
-        }
+      const row = await database
+        .prepare(
+          `SELECT module_ids_json
+           FROM ${ledgerRootTableName}
+           WHERE singleton = 1`,
+        )
+        .get();
+
+      if (row === undefined) {
+        throw new Error("composed ledger root identity is missing");
+      }
+
+      const decoded = Value.Decode(LedgerRootRowSchema, row);
+      const storedModuleIds = decodeValue(
+        ComposedModuleIdsSchema,
+        parseJson<unknown>(
+          decoded.module_ids_json,
+          "composed ledger root identity",
+        ),
+      );
+
+      if (
+        storedModuleIds.length !== moduleIds.length ||
+        storedModuleIds.some((moduleId, index) => moduleId !== moduleIds[index])
+      ) {
+        throw new Error(
+          `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; received ${JSON.stringify(moduleIds)}`,
+        );
       }
 
       await database.exec("COMMIT");
