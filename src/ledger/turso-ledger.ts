@@ -8,40 +8,88 @@ import {
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import type {
-  AnyComposedLedgerModel,
   ComposedLedgerEventTokens,
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
   Ledger,
+  LedgerModelSource,
   LedgerTiming,
+  ComposedLedgerModelFor,
 } from "./ledger.ts";
 import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
+import { resolveLedgerModelSource } from "./ledger-model-resolution.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 import { assertWalCheckpointTruncated } from "./sqlite-wal-checkpoint.ts";
 
-type CreateTursoLedgerInput<TModel extends AnyComposedLedgerModel> = {
+type CreateTursoLedgerInput<TSource extends LedgerModelSource> = {
   readonly databaseUrl: string;
-  readonly model: TModel;
+  readonly model: TSource;
   readonly timing: LedgerTiming;
 };
 
 export async function createTursoLedger<
-  const TModel extends AnyComposedLedgerModel,
+  const TSource extends LedgerModelSource,
 >(
-  input: CreateTursoLedgerInput<TModel>,
+  input: CreateTursoLedgerInput<TSource>,
 ): Promise<
   Ledger<
-    ComposedLedgerEventTokens<TModel>,
-    ComposedLedgerQueryTokens<TModel>,
-    ComposedLedgerSignalTokens<TModel>
+    ComposedLedgerEventTokens<ComposedLedgerModelFor<TSource>>,
+    ComposedLedgerQueryTokens<ComposedLedgerModelFor<TSource>>,
+    ComposedLedgerSignalTokens<ComposedLedgerModelFor<TSource>>
   >
 > {
-  return createComposedDatabaseLedger({
-    storage: await createTursoStorageRuntime(input.databaseUrl),
-    model: input.model,
-    projectionCompiler: createRuntimeKyselySqliteProjectionStatementCompiler(),
-    timing: input.timing,
-  });
+  const storage = await createTursoStorageRuntime(input.databaseUrl);
+  const projectionCompiler =
+    createRuntimeKyselySqliteProjectionStatementCompiler();
+  let storageTransferred = false;
+
+  try {
+    const model = await resolveLedgerModelSource({
+      source: input.model,
+      storage,
+      projectionCompiler,
+      timing: input.timing,
+    });
+
+    const ledger = createComposedDatabaseLedger({
+      storage,
+      model,
+      projectionCompiler,
+      timing: input.timing,
+    });
+    storageTransferred = true;
+
+    try {
+      await ledger.ready();
+      return ledger;
+    } catch (error: unknown) {
+      try {
+        await ledger.abortOpen();
+      } catch (closeError: unknown) {
+        throw new AggregateError(
+          [error, closeError],
+          "failed to open ledger and close storage",
+        );
+      }
+
+      throw error;
+    }
+  } catch (error: unknown) {
+    if (storageTransferred) {
+      throw error;
+    }
+
+    try {
+      await storage.close();
+    } catch (closeError: unknown) {
+      throw new AggregateError(
+        [error, closeError],
+        "failed to resolve ledger model and close storage",
+      );
+    }
+
+    throw error;
+  }
 }
 
 export async function createTursoStorageRuntime(

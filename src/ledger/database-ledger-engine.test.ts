@@ -26,12 +26,13 @@ import {
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
-  composeLedgerModels,
-  defineLedgerShape,
+  composeLedgerModules,
+  declareLedgerModule,
+  linkLedgerModule,
   LedgerHistoryExpiredError,
   type EnqueueOptions,
   type LedgerTiming,
-  type RegisteredLedgerModel,
+  type RegisteredLedgerModule,
   type LedgerModel,
   type QuerySchema,
   type RegisterFunction,
@@ -61,7 +62,7 @@ function createBetterSqliteLedger<
   const TQueryDefinitions extends ProjectionQueryDefinitions = {},
 >(input: {
   readonly databaseUrl: string;
-  readonly model: RegisteredLedgerModel<
+  readonly model: RegisteredLedgerModule<
     TEvents,
     TQueues,
     TIndexers,
@@ -108,7 +109,7 @@ type EngineFixtureModel<
   >;
   withImplementations(
     implementations: LedgerImplementations<TIndexers, TQueries, TEvents>,
-  ): RegisteredLedgerModel<
+  ): RegisteredLedgerModule<
     TEvents,
     TQueues,
     TIndexers,
@@ -187,7 +188,7 @@ function defineEngineFixtureModel<
         model,
         projections,
         register: input.register,
-      } as unknown as RegisteredLedgerModel<
+      } as unknown as RegisteredLedgerModule<
         TEvents,
         TQueues,
         TIndexers,
@@ -2833,7 +2834,7 @@ test("queue emissions require an unexpired authenticated lease", async () => {
   let secondAttemptEntered = false;
   let immediateError: unknown;
 
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "lease-authentication.test",
     events: {
       jobRequested: Type.Object({
@@ -2849,7 +2850,7 @@ test("queue emissions require an unexpired authenticated lease", async () => {
       }),
     },
   });
-  const module = shape.register({
+  const module = linkLedgerModule(shape, null).register({
     events: {
       jobRequested: ({ event, actions }) => {
         actions.enqueue("runJob", event.payload);
@@ -2887,9 +2888,9 @@ test("queue emissions require an unexpired authenticated lease", async () => {
     },
   });
 
-  await using ledger = createPublicBetterSqliteLedger({
+  await using ledger = await createPublicBetterSqliteLedger({
     databaseUrl,
-    model: composeLedgerModels(module),
+    model: composeLedgerModules(module),
     timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
   await using workers = await ledger.startWorkers({

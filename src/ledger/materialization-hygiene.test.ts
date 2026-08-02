@@ -12,10 +12,10 @@ import {
   type LedgerStorageStatement,
 } from "./internal-storage.ts";
 import {
-  defineLedgerShape,
+  declareLedgerModule,
   defineMaterialization,
   type LedgerTiming,
-  withMaterializations,
+  linkLedgerModule,
 } from "./ledger.ts";
 import {
   createDatabaseLedger,
@@ -44,7 +44,7 @@ function physicalName(
 }
 
 test("database ledger startup applies materialization history hygiene", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.apply-history",
     events: {
       "user.created": Type.Object({
@@ -83,7 +83,7 @@ test("database ledger startup applies materialization history hygiene", async ()
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage();
   const ledger = createDatabaseLedger({
     model,
@@ -120,7 +120,7 @@ test("database ledger startup applies materialization history hygiene", async ()
 });
 
 test("database ledger startup replays fresh materializations in migration order", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.fresh-order",
     events: {},
     queues: {},
@@ -157,7 +157,7 @@ test("database ledger startup replays fresh materializations in migration order"
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage();
   const ledger = createDatabaseLedger({
     model,
@@ -189,7 +189,7 @@ test("database ledger startup replays fresh materializations in migration order"
 });
 
 test("database ledger startup re-reads materialization version under the migration lock", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.lock-reread",
     events: {
       "user.created": Type.Object({
@@ -228,7 +228,7 @@ test("database ledger startup re-reads materialization version under the migrati
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [undefined, 1],
   });
@@ -280,7 +280,7 @@ test("database ledger startup re-reads materialization version under the migrati
 });
 
 test("database ledger startup creates indexes for incremental create-table migrations", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.incremental-indexes",
     events: {},
     queues: {},
@@ -314,7 +314,7 @@ test("database ledger startup creates indexes for incremental create-table migra
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [1, 1],
   });
@@ -376,7 +376,7 @@ test("database ledger startup creates indexes for incremental create-table migra
 });
 
 test("database ledger startup preserves foreign keys for incrementally created tables", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.incremental-foreign-keys",
     events: {},
     queues: {},
@@ -413,7 +413,7 @@ test("database ledger startup preserves foreign keys for incrementally created t
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [1, 1],
   });
@@ -450,7 +450,7 @@ test("database ledger startup preserves foreign keys for incrementally created t
 });
 
 test("database ledger startup rejects foreign keys that depend on same-migration added columns", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.late-foreign-key-columns",
     events: {},
     queues: {},
@@ -487,7 +487,7 @@ test("database ledger startup rejects foreign keys that depend on same-migration
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage({
     materializationVersions: [1, 1],
   });
@@ -522,7 +522,7 @@ test("database ledger startup rejects foreign keys that depend on same-migration
 });
 
 test("database ledger startup runs data migrations against replayed schema state", async () => {
-  const shape = defineLedgerShape({
+  const shape = declareLedgerModule({
     moduleId: "hygiene.replayed-data",
     events: {},
     queues: {},
@@ -565,7 +565,7 @@ test("database ledger startup runs data migrations against replayed schema state
       indexers: {},
       queries: {},
     });
-  const model = withMaterializations(shape, materializations).register({});
+  const model = linkLedgerModule(shape, materializations).register({});
   const storage = createMaterializationHygieneStorage();
   const ledger = createDatabaseLedger({
     model,

@@ -4,6 +4,7 @@ import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import { createEventRef, type EventRef } from "./event-ref.ts";
 import type { LedgerImplementations } from "./internal-storage.ts";
 import {
+  attachLedgerModelResolver,
   attachLedgerImplementationFactory,
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
@@ -72,6 +73,8 @@ declare const queryTokenTypeBrand: unique symbol;
 declare const queueTokenTypeBrand: unique symbol;
 declare const signalTokenTypeBrand: unique symbol;
 declare const signalQueueTokenTypeBrand: unique symbol;
+declare const preparedLedgerModelTypeBrand: unique symbol;
+declare const ledgerModelDefinitionTypeBrand: unique symbol;
 const ledgerContractTokenMetadata = new WeakMap<
   object,
   LedgerContractMetadata
@@ -1267,7 +1270,11 @@ export type LedgerTiming = {
   readonly scheduler: RuntimeScheduler;
 };
 
-export type RegisteredLedgerModel<
+/**
+ * An inert module whose implementations are complete and ready to participate
+ * in static composition or storage-backed model preparation.
+ */
+export type RegisteredLedgerModule<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TIndexers extends Record<string, TSchema> = {},
@@ -2041,7 +2048,7 @@ export function defineMaterialization<
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   },
 >(
-  shape: DefinedLedgerShape<
+  shape: DeclaredLedgerModule<
     TEvents,
     TQueues,
     TSignals,
@@ -2077,7 +2084,10 @@ export function defineMaterialization<
   });
 }
 
-export type DefinedLedgerShape<
+/**
+ * Durable logical contracts without materialization or handler capability.
+ */
+export type DeclaredLedgerModule<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TSignals extends Record<string, TSchema>,
@@ -2091,36 +2101,14 @@ export type DefinedLedgerShape<
   readonly events: TEventTokens;
   readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
-  register(
-    register: RegisterFunction<
-      TEvents,
-      TQueues,
-      {},
-      {},
-      TSignals,
-      TSignalQueues,
-      {},
-      TEventTokens,
-      {},
-      TModuleId
-    >,
-  ): RegisteredLedgerModel<
-    TEvents,
-    TQueues,
-    {},
-    {},
-    TSignals,
-    TSignalQueues,
-    ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>,
-    {},
-    {},
-    null,
-    TModuleId,
-    TEventTokens
-  >;
 };
 
-export type DefinedLedgerModel<
+/**
+ * A declaration linked to its materialization contract and ready to register
+ * implementations. Linking returns a new value; it does not mutate the
+ * declaration.
+ */
+export type LinkedLedgerModule<
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
   TProjectionSchema extends AnyProjectionSchema,
@@ -2174,7 +2162,7 @@ export type DefinedLedgerModel<
         TEvents,
         TSignals
       >,
-  ): RegisteredLedgerModel<
+  ): RegisteredLedgerModule<
     TEvents,
     TQueues,
     TIndexers,
@@ -2191,7 +2179,7 @@ export type DefinedLedgerModel<
   >;
 };
 
-export function defineLedgerShape<
+export function declareLedgerModule<
   const TModuleId extends string,
   const TEventDefinitions extends Record<string, EventDefinition>,
   const TQueues extends Record<string, TSchema> = {},
@@ -2204,7 +2192,7 @@ export function defineLedgerShape<
   readonly signals?: TSignals & PrivateSchemaDefinitions<TSignals>;
   readonly signalQueues?: TSignalQueues &
     PrivateSchemaDefinitions<TSignalQueues>;
-}): DefinedLedgerShape<
+}): DeclaredLedgerModule<
   EventSchemasFor<TEventDefinitions>,
   TQueues,
   TSignals,
@@ -2220,16 +2208,10 @@ export function defineLedgerShape<
   validatePrivateSchemaDefinitions("signal", signalDefinitions);
   validatePrivateSchemaDefinitions("signal queue", signalQueueDefinitions);
   const events = createEventTokens(input.moduleId, input.events);
-  const queues = createSchemaTokens(input.moduleId, "queue", queueDefinitions);
   const signals = createSchemaTokens(
     input.moduleId,
     "signal",
     signalDefinitions,
-  );
-  const signalQueues = createSchemaTokens(
-    input.moduleId,
-    "signal_queue",
-    signalQueueDefinitions,
   );
   const eventSchemas = readEventSchemas(input.events);
   const eventOutcomeSchemas = readEventOutcomeSchemas(input.events);
@@ -2251,39 +2233,157 @@ export function defineLedgerShape<
     events,
     signals,
     shape,
-    register: (register) => {
-      const model = createDefinedLedgerModel({
-        moduleId: input.moduleId,
-        contracts: {
-          events,
-          queries: {},
-          queues,
-          signals,
-          signalQueues,
-        },
-        shape: shape as LedgerShape<
-          EventSchemasFor<TEventDefinitions>,
-          TQueues,
-          TSignals,
-          TSignalQueues
-        >,
-        access:
-          createEmptyProjectionAccess<
-            Extract<keyof TEventDefinitions, string>
-          >(),
-        materializationHistory: null,
-      });
-      type ModelRegister = Parameters<typeof model.register>[0];
-
-      // The projection-free wrapper and the defined model expose the same
-      // registration contract. TypeScript does not reduce the empty
-      // projection conditional through this generic boundary.
-      return model.register(register as unknown as ModelRegister);
-    },
   };
 }
 
-export function withMaterializations<
+type LinkedLedgerModuleFor<
+  TEvents extends Record<string, TSchema>,
+  TQueues extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
+  TModuleId extends string,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+  TMaterializations extends Materializations<
+    AnyMaterializationHistory<TEvents>,
+    ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
+    LedgerQueryDefinitions
+  > | null,
+> =
+  TMaterializations extends Materializations<
+    infer THistory extends AnyMaterializationHistory<TEvents>,
+    infer TIndexerDefinitions extends ProjectionIndexerDefinitions<
+      Extract<keyof TEvents, string>
+    >,
+    infer TQueryDefinitions extends LedgerQueryDefinitions
+  >
+    ? LinkedLedgerModule<
+        TEvents,
+        TQueues,
+        THistory["current"],
+        ProjectionIndexerSchemas<TIndexerDefinitions>,
+        ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>>,
+        TSignals,
+        TSignalQueues,
+        TIndexerDefinitions,
+        OwnedQueryDefinitions<TQueryDefinitions>,
+        THistory,
+        TModuleId,
+        TEventTokens,
+        QueryTokensFor<TModuleId, TQueryDefinitions>
+      >
+    : LinkedLedgerModule<
+        TEvents,
+        TQueues,
+        ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>,
+        {},
+        {},
+        TSignals,
+        TSignalQueues,
+        {},
+        {},
+        null,
+        TModuleId,
+        TEventTokens,
+        {}
+      >;
+
+/**
+ * Links a declaration to its storage materialization contract.
+ *
+ * Passing `null` is an explicit declaration that the module owns no durable
+ * projection. Either path returns a new value with registration capability;
+ * the declared value remains inert.
+ */
+export function linkLedgerModule<
+  const TModuleId extends string,
+  const TEvents extends Record<string, TSchema>,
+  const TQueues extends Record<string, TSchema>,
+  const TSignals extends Record<string, TSchema>,
+  const TSignalQueues extends Record<string, TSchema>,
+  const TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventToken;
+  },
+  const TMaterializations extends Materializations<
+    AnyMaterializationHistory<TEvents>,
+    ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
+    LedgerQueryDefinitions
+  > | null,
+>(
+  shape: DeclaredLedgerModule<
+    TEvents,
+    TQueues,
+    TSignals,
+    TSignalQueues,
+    TModuleId,
+    TEventTokens
+  >,
+  materializations: TMaterializations,
+): LinkedLedgerModuleFor<
+  TEvents,
+  TQueues,
+  TSignals,
+  TSignalQueues,
+  TModuleId,
+  TEventTokens,
+  TMaterializations
+> {
+  // The runtime branch and the public conditional type describe the same two
+  // states. TypeScript cannot narrow a generic materialization parameter to
+  // its conditional return branch, so each trusted construction is asserted
+  // back to that exact public result type.
+  if (materializations === null) {
+    const queues = createSchemaTokens(
+      shape.moduleId,
+      "queue",
+      shape.shape.queues,
+    );
+    const signalQueues = createSchemaTokens(
+      shape.moduleId,
+      "signal_queue",
+      shape.shape.signalQueues,
+    );
+    const linked = createLinkedLedgerModule({
+      moduleId: shape.moduleId,
+      contracts: {
+        events: shape.events,
+        queries: {},
+        queues,
+        signals: shape.signals,
+        signalQueues,
+      },
+      shape: shape.shape,
+      access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
+      materializationHistory: null,
+    });
+
+    return linked as LinkedLedgerModuleFor<
+      TEvents,
+      TQueues,
+      TSignals,
+      TSignalQueues,
+      TModuleId,
+      TEventTokens,
+      TMaterializations
+    >;
+  }
+
+  return linkMaterializedLedgerModule(
+    shape,
+    materializations,
+  ) as LinkedLedgerModuleFor<
+    TEvents,
+    TQueues,
+    TSignals,
+    TSignalQueues,
+    TModuleId,
+    TEventTokens,
+    TMaterializations
+  >;
+}
+
+function linkMaterializedLedgerModule<
   const TModuleId extends string,
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
@@ -2298,7 +2398,7 @@ export function withMaterializations<
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   },
 >(
-  shape: DefinedLedgerShape<
+  shape: DeclaredLedgerModule<
     TEvents,
     TQueues,
     TSignals,
@@ -2317,7 +2417,7 @@ export function withMaterializations<
     > extends never
       ? unknown
       : never),
-): DefinedLedgerModel<
+): LinkedLedgerModule<
   TEvents,
   TQueues,
   THistory["current"],
@@ -2358,7 +2458,7 @@ export function withMaterializations<
     ownedQueries: ownedQueryDefinitions,
   });
 
-  return createDefinedLedgerModel({
+  return createLinkedLedgerModule({
     moduleId: shape.moduleId,
     contracts: {
       events: shape.events,
@@ -2373,7 +2473,7 @@ export function withMaterializations<
   });
 }
 
-type RegisteredLedgerModelRuntime = {
+export type AnyRegisteredLedgerModule = {
   readonly [registeredLedgerModelBrand]: true;
   readonly moduleId: string;
   readonly events: Readonly<Record<string, AnyEventToken>>;
@@ -2417,29 +2517,29 @@ type RegisteredLedgerModelRuntime = {
 type ContractValues<TContracts extends Readonly<Record<string, object>>> =
   TContracts[keyof TContracts];
 
-type ModuleEventTokens<TModule> = TModule extends RegisteredLedgerModelRuntime
+type ModuleEventTokens<TModule> = TModule extends AnyRegisteredLedgerModule
   ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["events"]>
   : never;
 
-type ModuleSignalTokens<TModule> = TModule extends RegisteredLedgerModelRuntime
+type ModuleSignalTokens<TModule> = TModule extends AnyRegisteredLedgerModule
   ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["signals"]>
   : never;
 
-type ModuleQueryTokens<TModule> = TModule extends RegisteredLedgerModelRuntime
+type ModuleQueryTokens<TModule> = TModule extends AnyRegisteredLedgerModule
   ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["queries"]>
   : never;
 
 export type ComposedLedgerModel<
-  TModules extends readonly RegisteredLedgerModelRuntime[],
+  TModules extends readonly AnyRegisteredLedgerModule[],
 > = {
   readonly [composedLedgerModelBrand]: true;
   readonly [composedLedgerModulesBrand]: TModules;
-  readonly [registeredLedgerContractsBrand]: RegisteredLedgerModelRuntime[typeof registeredLedgerContractsBrand];
-  readonly [registeredLedgerRuntimeBrand]: RegisteredLedgerModelRuntime[typeof registeredLedgerRuntimeBrand];
+  readonly [registeredLedgerContractsBrand]: AnyRegisteredLedgerModule[typeof registeredLedgerContractsBrand];
+  readonly [registeredLedgerRuntimeBrand]: AnyRegisteredLedgerModule[typeof registeredLedgerRuntimeBrand];
 };
 
 export type AnyComposedLedgerModel = ComposedLedgerModel<
-  readonly RegisteredLedgerModelRuntime[]
+  readonly AnyRegisteredLedgerModule[]
 >;
 
 export type ComposedLedgerEventTokens<TModel extends AnyComposedLedgerModel> =
@@ -2451,9 +2551,103 @@ export type ComposedLedgerSignalTokens<TModel extends AnyComposedLedgerModel> =
 export type ComposedLedgerQueryTokens<TModel extends AnyComposedLedgerModel> =
   ModuleQueryTokens<TModel[typeof composedLedgerModulesBrand][number]>;
 
-export function composeLedgerModels<
-  const TFirst extends RegisteredLedgerModelRuntime,
-  const TRest extends readonly RegisteredLedgerModelRuntime[],
+export type PreparedLedgerModel<
+  TModules extends readonly AnyRegisteredLedgerModule[],
+> = {
+  readonly [preparedLedgerModelTypeBrand]: TModules;
+
+  /**
+   * Executes a storage-local, schema-decoded query against the modules already
+   * present in this prepared value. Append and worker capabilities do not
+   * exist until the model definition is opened.
+   */
+  query<const TQuery extends ModuleQueryTokens<TModules[number]>>(
+    query: TQuery,
+    params: QueryParameters<TQuery>,
+  ): Promise<QueryResult<TQuery>>;
+};
+
+export type AnyPreparedLedgerModel = PreparedLedgerModel<
+  readonly AnyRegisteredLedgerModule[]
+>;
+
+type PreparedLedgerModules<TPrepared extends AnyPreparedLedgerModel> =
+  TPrepared[typeof preparedLedgerModelTypeBrand];
+
+/**
+ * Capabilities scoped to one adapter-owned model resolution.
+ *
+ * Every transition returns a new value. In particular, `extend` does not
+ * mutate or activate the prepared value it receives.
+ */
+export interface LedgerModelResolutionPorts {
+  prepare<
+    const TFirst extends AnyRegisteredLedgerModule,
+    const TRest extends readonly AnyRegisteredLedgerModule[],
+  >(
+    first: TFirst,
+    ...rest: TRest
+  ): Promise<PreparedLedgerModel<readonly [TFirst, ...TRest]>>;
+
+  extend<
+    const TPrepared extends AnyPreparedLedgerModel,
+    const TFirst extends AnyRegisteredLedgerModule,
+    const TRest extends readonly AnyRegisteredLedgerModule[],
+  >(
+    prepared: TPrepared,
+    first: TFirst,
+    ...rest: TRest
+  ): Promise<
+    PreparedLedgerModel<
+      readonly [...PreparedLedgerModules<TPrepared>, TFirst, ...TRest]
+    >
+  >;
+}
+
+export type LedgerModelDefinition<
+  TModules extends readonly AnyRegisteredLedgerModule[] =
+    readonly AnyRegisteredLedgerModule[],
+> = {
+  readonly [ledgerModelDefinitionTypeBrand]: TModules;
+};
+
+export type LedgerModelSource = AnyComposedLedgerModel | LedgerModelDefinition;
+
+export type ComposedLedgerModelFor<TSource extends LedgerModelSource> =
+  TSource extends LedgerModelDefinition<infer TModules>
+    ? ComposedLedgerModel<TModules>
+    : TSource extends AnyComposedLedgerModel
+      ? TSource
+      : never;
+
+type LedgerModelResolver<TPrepared extends AnyPreparedLedgerModel> = (
+  phases: LedgerModelResolutionPorts,
+) => Promise<TPrepared>;
+
+/**
+ * Defines a storage-backed model resolution without giving the resolver a
+ * ledger runtime. The callback can prepare closed module sets, query them, and
+ * extend them in explicit waves. Returning a prepared value marks the graph
+ * complete; the adapter claims its durable identity while opening the ledger.
+ */
+export function defineLedgerModel<
+  const TPrepared extends AnyPreparedLedgerModel,
+>(
+  resolve: LedgerModelResolver<TPrepared>,
+): LedgerModelDefinition<PreparedLedgerModules<TPrepared>> {
+  const definition = {} as LedgerModelDefinition<
+    PreparedLedgerModules<TPrepared>
+  >;
+  return attachLedgerModelResolver(definition, resolve);
+}
+
+/**
+ * Builds and validates a storage-independent model when its complete module
+ * set is already known. No database is opened and no runtime is activated.
+ */
+export function composeLedgerModules<
+  const TFirst extends AnyRegisteredLedgerModule,
+  const TRest extends readonly AnyRegisteredLedgerModule[],
 >(
   first: TFirst,
   ...rest: TRest
@@ -2570,9 +2764,9 @@ export function composeLedgerModels<
 }
 
 function mergeModelSchemas(
-  modules: readonly RegisteredLedgerModelRuntime[],
+  modules: readonly AnyRegisteredLedgerModule[],
   key: Exclude<
-    keyof RegisteredLedgerModelRuntime[typeof registeredLedgerRuntimeBrand]["model"],
+    keyof AnyRegisteredLedgerModule[typeof registeredLedgerRuntimeBrand]["model"],
     "eventOutcomes"
   >,
 ): Record<string, TSchema | AnyQuerySchema> {
@@ -2586,7 +2780,7 @@ function mergeModelSchemas(
 }
 
 function mergeEventOutcomeSchemas(
-  modules: readonly RegisteredLedgerModelRuntime[],
+  modules: readonly AnyRegisteredLedgerModule[],
 ): Record<string, TSchema | null> {
   const merged: Record<string, TSchema | null> = {};
 
@@ -2601,7 +2795,7 @@ function mergeEventOutcomeSchemas(
 }
 
 function mergeContributionHandlers(
-  modules: readonly RegisteredLedgerModelRuntime[],
+  modules: readonly AnyRegisteredLedgerModule[],
   key: "signals",
 ): Readonly<Record<string, (input: unknown) => Promise<void>>> {
   const contributions = new Map<
@@ -2639,7 +2833,7 @@ function mergeContributionHandlers(
 }
 
 function mergeEventContributionHandlers(
-  modules: readonly RegisteredLedgerModelRuntime[],
+  modules: readonly AnyRegisteredLedgerModule[],
 ): Readonly<Record<string, (input: unknown) => Promise<unknown>>> {
   const contributions = new Map<
     string,
@@ -2700,7 +2894,7 @@ function mergeEventContributionHandlers(
 }
 
 function mergeExclusiveHandlers(
-  modules: readonly RegisteredLedgerModelRuntime[],
+  modules: readonly AnyRegisteredLedgerModule[],
   key: "queues" | "signalQueues",
 ): Readonly<Record<string, (input: unknown) => void | Promise<void>>> {
   const merged: Record<string, (input: unknown) => void | Promise<void>> = {};
@@ -2725,8 +2919,8 @@ function mergeExclusiveHandlers(
 }
 
 function mergeRootContracts(
-  modules: readonly RegisteredLedgerModelRuntime[],
-): RegisteredLedgerModelRuntime[typeof registeredLedgerContractsBrand] {
+  modules: readonly AnyRegisteredLedgerModule[],
+): AnyRegisteredLedgerModule[typeof registeredLedgerContractsBrand] {
   const events: Record<string, AnyEventToken> = {};
   const queries: Record<string, AnyQueryToken> = {};
   const queues: Record<string, AnyQueueToken> = {};
@@ -5241,7 +5435,7 @@ function namespaceProjectionStatementTableName(
   return createPhysicalName(moduleId, "table", tableName);
 }
 
-function createDefinedLedgerModel<
+function createLinkedLedgerModule<
   TModuleId extends string,
   TEvents extends Record<string, TSchema>,
   TQueues extends Record<string, TSchema>,
@@ -5283,7 +5477,7 @@ function createDefinedLedgerModel<
     TAllQueryDefinitions,
     TQueryDefinitions
   >;
-}): DefinedLedgerModel<
+}): LinkedLedgerModule<
   TEvents,
   TQueues,
   TProjectionSchema,
@@ -5345,7 +5539,7 @@ function createDefinedLedgerModel<
       // Registration requires exact token identities while the returned model
       // exposes a schema-oriented, variance-safe implementation view. Runtime
       // dispatch reads the separately branded physical registration.
-      type PublicRegister = RegisteredLedgerModel<
+      type PublicRegister = RegisteredLedgerModule<
         TEvents,
         TQueues,
         TIndexers,
@@ -5360,7 +5554,7 @@ function createDefinedLedgerModel<
         TEventTokens,
         TQueryTokens
       >["register"];
-      const registeredModel: RegisteredLedgerModel<
+      const registeredModel: RegisteredLedgerModule<
         TEvents,
         TQueues,
         TIndexers,

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Add immutable ledger-module construction phases: declare contracts with
+  `declareLedgerModule(...)`, link materializations with
+  `linkLedgerModule(...)`, register implementations, and compose static roots
+  with `composeLedgerModules(...)`.
+- Add storage-backed `defineLedgerModel(...)` resolution. A resolver can
+  prepare a closed module prefix, run its typed queries, and return newly
+  extended prepared values before the adapter opens the completed model. The
+  prepared capability cannot append events or start workers, and existing
+  durable roots require every prepared set to be an ordered prefix. Fresh
+  databases must establish their root from a static composed model.
+- Breaking: storage adapter constructors are asynchronous so model resolution
+  can query the target database before opening the ledger runtime.
 - Add `expireHistory({ through: cursor })` as a durable, monotonic event-stream
   boundary. Tailing omits expired history, resuming an older cursor raises
   `LedgerHistoryExpiredError`, and no event rows are physically deleted.
@@ -42,13 +54,14 @@
 - Reject ambiguous `null` predicates for nullable JSON columns and `null`
   entries in nullable-column `orderByList(...)` values; use `whereNull(...)`
   and `orderByNulls(...)` for SQL null semantics.
-- Breaking: require every ledger shape to declare a stable `moduleId`, compose
-  registered modules explicitly with `composeLedgerModels(...)`, and use opaque
-  event, query, and signal tokens at runtime.
+- Breaking: require every ledger module to declare a stable `moduleId`, compose
+  registered modules explicitly with `composeLedgerModules(...)`, and use
+  opaque event, query, and signal tokens at runtime.
 - Allow unused `queues`, `signals`, and `signalQueues` shape categories to be
   omitted; omitted categories are exact empty definitions.
-- Breaking: storage adapters now accept only a composed root model; remove the
-  uncomposed `createLedger(...)` and `LedgerEngineFactory` public seam.
+- Breaking: storage adapters now accept only a composed root model or a
+  `LedgerModelDefinition`; remove the uncomposed `createLedger(...)` and
+  `LedgerEngineFactory` public seam.
 - Breaking: make `WorkRef` an opaque Sledge-generated string instead of a
   caller-constructible queue tuple. Keyed work persists its own stable identity,
   so cancellation never depends on public queue or module names.

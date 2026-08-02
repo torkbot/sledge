@@ -17,11 +17,11 @@ import type {
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
 import {
   createEventRef,
-  defineLedgerShape,
+  declareLedgerModule,
   defineMaterialization,
   LedgerHistoryExpiredError,
   WorkOperationTimeoutError,
-  withMaterializations,
+  linkLedgerModule,
 } from "./ledger.ts";
 
 export const MessageReceivedSchema = Type.Object({
@@ -157,7 +157,7 @@ const JsonNullValuesQueryResultSchema = Type.Union([
   }),
 ]);
 
-const ledgerContractShape = defineLedgerShape({
+const ledgerContractShape = declareLedgerModule({
   moduleId: "ledger.contract",
   events: {
     "message.received": MessageReceivedSchema,
@@ -292,7 +292,7 @@ const ledgerContractMaterializations = defineMaterialization(
     },
   });
 
-const ledgerContractDefinition = withMaterializations(
+const ledgerContractDefinition = linkLedgerModule(
   ledgerContractShape,
   ledgerContractMaterializations,
 );

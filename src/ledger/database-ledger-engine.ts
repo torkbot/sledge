@@ -27,7 +27,7 @@ import type {
   ComposedLedgerEventTokens,
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
-  RegisteredLedgerModel,
+  RegisteredLedgerModule,
   EmitOptions,
   EventCausationWork,
   EventEnvelope,
@@ -99,6 +99,12 @@ export interface DatabaseLedger<
   TQueries extends Record<string, AnyQueryDef>,
   TSignals extends Record<string, TSchema> = {},
 > extends AsyncDisposable {
+  /** Closes engine resources after a separately observed startup failure. */
+  abortOpen(): Promise<void>;
+
+  /** Waits for root validation and storage/materialization initialization. */
+  ready(): Promise<void>;
+
   emit<const TEventName extends keyof TEvents>(
     eventName: TEventName,
     event: Static<TEvents[TEventName]>,
@@ -303,7 +309,7 @@ type OpenDatabaseLedgerEngineInput<
   TQueryDefinitions extends ProjectionQueryDefinitions,
   TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null,
 > = {
-  readonly model: RegisteredLedgerModel<
+  readonly model: RegisteredLedgerModule<
     TEvents,
     TQueues,
     TIndexers,
@@ -318,6 +324,7 @@ type OpenDatabaseLedgerEngineInput<
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
   readonly storage: StorageRuntime;
+  readonly rootIdentity: "open" | "prepared";
 };
 
 export type CreateDatabaseLedgerInput<
@@ -334,7 +341,7 @@ export type CreateDatabaseLedgerInput<
     AnyMaterializationHistory<TEvents> | null,
 > = {
   readonly storage: StorageRuntime;
-  readonly model: RegisteredLedgerModel<
+  readonly model: RegisteredLedgerModule<
     TEvents,
     TQueues,
     TIndexers,
@@ -380,10 +387,21 @@ export function createDatabaseLedger<
   return openDatabaseLedgerEngine({
     model: input.model,
     projectionCompiler: input.projectionCompiler,
+    rootIdentity: "open",
     timing: input.timing,
     storage: input.storage,
   });
 }
+
+type InitializableComposedLedger<TModel extends AnyComposedLedgerModel> =
+  Ledger<
+    ComposedLedgerEventTokens<TModel>,
+    ComposedLedgerQueryTokens<TModel>,
+    ComposedLedgerSignalTokens<TModel>
+  > & {
+    abortOpen(): Promise<void>;
+    ready(): Promise<void>;
+  };
 
 export function createComposedDatabaseLedger<
   const TModel extends AnyComposedLedgerModel,
@@ -392,11 +410,32 @@ export function createComposedDatabaseLedger<
   readonly model: TModel;
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
-}): Ledger<
-  ComposedLedgerEventTokens<TModel>,
-  ComposedLedgerQueryTokens<TModel>,
-  ComposedLedgerSignalTokens<TModel>
-> {
+}): InitializableComposedLedger<TModel> {
+  return createContractDatabaseLedger(input, "open");
+}
+
+export function createPreparedComposedDatabaseLedger<
+  const TModel extends AnyComposedLedgerModel,
+>(input: {
+  readonly storage: StorageRuntime;
+  readonly model: TModel;
+  readonly projectionCompiler: ProjectionStatementCompiler;
+  readonly timing: LedgerTiming;
+}): InitializableComposedLedger<TModel> {
+  return createContractDatabaseLedger(input, "prepared");
+}
+
+function createContractDatabaseLedger<
+  const TModel extends AnyComposedLedgerModel,
+>(
+  input: {
+    readonly storage: StorageRuntime;
+    readonly model: TModel;
+    readonly projectionCompiler: ProjectionStatementCompiler;
+    readonly timing: LedgerTiming;
+  },
+  rootIdentity: "open" | "prepared",
+): InitializableComposedLedger<TModel> {
   const rawInput = input as unknown as CreateDatabaseLedgerInput<
     Record<string, TSchema>,
     Record<string, TSchema>,
@@ -405,13 +444,15 @@ export function createComposedDatabaseLedger<
     Record<string, TSchema>,
     Record<string, TSchema>
   >;
-  const ledger = createDatabaseLedger(rawInput);
+  const ledger = openDatabaseLedgerEngine({
+    ...rawInput,
+    rootIdentity,
+  });
 
-  return createLedgerContractFacade(ledger, input.model) as unknown as Ledger<
-    ComposedLedgerEventTokens<TModel>,
-    ComposedLedgerQueryTokens<TModel>,
-    ComposedLedgerSignalTokens<TModel>
-  >;
+  return createLedgerContractFacade(
+    ledger,
+    input.model,
+  ) as unknown as InitializableComposedLedger<TModel>;
 }
 
 function createLedgerContractFacade<
@@ -1347,7 +1388,11 @@ function openDatabaseLedgerEngine<
       storage[storageRuntimeIdentityBrand],
       async () => {
         await storage.write(async (database) => {
-          await ensureLedgerRoot(database, moduleIds);
+          if (input.rootIdentity === "prepared") {
+            await ensurePreparedLedgerRoot(database, moduleIds);
+          } else {
+            await ensureLedgerRoot(database, moduleIds);
+          }
         });
 
         await storage.write(async (database) => {
@@ -1697,6 +1742,57 @@ function openDatabaseLedgerEngine<
     } catch (error: unknown) {
       await database.exec("ROLLBACK").catch(() => undefined);
       throw error;
+    }
+  }
+
+  async function ensurePreparedLedgerRoot(
+    database: StorageDatabase,
+    moduleIds: readonly string[],
+  ): Promise<void> {
+    const table = await database
+      .prepare(
+        `SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name = ?`,
+      )
+      .get(ledgerRootTableName);
+
+    // Preparation never claims a new durable root. A first open must establish
+    // the complete graph before any query-driven subset can run migrations.
+    if (table === undefined) {
+      throw new Error(
+        "cannot prepare an unowned database; open a composed model to establish its ledger root",
+      );
+    }
+
+    const row = await database
+      .prepare(
+        `SELECT module_ids_json
+         FROM ${ledgerRootTableName}
+         WHERE singleton = 1`,
+      )
+      .get();
+
+    if (row === undefined) {
+      throw new Error("composed ledger root identity is missing");
+    }
+
+    const decoded = Value.Decode(LedgerRootRowSchema, row);
+    const storedModuleIds = decodeValue(
+      ComposedModuleIdsSchema,
+      parseJson<unknown>(
+        decoded.module_ids_json,
+        "composed ledger root identity",
+      ),
+    );
+    const isStoredPrefix =
+      moduleIds.length <= storedModuleIds.length &&
+      moduleIds.every((moduleId, index) => moduleId === storedModuleIds[index]);
+
+    if (!isStoredPrefix) {
+      throw new Error(
+        `database belongs to composed ledger root ${JSON.stringify(storedModuleIds)}; prepared modules must be an ordered prefix, received ${JSON.stringify(moduleIds)}`,
+      );
     }
   }
 
@@ -4706,11 +4802,16 @@ function openDatabaseLedgerEngine<
   }
 
   function close(): Promise<void> {
-    closePromise ??= closeLedger();
+    closePromise ??= closeLedger(true);
     return closePromise;
   }
 
-  async function closeLedger(): Promise<void> {
+  function abortOpen(): Promise<void> {
+    closePromise ??= closeLedger(false);
+    return closePromise;
+  }
+
+  async function closeLedger(reportStartupFailure: boolean): Promise<void> {
     closed = true;
     eventChanges.signal.notify();
 
@@ -4726,10 +4827,14 @@ function openDatabaseLedgerEngine<
 
     const storageFailures: unknown[] = [];
 
-    try {
-      await startup;
-    } catch (error: unknown) {
-      storageFailures.push(error);
+    if (reportStartupFailure) {
+      try {
+        await startup;
+      } catch (error: unknown) {
+        storageFailures.push(error);
+      }
+    } else {
+      await startup.catch(() => undefined);
     }
 
     try {
@@ -4762,6 +4867,8 @@ function openDatabaseLedgerEngine<
   }
 
   const ledger: DatabaseLedger<TEvents, TQueries, TSignals> = {
+    abortOpen,
+    ready: async () => await startup,
     emit: async (eventName, event, options) => {
       return await emitDurableEvent(eventName, event, options, null, null);
     },

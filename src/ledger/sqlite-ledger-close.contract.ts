@@ -10,16 +10,17 @@ import { Type } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import {
-  composeLedgerModels,
+  composeLedgerModules,
   type ComposedLedgerEventTokens,
   type ComposedLedgerQueryTokens,
   type ComposedLedgerSignalTokens,
-  defineLedgerShape,
+  declareLedgerModule,
+  linkLedgerModule,
   type Ledger,
   type LedgerTiming,
 } from "./ledger.ts";
 
-const closeContractShape = defineLedgerShape({
+const closeContractShape = declareLedgerModule({
   moduleId: "sqlite-ledger-close.contract",
   events: {
     recorded: {
@@ -30,12 +31,14 @@ const closeContractShape = defineLedgerShape({
     },
   },
 });
-const closeContractModule = closeContractShape.register({
-  events: {
-    recorded: ({ event }) => event.payload.value,
+const closeContractModule = linkLedgerModule(closeContractShape, null).register(
+  {
+    events: {
+      recorded: ({ event }) => event.payload.value,
+    },
   },
-});
-const closeContractModel = composeLedgerModels(closeContractModule);
+);
+const closeContractModel = composeLedgerModules(closeContractModule);
 const closeContractRuntime = new VirtualRuntimeHarness(1_900_000_000_000);
 const closeContractTiming: LedgerTiming = {
   clock: closeContractRuntime.clock,
