@@ -318,7 +318,7 @@ test("kysely projection compiler lowers semantic event scans", () => {
   const where = readRecord(query["where"], "where");
 
   assert.equal(query["kind"], "SelectQueryNode");
-  assert.equal(tableIdentifier["name"], "sledge_events");
+  assert.equal(tableIdentifier["name"], "events");
   assert.equal(orderItems.length, 1);
   assert.equal(limitValue["value"], 25);
   assert.equal(where["kind"], "WhereNode");
@@ -1102,7 +1102,7 @@ test(
       }),
       {
         params: ["input.appended", 0, "lane-1", 25],
-        text: 'select "sledge_events"."event_id" as "event_id", "sledge_events"."ts_ms" as "ts_ms", "sledge_events"."event_name" as "event_name", "sledge_events"."payload_json" as "payload_json", "sledge_events"."causation_event_id" as "causation_event_id", "sledge_events"."causation_work_json" as "causation_work_json", "sledge_events"."dedupe_key" as "dedupe_key", "pendingInputs"."source" as "__sledge_event_ref_id" from "pendingInputs" left join "sledge_events" on "sledge_events"."event_id" = "pendingInputs"."source" and "sledge_events"."event_name" = ? and "sledge_events"."signal" = ? where "pendingInputs"."laneId" = ? order by "pendingInputs"."sequence" asc limit ?',
+        text: 'select "events"."event_id" as "event_id", "events"."ts_ms" as "ts_ms", "events"."event_name" as "event_name", "events"."payload_json" as "payload_json", "events"."causation_event_id" as "causation_event_id", "events"."causation_work_json" as "causation_work_json", "events"."dedupe_key" as "dedupe_key", "pendingInputs"."source" as "__sledge_event_ref_id" from "pendingInputs" left join "events" on "events"."event_id" = "pendingInputs"."source" and "events"."event_name" = ? and "events"."signal" = ? where "pendingInputs"."laneId" = ? order by "pendingInputs"."sequence" asc limit ?',
       },
     );
     assert.deepEqual(
@@ -1132,7 +1132,7 @@ test(
           0,
           "$.operationKey",
         ],
-        text: 'select json_extract("payload_json", ?) as "payload_value", max("event_id") as "event_id" from "sledge_events" where "event_name" = ? and "signal" = ? and json_extract("payload_json", ?) is not null group by "payload_value"',
+        text: 'select json_extract("payload_json", ?) as "payload_value", max("event_id") as "event_id" from "events" where "event_name" = ? and "signal" = ? and json_extract("payload_json", ?) is not null group by "payload_value"',
       },
     );
   },

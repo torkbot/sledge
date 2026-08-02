@@ -3254,7 +3254,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(fake.calls[0], {
     method: "all",
     params: ["user.created", 0, 42],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?)',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?)',
   });
   assert.deepEqual(payload, {
     userId: "u_123",
@@ -3298,7 +3298,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(batchFake.calls[0], {
     method: "all",
     params: ["user.created", 0, 43, 42, 99],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?, ?, ?)',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (?, ?, ?)',
   });
   assert.deepEqual(payloads, [
     {
@@ -3378,7 +3378,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(scanFake.calls[0], {
     method: "all",
     params: ["user.created", 0, 42, 25],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
   });
   assert.deepEqual(scannedPayloads, [
     {
@@ -3414,7 +3414,7 @@ test("projection access hydrates semantic event references without exposing even
   assert.deepEqual(payloadScanFake.calls[0], {
     method: "all",
     params: ["user.created", 0, "$.userId", "u_456", 1],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? ORDER BY "event_id" DESC LIMIT ?',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? ORDER BY "event_id" DESC LIMIT ?',
   });
   assert.deepEqual(payloadScannedPayloads, [
     {
@@ -3553,7 +3553,7 @@ test("projection access selects referenced events in one ordered storage query",
     {
       method: "all",
       params: ["user.created", 0],
-      sql: 'SELECT "sledge_events"."event_id" AS "event_id", "sledge_events"."ts_ms" AS "ts_ms", "sledge_events"."event_name" AS "event_name", "sledge_events"."payload_json" AS "payload_json", "sledge_events"."causation_event_id" AS "causation_event_id", "sledge_events"."causation_work_json" AS "causation_work_json", "sledge_events"."dedupe_key" AS "dedupe_key", "pendingInputs"."source" AS "__sledge_event_ref_id" FROM "pendingInputs" LEFT JOIN "sledge_events" ON "sledge_events"."event_id" = "pendingInputs"."source" AND "sledge_events"."event_name" = ? AND "sledge_events"."signal" = ? ORDER BY "pendingInputs"."inputId" DESC',
+      sql: 'SELECT "events"."event_id" AS "event_id", "events"."ts_ms" AS "ts_ms", "events"."event_name" AS "event_name", "events"."payload_json" AS "payload_json", "events"."causation_event_id" AS "causation_event_id", "events"."causation_work_json" AS "causation_work_json", "events"."dedupe_key" AS "dedupe_key", "pendingInputs"."source" AS "__sledge_event_ref_id" FROM "pendingInputs" LEFT JOIN "events" ON "events"."event_id" = "pendingInputs"."source" AND "events"."event_name" = ? AND "events"."signal" = ? ORDER BY "pendingInputs"."inputId" DESC',
     },
   ]);
 
@@ -3706,7 +3706,7 @@ test("projection access scans semantic signals without exposing events table", a
   assert.deepEqual(fake.calls[0], {
     method: "all",
     params: ["run.stream.frame", 1, "$.runId", "run_1", 100, 25],
-    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
+    sql: 'SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ? ORDER BY "event_id" ASC LIMIT ?',
   });
   assert.deepEqual(frames, [
     {
@@ -3731,7 +3731,7 @@ test("projection access scans semantic signals without exposing events table", a
   assert.deepEqual(boundsFake.calls[0], {
     method: "get",
     params: ["run.stream.frame", 1, "$.runId", "run_1", 100],
-    sql: 'SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ?',
+    sql: 'SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND json_extract("payload_json", ?) = ? AND "event_id" > ?',
   });
   assert.deepEqual(bounds, {
     maxEventId: 120,
@@ -4198,7 +4198,7 @@ test("projection facade supports TorkBot-style surface operation materialization
   );
   assert.equal(
     rebuildFake.calls[1]?.sql,
-    'SELECT json_extract("payload_json", ?) AS "payload_value", MAX("event_id") AS "event_id" FROM "sledge_events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? AND json_extract("payload_json", ?) IS NOT NULL GROUP BY "payload_value"',
+    'SELECT json_extract("payload_json", ?) AS "payload_value", MAX("event_id") AS "event_id" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" > ? AND json_extract("payload_json", ?) IS NOT NULL GROUP BY "payload_value"',
   );
   assert.deepEqual(rebuilt, [
     {

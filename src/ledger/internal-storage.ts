@@ -24,12 +24,6 @@ export const registeredLedgerRuntimeBrand: unique symbol = Symbol(
 export const storageRuntimeIdentityBrand: unique symbol = Symbol(
   "sledge.storageRuntimeIdentity",
 );
-/**
- * Canonical event storage for the current protocol. Keeping the engine and
- * projection compilers on one internal name is also the storage-level fence
- * that makes pre-expiration runtimes fail after a rolling upgrade.
- */
-export const ledgerEventTableName = "sledge_events";
 
 export type LedgerStorageRow = Record<string, unknown>;
 

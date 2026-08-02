@@ -6,7 +6,6 @@ import type {
   ProjectionSchemaMetadata,
   ProjectionTableMetadata,
 } from "./projections.ts";
-import { ledgerEventTableName } from "./internal-storage.ts";
 
 export type ProjectionCompiledSql = {
   readonly params: readonly unknown[];
@@ -504,7 +503,7 @@ function compileEventReadStatement(
 
   return {
     params: [statement.eventName, 0, ...statement.eventIds],
-    text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM ${quoteIdentifier(ledgerEventTableName)} WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
+    text: `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE "event_name" = ? AND "signal" = ? AND "event_id" IN (${eventIdsSql})`,
   };
 }
 
@@ -513,16 +512,16 @@ function compileEventRefSelectStatement(
 ): ProjectionCompiledSql {
   const selectedSql = [
     ...projectionEventRowColumnNames.map((columnName) => {
-      return `${compileColumnReference({ columnName, tableName: ledgerEventTableName })} AS ${quoteIdentifier(columnName)}`;
+      return `${compileColumnReference({ columnName, tableName: "events" })} AS ${quoteIdentifier(columnName)}`;
     }),
     `${compileColumnReference({ columnName: statement.eventRefColumnName, tableName: statement.fromTableName })} AS ${quoteIdentifier(projectionEventRefIdColumnAlias)}`,
   ].join(", ");
-  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.fromTableName)} LEFT JOIN ${quoteIdentifier(ledgerEventTableName)} ON ${compileColumnReference({ columnName: "event_id", tableName: ledgerEventTableName })} = ${compileColumnReference(
+  let text = `SELECT ${selectedSql} FROM ${quoteIdentifier(statement.fromTableName)} LEFT JOIN "events" ON "events"."event_id" = ${compileColumnReference(
     {
       columnName: statement.eventRefColumnName,
       tableName: statement.fromTableName,
     },
-  )} AND ${compileColumnReference({ columnName: "event_name", tableName: ledgerEventTableName })} = ? AND ${compileColumnReference({ columnName: "signal", tableName: ledgerEventTableName })} = ?`;
+  )} AND "events"."event_name" = ? AND "events"."signal" = ?`;
   const params: unknown[] = [statement.eventName, 0];
   const whereSql = compileWhere(statement.where);
 
@@ -553,7 +552,7 @@ function compileEventScanStatement(
 ): ProjectionCompiledSql {
   const where = compileEventStreamWhere(statement);
   const params = [...where.params];
-  let text = `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM ${quoteIdentifier(ledgerEventTableName)} WHERE ${where.text}`;
+  let text = `SELECT "event_id", "ts_ms", "event_name", "payload_json", "causation_event_id", "causation_work_json", "dedupe_key" FROM "events" WHERE ${where.text}`;
 
   text += ` ORDER BY "event_id" ${statement.orderDirection.toUpperCase()}`;
 
@@ -575,7 +574,7 @@ function compileEventIdBoundsStatement(
 
   return {
     params: where.params,
-    text: `SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM ${quoteIdentifier(ledgerEventTableName)} WHERE ${where.text}`,
+    text: `SELECT MIN("event_id") AS "min_event_id", MAX("event_id") AS "max_event_id" FROM "events" WHERE ${where.text}`,
   };
 }
 
@@ -587,7 +586,7 @@ function compileLatestEventRefsByPayloadStatement(
 
   return {
     params: [payloadPath, ...where.params, payloadPath],
-    text: `SELECT json_extract("payload_json", ?) AS "payload_value", MAX("event_id") AS "event_id" FROM ${quoteIdentifier(ledgerEventTableName)} WHERE ${where.text} AND json_extract("payload_json", ?) IS NOT NULL GROUP BY "payload_value"`,
+    text: `SELECT json_extract("payload_json", ?) AS "payload_value", MAX("event_id") AS "event_id" FROM "events" WHERE ${where.text} AND json_extract("payload_json", ?) IS NOT NULL GROUP BY "payload_value"`,
   };
 }
 

@@ -16,7 +16,6 @@ const reservedProjectionTableNames = new Set([
   "idx_work_due",
   "idx_work_partition_order",
   "idx_work_ref",
-  "sledge_events",
   "sledge_history",
   "sledge_materialization_versions",
   "sledge_storage_layout",

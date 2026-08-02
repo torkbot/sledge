@@ -654,7 +654,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
             await database
               .prepare(
                 `SELECT event_name
-                 FROM sledge_events
+                 FROM events
                  ORDER BY event_id`,
               )
               .all(),
@@ -708,9 +708,9 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     }
   });
 
-  test(`${driver} rejects a pre-composition database before mutation`, async () => {
+  test(`${driver} rejects unmarked Sledge storage before mutation`, async () => {
     const directory = await mkdtemp(
-      join(tmpdir(), `sledge-legacy-layout-${driver}-`),
+      join(tmpdir(), `sledge-unmarked-layout-${driver}-`),
     );
     const databaseUrl = join(directory, "ledger.sqlite");
 
@@ -757,7 +757,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         (error: unknown) => {
           return errorTreeIncludesMessage(
             error,
-            "database uses the pre-composition Sledge storage layout",
+            "database uses an unsupported Sledge storage layout",
           );
         },
       );
@@ -777,6 +777,96 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           .map((row) => readStringColumn(row, "name"));
 
         assert.deepEqual(names, ["events", "sqlite_sequence"]);
+      } finally {
+        inspection.close();
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test(`${driver} rejects an older storage layout before mutation`, async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), `sledge-older-layout-${driver}-`),
+    );
+    const databaseUrl = join(directory, "ledger.sqlite");
+
+    try {
+      const database = new Database(databaseUrl);
+      database.exec(`
+        CREATE TABLE sledge_storage_layout (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          version INTEGER NOT NULL,
+          module_ids_json TEXT NOT NULL
+        );
+
+        INSERT INTO sledge_storage_layout (
+          singleton,
+          version,
+          module_ids_json
+        ) VALUES (1, 2, '["contract.layout"]');
+
+        CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY AUTOINCREMENT
+        );
+      `);
+      database.close();
+
+      const shape = defineLedgerShape({
+        moduleId: "contract.layout",
+        events: {
+          pinged: Type.Object({}),
+        },
+        queues: {},
+        signals: {},
+        signalQueues: {},
+      });
+      const model = composeLedgerModels(shape.register({}));
+      const ledger =
+        driver === "better-sqlite3"
+          ? createBetterSqliteLedger({ databaseUrl, model, timing })
+          : await createTursoLedger({ databaseUrl, model, timing });
+
+      await assert.rejects(
+        async () => {
+          await ledger.close();
+        },
+        (error: unknown) => {
+          return errorTreeIncludesMessage(
+            error,
+            "unsupported Sledge storage layout version 2",
+          );
+        },
+      );
+
+      const inspection = new Database(databaseUrl, { readonly: true });
+      try {
+        const names = inspection
+          .prepare(
+            `SELECT name
+             FROM sqlite_schema
+             WHERE type = 'table'
+             ORDER BY name`,
+          )
+          .all()
+          .map((row) => readStringColumn(row, "name"));
+        const marker = inspection
+          .prepare(
+            `SELECT version, module_ids_json
+             FROM sledge_storage_layout
+             WHERE singleton = 1`,
+          )
+          .get();
+
+        assert.deepEqual(names, [
+          "events",
+          "sledge_storage_layout",
+          "sqlite_sequence",
+        ]);
+        assert.deepEqual(marker, {
+          module_ids_json: '["contract.layout"]',
+          version: 2,
+        });
       } finally {
         inspection.close();
       }

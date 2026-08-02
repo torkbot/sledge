@@ -6,10 +6,9 @@
   boundary. Tailing omits expired history, resuming an older cursor raises
   `LedgerHistoryExpiredError`, and no event rows are physically deleted.
   Event streams discover expiration performed by peer runtimes, including
-  while a previously read batch is being consumed. Opening an older database
-  advances its storage protocol and moves event storage to a v3-only physical
-  name. Older runtimes already open fail their next event read or write, while
-  later opens reject the v3 protocol marker.
+  while a previously read batch is being consumed. This release establishes a
+  new storage layout; Sledge rejects older layouts before mutation rather than
+  migrating them.
 - Add durable queue `control.deferUntil(availableAtMs)` for successful,
   non-retry deferral to an absolute runtime-clock deadline, including clean
   attempt/WorkRef semantics, restart-safe non-idle scheduling, prompt peer
@@ -25,8 +24,7 @@
 - Add engine-authored `causationWork` metadata to durable event envelopes so
   projections and replay consumers can authenticate the exact module, queue,
   work item, and attempt that emitted a fact. Existing and public emissions
-  carry `null`. Opening an older database upgrades its storage protocol and
-  fences pre-provenance workers before new queue facts are accepted.
+  carry `null`.
 - Add result-bearing events whose owning handler returns a validated durable
   outcome from `ledger.emit(...)`, including stable outcomes for deduplicated
   emissions.

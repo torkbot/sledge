@@ -10,7 +10,6 @@ import { ChangeSignal, raceWithSignal } from "../runtime/async-signals.ts";
 import { createEventRef } from "./event-ref.ts";
 import {
   composedLedgerModulesBrand,
-  ledgerEventTableName,
   readLedgerProjectionCompiler,
   readLedgerProjectionSchemas,
   readLedgerImplementations,
@@ -203,10 +202,7 @@ type StorageRow = LedgerStorageRow;
 const materializationVersionTableName = "sledge_materialization_versions";
 const historyTableName = "sledge_history";
 const storageLayoutTableName = "sledge_storage_layout";
-const legacyEventTableName = "events";
 const storageLayoutVersion = 3;
-const queueProvenanceStorageLayoutVersion = 2;
-const composableStorageLayoutVersion = 1;
 const queueProvenanceLeaseProtocolVersion = 1;
 const MaterializationVersionRowSchema = Type.Object({
   version: Type.Number(),
@@ -259,63 +255,6 @@ function acquireDatabaseChanges(
       }
     },
   };
-}
-
-function createWorkTableSql(
-  tableName: "work" | "work_pre_queue_provenance",
-): string {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      work_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      work_ref TEXT,
-      queue_name TEXT NOT NULL,
-      work_key TEXT,
-      coalescing_key TEXT,
-      deferred_generation INTEGER NOT NULL DEFAULT 0,
-      partition_key TEXT,
-      payload_json TEXT NOT NULL,
-      source_event_id INTEGER NOT NULL,
-      signal INTEGER NOT NULL DEFAULT 0,
-      attempt INTEGER NOT NULL DEFAULT 0,
-      available_at_ms INTEGER NOT NULL,
-      dead INTEGER NOT NULL DEFAULT 0,
-      lease_id TEXT,
-      lease_acquired_at_ms INTEGER,
-      lease_expires_at_ms INTEGER,
-      lease_protocol_version INTEGER NOT NULL DEFAULT 0,
-      last_error TEXT,
-      cancelled INTEGER NOT NULL DEFAULT 0,
-      cancel_requested_at_ms INTEGER,
-      cancel_reason TEXT,
-      terminal_at_ms INTEGER,
-      CONSTRAINT sledge_authenticated_queue_lease CHECK (
-        (lease_id IS NULL AND lease_protocol_version = 0)
-        OR
-        (
-          lease_id IS NOT NULL
-          AND lease_protocol_version = ${queueProvenanceLeaseProtocolVersion}
-        )
-      )
-    );
-  `;
-}
-
-function createEventTableSql(
-  tableName: typeof ledgerEventTableName | typeof legacyEventTableName,
-): string {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts_ms INTEGER NOT NULL,
-      event_name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      outcome_json TEXT,
-      causation_event_id INTEGER,
-      causation_work_json TEXT,
-      dedupe_key TEXT UNIQUE,
-      signal INTEGER NOT NULL DEFAULT 0
-    );
-  `;
 }
 
 async function serializeDatabaseInitialization<T>(
@@ -1085,10 +1024,6 @@ const EventIdRowSchema = Type.Object({
   event_id: Type.Number(),
 });
 
-const TableInfoRowSchema = Type.Object({
-  name: Type.String(),
-});
-
 const AvailableAtRowSchema = Type.Object({
   available_at_ms: Type.Number(),
 });
@@ -1404,7 +1339,7 @@ function openDatabaseLedgerEngine<
 
   let committedEventId = 0;
   let committedExpiredThroughEventId = 0;
-  let activeWriteTransactions = 0;
+  const activeTransactionScopes = new Set<StorageDatabase>();
 
   const startup = (async () => {
     // The SQLite drivers fail fast when concurrent handles overlap startup DDL.
@@ -1413,22 +1348,23 @@ function openDatabaseLedgerEngine<
     await serializeDatabaseInitialization(
       storage[storageRuntimeIdentityBrand],
       async () => {
-        let startingStorageLayoutVersion = storageLayoutVersion;
-
         await storage.write(async (database) => {
-          startingStorageLayoutVersion = await ensureStorageLayout(
-            database,
-            moduleIds,
-          );
+          await ensureStorageLayout(database, moduleIds);
         });
-        const startupEventTableName =
-          startingStorageLayoutVersion === storageLayoutVersion
-            ? ledgerEventTableName
-            : legacyEventTableName;
 
         await storage.write(async (database) => {
           await database.exec(`
-      ${createEventTableSql(startupEventTableName)}
+      CREATE TABLE IF NOT EXISTS events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_ms INTEGER NOT NULL,
+        event_name TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        outcome_json TEXT,
+        causation_event_id INTEGER,
+        causation_work_json TEXT,
+        dedupe_key TEXT UNIQUE,
+        signal INTEGER NOT NULL DEFAULT 0
+      );
 
       CREATE TABLE IF NOT EXISTS ${historyTableName} (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1440,46 +1376,42 @@ function openDatabaseLedgerEngine<
       VALUES (1, 0)
       ON CONFLICT(singleton) DO NOTHING;
 
-      ${createWorkTableSql("work")}
+      CREATE TABLE IF NOT EXISTS work (
+        work_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_ref TEXT,
+        queue_name TEXT NOT NULL,
+        work_key TEXT,
+        coalescing_key TEXT,
+        deferred_generation INTEGER NOT NULL DEFAULT 0,
+        partition_key TEXT,
+        payload_json TEXT NOT NULL,
+        source_event_id INTEGER NOT NULL,
+        signal INTEGER NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        available_at_ms INTEGER NOT NULL,
+        dead INTEGER NOT NULL DEFAULT 0,
+        lease_id TEXT,
+        lease_acquired_at_ms INTEGER,
+        lease_expires_at_ms INTEGER,
+        lease_protocol_version INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        cancelled INTEGER NOT NULL DEFAULT 0,
+        cancel_requested_at_ms INTEGER,
+        cancel_reason TEXT,
+        terminal_at_ms INTEGER,
+        CONSTRAINT sledge_authenticated_queue_lease CHECK (
+          (lease_id IS NULL AND lease_protocol_version = 0)
+          OR
+          (
+            lease_id IS NOT NULL
+            AND lease_protocol_version = ${queueProvenanceLeaseProtocolVersion}
+          )
+        )
+      );
 
       CREATE INDEX IF NOT EXISTS idx_work_due
         ON work(dead, lease_id, available_at_ms, work_id);
     `);
-        });
-
-        await ensureColumn(
-          startupEventTableName,
-          "signal",
-          "INTEGER NOT NULL DEFAULT 0",
-        );
-        await ensureColumn(startupEventTableName, "outcome_json", "TEXT");
-        await ensureColumn(
-          startupEventTableName,
-          "causation_work_json",
-          "TEXT",
-        );
-        await ensureColumn("work", "signal", "INTEGER NOT NULL DEFAULT 0");
-        await ensureColumn("work", "work_ref", "TEXT");
-        await ensureColumn("work", "work_key", "TEXT");
-        await ensureColumn("work", "coalescing_key", "TEXT");
-        await ensureColumn(
-          "work",
-          "deferred_generation",
-          "INTEGER NOT NULL DEFAULT 0",
-        );
-        await ensureColumn("work", "partition_key", "TEXT");
-        await ensureColumn("work", "cancelled", "INTEGER NOT NULL DEFAULT 0");
-        await ensureColumn("work", "cancel_requested_at_ms", "INTEGER");
-        await ensureColumn("work", "cancel_reason", "TEXT");
-        await ensureColumn("work", "terminal_at_ms", "INTEGER");
-        await storage.write(async (database) => {
-          await ensureQueueProvenanceProtocol(
-            database,
-            startingStorageLayoutVersion,
-          );
-        });
-        await storage.write(async (database) => {
-          await ensureHistoryExpirationProtocol(database);
         });
         await storage.write(async (database) => {
           // Deriving the reservation from durable work state keeps claim
@@ -1715,9 +1647,7 @@ function openDatabaseLedgerEngine<
   async function ensureStorageLayout(
     database: StorageDatabase,
     moduleIds: readonly string[],
-  ): Promise<number> {
-    let verifiedVersion = storageLayoutVersion;
-
+  ): Promise<void> {
     await database.exec("BEGIN IMMEDIATE");
 
     try {
@@ -1731,7 +1661,7 @@ function openDatabaseLedgerEngine<
         .get(storageLayoutTableName);
 
       if (layoutTable === undefined) {
-        const legacyTable = await database
+        const existingSledgeTable = await database
           .prepare(
             `SELECT name
              FROM sqlite_schema
@@ -1740,15 +1670,15 @@ function openDatabaseLedgerEngine<
              LIMIT 1`,
           )
           .get(
-            legacyEventTableName,
-            ledgerEventTableName,
+            "events",
             "work",
+            historyTableName,
             materializationVersionTableName,
           );
 
-        if (legacyTable !== undefined) {
+        if (existingSledgeTable !== undefined) {
           throw new Error(
-            "database uses the pre-composition Sledge storage layout; reset the database before opening it with composable ledger models",
+            "database uses an unsupported Sledge storage layout; reset the database before opening it",
           );
         }
 
@@ -1782,13 +1712,8 @@ function openDatabaseLedgerEngine<
         }
 
         const decoded = Value.Decode(StorageLayoutRowSchema, row);
-        verifiedVersion = decoded.version;
 
-        if (
-          decoded.version !== storageLayoutVersion &&
-          decoded.version !== queueProvenanceStorageLayoutVersion &&
-          decoded.version !== composableStorageLayoutVersion
-        ) {
+        if (decoded.version !== storageLayoutVersion) {
           throw new Error(
             `unsupported Sledge storage layout version ${decoded.version}`,
           );
@@ -1815,220 +1740,8 @@ function openDatabaseLedgerEngine<
       }
 
       await database.exec("COMMIT");
-      return verifiedVersion;
     } catch (error: unknown) {
       await database.exec("ROLLBACK").catch(() => undefined);
-      throw error;
-    }
-  }
-
-  async function ensureQueueProvenanceProtocol(
-    database: StorageDatabase,
-    startingLayoutVersion: number,
-  ): Promise<void> {
-    if (startingLayoutVersion >= queueProvenanceStorageLayoutVersion) {
-      return;
-    }
-
-    await database.exec("BEGIN IMMEDIATE");
-
-    try {
-      const layoutRow = await database
-        .prepare(
-          `SELECT version, module_ids_json
-           FROM ${storageLayoutTableName}
-           WHERE singleton = 1`,
-        )
-        .get();
-
-      if (layoutRow === undefined) {
-        throw new Error("Sledge storage layout marker is missing");
-      }
-
-      const layout = Value.Decode(StorageLayoutRowSchema, layoutRow);
-
-      if (layout.version >= queueProvenanceStorageLayoutVersion) {
-        await database.exec("COMMIT");
-        return;
-      }
-
-      if (layout.version !== composableStorageLayoutVersion) {
-        throw new Error(
-          `unsupported Sledge storage layout version ${layout.version}`,
-        );
-      }
-
-      // A worker predating authenticated queue provenance does not populate
-      // lease_protocol_version. Rebuilding the table installs a storage-level
-      // claim invariant that those workers cannot satisfy. Clearing legacy
-      // leases also fences handlers that were already running at cutover.
-      await database.exec(`
-        ALTER TABLE work RENAME TO work_pre_queue_provenance;
-        ${createWorkTableSql("work")}
-      `);
-      await database
-        .prepare(
-          `INSERT INTO work (
-             work_id,
-             work_ref,
-             queue_name,
-             work_key,
-             coalescing_key,
-             partition_key,
-             payload_json,
-             source_event_id,
-             signal,
-             attempt,
-             available_at_ms,
-             dead,
-             lease_id,
-             lease_acquired_at_ms,
-             lease_expires_at_ms,
-             lease_protocol_version,
-             last_error,
-             cancelled,
-             cancel_requested_at_ms,
-             cancel_reason,
-             terminal_at_ms
-           )
-           SELECT
-             work_id,
-             work_ref,
-             queue_name,
-             work_key,
-             coalescing_key,
-             partition_key,
-             payload_json,
-             source_event_id,
-             signal,
-             attempt,
-             CASE
-               WHEN lease_id IS NULL THEN available_at_ms
-               ELSE ?
-             END,
-             dead,
-             NULL,
-             NULL,
-             NULL,
-             0,
-             last_error,
-             cancelled,
-             cancel_requested_at_ms,
-             cancel_reason,
-             terminal_at_ms
-           FROM work_pre_queue_provenance`,
-        )
-        .run(clock.nowMs());
-      await database.exec(`
-        DROP TABLE work_pre_queue_provenance;
-
-        CREATE INDEX IF NOT EXISTS idx_work_due
-          ON work(dead, lease_id, available_at_ms, work_id);
-      `);
-      await database
-        .prepare(
-          `UPDATE ${storageLayoutTableName}
-           SET version = ?
-           WHERE singleton = 1
-             AND version = ?`,
-        )
-        .run(
-          queueProvenanceStorageLayoutVersion,
-          composableStorageLayoutVersion,
-        );
-      await database.exec("COMMIT");
-    } catch (error: unknown) {
-      await database.exec("ROLLBACK").catch(() => undefined);
-      throw error;
-    }
-  }
-
-  async function ensureHistoryExpirationProtocol(
-    database: StorageDatabase,
-  ): Promise<void> {
-    await database.exec("BEGIN IMMEDIATE");
-
-    try {
-      const layoutRow = await database
-        .prepare(
-          `SELECT version, module_ids_json
-           FROM ${storageLayoutTableName}
-           WHERE singleton = 1`,
-        )
-        .get();
-
-      if (layoutRow === undefined) {
-        throw new Error("Sledge storage layout marker is missing");
-      }
-
-      const layout = Value.Decode(StorageLayoutRowSchema, layoutRow);
-
-      if (layout.version === storageLayoutVersion) {
-        await database.exec("COMMIT");
-        return;
-      }
-
-      if (layout.version !== queueProvenanceStorageLayoutVersion) {
-        throw new Error(
-          `unsupported Sledge storage layout version ${layout.version}`,
-        );
-      }
-
-      // Publish the new physical name and protocol marker atomically. Removing
-      // the v2 table name invalidates already-open legacy runtimes at their
-      // next event read or write; the marker rejects legacy runtimes that open
-      // after this transaction commits.
-      await database.exec(
-        `ALTER TABLE ${legacyEventTableName} RENAME TO ${ledgerEventTableName}`,
-      );
-
-      await database
-        .prepare(
-          `UPDATE ${storageLayoutTableName}
-           SET version = ?
-           WHERE singleton = 1
-             AND version = ?`,
-        )
-        .run(storageLayoutVersion, queueProvenanceStorageLayoutVersion);
-      await database.exec("COMMIT");
-    } catch (error: unknown) {
-      await database.exec("ROLLBACK").catch(() => undefined);
-      throw error;
-    }
-  }
-
-  async function ensureColumn(
-    tableName:
-      | typeof ledgerEventTableName
-      | typeof legacyEventTableName
-      | "work",
-    columnName: string,
-    definition: string,
-  ): Promise<void> {
-    let rows: readonly StorageRow[] = [];
-    await storage.read(async (database) => {
-      rows = await database.prepare(`PRAGMA table_info(${tableName})`).all();
-    });
-
-    const hasColumn = rows.some((row) => {
-      return decodeRow(row, TableInfoRowSchema).name === columnName;
-    });
-
-    if (hasColumn) {
-      return;
-    }
-
-    try {
-      await storage.write(async (database) => {
-        await database.exec(
-          `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
-        );
-      });
-    } catch (error: unknown) {
-      if (isDuplicateColumnError(error)) {
-        return;
-      }
-
       throw error;
     }
   }
@@ -2583,11 +2296,11 @@ function openDatabaseLedgerEngine<
       try {
         await database.exec("BEGIN IMMEDIATE");
         began = true;
-        activeWriteTransactions += 1;
+        activeTransactionScopes.add(database);
 
         const result = await run(database, createTransactionScope(database));
         await database.exec("COMMIT");
-        activeWriteTransactions -= 1;
+        activeTransactionScopes.delete(database);
         began = false;
 
         return result;
@@ -2598,7 +2311,7 @@ function openDatabaseLedgerEngine<
           } catch {
             // Suppress rollback failures to preserve the root cause.
           } finally {
-            activeWriteTransactions -= 1;
+            activeTransactionScopes.delete(database);
           }
         }
 
@@ -2897,7 +2610,7 @@ function openDatabaseLedgerEngine<
     if (eventInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO ${ledgerEventTableName} (
+          `INSERT INTO events (
              ts_ms,
              event_name,
              payload_json,
@@ -2921,7 +2634,7 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO ${ledgerEventTableName} (
+          `INSERT INTO events (
              ts_ms,
              event_name,
              payload_json,
@@ -2957,7 +2670,7 @@ function openDatabaseLedgerEngine<
                causation_event_id,
                causation_work_json,
                dedupe_key
-             FROM ${ledgerEventTableName}
+             FROM events
              WHERE dedupe_key = ?
                AND signal = 0`,
           )
@@ -3215,11 +2928,7 @@ function openDatabaseLedgerEngine<
       }
 
       const outcomeUpdate = await database
-        .prepare(
-          `UPDATE ${ledgerEventTableName}
-           SET outcome_json = ?
-           WHERE event_id = ?`,
-        )
+        .prepare(`UPDATE events SET outcome_json = ? WHERE event_id = ?`)
         .run(outcomeJson, eventId);
 
       if (outcomeUpdate.changes !== 1) {
@@ -3350,7 +3059,7 @@ function openDatabaseLedgerEngine<
     if (signalInput.dedupeKey === undefined) {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO ${ledgerEventTableName} (
+          `INSERT INTO events (
              ts_ms,
              event_name,
              payload_json,
@@ -3374,7 +3083,7 @@ function openDatabaseLedgerEngine<
     } else {
       const eventInsert = await database
         .prepare(
-          `INSERT INTO ${ledgerEventTableName} (
+          `INSERT INTO events (
              ts_ms,
              event_name,
              payload_json,
@@ -3400,11 +3109,7 @@ function openDatabaseLedgerEngine<
         eventId = Number(eventInsert.lastInsertRowid);
       } else {
         const existing = await database
-          .prepare(
-            `SELECT event_id
-             FROM ${ledgerEventTableName}
-             WHERE dedupe_key = ?`,
-          )
+          .prepare(`SELECT event_id FROM events WHERE dedupe_key = ?`)
           .get(signalInput.dedupeKey);
 
         if (existing === undefined) {
@@ -3525,11 +3230,7 @@ function openDatabaseLedgerEngine<
 
     if (queued.length === 0) {
       await database
-        .prepare(
-          `DELETE FROM ${ledgerEventTableName}
-           WHERE event_id = ?
-             AND signal = 1`,
-        )
+        .prepare(`DELETE FROM events WHERE event_id = ? AND signal = 1`)
         .run(eventId);
     }
 
@@ -3801,7 +3502,7 @@ function openDatabaseLedgerEngine<
              causation_event_id,
              causation_work_json,
              dedupe_key
-           FROM ${ledgerEventTableName}
+           FROM events
            WHERE signal = 0
              AND event_id > ?
              AND event_id <= ?
@@ -3832,7 +3533,7 @@ function openDatabaseLedgerEngine<
              causation_event_id,
              causation_work_json,
              dedupe_key
-           FROM ${ledgerEventTableName}
+           FROM events
            WHERE signal = 0
              AND event_id > ?
              AND event_id <= ?
@@ -3866,10 +3567,11 @@ function openDatabaseLedgerEngine<
     readonly expiredThroughEventId: number;
     readonly latestEventId: number;
   }> {
-    // A storage adapter may serve reads and writes through one connection.
-    // Reentrant stream reads must not observe either boundary from a write
-    // transaction that can still roll back.
-    if (activeWriteTransactions > 0) {
+    // A storage adapter may serve reads and writes through one scope. Reentrant
+    // stream reads on that exact scope must not observe a transaction that can
+    // still roll back. Independent WAL readers remain free to discover durable
+    // changes committed by peer handles while a local write is in flight.
+    if (activeTransactionScopes.has(database)) {
       return readCommittedStreamState();
     }
 
@@ -3888,7 +3590,7 @@ function openDatabaseLedgerEngine<
              expired_through_event_id,
              (
                SELECT COALESCE(MAX(event_id), 0)
-               FROM ${ledgerEventTableName}
+               FROM events
                WHERE signal = 0
              )
            ) AS latest_event_id
@@ -4794,9 +4496,7 @@ function openDatabaseLedgerEngine<
               if (remainingSignalWork === undefined) {
                 await database
                   .prepare(
-                    `DELETE FROM ${ledgerEventTableName}
-                     WHERE event_id = ?
-                       AND signal = 1`,
+                    `DELETE FROM events WHERE event_id = ? AND signal = 1`,
                   )
                   .run(claimed.sourceEventId);
               }
@@ -5475,7 +5175,7 @@ function openDatabaseLedgerEngine<
                AND expired_through_event_id < ?
                AND EXISTS (
                  SELECT 1
-                 FROM ${ledgerEventTableName}
+                 FROM events
                  WHERE event_id = ?
                    AND signal = 0
                )`,

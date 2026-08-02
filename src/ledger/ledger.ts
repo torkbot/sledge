@@ -84,7 +84,6 @@ const reservedMaterializationSqliteObjectNames = [
   "idx_work_key",
   "idx_work_partition_order",
   "idx_work_ref",
-  "sledge_events",
   "sledge_history",
   "sledge_materialization_versions",
   "sledge_storage_layout",
