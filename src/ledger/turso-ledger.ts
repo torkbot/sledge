@@ -8,34 +8,31 @@ import {
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import type {
+  AnyComposedLedgerModel,
   ComposedLedgerEventTokens,
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
-  Ledger,
-  LedgerModelSource,
-  LedgerTiming,
-  ComposedLedgerModelFor,
-} from "./ledger.ts";
+} from "./ledger-composition.ts";
+import type { Ledger, LedgerTiming } from "./ledger.ts";
 import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
-import { resolveLedgerModelSource } from "./ledger-model-resolution.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 import { assertWalCheckpointTruncated } from "./sqlite-wal-checkpoint.ts";
 
-type CreateTursoLedgerInput<TSource extends LedgerModelSource> = {
+type CreateTursoLedgerInput<TModel extends AnyComposedLedgerModel> = {
   readonly databaseUrl: string;
-  readonly model: TSource;
+  readonly model: TModel;
   readonly timing: LedgerTiming;
 };
 
 export async function createTursoLedger<
-  const TSource extends LedgerModelSource,
+  const TModel extends AnyComposedLedgerModel,
 >(
-  input: CreateTursoLedgerInput<TSource>,
+  input: CreateTursoLedgerInput<TModel>,
 ): Promise<
   Ledger<
-    ComposedLedgerEventTokens<ComposedLedgerModelFor<TSource>>,
-    ComposedLedgerQueryTokens<ComposedLedgerModelFor<TSource>>,
-    ComposedLedgerSignalTokens<ComposedLedgerModelFor<TSource>>
+    ComposedLedgerEventTokens<TModel>,
+    ComposedLedgerQueryTokens<TModel>,
+    ComposedLedgerSignalTokens<TModel>
   >
 > {
   const storage = await createTursoStorageRuntime(input.databaseUrl);
@@ -44,16 +41,9 @@ export async function createTursoLedger<
   let storageTransferred = false;
 
   try {
-    const model = await resolveLedgerModelSource({
-      source: input.model,
-      storage,
-      projectionCompiler,
-      timing: input.timing,
-    });
-
     const ledger = createComposedDatabaseLedger({
       storage,
-      model,
+      model: input.model,
       projectionCompiler,
       timing: input.timing,
     });

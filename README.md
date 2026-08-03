@@ -12,20 +12,21 @@ handles to indexer and query callbacks.
 - Durable event append with producer idempotency through `dedupeKey`
 - Event -> materialization -> work in one transaction
 - Typed materialization schema, event refs, indexers, and queries
-- Immutable module phases with optional query-backed model resolution
+- Immutable module phases with ordered, query-backed application assembly
 - Durable queue work with leases, retries, dead-letter outcomes, and restart
   recovery
 - Durable event streams through `tailEvents(...)` and `resumeEvents(...)`
 - Process-local live signals for short-lived follow-up work
+- Owner-bound typed result capabilities for composing reusable ledger modules
 
 ## Quick Start
 
 ```ts
 import { Type } from "typebox";
 
-import { createBetterSqliteLedger } from "@torkbot/sledge/better-sqlite3-ledger";
+import { defineSledge } from "@torkbot/sledge";
+import { createBetterSqliteSledge } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
-  composeLedgerModules,
   declareLedgerModule,
   defineMaterialization,
   linkLedgerModule,
@@ -119,7 +120,7 @@ const usersModule = linkedUsers.register({
         .where("userId", "=", params.userId)
         .executeTakeFirst();
 
-      if (row === null) {
+      if (row === undefined) {
         return null;
       }
 
@@ -153,65 +154,163 @@ const usersModule = linkedUsers.register({
   },
 });
 
-const model = composeLedgerModules(usersModule);
+const application = defineSledge((sledge) => {
+  const users = sledge.install({
+    module: usersModule,
+    capabilities: {
+      events: usersModule.events,
+      queries: usersModule.queries,
+    },
+  });
+
+  return sledge.expose({ users });
+});
 const runtimeScheduler = new NodeRuntimeScheduler();
 
-await using ledger = await createBetterSqliteLedger({
+await using opened = await createBetterSqliteSledge({
+  application,
   databaseUrl,
-  model,
   timing: {
     clock: new SystemRuntimeClock(),
     scheduler: runtimeScheduler,
   },
 });
 
-await using workers = await ledger.startWorkers({
+await using workers = await opened.ledger.startWorkers({
   scheduler: runtimeScheduler,
 });
 
-await ledger.emit(usersModule.events["user.created"], {
+await opened.ledger.emit(opened.capabilities.users.events["user.created"], {
   userId: "u_123",
   email: "alice@example.com",
 });
 
-const user = await ledger.query(usersModule.queries.userById, {
-  userId: "u_123",
-});
+const user = await opened.ledger.query(
+  opened.capabilities.users.queries.userById,
+  {
+    userId: "u_123",
+  },
+);
 console.log(user);
 ```
 
+## Standard Library: Typed Results
+
+The first standard-library contract is an addressable durable result. It gives
+independently defined modules a common way to name and observe eventual results
+without making `WorkRef` a domain identity or appending a second generic
+settlement event.
+
+Declare the result before declaring the producer module so its owner-bound ref
+schema can be used directly in durable payloads:
+
+```ts
+import { Type } from "typebox";
+
+import { defineSledge } from "@torkbot/sledge";
+import { createBetterSqliteSledge } from "@torkbot/sledge/better-sqlite3-ledger";
+import {
+  declareLedgerModule,
+  linkLedgerModule,
+  type LedgerTiming,
+} from "@torkbot/sledge/ledger";
+import { defineResult } from "@torkbot/sledge/stdlib";
+
+const CompactionResultSchema = Type.Object({
+  keptRevision: Type.String(),
+  removedRevisions: Type.Integer({ minimum: 0 }),
+});
+
+function defineCompactionsModule() {
+  const result = defineResult({
+    moduleId: "app.compactions",
+    resultSchema: CompactionResultSchema,
+  });
+  const declaration = declareLedgerModule({
+    moduleId: "app.compactions",
+    events: {
+      completed: Type.Object({
+        ref: result.refSchema,
+        output: CompactionResultSchema,
+      }),
+    },
+  });
+  const module = linkLedgerModule(declaration, null).register({});
+
+  return {
+    module,
+    capabilities: {
+      result: result.fromEvent(module.events.completed, (payload) => ({
+        ref: payload.ref,
+        outcome: "succeeded",
+      })),
+    },
+  };
+}
+
+const application = defineSledge((sledge) =>
+  sledge.expose({
+    compactions: sledge.install(defineCompactionsModule()),
+  }),
+);
+
+declare const databaseUrl: string;
+declare const timing: LedgerTiming;
+
+await using opened = await createBetterSqliteSledge({
+  application,
+  databaseUrl,
+  timing,
+});
+const ref = opened.capabilities.compactions.result.ref("document-42");
+```
+
+`ResultRef<TResult, TModuleId>` carries both the result type and its producing
+module as phantom types. A ref from another module is rejected by TypeScript
+even when both modules return the same payload shape. `refSchema` also validates
+the producer prefix when refs cross event, outcome, or projection boundaries.
+Store refs exactly as returned and do not construct or parse their string
+representation.
+
+`fromEvent(...)` accepts only a plain event token owned by the same module and
+returns a new `ResultPort`; it never activates or mutates the declared result.
+Its `source` pairs that exact terminal event with a normalized
+`succeeded | failed | cancelled` observation. A join or race module can
+contribute a handler to the original typed event, update its own projection,
+and wake dependents in the same append transaction. The typed terminal event
+therefore remains the only durable fact.
+
+`ResultSource.observe(...)` is a composition-time adapter for payloads already
+decoded by the paired Sledge event token. It is not an input-validation API;
+untrusted I/O must still enter through declared ledger schemas.
+
 ## Module and Model Phases
 
-Sledge separates module construction from ledger runtime construction. Each
-transition returns a new value with the capabilities that are valid in that
-phase; construction never activates an existing value in place.
-
-This separation serves two distinct model-building paths:
-
-- A statically known application composes its registered modules without
-  opening storage.
-- An application whose module set is stored in the ledger prepares a closed
-  subset, queries it, and returns a new prepared value extended with the
-  discovered modules.
+Sledge separates module construction, application assembly, and the opened
+runtime. Module construction returns new values as capabilities become valid.
+Application assembly uses one small scoped interface: install a module, query
+the installed prefix when discovery needs durable state, and expose the
+capabilities the opened application should reveal.
 
 Sledge does not define plugins, plugin manifests, or module loading policy. A
 userspace registry may store plugin descriptors, package ids, feature flags, or
 any other configuration. Sledge only supplies the phase boundaries needed to
 query that registry and build one final ledger model safely.
 
-| Value                    | Produced by                                                             | Capability added                                              |
-| ------------------------ | ----------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `DeclaredLedgerModule`   | `declareLedgerModule(...)`                                              | Durable contract tokens and a typed logical shape             |
-| `LinkedLedgerModule`     | `linkLedgerModule(...)`                                                 | A materialization contract and registration capability        |
-| `RegisteredLedgerModule` | `linked.register(...)`                                                  | Implementations and handlers; ready for model construction    |
-| `ComposedLedgerModel`    | `composeLedgerModules(...)`                                             | A closed, storage-independent static module graph             |
-| `PreparedLedgerModel`    | resolver `prepare(...)` / `extend(...)`                                 | Storage-backed query capability for the modules in that value |
-| `Ledger`                 | `await createBetterSqliteLedger(...)` or `await createTursoLedger(...)` | Append, query, streams, signals, history, and worker startup  |
+| Phase                      | Produced by                                    | Capability added                                           |
+| -------------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
+| `DeclaredLedgerModule`     | `declareLedgerModule(...)`                     | Durable contract tokens and a typed logical shape          |
+| `LinkedLedgerModule`       | `linkLedgerModule(...)`                        | A materialization contract and registration capability     |
+| `RegisteredLedgerModule`   | `linked.register(...)`                         | Implementations and handlers; ready to install             |
+| `LedgerModuleContribution` | A module factory                               | Registered module plus the bounded capabilities it reveals |
+| `SledgeApplication`        | `defineSledge(...)`                            | A reusable, storage-independent assembly definition        |
+| `OpenedSledge`             | `await createBetterSqliteSledge(...)` or Turso | Per-open capabilities plus the owning ledger runtime       |
 
-A composed model is not a dormant ledger. It owns no connection or mutable
-runtime state; it is a reusable, adapter-independent graph description. The
-dynamic path does not add a separate public "sealed" value: returning the final
-prepared value completes resolution, and the adapter opens that exact graph.
+There is no public composed, prepared, sealed, or activated model. Those are
+adapter-owned implementation phases. `sledge.expose(...)` proves that the
+returned capability tree belongs to this assembly. Returning it finishes
+assembly, revokes the scoped methods, and lets the adapter open the exact
+installed graph.
 
 ### 1. Declare Durable Contracts
 
@@ -501,140 +600,117 @@ Registration returns an inert `RegisteredLedgerModule`. It exposes the exact
 event, query, and signal tokens that consumers use, but it cannot touch storage
 or start work.
 
-### 4. Construct the Model
+### 4. Define the Application
 
-When the complete module set is known in code, compose it without opening
-storage:
-
-```ts
-const model = composeLedgerModules(usersModule, auditModule, deliveryModule);
-```
-
-`composeLedgerModules(...)` validates unique module ids and exact owners for
-every imported event and query token. The returned `ComposedLedgerModel` is a
-pure graph description: it can be inspected, reused for multiple handles, or
-passed to either storage adapter. It is not an open or stateful ledger.
-
-Registered modules retain the exact event, query, and signal token maps created
-during definition. A module factory can therefore return its registered module
-directly: consumers use its public tokens as capabilities, while the
-composition root passes the same value to `composeLedgerModules(...)`.
-Generic module factories preserve those aliased event payload and query types
-without widening the referenced module's identity.
-
-Modules can reuse an event contract by supplying another module's event token
-as the definition value. The alias is a code-level name for the exact same
-persisted event:
+A module factory returns one `LedgerModuleContribution`: its registered module
+and only the capabilities consumers should see. `defineSledge(...)` installs
+those contributions in deterministic order and returns the application-level
+capability tree:
 
 ```ts
-const auditDeclaration = declareLedgerModule({
-  moduleId: "app.audit",
-  events: {
-    userCreated: usersModule.events["user.created"],
-  },
+import { defineSledge } from "@torkbot/sledge";
+
+const application = defineSledge((sledge) => {
+  const users = sledge.install(defineUsersModule());
+  const audit = sledge.install(defineAuditModule(users));
+  const delivery = sledge.install(defineDeliveryModule(users));
+
+  return sledge.expose({ audit, delivery, users });
 });
 ```
 
-Query definitions work the same way: supplying
-`usersModule.queries.userById` in another module's materialization query
-definitions creates a local alias that routes to the owning module's query
-implementation. The consuming module does not implement that alias.
+`install(...)` immediately returns that contribution's exact capability type.
+The registered module stays inside assembly, so callers neither retain model
+handles nor perform a final composition step. The same application definition
+is reusable: every open runs it again and receives the capability tree returned
+by that run. Concurrent opens never share assembly state.
 
-Event and query references establish contract availability, not execution
-order. For one append, Sledge runs contributions in
-`composeLedgerModules(...)` order, left to right, inside the existing atomic
-transaction. A query invoked during indexing sees committed state plus writes
-performed earlier in that append, but never writes from later contributions.
-Any failure rolls back the persisted event, projection writes, and queued work
-from every module.
+Module factories may consume capabilities installed earlier in the same
+assembly, as `defineAuditModule(users)` does above. Passing those dependencies
+through another contribution preserves their original module ownership.
+Capabilities from another application cannot be rebound through `install(...)`.
+Any raw event, query, or signal token exposed by a contribution must also be a
+contract of that contribution's registered module, including an explicit alias.
 
-Indexer definitions, durable queue definitions, projection tables and indexes,
-and materialization histories remain owned by their defining module. Consumers
-reference source event tokens and define their own indexers or queues; queues
-and indexers cannot be aliased across modules.
+`expose(...)` is a type-only ownership boundary, not a composition step. It
+returns the same object while proving that every installed capability in the
+tree came from this invocation. A capability retained from another application
+cannot be exposed or queried through this assembly, even when both applications
+use the same module factory.
 
-#### Resolve a Model From Ledger Queries
+Installed tokens retain their module identity independently of the surrounding
+object, so applications can expose a selected subtree such as
+`sledge.expose({ events: users.events })` without also revealing the rest of the
+module's capabilities. Callable capability values are leaves; represent
+metadata or related installed capabilities as sibling object fields rather than
+properties attached to the function.
 
-Sometimes the ledger itself stores which modules should participate in its
-model. `defineLedgerModel(...)` lets the storage adapter resolve that graph
-before it opens the runtime:
+Installed capabilities carry graph membership only in the type system.
+`sledge.query(...)` rejects tokens that did not come through `install(...)`, and
+the opened ledger accepts tokens only from modules reachable through the
+returned application capability tree. Runtime validation enforces the same
+ownership boundary for untyped callers.
+
+Installation order is durable and semantic. For one append, Sledge runs module
+contributions from left to right in that order inside one atomic transaction.
+A query during indexing sees committed state plus earlier writes from the same
+append, never later writes. Any failure rolls back the event, projection
+writes, and queued work from every module.
+
+Modules may reuse another installed module's exact event or query tokens when
+declaring their own contracts. Those aliases establish contract availability;
+they do not duplicate persisted events, query implementations, or storage
+ownership. Indexers, queues, projection schema, and migrations remain owned by
+the module that defines them.
+
+#### Discover Modules From Ledger Queries
+
+An application can query its installed prefix before choosing later modules:
 
 ```ts
-import {
-  defineLedgerModel,
-  type AnyRegisteredLedgerModule,
-} from "@torkbot/sledge/ledger";
-
-type ModuleDescriptor = {
-  readonly specifier: string;
-};
-
-declare function loadConfiguredModules(
-  descriptors: readonly ModuleDescriptor[],
-): Promise<
-  readonly [AnyRegisteredLedgerModule, ...AnyRegisteredLedgerModule[]]
->;
-
-const model = defineLedgerModel(async ({ prepare, extend }) => {
-  const registry = await prepare(moduleRegistry);
-  const descriptors = await registry.query(
-    moduleRegistry.queries.configuredModules,
+const application = defineSledge(async (sledge) => {
+  const registry = sledge.install(defineModuleRegistry());
+  const descriptors = await sledge.query(
+    registry.queries.configuredModules,
     {},
   );
 
-  if (descriptors.length === 0) {
-    return registry;
+  for (const descriptor of descriptors) {
+    sledge.install(await loadConfiguredModule(descriptor));
   }
 
-  const [first, ...rest] = await loadConfiguredModules(descriptors);
-  return await extend(registry, first, ...rest);
-});
-
-await using ledger = await createBetterSqliteLedger({
-  databaseUrl,
-  model,
-  timing,
+  return sledge.expose({ registry });
 });
 ```
 
-The resolver receives methods scoped to that one open operation:
+Calling `query(...)` forms a phase boundary. Sledge prepares an immutable,
+query-only view of every module installed so far, runs the typed query, and
+keeps append, workers, streams, signals, and the public ledger API unavailable.
+Installing more modules creates the next prefix; another query observes that
+expanded prefix. Repeated queries without another install reuse the prepared
+view.
 
-- `prepare(first, ...rest)` creates a query-only prepared value for one closed
-  set of registered modules.
-- `extend(prepared, first, ...rest)` returns a different prepared value whose
-  query capability includes the added modules. It never mutates the input.
-- Returning a prepared value ends model resolution. The adapter then opens
-  that exact graph; there is no separate activation or sealing call.
+The application—not Sledge—interprets descriptors, loads code, applies trust
+policy, and decides when discovery is complete. Sledge has no built-in concept
+of plugins. A plugin registry, feature flags, tenant configuration, or another
+design can all be built from the same `install` and `query` phases.
 
-A prepared value exposes `query(...)` only. It cannot append events, start
-workers, tail events, publish signals, or re-enter the public ledger API.
-Prepared values and resolver methods are revoked when the resolver returns;
-retaining one in an application closure does not extend its storage access.
-Preparation may install or migrate the selected modules' storage-local
-materializations so their queries are valid, but application callbacks still
-receive only the ordinary typed read facade.
+Assembly methods are scoped to one open and revoked as soon as the definition
+returns. Sledge drains queries that began legitimately before opening the
+owning runtime, so a retained closure cannot overlap or re-enter it. Every
+started query must succeed: an abandoned rejection fails the open rather than
+becoming an unobserved background error.
 
-Discovery happens in explicit application-controlled waves. A resolver may
-query one prepared value, extend it, query the returned value, and extend again.
-Sledge does not search for modules, run an automatic fixed point, or interpret
-the query result. This keeps loading, trust, authorization, and termination
-policy in userspace.
+On an existing database, every queried prefix must match the beginning of the
+stored module order. The final installed graph must match that durable root
+exactly. Changing the set or order is a durable model change requiring an
+intentional migration or reset; it is not runtime hot-plugging.
 
-On an existing database, every prepared module list must be an ordered prefix
-of the stored composed root. This permits a registry module to be queried
-before later modules are loaded without allowing an unrelated graph to run
-migrations. The final opened model must still match the stored root exactly.
-Changing the configured module set or its order is therefore a durable model
-change that requires an intentional compatibility, migration, or reset policy;
-it is not runtime hot-plugging.
-
-A fresh database contains neither ledger facts nor a durable root to discover.
-Its first boot must compose the complete initial module set from code or an
-external bootstrap input and open that static model. Later boots can use ledger
-queries to reconstruct the same root. Prepared resolution rejects an unowned
-database rather than running migrations before the durable root is known.
-Sledge deliberately does not invent a bootstrap or root-evolution policy at
-this boundary.
+A fresh database has no durable facts or root from which to discover modules.
+Its first open must install the complete initial graph from code or external
+bootstrap input without querying. Later opens may reconstruct that same graph
+from ledger queries. Querying an unowned database fails before migrations run,
+so Sledge never guesses a bootstrap or root-evolution policy.
 
 ### 5. Run Database Hygiene
 
@@ -652,23 +728,22 @@ Module identity namespaces projection tables, projection indexes, durable
 queues, and materialization histories in SQLite, so independently defined
 modules can use the same local names without physical collisions.
 
-The first open records the composed root's ordered module ids. Every later
+The first open records the application's ordered module ids. Every later
 runtime opening that database must supply the exact same modules in the same
-composition order. Static models are checked before schema mutation or work
-dispatch. During query-backed resolution, each prepared prefix is checked
-before its module migrations and the completed graph is checked exactly before
-the runtime opens. Rolling processes therefore cannot apply different handler
+installation order. Query-backed prefixes are checked before their module
+migrations, and the completed graph is checked exactly before the runtime
+opens. Rolling processes therefore cannot apply different handler
 contributions to one logical ledger.
 
 ### 6. Open a Runtime
 
-Await one adapter to open the ledger:
+Await one adapter to open the application:
 
-- `createBetterSqliteLedger(...)`
-- `createTursoLedger(...)`
+- `createBetterSqliteSledge(...)`
+- `createTursoSledge(...)`
 
-Both functions are asynchronous because a `LedgerModelDefinition` may need to
-prepare and query storage before the runtime model is known.
+Both return an `OpenedSledge` containing the per-open `capabilities` returned
+by the application definition and the owning `ledger` runtime.
 
 Adapters take a `databaseUrl` filesystem path and Sledge owns the database
 connections it opens. SQLite in-memory URLs (`:memory:` and `file:...mode=memory`
@@ -1031,12 +1106,14 @@ without being embedded in event consumption.
 
 ## Package Exports
 
+- `@torkbot/sledge`
 - `@torkbot/sledge/ledger`
 - `@torkbot/sledge/better-sqlite3-ledger`
 - `@torkbot/sledge/turso-ledger`
 - `@torkbot/sledge/runtime/contracts`
 - `@torkbot/sledge/runtime/node-runtime`
 - `@torkbot/sledge/runtime/virtual-runtime`
+- `@torkbot/sledge/stdlib`
 
 ## Development
 

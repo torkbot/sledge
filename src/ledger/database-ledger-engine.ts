@@ -23,10 +23,12 @@ import {
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
   AnyComposedLedgerModel,
-  AnyMaterializationHistory,
   ComposedLedgerEventTokens,
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
+} from "./ledger-composition.ts";
+import type {
+  AnyMaterializationHistory,
   RegisteredLedgerModule,
   AddressedEnqueueOptions,
   EmitOptions,

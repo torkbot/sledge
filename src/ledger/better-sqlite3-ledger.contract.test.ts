@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
+import { createBetterSqliteSledge } from "../better-sqlite3-ledger.ts";
 import { createBetterSqliteLedger } from "./better-sqlite3-ledger.ts";
 import {
   createLedgerContractControlledWork,
@@ -16,8 +17,9 @@ import {
   type LedgerContractDecisionMode,
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
-import { composeLedgerModules, type LedgerWorkers } from "./ledger.ts";
+import type { LedgerWorkers } from "./ledger.ts";
 import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
+import { defineSledge } from "../sledge.ts";
 
 runSqliteLedgerCloseContract({
   suiteName: "better-sqlite ledger",
@@ -59,16 +61,21 @@ runLedgerContractSuite({
         runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
           timedWork.run(workKey, timeoutMs, leaseSignal, control),
       });
-      const ledger = await createBetterSqliteLedger({
+      const application = defineSledge((sledge) => {
+        sledge.install({ module: model, capabilities: {} });
+
+        return sledge.expose({});
+      });
+      const opened = await createBetterSqliteSledge({
+        application,
         databaseUrl,
-        model: composeLedgerModules(model),
         timing: {
           clock: runtime.clock,
           scheduler: runtime.scheduler,
         },
       });
 
-      return createLedgerContractHarnessLedger(ledger);
+      return createLedgerContractHarnessLedger(opened.ledger);
     };
 
     let ledger = await createRuntimeLedger();

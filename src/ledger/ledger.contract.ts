@@ -681,6 +681,7 @@ export type LedgerContractDecisionMode =
 
 export type LedgerContractControlledWorkGate = {
   readonly entered: Promise<void>;
+  readonly settled: Promise<void>;
   release(): void;
 };
 
@@ -772,6 +773,7 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
     readonly entered: PromiseWithResolvers<void>;
     readonly outcome: LedgerContractControlledWorkOutcome;
     readonly release: PromiseWithResolvers<void>;
+    readonly settled: PromiseWithResolvers<void>;
   };
 
   const gates = new Map<string, ControlledWorkGate[]>();
@@ -785,14 +787,16 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
   ): LedgerContractControlledWorkGate => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
+    const settled = Promise.withResolvers<void>();
     const attemptKey = `${workKey}:${attempt}`;
 
     const prepared = gates.get(attemptKey) ?? [];
-    prepared.push({ entered, outcome, release });
+    prepared.push({ entered, outcome, release, settled });
     gates.set(attemptKey, prepared);
 
     return {
       entered: entered.promise,
+      settled: settled.promise,
       release: () => release.resolve(),
     };
   };
@@ -827,6 +831,7 @@ export function createLedgerContractControlledWork(): LedgerContractControlledWo
         return gate.outcome;
       } finally {
         activeGates.delete(gate);
+        gate.settled.resolve();
       }
     },
     startedWorkKeys: () => [...startedWorkKeys],
@@ -2663,6 +2668,91 @@ export function runLedgerContractSuite(input: {
         assert.equal(cancellation.status, "cancelled");
       });
     });
+
+    await t.test(
+      "cancellation wins against a leased acknowledgement and remains recoverable after restart",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const workKey = "cancelled-before-ack";
+          const gate = harness.prepareControlledWork(workKey);
+          const committed = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              partitionKey: null,
+              workKey,
+            },
+          );
+          const outcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            committed.outcome,
+          );
+
+          await harness.flush();
+          await gate.entered;
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "cancel before acknowledgement",
+          });
+
+          assert.equal(cancellation.status, "cancelled");
+
+          gate.release();
+          await gate.settled;
+          await harness.restart();
+
+          const recoveredCancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "recover cancellation settlement",
+          });
+
+          assert.equal(recoveredCancellation.status, "cancelled");
+        });
+      },
+    );
+
+    await t.test(
+      "acknowledgement wins against a later cancellation",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const workKey = "acked-before-cancellation";
+          const gate = harness.prepareControlledWork(workKey);
+          const committed = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              partitionKey: null,
+              workKey,
+            },
+          );
+          const outcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            committed.outcome,
+          );
+
+          await harness.flush();
+
+          const attempted = observeControlledAttempt(
+            harness,
+            workKey,
+            1,
+            gate.release,
+          );
+
+          await gate.entered;
+          await attempted;
+          await harness.waitForIdle();
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "too late to cancel",
+          });
+
+          assert.equal(cancellation.status, "not_found");
+        });
+      },
+    );
 
     await t.test(
       "coalesced enqueue returns the preserved WorkRef",
