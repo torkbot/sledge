@@ -27,21 +27,19 @@ application definition installs those contributions in durable order and
 exposes one capability tree:
 
 ```ts
-import { defineSledge } from "@torkbot/sledge";
-import { createBetterSqliteSledge } from "@torkbot/sledge/better-sqlite3-ledger";
+import { defineLedger } from "@torkbot/sledge";
+import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
 
-const application = defineSledge((sledge) => {
+const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
   const audit = sledge.install(defineAuditModule(users));
 
   return sledge.expose({ audit, users });
 });
 
-await using opened = await createBetterSqliteSledge({
-  application,
-  databaseUrl,
-  timing,
-});
+await using opened = await application.open(
+  createBetterSqliteDriver({ databaseUrl }),
+);
 
 await opened.ledger.emit(opened.capabilities.users.events.created, {
   userId: "u_123",
@@ -58,26 +56,25 @@ assembly vocabulary:
 - `expose(capabilities)` selects what consumers receive and proves that its
   installed capabilities belong to this assembly.
 
-The storage adapter owns compilation, migrations, temporary query-only prefix
-views, final graph validation, and the one live ledger runtime. Applications do
-not compose model handles or activate a partially prepared value.
+The application owns assembly and opening. Its driver owns storage compilation,
+connections, and migrations. Together they create temporary query-only prefix
+views, validate the final graph, and open the one live ledger runtime.
+Applications do not compose model handles or activate a partially prepared
+value.
 
 ## Complete Example
 
 ```ts
 import { Type } from "typebox";
 
-import { defineSledge } from "@torkbot/sledge";
-import { createBetterSqliteSledge } from "@torkbot/sledge/better-sqlite3-ledger";
+import { defineLedger } from "@torkbot/sledge";
+import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
   declareLedgerModule,
   defineMaterialization,
   linkLedgerModule,
 } from "@torkbot/sledge/ledger";
-import {
-  NodeRuntimeScheduler,
-  SystemRuntimeClock,
-} from "@torkbot/sledge/runtime/node-runtime";
+import { NodeRuntimeScheduler } from "@torkbot/sledge/runtime/node-runtime";
 
 const databaseUrl = "./app.sqlite";
 
@@ -197,7 +194,7 @@ const usersModule = linkedUsers.register({
   },
 });
 
-const application = defineSledge((sledge) => {
+const application = defineLedger((sledge) => {
   const users = sledge.install({
     module: usersModule,
     capabilities: {
@@ -210,14 +207,9 @@ const application = defineSledge((sledge) => {
 });
 const runtimeScheduler = new NodeRuntimeScheduler();
 
-await using opened = await createBetterSqliteSledge({
-  application,
-  databaseUrl,
-  timing: {
-    clock: new SystemRuntimeClock(),
-    scheduler: runtimeScheduler,
-  },
-});
+await using opened = await application.open(
+  createBetterSqliteDriver({ databaseUrl }),
+);
 
 await using workers = await opened.ledger.startWorkers({
   scheduler: runtimeScheduler,
@@ -237,11 +229,12 @@ const user = await opened.ledger.query(
 console.log(user);
 ```
 
-## Migrating from 0.24
+## Migrating to 0.26
 
-Version 0.25 replaces the public composed-model and prepared-model APIs with
-one application assembly API. This is an intentional source-level break; there
-are no deprecated aliases or compatibility adapters.
+Version 0.26 finishes the application assembly design introduced in 0.25. The
+application now opens itself with an injected storage driver, and Node timing is
+the default. This is an intentional source-level break; there are no deprecated
+aliases or compatibility adapters.
 
 ### Replace root composition with an application
 
@@ -260,23 +253,21 @@ await using ledger = await createBetterSqliteLedger({
 await ledger.emit(usersModule.events.created, payload);
 ```
 
-In 0.25, module factories return `{ module, capabilities }`. Install them inside
-`defineSledge(...)`, expose the application capability tree, and open it through
-the renamed adapter:
+Module factories return `{ module, capabilities }`. Install them inside
+`defineLedger(...)`, expose the application capability tree, then ask that
+application to open with a driver:
 
 ```ts
-const application = defineSledge((sledge) => {
+const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
   const audit = sledge.install(defineAuditModule(users));
 
   return sledge.expose({ audit, users });
 });
 
-await using opened = await createBetterSqliteSledge({
-  application,
-  databaseUrl,
-  timing,
-});
+await using opened = await application.open(
+  createBetterSqliteDriver({ databaseUrl }),
+);
 
 await opened.ledger.emit(opened.capabilities.users.events.created, payload);
 ```
@@ -292,7 +283,7 @@ the registry contribution, query that installed prefix, then install the modules
 selected by userspace policy:
 
 ```ts
-const application = defineSledge(async (sledge) => {
+const application = defineLedger(async (sledge) => {
   const registry = sledge.install(defineModuleRegistry());
   const descriptors = await sledge.query(
     registry.queries.configuredModules,
@@ -314,19 +305,20 @@ opening the final runtime, and an abandoned query failure rejects the open.
 
 ### Update imports and opened values
 
-| 0.24                                         | 0.25                                             |
-| -------------------------------------------- | ------------------------------------------------ |
-| `composeLedgerModules(...)`                  | `defineSledge(...)` plus `sledge.install(...)`   |
-| `defineLedgerModel(...)`                     | An async `defineSledge(...)` callback            |
-| `prepare(...)` / `extend(...)`               | `sledge.query(...)` / `sledge.install(...)`      |
-| `createBetterSqliteLedger({ model, ... })`   | `createBetterSqliteSledge({ application, ... })` |
-| `createTursoLedger({ model, ... })`          | `createTursoSledge({ application, ... })`        |
-| The returned `Ledger`                        | `OpenedSledge.ledger`                            |
-| Registered module handles used as public API | `OpenedSledge.capabilities`                      |
+| Before                                           | 0.26                                                  |
+| ------------------------------------------------ | ----------------------------------------------------- |
+| `composeLedgerModules(...)`                      | `defineLedger(...)` plus `sledge.install(...)`        |
+| `defineLedgerModel(...)`                         | An async `defineLedger(...)` callback                 |
+| `prepare(...)` / `extend(...)`                   | `sledge.query(...)` / `sledge.install(...)`           |
+| `defineSledge(...)`                              | `defineLedger(...)`                                   |
+| `createBetterSqliteSledge({ application, ... })` | `application.open(createBetterSqliteDriver({ ... }))` |
+| `createTursoSledge({ application, ... })`        | `application.open(createTursoDriver({ ... }))`        |
+| A required production `timing` input             | Node timing by default; an optional test override     |
+| Registered module handles used as public API     | `OpenedLedger.capabilities`                           |
 
-The root `defineSledge` export is now the application entry point. Low-level
-ledger declarations remain under `@torkbot/sledge/ledger`, the two storage
-constructors keep their adapter subpaths, and curated primitives live under
+The root `defineLedger` export is now the application entry point. Low-level
+ledger declarations remain under `@torkbot/sledge/ledger`, the two driver
+factories keep their adapter subpaths, and curated primitives live under
 `@torkbot/sledge/stdlib`.
 
 ### Preserve the durable graph
@@ -354,13 +346,9 @@ schema can be used directly in durable payloads:
 ```ts
 import { Type } from "typebox";
 
-import { defineSledge } from "@torkbot/sledge";
-import { createBetterSqliteSledge } from "@torkbot/sledge/better-sqlite3-ledger";
-import {
-  declareLedgerModule,
-  linkLedgerModule,
-  type LedgerTiming,
-} from "@torkbot/sledge/ledger";
+import { defineLedger } from "@torkbot/sledge";
+import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
+import { declareLedgerModule, linkLedgerModule } from "@torkbot/sledge/ledger";
 import { defineResult } from "@torkbot/sledge/stdlib";
 
 const CompactionResultSchema = Type.Object({
@@ -369,12 +357,13 @@ const CompactionResultSchema = Type.Object({
 });
 
 function defineCompactionsModule() {
+  const moduleId = "app.compactions";
   const result = defineResult({
-    moduleId: "app.compactions",
+    moduleId,
     resultSchema: CompactionResultSchema,
   });
   const declaration = declareLedgerModule({
-    moduleId: "app.compactions",
+    moduleId,
     events: {
       completed: Type.Object({
         ref: result.refSchema,
@@ -395,20 +384,17 @@ function defineCompactionsModule() {
   };
 }
 
-const application = defineSledge((sledge) =>
+const application = defineLedger((sledge) =>
   sledge.expose({
     compactions: sledge.install(defineCompactionsModule()),
   }),
 );
 
 declare const databaseUrl: string;
-declare const timing: LedgerTiming;
 
-await using opened = await createBetterSqliteSledge({
-  application,
-  databaseUrl,
-  timing,
-});
+await using opened = await application.open(
+  createBetterSqliteDriver({ databaseUrl }),
+);
 const ref = opened.capabilities.compactions.result.ref("document-42");
 ```
 
@@ -444,14 +430,14 @@ userspace registry may store plugin descriptors, package ids, feature flags, or
 any other configuration. Sledge only supplies the phase boundaries needed to
 query that registry and build one final ledger model safely.
 
-| Phase                      | Produced by                                    | Capability added                                           |
-| -------------------------- | ---------------------------------------------- | ---------------------------------------------------------- |
-| `DeclaredLedgerModule`     | `declareLedgerModule(...)`                     | Durable contract tokens and a typed logical shape          |
-| `LinkedLedgerModule`       | `linkLedgerModule(...)`                        | A materialization contract and registration capability     |
-| `RegisteredLedgerModule`   | `linked.register(...)`                         | Implementations and handlers; ready to install             |
-| `LedgerModuleContribution` | A module factory                               | Registered module plus the bounded capabilities it reveals |
-| `SledgeApplication`        | `defineSledge(...)`                            | A reusable, storage-independent assembly definition        |
-| `OpenedSledge`             | `await createBetterSqliteSledge(...)` or Turso | Per-open capabilities plus the owning ledger runtime       |
+| Phase                      | Produced by                      | Capability added                                           |
+| -------------------------- | -------------------------------- | ---------------------------------------------------------- |
+| `DeclaredLedgerModule`     | `declareLedgerModule(...)`       | Durable contract tokens and a typed logical shape          |
+| `LinkedLedgerModule`       | `linkLedgerModule(...)`          | A materialization contract and registration capability     |
+| `RegisteredLedgerModule`   | `linked.register(...)`           | Implementations and handlers; ready to install             |
+| `LedgerModuleContribution` | A module factory                 | Registered module plus the bounded capabilities it reveals |
+| `LedgerApplication`        | `defineLedger(...)`              | A reusable, storage-independent assembly definition        |
+| `OpenedLedger`             | `await application.open(driver)` | Per-open capabilities plus the owning ledger runtime       |
 
 There is no public composed, prepared, sealed, or activated model. Those are
 adapter-owned implementation phases. `sledge.expose(...)` proves that the
@@ -750,14 +736,14 @@ or start work.
 ### 4. Define the Application
 
 A module factory returns one `LedgerModuleContribution`: its registered module
-and only the capabilities consumers should see. `defineSledge(...)` installs
+and only the capabilities consumers should see. `defineLedger(...)` installs
 those contributions in deterministic order and returns the application-level
 capability tree:
 
 ```ts
-import { defineSledge } from "@torkbot/sledge";
+import { defineLedger } from "@torkbot/sledge";
 
-const application = defineSledge((sledge) => {
+const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
   const audit = sledge.install(defineAuditModule(users));
   const delivery = sledge.install(defineDeliveryModule(users));
@@ -815,7 +801,7 @@ the module that defines them.
 An application can query its installed prefix before choosing later modules:
 
 ```ts
-const application = defineSledge(async (sledge) => {
+const application = defineLedger(async (sledge) => {
   const registry = sledge.install(defineModuleRegistry());
   const descriptors = await sledge.query(
     registry.queries.configuredModules,
@@ -884,16 +870,36 @@ contributions to one logical ledger.
 
 ### 6. Open a Runtime
 
-Await one adapter to open the application:
+Create a driver, then pass it to the application:
 
-- `createBetterSqliteSledge(...)`
-- `createTursoSledge(...)`
+```ts
+await using opened = await application.open(
+  createBetterSqliteDriver({ databaseUrl }),
+);
+```
 
-Both return an `OpenedSledge` containing the per-open `capabilities` returned
-by the application definition and the owning `ledger` runtime.
+`createBetterSqliteDriver(...)` and `createTursoDriver(...)` return inert,
+storage-specific drivers. `application.open(driver)` runs assembly against that
+driver and returns an `OpenedLedger` containing the per-open `capabilities` and
+the owning `ledger` runtime.
 
-Adapters take a `databaseUrl` filesystem path and Sledge owns the database
-connections it opens. SQLite in-memory URLs (`:memory:` and `file:...mode=memory`
+On Node.js, `open(...)` supplies `SystemRuntimeClock` and
+`NodeRuntimeScheduler` automatically. Deterministic tests may pass one coherent
+`LedgerTiming` override as the second argument:
+
+```ts
+import { VirtualRuntimeHarness } from "@torkbot/sledge/runtime/virtual-runtime";
+
+const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+
+await using opened = await application.open(
+  createBetterSqliteDriver({ databaseUrl }),
+  runtime,
+);
+```
+
+Drivers take a `databaseUrl` filesystem path and Sledge owns the database
+connections they open. SQLite in-memory URLs (`:memory:` and `file:...mode=memory`
 forms) are rejected because they cannot provide Sledge's required
 multi-connection read/write semantics through these adapters. SQLite URI strings
 starting with `file:` are also rejected because the current drivers do not parse

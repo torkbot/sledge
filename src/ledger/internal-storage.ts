@@ -1,7 +1,18 @@
 import type { Static, TSchema } from "typebox";
 
-import type { LedgerIndexerContext } from "./ledger.ts";
+import type {
+  AnyRegisteredLedgerModule,
+  LedgerIndexerContext,
+  LedgerTiming,
+} from "./ledger.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
+import type {
+  LedgerApplication,
+  LedgerApplicationCapabilities,
+  LedgerApplicationModules,
+  LedgerDriver,
+  OpenedLedger,
+} from "../sledge.ts";
 
 const registeredLedgerImplementationFactoryBrand: unique symbol = Symbol(
   "sledge.registeredLedgerImplementationFactory",
@@ -12,7 +23,8 @@ const registeredLedgerProjectionCompilerFactoryBrand: unique symbol = Symbol(
 const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
   "sledge.registeredLedgerProjectionSchemas",
 );
-const sledgeApplicationConfigureFunctions = new WeakMap<object, unknown>();
+const ledgerApplicationConfigureFunctions = new WeakMap<object, unknown>();
+const ledgerDriverOpenFunctions = new WeakMap<object, LedgerDriverOpen>();
 const ledgerModuleComposers = new WeakMap<
   object,
   (first: object, ...rest: readonly object[]) => object
@@ -27,20 +39,57 @@ export const registeredLedgerRuntimeBrand: unique symbol = Symbol(
   "sledge.registeredLedgerRuntime",
 );
 
-export function attachSledgeApplicationConfigure<
+export function attachLedgerApplicationConfigure<
   TApplication extends object,
   TConfigure,
 >(application: TApplication, configure: TConfigure): TApplication {
-  sledgeApplicationConfigureFunctions.set(application, configure);
+  ledgerApplicationConfigureFunctions.set(application, configure);
   return application;
 }
 
-export function readSledgeApplicationConfigure<TConfigure>(
+export function readLedgerApplicationConfigure<TConfigure>(
   application: object,
 ): TConfigure | undefined {
-  return sledgeApplicationConfigureFunctions.get(application) as
+  return ledgerApplicationConfigureFunctions.get(application) as
     | TConfigure
     | undefined;
+}
+
+export type LedgerDriverOpen = <
+  const TApplication extends LedgerApplication<
+    object,
+    AnyRegisteredLedgerModule
+  >,
+>(input: {
+  readonly application: TApplication;
+  readonly timing: LedgerTiming;
+}) => Promise<
+  OpenedLedger<
+    LedgerApplicationCapabilities<TApplication>,
+    LedgerApplicationModules<TApplication>
+  >
+>;
+
+export function attachLedgerDriverOpen<TDriver extends object>(
+  driver: TDriver,
+  open: LedgerDriverOpen,
+): TDriver {
+  ledgerDriverOpenFunctions.set(driver, open);
+  return driver;
+}
+
+export function createLedgerDriver(open: LedgerDriverOpen): LedgerDriver {
+  // The public brand prevents callers from constructing a driver. Runtime
+  // authenticity is enforced independently by this private open registry.
+  const driver = {} as LedgerDriver;
+  attachLedgerDriverOpen(driver, open);
+  return Object.freeze(driver);
+}
+
+export function readLedgerDriverOpen(
+  driver: object,
+): LedgerDriverOpen | undefined {
+  return ledgerDriverOpenFunctions.get(driver);
 }
 
 /**

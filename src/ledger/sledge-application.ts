@@ -15,26 +15,26 @@ import {
 } from "./database-ledger-engine.ts";
 import {
   composeRegisteredLedgerModules,
-  readSledgeApplicationConfigure,
+  readLedgerApplicationConfigure,
   storageRuntimeIdentityBrand,
 } from "./internal-storage.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
-  OpenedSledge,
+  ApplicationLedger,
   InstalledLedgerModuleCapabilities,
+  LedgerApplication,
+  LedgerApplicationCapabilities,
+  LedgerApplicationModules,
+  LedgerAssembly,
   LedgerModuleContribution,
-  SledgeApplication,
-  SledgeApplicationCapabilities,
-  SledgeApplicationModules,
-  SledgeAssembly,
-  SledgeLedger,
+  OpenedLedger,
 } from "../sledge.ts";
 
-declare const runtimeSledgeAssemblyScope: unique symbol;
-type RuntimeSledgeAssemblyScope = typeof runtimeSledgeAssemblyScope;
+declare const runtimeLedgerAssemblyScope: unique symbol;
+type RuntimeLedgerAssemblyScope = typeof runtimeLedgerAssemblyScope;
 
-type RuntimeSledgeConfigure<TCapabilities extends object> = (
-  assembly: SledgeAssembly<RuntimeSledgeAssemblyScope>,
+type RuntimeLedgerConfigure<TCapabilities extends object> = (
+  assembly: LedgerAssembly<RuntimeLedgerAssemblyScope>,
 ) => TCapabilities | Promise<TCapabilities>;
 
 type PreparedLedger = ReturnType<
@@ -46,23 +46,23 @@ type PreparedLedger = ReturnType<
  * observes an immutable prefix of the installed module order. Returning from
  * the definition revokes the assembly before the owning ledger is opened.
  */
-async function resolveSledgeApplication<
-  const TApplication extends SledgeApplication<object>,
+async function resolveLedgerApplication<
+  const TApplication extends LedgerApplication<object>,
 >(input: {
   readonly application: TApplication;
   readonly storage: StorageRuntime;
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
 }): Promise<{
-  readonly capabilities: SledgeApplicationCapabilities<TApplication>;
+  readonly capabilities: LedgerApplicationCapabilities<TApplication>;
   readonly model: AnyComposedLedgerModel;
 }> {
-  const configure = readSledgeApplicationConfigure<
-    RuntimeSledgeConfigure<SledgeApplicationCapabilities<TApplication>>
+  const configure = readLedgerApplicationConfigure<
+    RuntimeLedgerConfigure<LedgerApplicationCapabilities<TApplication>>
   >(input.application);
 
   if (configure === undefined) {
-    throw new Error("invalid Sledge application");
+    throw new Error("invalid ledger application");
   }
 
   const modules: AnyRegisteredLedgerModule[] = [];
@@ -84,7 +84,7 @@ async function resolveSledgeApplication<
 
   const assertAssemblyOpen = (): void => {
     if (!assemblyOpen) {
-      throw new Error("Sledge assembly has already closed");
+      throw new Error("ledger assembly has already closed");
     }
   };
 
@@ -194,7 +194,7 @@ async function resolveSledgeApplication<
 
       if (first === undefined) {
         throw new Error(
-          "Sledge must install at least one module before querying",
+          "ledger application must install at least one module before querying",
         );
       }
 
@@ -213,12 +213,12 @@ async function resolveSledgeApplication<
     install,
     query,
     expose,
-  }) as SledgeAssembly<RuntimeSledgeAssemblyScope>;
+  }) as LedgerAssembly<RuntimeLedgerAssemblyScope>;
 
   let configuration:
     | {
         readonly status: "fulfilled";
-        readonly value: SledgeApplicationCapabilities<TApplication>;
+        readonly value: LedgerApplicationCapabilities<TApplication>;
       }
     | { readonly status: "rejected"; readonly reason: unknown };
 
@@ -248,7 +248,7 @@ async function resolveSledgeApplication<
     if (additionalFailures.length > 0) {
       throw new AggregateError(
         [configuration.reason, ...additionalFailures],
-        "Sledge application definition and assembly queries failed",
+        "ledger application definition and assembly queries failed",
       );
     }
 
@@ -262,14 +262,14 @@ async function resolveSledgeApplication<
   if (queryFailures.length > 1) {
     throw new AggregateError(
       queryFailures,
-      "Sledge application assembly queries failed",
+      "ledger application assembly queries failed",
     );
   }
 
   const [first, ...rest] = modules;
 
   if (first === undefined) {
-    throw new Error("Sledge application must install at least one module");
+    throw new Error("ledger application must install at least one module");
   }
 
   return {
@@ -279,23 +279,23 @@ async function resolveSledgeApplication<
 }
 
 /** Opens the final graph and transfers adapter storage ownership atomically. */
-export async function openSledgeApplication<
-  const TApplication extends SledgeApplication<object>,
+export async function openLedgerApplication<
+  const TApplication extends LedgerApplication<object>,
 >(input: {
   readonly application: TApplication;
   readonly storage: StorageRuntime;
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
 }): Promise<
-  OpenedSledge<
-    SledgeApplicationCapabilities<TApplication>,
-    SledgeApplicationModules<TApplication>
+  OpenedLedger<
+    LedgerApplicationCapabilities<TApplication>,
+    LedgerApplicationModules<TApplication>
   >
 > {
   let storageTransferred = false;
 
   try {
-    const resolved = await resolveSledgeApplication(input);
+    const resolved = await resolveLedgerApplication(input);
     const ledger = createComposedDatabaseLedger({
       storage: input.storage,
       model: resolved.model,
@@ -312,7 +312,7 @@ export async function openSledgeApplication<
       } catch (closeError: unknown) {
         throw new AggregateError(
           [error, closeError],
-          "failed to open Sledge and close storage",
+          "failed to open ledger application and close storage",
         );
       }
 
@@ -323,8 +323,8 @@ export async function openSledgeApplication<
 
     // The application capability brands carry the exact installed module
     // union. Resolution has just validated and opened that same runtime graph.
-    const typedLedger = ledger as SledgeLedger<
-      SledgeApplicationModules<TApplication>
+    const typedLedger = ledger as ApplicationLedger<
+      LedgerApplicationModules<TApplication>
     >;
 
     return Object.freeze({
@@ -343,7 +343,7 @@ export async function openSledgeApplication<
     } catch (closeError: unknown) {
       throw new AggregateError(
         [error, closeError],
-        "failed to define Sledge and close storage",
+        "failed to open ledger application and close storage",
       );
     }
 

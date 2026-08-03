@@ -25,9 +25,9 @@ import {
   createTursoLedger,
   createTursoStorageRuntime,
 } from "./turso-ledger.ts";
-import { createBetterSqliteSledge } from "../better-sqlite3-ledger.ts";
-import { defineSledge } from "../sledge.ts";
-import { createTursoSledge } from "../turso-ledger.ts";
+import { createBetterSqliteDriver } from "../better-sqlite3-ledger.ts";
+import { defineLedger } from "../sledge.ts";
+import { createTursoDriver } from "../turso-ledger.ts";
 
 const nowMs = 1_900_000_000_000;
 const runtime = new VirtualRuntimeHarness(nowMs);
@@ -468,7 +468,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           },
         },
       });
-      const application = defineSledge((sledge) => {
+      const application = defineLedger((sledge) => {
         const sourceCapabilities = sledge.install({
           module: source,
           capabilities: {},
@@ -491,20 +491,18 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       });
       const openLedger = async () => {
         if (driver === "better-sqlite3") {
-          const opened = await createBetterSqliteSledge({
-            application,
-            databaseUrl,
+          const opened = await application.open(
+            createBetterSqliteDriver({ databaseUrl }),
             timing,
-          });
+          );
 
           return opened.ledger;
         }
 
-        const opened = await createTursoSledge({
-          application,
-          databaseUrl,
+        const opened = await application.open(
+          createTursoDriver({ databaseUrl }),
           timing,
-        });
+        );
 
         return opened.ledger;
       };
