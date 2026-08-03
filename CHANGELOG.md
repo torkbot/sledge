@@ -32,6 +32,10 @@
   `createTursoSledge(...)` constructors. Opened values contain per-open
   capabilities and the owning ledger runtime; adapter-owned composition and
   storage linking remain internal.
+- Migration: the application API preserves the existing durable storage layout.
+  Databases created by 0.24 remain valid when the application installs the same
+  module ids in the same order. Changing that durable graph still requires an
+  intentional migration or reset.
 - Add `expireHistory({ through: cursor })` as a durable, monotonic event-stream
   boundary. Tailing omits expired history, resuming an older cursor raises
   `LedgerHistoryExpiredError`, and no event rows are physically deleted.

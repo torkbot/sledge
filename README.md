@@ -19,7 +19,50 @@ handles to indexer and query callbacks.
 - Process-local live signals for short-lived follow-up work
 - Owner-bound typed result capabilities for composing reusable ledger modules
 
-## Quick Start
+## The Application Model
+
+A Sledge module factory returns one installable contribution: a registered
+ledger module plus the bounded capabilities that other code may use. The
+application definition installs those contributions in durable order and
+exposes one capability tree:
+
+```ts
+import { defineSledge } from "@torkbot/sledge";
+import { createBetterSqliteSledge } from "@torkbot/sledge/better-sqlite3-ledger";
+
+const application = defineSledge((sledge) => {
+  const users = sledge.install(defineUsersModule());
+  const audit = sledge.install(defineAuditModule(users));
+
+  return sledge.expose({ audit, users });
+});
+
+await using opened = await createBetterSqliteSledge({
+  application,
+  databaseUrl,
+  timing,
+});
+
+await opened.ledger.emit(opened.capabilities.users.events.created, {
+  userId: "u_123",
+});
+```
+
+The callback runs once for every open. Its three methods are the complete
+assembly vocabulary:
+
+- `install(contribution)` adds one registered module and immediately returns
+  its capabilities, scoped to this assembly.
+- `query(token, params)` reads the immutable installed prefix when later module
+  choices depend on durable ledger state.
+- `expose(capabilities)` selects what consumers receive and proves that its
+  installed capabilities belong to this assembly.
+
+The storage adapter owns compilation, migrations, temporary query-only prefix
+views, final graph validation, and the one live ledger runtime. Applications do
+not compose model handles or activate a partially prepared value.
+
+## Complete Example
 
 ```ts
 import { Type } from "typebox";
@@ -194,6 +237,110 @@ const user = await opened.ledger.query(
 console.log(user);
 ```
 
+## Migrating from 0.24
+
+Version 0.25 replaces the public composed-model and prepared-model APIs with
+one application assembly API. This is an intentional source-level break; there
+are no deprecated aliases or compatibility adapters.
+
+### Replace root composition with an application
+
+In 0.24, callers retained every registered module so they could compose the
+final model and then use those same handles as runtime capabilities:
+
+```ts
+const model = composeLedgerModules(usersModule, auditModule);
+
+await using ledger = await createBetterSqliteLedger({
+  model,
+  databaseUrl,
+  timing,
+});
+
+await ledger.emit(usersModule.events.created, payload);
+```
+
+In 0.25, module factories return `{ module, capabilities }`. Install them inside
+`defineSledge(...)`, expose the application capability tree, and open it through
+the renamed adapter:
+
+```ts
+const application = defineSledge((sledge) => {
+  const users = sledge.install(defineUsersModule());
+  const audit = sledge.install(defineAuditModule(users));
+
+  return sledge.expose({ audit, users });
+});
+
+await using opened = await createBetterSqliteSledge({
+  application,
+  databaseUrl,
+  timing,
+});
+
+await opened.ledger.emit(opened.capabilities.users.events.created, payload);
+```
+
+The application owns the registered module handles. Consumers receive only the
+capabilities deliberately returned through `expose(...)`; they do not need to
+retain or propagate a parallel model graph.
+
+### Replace prepared-model resolution with assembly queries
+
+`defineLedgerModel(...)`, `prepare(...)`, and `extend(...)` are removed. Install
+the registry contribution, query that installed prefix, then install the modules
+selected by userspace policy:
+
+```ts
+const application = defineSledge(async (sledge) => {
+  const registry = sledge.install(defineModuleRegistry());
+  const descriptors = await sledge.query(
+    registry.queries.configuredModules,
+    {},
+  );
+  const configured = [];
+
+  for (const descriptor of descriptors) {
+    configured.push(sledge.install(await loadModule(descriptor)));
+  }
+
+  return sledge.expose({ configured, registry });
+});
+```
+
+Each query observes the immutable module prefix installed at that point. A
+later install creates the next prefix. Sledge drains every started query before
+opening the final runtime, and an abandoned query failure rejects the open.
+
+### Update imports and opened values
+
+| 0.24                                         | 0.25                                             |
+| -------------------------------------------- | ------------------------------------------------ |
+| `composeLedgerModules(...)`                  | `defineSledge(...)` plus `sledge.install(...)`   |
+| `defineLedgerModel(...)`                     | An async `defineSledge(...)` callback            |
+| `prepare(...)` / `extend(...)`               | `sledge.query(...)` / `sledge.install(...)`      |
+| `createBetterSqliteLedger({ model, ... })`   | `createBetterSqliteSledge({ application, ... })` |
+| `createTursoLedger({ model, ... })`          | `createTursoSledge({ application, ... })`        |
+| The returned `Ledger`                        | `OpenedSledge.ledger`                            |
+| Registered module handles used as public API | `OpenedSledge.capabilities`                      |
+
+The root `defineSledge` export is now the application entry point. Low-level
+ledger declarations remain under `@torkbot/sledge/ledger`, the two storage
+constructors keep their adapter subpaths, and curated primitives live under
+`@torkbot/sledge/stdlib`.
+
+### Preserve the durable graph
+
+The application API does not change the durable storage layout. Existing
+databases remain valid when the application installs the same module ids in the
+same order as the 0.24 composed root. Changing that set or order is still a
+durable model change requiring an intentional migration or reset.
+
+A fresh database has no ledger-owned registry state to query. Its first open
+must install the complete initial graph from code or external bootstrap input.
+Later opens may query an installed registry prefix to reconstruct that exact
+graph.
+
 ## Standard Library: Typed Results
 
 The first standard-library contract is an addressable durable result. It gives
@@ -284,7 +431,7 @@ therefore remains the only durable fact.
 decoded by the paired Sledge event token. It is not an input-validation API;
 untrusted I/O must still enter through declared ledger schemas.
 
-## Module and Model Phases
+## Module and Application Phases
 
 Sledge separates module construction, application assembly, and the opened
 runtime. Module construction returns new values as capabilities become valid.
