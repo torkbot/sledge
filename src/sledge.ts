@@ -341,6 +341,8 @@ export function defineLedger<const TCapabilities extends object>(
 
     return await openDriver({ application, timing });
   };
+  // The brands prove capabilities and installed modules only to TypeScript.
+  // Runtime state consists of this method plus the private configure registry.
   application = { open } as TApplication;
   attachLedgerApplicationConfigure(application, configure);
   return Object.freeze(application);

@@ -79,6 +79,8 @@ export function attachLedgerDriverOpen<TDriver extends object>(
 }
 
 export function createLedgerDriver(open: LedgerDriverOpen): LedgerDriver {
+  // The public brand prevents callers from constructing a driver. Runtime
+  // authenticity is enforced independently by this private open registry.
   const driver = {} as LedgerDriver;
   attachLedgerDriverOpen(driver, open);
   return Object.freeze(driver);
