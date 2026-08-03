@@ -25,6 +25,8 @@ const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
 );
 const ledgerApplicationConfigureFunctions = new WeakMap<object, unknown>();
 const ledgerDriverOpenFunctions = new WeakMap<object, LedgerDriverOpen>();
+const ledgerModuleOwnerReaders = new WeakMap<object, () => string>();
+const ledgerModuleContributions = new WeakSet<object>();
 const ledgerModuleComposers = new WeakMap<
   object,
   (first: object, ...rest: readonly object[]) => object
@@ -92,6 +94,37 @@ export function readLedgerDriverOpen(
   return ledgerDriverOpenFunctions.get(driver);
 }
 
+export function attachLedgerModuleOwner<TModuleOwner extends object>(
+  owner: TModuleOwner,
+  readModuleId: () => string,
+): TModuleOwner {
+  ledgerModuleOwnerReaders.set(owner, readModuleId);
+  return owner;
+}
+
+export function readLedgerModuleOwnerId<TModuleId extends string>(owner: {
+  readonly moduleId: TModuleId;
+}): TModuleId {
+  const readModuleId = ledgerModuleOwnerReaders.get(owner);
+
+  if (readModuleId === undefined) {
+    throw new Error("invalid ledger module owner");
+  }
+
+  return readModuleId() as TModuleId;
+}
+
+export function attachLedgerModuleContribution<TContribution extends object>(
+  contribution: TContribution,
+): TContribution {
+  ledgerModuleContributions.add(contribution);
+  return contribution;
+}
+
+export function isLedgerModuleContribution(contribution: object): boolean {
+  return ledgerModuleContributions.has(contribution);
+}
+
 /**
  * Gives each registered module the internal graph-construction capability
  * needed by adapter-owned assembly without exposing another public API.
@@ -101,6 +134,10 @@ export function attachLedgerModuleComposer(
   compose: (first: object, ...rest: readonly object[]) => object,
 ): void {
   ledgerModuleComposers.set(module, compose);
+}
+
+export function isRegisteredLedgerModule(module: object): boolean {
+  return ledgerModuleComposers.has(module);
 }
 
 export function composeRegisteredLedgerModules(

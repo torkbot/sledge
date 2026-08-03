@@ -10,10 +10,13 @@ import {
 import type { LedgerImplementations } from "./internal-storage.ts";
 import {
   attachLedgerImplementationFactory,
+  attachLedgerModuleContribution,
   attachLedgerModuleComposer,
+  attachLedgerModuleOwner,
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
   composedLedgerModulesBrand,
+  isRegisteredLedgerModule,
   readLedgerImplementations,
   registeredLedgerContractsBrand,
   registeredLedgerRuntimeBrand,
@@ -79,6 +82,8 @@ declare const queryTokenTypeBrand: unique symbol;
 declare const queueTokenTypeBrand: unique symbol;
 declare const signalTokenTypeBrand: unique symbol;
 declare const signalQueueTokenTypeBrand: unique symbol;
+declare const ledgerModuleContributionTypeBrand: unique symbol;
+declare const ledgerModuleOwnerTypeBrand: unique symbol;
 const ledgerContractTokenMetadata = new WeakMap<
   object,
   LedgerContractMetadata
@@ -2157,6 +2162,78 @@ export type DeclaredLedgerModule<
 };
 
 /**
+ * A registered module and the bounded capabilities its definition reveals.
+ * Contributions can only be created by the scoped owner passed to
+ * `defineModule(...)`.
+ */
+export type LedgerModuleContribution<
+  TCapabilities extends object,
+  TModule extends AnyRegisteredLedgerModule = AnyRegisteredLedgerModule,
+> = {
+  readonly [ledgerModuleContributionTypeBrand]: true;
+  readonly module: TModule;
+  readonly capabilities: TCapabilities;
+};
+
+/**
+ * Stable identity shared with reusable module primitives such as stdlib
+ * result refs. The owner remains valid only while its module factory runs.
+ */
+export interface LedgerModuleOwner<TModuleId extends string> {
+  readonly [ledgerModuleOwnerTypeBrand]: TModuleId;
+  readonly moduleId: TModuleId;
+}
+
+type LedgerModuleContractDefinitions<
+  TEventDefinitions extends Record<string, EventDefinition>,
+  TQueues extends Record<string, TSchema>,
+  TSignals extends Record<string, TSchema>,
+  TSignalQueues extends Record<string, TSchema>,
+> = {
+  readonly events: TEventDefinitions;
+  readonly queues?: TQueues & PrivateSchemaDefinitions<TQueues>;
+  readonly signals?: TSignals & PrivateSchemaDefinitions<TSignals>;
+  readonly signalQueues?: TSignalQueues &
+    PrivateSchemaDefinitions<TSignalQueues>;
+};
+
+/** The scoped construction capability received by one module factory. */
+export interface LedgerModuleDefinition<
+  TModuleId extends string,
+> extends LedgerModuleOwner<TModuleId> {
+  declare<
+    const TEventDefinitions extends Record<string, EventDefinition>,
+    const TQueues extends Record<string, TSchema> = {},
+    const TSignals extends Record<string, TSchema> = {},
+    const TSignalQueues extends Record<string, TSchema> = {},
+  >(
+    input: LedgerModuleContractDefinitions<
+      TEventDefinitions,
+      TQueues,
+      TSignals,
+      TSignalQueues
+    >,
+  ): DeclaredLedgerModule<
+    EventSchemasFor<TEventDefinitions>,
+    TQueues,
+    TSignals,
+    TSignalQueues,
+    TModuleId,
+    EventTokensFor<TModuleId, TEventDefinitions>
+  >;
+
+  expose<
+    const TModule extends AnyRegisteredLedgerModule & {
+      readonly moduleId: TModuleId;
+    },
+    const TCapabilities extends object,
+  >(
+    module: TModule,
+    capabilities: TCapabilities,
+  ): LedgerModuleContribution<TCapabilities, TModule>;
+}
+
+/**
  * A declaration linked to its materialization contract and ready to register
  * implementations. Linking returns a new value; it does not mutate the
  * declaration.
@@ -2238,14 +2315,16 @@ export function declareLedgerModule<
   const TQueues extends Record<string, TSchema> = {},
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
->(input: {
-  readonly moduleId: TModuleId;
-  readonly events: TEventDefinitions;
-  readonly queues?: TQueues & PrivateSchemaDefinitions<TQueues>;
-  readonly signals?: TSignals & PrivateSchemaDefinitions<TSignals>;
-  readonly signalQueues?: TSignalQueues &
-    PrivateSchemaDefinitions<TSignalQueues>;
-}): DeclaredLedgerModule<
+>(
+  input: LedgerModuleContractDefinitions<
+    TEventDefinitions,
+    TQueues,
+    TSignals,
+    TSignalQueues
+  > & {
+    readonly moduleId: TModuleId;
+  },
+): DeclaredLedgerModule<
   EventSchemasFor<TEventDefinitions>,
   TQueues,
   TSignals,
@@ -2287,6 +2366,140 @@ export function declareLedgerModule<
     signals,
     shape,
   };
+}
+
+/**
+ * Defines a reusable module factory around one stable durable identity.
+ *
+ * Each invocation receives a fresh owner that is revoked when the callback
+ * returns. Returning `module.expose(...)` proves that the registered module
+ * and its public capabilities were assembled under that same owner.
+ */
+export function defineModule<
+  const TModuleId extends string,
+  const TArguments extends readonly unknown[],
+  const TCapabilities extends object,
+  const TModule extends AnyRegisteredLedgerModule & {
+    readonly moduleId: TModuleId;
+  },
+>(
+  moduleId: TModuleId,
+  define: (
+    module: LedgerModuleDefinition<TModuleId>,
+    ...args: TArguments
+  ) => LedgerModuleContribution<TCapabilities, TModule>,
+): (...args: TArguments) => LedgerModuleContribution<TCapabilities, TModule> {
+  validateLedgerModuleId(moduleId);
+
+  const factory = (...args: TArguments) => {
+    let definitionOpen = true;
+    let revealed: object | undefined;
+
+    const assertDefinitionOpen = (): void => {
+      if (!definitionOpen) {
+        throw new Error("ledger module definition has already closed");
+      }
+    };
+    const readModuleId = (): TModuleId => {
+      assertDefinitionOpen();
+      return moduleId;
+    };
+    const declare = <
+      const TEventDefinitions extends Record<string, EventDefinition>,
+      const TQueues extends Record<string, TSchema> = {},
+      const TSignals extends Record<string, TSchema> = {},
+      const TSignalQueues extends Record<string, TSchema> = {},
+    >(
+      input: LedgerModuleContractDefinitions<
+        TEventDefinitions,
+        TQueues,
+        TSignals,
+        TSignalQueues
+      >,
+    ): DeclaredLedgerModule<
+      EventSchemasFor<TEventDefinitions>,
+      TQueues,
+      TSignals,
+      TSignalQueues,
+      TModuleId,
+      EventTokensFor<TModuleId, TEventDefinitions>
+    > => {
+      assertDefinitionOpen();
+
+      return declareLedgerModule<
+        TModuleId,
+        TEventDefinitions,
+        TQueues,
+        TSignals,
+        TSignalQueues
+      >({
+        moduleId,
+        events: input.events,
+        queues: input.queues,
+        signals: input.signals,
+        signalQueues: input.signalQueues,
+      });
+    };
+    const expose: LedgerModuleDefinition<TModuleId>["expose"] = (
+      registeredModule,
+      capabilities,
+    ) => {
+      assertDefinitionOpen();
+
+      if (!isRegisteredLedgerModule(registeredModule)) {
+        throw new Error("invalid registered ledger module");
+      }
+
+      if (registeredModule.moduleId !== moduleId) {
+        throw new Error(
+          `ledger module ${moduleId} cannot expose registered module ${registeredModule.moduleId}`,
+        );
+      }
+
+      // Public brands are type-only. Private registries below enforce that
+      // both the owner and contribution were minted by this invocation.
+      const contribution = Object.freeze({
+        module: registeredModule,
+        capabilities,
+      }) as LedgerModuleContribution<
+        typeof capabilities,
+        typeof registeredModule
+      >;
+      revealed = contribution;
+      definitionOpen = false;
+      return contribution;
+    };
+    const owner = attachLedgerModuleOwner(
+      Object.freeze({
+        get moduleId() {
+          return readModuleId();
+        },
+        declare,
+        expose,
+      }) as LedgerModuleDefinition<TModuleId>,
+      readModuleId,
+    );
+
+    try {
+      const contribution = define(owner, ...args);
+
+      if (revealed === undefined || contribution !== revealed) {
+        // Unsafe JavaScript can return a promise even though module factories
+        // are synchronous. Assimilation observes a rejecting thenable before
+        // reporting the construction contract violation.
+        void Promise.resolve(contribution).catch(() => undefined);
+        throw new Error(
+          "ledger module definition must return module.expose(...) directly",
+        );
+      }
+
+      return attachLedgerModuleContribution(contribution);
+    } finally {
+      definitionOpen = false;
+    }
+  };
+
+  return Object.freeze(factory);
 }
 
 type LinkedLedgerModuleFor<
@@ -5569,7 +5782,10 @@ function createLinkedLedgerModule<
           ),
       );
 
-      return registeredWithImplementations;
+      // Registration is the final module-construction phase. Freezing the
+      // carrier keeps its durable identity aligned with its already-namespaced
+      // contracts and with contribution provenance.
+      return Object.freeze(registeredWithImplementations);
     },
   };
 }

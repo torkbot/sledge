@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Breaking: add `defineModule(moduleId, callback)` as the canonical module
+  construction boundary. Each factory invocation receives a fresh scoped
+  `LedgerModuleDefinition`; `module.declare(...)` injects the stable identity,
+  and its single `module.expose(...)` call returns the only contribution shape
+  accepted by `sledge.install(...)`. Owners and contributions carry private
+  runtime provenance as well as opaque TypeScript brands, so retained owners,
+  forged or mismatched registered modules, repeated reveals, async factories,
+  and hand-assembled contributions fail at their boundary.
+- Freeze registered module carriers once their contracts, implementations, and
+  private composition provenance are complete, preventing untyped callers from
+  rewriting durable module identity after registration.
 - Breaking: rename `defineSledge(...)` to `defineLedger(...)`. Sledge remains
   the conventional name of the scoped assembly port passed to the definition;
   ledger concepts no longer carry the package name in their function names.
@@ -11,11 +22,13 @@
   an application. Node.js clock and scheduler implementations are used by
   default; deterministic tests may pass one coherent `LedgerTiming` override.
 - Start the composable ledger standard library with owner-bound typed result
-  refs and terminal event sources. `defineResult(...)` returns immutable phases:
-  first a result identity and schema, then `fromEvent(...)` returns a new
-  capability that generic modules can observe without requiring producers to
-  append a duplicate generic settlement event. The curated surface is available
-  from `@torkbot/sledge/stdlib`.
+  refs and terminal event sources. `defineResult(module, ...)` consumes the
+  narrower `LedgerModuleOwner` capability, so producer identity is supplied
+  once by `defineModule(...)`. It returns immutable phases: first a result
+  identity and schema, then `fromEvent(...)` returns a new capability that
+  generic modules can observe without requiring producers to append a duplicate
+  generic settlement event. The curated surface is available from
+  `@torkbot/sledge/stdlib`.
 - Breaking: make durable event `actions.enqueue(...)` asynchronous. Addressed
   work resolves to its persisted `WorkRef`, including an existing identity
   preserved by coalescing; anonymous work resolves to `null`. Export

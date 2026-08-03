@@ -4,7 +4,12 @@ import test from "node:test";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
-import { declareLedgerModule } from "./ledger/ledger.ts";
+import {
+  declareLedgerModule,
+  linkLedgerModule,
+  type LedgerModuleOwner,
+} from "./ledger/ledger.ts";
+import { defineModule } from "./sledge.ts";
 import { defineResult, type ResultRef } from "./stdlib.ts";
 
 const OutputSchema = Type.Object({
@@ -12,14 +17,9 @@ const OutputSchema = Type.Object({
 });
 
 test("result refs are bound to their producing module", () => {
-  const jobs = defineResult({
-    moduleId: "contract.jobs",
-    resultSchema: OutputSchema,
-  });
-  const deadlines = defineResult({
-    moduleId: "contract.deadlines",
-    resultSchema: OutputSchema,
-  });
+  const jobs = defineResultModule("contract.jobs")().capabilities.result;
+  const deadlines =
+    defineResultModule("contract.deadlines")().capabilities.result;
   const jobRef = jobs.ref("job-1");
   const deadlineRef = deadlines.ref("job-1");
 
@@ -41,30 +41,34 @@ test("result refs are bound to their producing module", () => {
 });
 
 test("a declared result returns a new terminal-event capability", () => {
-  const result = defineResult({
-    moduleId: "contract.operations",
-    resultSchema: OutputSchema,
-  });
-  const declaration = declareLedgerModule({
-    moduleId: "contract.operations",
-    events: {
-      completed: Type.Object({
-        ref: result.refSchema,
-        output: OutputSchema,
-      }),
+  const defineOperationsModule = defineModule(
+    "contract.operations",
+    (module) => {
+      const declared = defineResult(module, { resultSchema: OutputSchema });
+      const declaration = module.declare({
+        events: {
+          completed: Type.Object({
+            ref: declared.refSchema,
+            output: OutputSchema,
+          }),
+        },
+      });
+      const completed = declared.fromEvent(
+        declaration.events.completed,
+        (payload) => ({
+          ref: payload.ref,
+          outcome: "succeeded",
+        }),
+      );
+      const registered = linkLedgerModule(declaration, null).register({});
+
+      return module.expose(registered, { completed, declared });
     },
-  });
-  const completed = result.fromEvent(
-    declaration.events.completed,
-    (payload) => ({
-      ref: payload.ref,
-      outcome: "succeeded",
-    }),
   );
+  const { completed, declared } = defineOperationsModule().capabilities;
   const ref = completed.ref("operation-1");
 
-  assert.notEqual(completed, result);
-  assert.equal(completed.source.event, declaration.events.completed);
+  assert.notEqual(completed, declared);
   assert.deepEqual(
     completed.source.observe({
       ref,
@@ -75,7 +79,7 @@ test("a declared result returns a new terminal-event capability", () => {
       outcome: "succeeded",
     },
   );
-  assert(Object.isFrozen(result));
+  assert(Object.isFrozen(declared));
   assert(Object.isFrozen(completed));
   assert(Object.isFrozen(completed.source));
 
@@ -83,7 +87,7 @@ test("a declared result returns a new terminal-event capability", () => {
     moduleId: "contract.foreign",
     events: {
       completed: Type.Object({
-        ref: result.refSchema,
+        ref: declared.refSchema,
         output: OutputSchema,
       }),
     },
@@ -93,20 +97,61 @@ test("a declared result returns a new terminal-event capability", () => {
     // A module cannot claim another module's event as the producer of its
     // terminal result.
     // @ts-expect-error terminal result events must have the same module owner
-    result.fromEvent(foreignDeclaration.events.completed, () => ({
-      ref: result.ref("foreign"),
+    declared.fromEvent(foreignDeclaration.events.completed, () => ({
+      ref: declared.ref("foreign"),
       outcome: "succeeded",
     }));
   }
 });
 
-test("result module ids use Sledge's reserved identity separator", () => {
+test("result definitions require a live Sledge module owner", () => {
+  let retainedOwner!: LedgerModuleOwner<"contract.scoped-result">;
+  const defineScopedResultModule = defineModule(
+    "contract.scoped-result",
+    (module) => {
+      retainedOwner = module;
+      const result = defineResult(module, { resultSchema: OutputSchema });
+      const declaration = module.declare({ events: {} });
+      const registered = linkLedgerModule(declaration, null).register({});
+
+      return module.expose(registered, { result });
+    },
+  );
+
+  defineScopedResultModule();
+
   assert.throws(
-    () =>
-      defineResult({
-        moduleId: "contract::invalid",
-        resultSchema: OutputSchema,
-      }),
-    /ledger module id must not contain reserved separator ::/,
+    () => defineResult(retainedOwner, { resultSchema: OutputSchema }),
+    /ledger module definition has already closed/,
+  );
+
+  if (false) {
+    defineResult(
+      // @ts-expect-error plain objects are not Sledge-owned module identities
+      { moduleId: "contract.forged" },
+      { resultSchema: OutputSchema },
+    );
+  }
+
+  // This cast models untyped JavaScript crossing the public boundary. The
+  // private owner registry still rejects a structurally similar object.
+  const forged = {
+    moduleId: "contract.forged",
+  } as unknown as LedgerModuleOwner<"contract.forged">;
+  assert.throws(
+    () => defineResult(forged, { resultSchema: OutputSchema }),
+    /invalid ledger module owner/,
   );
 });
+
+function defineResultModule<const TModuleId extends string>(
+  moduleId: TModuleId,
+) {
+  return defineModule(moduleId, (module) => {
+    const result = defineResult(module, { resultSchema: OutputSchema });
+    const declaration = module.declare({ events: {} });
+    const registered = linkLedgerModule(declaration, null).register({});
+
+    return module.expose(registered, { result });
+  });
+}

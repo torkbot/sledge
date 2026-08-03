@@ -7,17 +7,14 @@ import test from "node:test";
 import { Type } from "typebox";
 
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
-import {
-  declareLedgerModule,
-  defineMaterialization,
-  linkLedgerModule,
-} from "./ledger/ledger.ts";
+import { defineMaterialization, linkLedgerModule } from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
 import { createBetterSqliteDriver } from "./better-sqlite3-ledger.ts";
 import { createTursoDriver } from "./turso-ledger.ts";
 import { VirtualRuntimeHarness } from "./runtime/virtual-runtime.ts";
 import {
   defineLedger,
+  defineModule,
   type OpenedLedger,
   type LedgerApplication,
   type LedgerApplicationCapabilities,
@@ -105,38 +102,59 @@ if (false) {
   });
 
   defineLedger((sledge) => {
-    const unexpected = defineUnexpectedModule();
+    const defineLaunderingModule = defineModule(
+      "contract.laundering",
+      (module, foreign: typeof firstCapabilities) => {
+        const declaration = module.declare({ events: {} });
+        const registered = linkLedgerModule(declaration, null).register({});
 
-    const laundering = sledge.install({
-      module: unexpected.module,
+        return module.expose(registered, { foreign });
+      },
+    );
+    const laundering = sledge.install(
       // @ts-expect-error install cannot rebind capabilities from another application
-      capabilities: { foreign: firstCapabilities },
-    });
+      defineLaunderingModule(firstCapabilities),
+    );
 
     return sledge.expose({ laundering });
   });
 
   defineLedger((sledge) => {
     const source = sledge.install(defineSourceModule());
-    const unexpected = defineUnexpectedModule();
-    const composed = sledge.install({
-      module: unexpected.module,
-      capabilities: { source },
-    });
+    const defineComposedModule = defineModule(
+      "contract.composed",
+      (module, sourceToCompose: typeof source) => {
+        const declaration = module.declare({ events: {} });
+        const registered = linkLedgerModule(declaration, null).register({});
+
+        return module.expose(registered, { source: sourceToCompose });
+      },
+    );
+    const composed = sledge.install(defineComposedModule(source));
 
     return sledge.expose({ composed });
   });
 
   defineLedger((sledge) => {
     const foreign = defineRegistryModule();
-    const source = defineSourceModule();
-    const installed = sledge.install({
-      module: source.module,
-      capabilities: {
-        // @ts-expect-error raw tokens must belong to the contributed module
-        query: foreign.capabilities.queries.configuredModuleIds,
+    const defineForeignTokenModule = defineModule(
+      "contract.foreign-token",
+      (
+        module,
+        query: typeof foreign.capabilities.queries.configuredModuleIds,
+      ) => {
+        const declaration = module.declare({ events: {} });
+        const registered = linkLedgerModule(declaration, null).register({});
+
+        return module.expose(registered, { query });
       },
-    });
+    );
+    const installed = sledge.install(
+      // @ts-expect-error raw tokens must belong to the contributed module
+      defineForeignTokenModule(
+        foreign.capabilities.queries.configuredModuleIds,
+      ),
+    );
 
     return sledge.expose({ installed });
   });
@@ -369,6 +387,68 @@ test("a Sledge application rejects duplicate module ids", async () => {
   );
 });
 
+test("a Sledge application rejects hand-assembled module contributions", async () => {
+  await using fixture = await createFixture(
+    "better-sqlite3",
+    "raw-contribution",
+  );
+  const source = defineSourceModule();
+  const application = defineLedger((sledge) => {
+    // This adapter models JavaScript without TypeScript's contribution brand.
+    // The private factory registry remains the runtime source of authenticity.
+    const unsafeInstall = sledge.install as unknown as (
+      contribution: object,
+    ) => object;
+    unsafeInstall({
+      module: source.module,
+      capabilities: source.capabilities,
+    });
+
+    return sledge.expose({});
+  });
+
+  await assert.rejects(
+    fixture.open(application),
+    /invalid ledger module contribution/,
+  );
+});
+
+test("a failed module factory does not authenticate its leaked contribution", async () => {
+  await using fixture = await createFixture(
+    "better-sqlite3",
+    "failed-contribution",
+  );
+  let leaked: object | undefined;
+  const defineFailingModule = defineModule(
+    "contract.failed-contribution",
+    (module) => {
+      const declaration = module.declare({ events: {} });
+      const registered = linkLedgerModule(declaration, null).register({});
+      leaked = module.expose(registered, {});
+
+      throw new Error("failure after reveal");
+    },
+  );
+
+  assert.throws(defineFailingModule, /failure after reveal/);
+  const leakedContribution = leaked;
+  assert(leakedContribution !== undefined);
+
+  const application = defineLedger((sledge) => {
+    const unsafeInstall = sledge.install as unknown as (
+      contribution: object,
+    ) => object;
+    unsafeInstall(leakedContribution);
+
+    return sledge.expose({});
+  });
+
+  await assert.rejects(
+    fixture.open(application),
+    /invalid ledger module contribution/,
+  );
+});
+
 test("a Sledge application must install a module before querying", async () => {
   await using fixture = await createFixture("better-sqlite3", "query-empty");
   const registry = defineRegistryModule();
@@ -496,98 +576,99 @@ test("opening waits for an abandoned in-flight assembly query", async () => {
   await opened.ledger.listWork();
 });
 
-function defineSourceModule() {
-  const declaration = declareLedgerModule({
-    moduleId: "contract.application-source",
-    events: {
-      created: Type.Object({ id: Type.String({ minLength: 1 }) }),
-    },
-  });
-  const module = linkLedgerModule(declaration, null).register({});
+const defineSourceModule = defineModule(
+  "contract.application-source",
+  (module) => {
+    const declaration = module.declare({
+      events: {
+        created: Type.Object({ id: Type.String({ minLength: 1 }) }),
+      },
+    });
+    const registered = linkLedgerModule(declaration, null).register({});
 
-  return {
-    module,
-    capabilities: {
-      events: module.events,
-    },
-  };
-}
+    return module.expose(registered, {
+      events: registered.events,
+    });
+  },
+);
 
 function defineRegistryModule() {
-  const declaration = declareLedgerModule({
-    moduleId: "contract.model-registry",
-    events: {
-      configured: Type.Object({ moduleIds: Type.Array(Type.String()) }),
-    },
-  });
-  const materialization = defineMaterialization(declaration, {
-    namespace: "registry",
-  })
-    .version(1, "create model registry", (schema) =>
-      schema.createTable("configuration", (table) =>
-        table
-          .columns({
-            singleton: table.integer().notNull(),
-            moduleIds: table.json<string[]>().notNull(),
-          })
-          .primaryKey(["singleton"]),
-      ),
-    )
-    .define({
+  return defineRegistryModuleFactory();
+}
+
+const defineRegistryModuleFactory = defineModule(
+  "contract.model-registry",
+  (module) => {
+    const declaration = module.declare({
+      events: {
+        configured: Type.Object({ moduleIds: Type.Array(Type.String()) }),
+      },
+    });
+    const materialization = defineMaterialization(declaration, {
+      namespace: "registry",
+    })
+      .version(1, "create model registry", (schema) =>
+        schema.createTable("configuration", (table) =>
+          table
+            .columns({
+              singleton: table.integer().notNull(),
+              moduleIds: table.json<string[]>().notNull(),
+            })
+            .primaryKey(["singleton"]),
+        ),
+      )
+      .define({
+        indexers: {
+          storeConfiguration: {
+            sourceEvent: "configured",
+            input: Type.Object({ moduleIds: Type.Array(Type.String()) }),
+          },
+        },
+        queries: {
+          configuredModuleIds: {
+            params: Type.Object({}),
+            result: Type.Union([Type.Null(), Type.Array(Type.String())]),
+          },
+        },
+      });
+    const registered = linkLedgerModule(declaration, materialization).register({
+      events: {
+        configured: async ({ event, actions }) => {
+          await actions.index("storeConfiguration", event.payload);
+        },
+      },
       indexers: {
-        storeConfiguration: {
-          sourceEvent: "configured",
-          input: Type.Object({ moduleIds: Type.Array(Type.String()) }),
+        storeConfiguration: async ({ input, db }) => {
+          await db
+            .insertInto("configuration")
+            .values({ singleton: 1, moduleIds: input.moduleIds })
+            .onConflict(["singleton"])
+            .doUpdateSet({ moduleIds: input.moduleIds })
+            .execute();
         },
       },
       queries: {
-        configuredModuleIds: {
-          params: Type.Object({}),
-          result: Type.Union([Type.Null(), Type.Array(Type.String())]),
+        configuredModuleIds: async ({ db }) => {
+          const configured = await db
+            .selectFrom("configuration")
+            .select(["moduleIds"])
+            .where("singleton", "=", 1)
+            .executeTakeFirst();
+
+          return configured?.moduleIds ?? null;
         },
       },
     });
-  const module = linkLedgerModule(declaration, materialization).register({
-    events: {
-      configured: async ({ event, actions }) => {
-        await actions.index("storeConfiguration", event.payload);
-      },
-    },
-    indexers: {
-      storeConfiguration: async ({ input, db }) => {
-        await db
-          .insertInto("configuration")
-          .values({ singleton: 1, moduleIds: input.moduleIds })
-          .onConflict(["singleton"])
-          .doUpdateSet({ moduleIds: input.moduleIds })
-          .execute();
-      },
-    },
-    queries: {
-      configuredModuleIds: async ({ db }) => {
-        const configured = await db
-          .selectFrom("configuration")
-          .select(["moduleIds"])
-          .where("singleton", "=", 1)
-          .executeTakeFirst();
 
-        return configured?.moduleIds ?? null;
-      },
-    },
-  });
+    return module.expose(registered, {
+      events: registered.events,
+      queries: registered.queries,
+    });
+  },
+);
 
-  return {
-    module,
-    capabilities: {
-      events: module.events,
-      queries: module.queries,
-    },
-  };
-}
-
-function defineDiscoveredModule() {
-  const declaration = declareLedgerModule({
-    moduleId: "contract.discovered",
+const defineDiscoveredModule = defineModule("contract.discovered", (module) => {
+  const declaration = module.declare({
     events: {
       invoked: Type.Object({ value: Type.String() }),
     },
@@ -609,27 +690,21 @@ function defineDiscoveredModule() {
         },
       },
     });
-  const module = linkLedgerModule(declaration, materialization).register({
+  const registered = linkLedgerModule(declaration, materialization).register({
     queries: {
       status: () => "ready" as const,
     },
   });
 
-  return {
-    module,
-    capabilities: {
-      events: module.events,
-      moduleId: module.moduleId,
-      queries: module.queries,
-    },
-  };
-}
-
-function defineUnexpectedModule() {
-  const declaration = declareLedgerModule({
-    moduleId: "contract.unexpected",
-    events: {},
+  return module.expose(registered, {
+    events: registered.events,
+    moduleId: registered.moduleId,
+    queries: registered.queries,
   });
+});
+
+const defineUnexpectedModule = defineModule("contract.unexpected", (module) => {
+  const declaration = module.declare({ events: {} });
   const materialization = defineMaterialization(declaration, {
     namespace: "unexpected",
   })
@@ -647,44 +722,41 @@ function defineUnexpectedModule() {
         },
       },
     });
-  const module = linkLedgerModule(declaration, materialization).register({
+  const registered = linkLedgerModule(declaration, materialization).register({
     queries: { status: () => "unexpected" as const },
   });
 
-  return { module, capabilities: { queries: module.queries } };
-}
+  return module.expose(registered, { queries: registered.queries });
+});
 
-function defineQueryModule(run: () => "ready" | Promise<"ready">) {
-  const declaration = declareLedgerModule({
-    moduleId: "contract.query",
-    events: {},
-  });
-  const materialization = defineMaterialization(declaration, {
-    namespace: "state",
-  })
-    .version(1, "initialize query state", (schema) =>
-      schema.createTable("queryState", (table) =>
-        table.columns({ id: table.integer().notNull() }).primaryKey(["id"]),
-      ),
-    )
-    .define({
-      indexers: {},
-      queries: {
-        status: {
-          params: Type.Object({}),
-          result: Type.Literal("ready"),
+const defineQueryModule = defineModule(
+  "contract.query",
+  (module, run: () => "ready" | Promise<"ready">) => {
+    const declaration = module.declare({ events: {} });
+    const materialization = defineMaterialization(declaration, {
+      namespace: "state",
+    })
+      .version(1, "initialize query state", (schema) =>
+        schema.createTable("queryState", (table) =>
+          table.columns({ id: table.integer().notNull() }).primaryKey(["id"]),
+        ),
+      )
+      .define({
+        indexers: {},
+        queries: {
+          status: {
+            params: Type.Object({}),
+            result: Type.Literal("ready"),
+          },
         },
-      },
+      });
+    const registered = linkLedgerModule(declaration, materialization).register({
+      queries: { status: run },
     });
-  const module = linkLedgerModule(declaration, materialization).register({
-    queries: { status: run },
-  });
 
-  return {
-    module,
-    capabilities: { queries: module.queries },
-  };
-}
+    return module.expose(registered, { queries: registered.queries });
+  },
+);
 
 async function createFixture(
   driver: "better-sqlite3" | "turso",

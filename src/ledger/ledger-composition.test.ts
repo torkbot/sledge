@@ -26,7 +26,7 @@ import {
   createTursoStorageRuntime,
 } from "./turso-ledger.ts";
 import { createBetterSqliteDriver } from "../better-sqlite3-ledger.ts";
-import { defineLedger } from "../sledge.ts";
+import { defineLedger, defineModule } from "../sledge.ts";
 import { createTursoDriver } from "../turso-ledger.ts";
 
 const nowMs = 1_900_000_000_000;
@@ -468,20 +468,23 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           },
         },
       });
+      const defineSourceModule = defineModule(source.moduleId, (module) =>
+        module.expose(source, {}),
+      );
+      const defineConsumerModule = defineModule(consumer.moduleId, (module) =>
+        module.expose(consumer, {}),
+      );
+      const defineLaterModule = defineModule(later.moduleId, (module) =>
+        module.expose(later, {}),
+      );
+      const defineFailureModule = defineModule(failure.moduleId, (module) =>
+        module.expose(failure, {}),
+      );
       const application = defineLedger((sledge) => {
-        const sourceCapabilities = sledge.install({
-          module: source,
-          capabilities: {},
-        });
-        const consumerCapabilities = sledge.install({
-          module: consumer,
-          capabilities: {},
-        });
-        const laterCapabilities = sledge.install({
-          module: later,
-          capabilities: {},
-        });
-        sledge.install({ module: failure, capabilities: {} });
+        const sourceCapabilities = sledge.install(defineSourceModule());
+        const consumerCapabilities = sledge.install(defineConsumerModule());
+        const laterCapabilities = sledge.install(defineLaterModule());
+        sledge.install(defineFailureModule());
 
         return sledge.expose({
           consumer: consumerCapabilities,
