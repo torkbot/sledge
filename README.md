@@ -572,49 +572,99 @@ Each `.version(...)` callback receives a typed migration chain. Operations
 append metadata and advance the schema type visible to later operations:
 
 ```ts
-const materializations = defineMaterialization(usersDeclaration, {
-  namespace: "app",
-})
-  .version(1, "create users", (s) =>
-    s.createTable("users", (t) =>
-      t
-        .columns({
-          userId: t.text().notNull(),
-          source: t.eventRef("user.created").notNull(),
-        })
-        .primaryKey(["userId"]),
-    ),
-  )
-  .version(2, "add user email", (s) =>
-    s
-      .addColumn("users", "email", (t) => t.text())
-      .createIndex("usersByEmail", "users", ["email"])
-      .data("backfill user email", async ({ db }) => {
-        const events = await db.scanEvents("user.created").execute();
+import type {
+  MaterializationDatabaseFor,
+  MaterializationImplementationRegistrationFor,
+  MaterializationMigrationDatabaseFor,
+  MaterializationReadDatabaseFor,
+  MaterializationSchemaFor,
+  MaterializationWriteDatabaseFor,
+} from "@torkbot/sledge/ledger";
 
-        for (const event of events) {
-          await db
-            .updateTable("users")
-            .set({ email: event.payload.email })
-            .where("userId", "=", event.payload.userId)
-            .execute();
-        }
+const defineUsersModule = defineModule("app.users", (module) => {
+  const declaration = module.declare({
+    events: {
+      "user.created": Type.Object({
+        userId: Type.String(),
+        email: Type.String(),
       }),
-  )
-  .define({
-    indexers: {
-      upsertUser: {
-        sourceEvent: "user.created",
-        input: Type.Object({ userId: Type.String() }),
-      },
-    },
-    queries: {
-      userById: {
-        params: Type.Object({ userId: Type.String() }),
-        result: Type.Null(),
-      },
     },
   });
+
+  const materializations = defineMaterialization(declaration, {
+    namespace: "app",
+  })
+    .version(1, "create users", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .version(2, "add user email", (s) =>
+      s
+        .addColumn("users", "email", (t) => t.text())
+        .createIndex("usersByEmail", "users", ["email"])
+        .data("backfill user email", async ({ db }) => {
+          const events = await db.scanEvents("user.created").execute();
+
+          for (const event of events) {
+            await db
+              .updateTable("users")
+              .set({ email: event.payload.email })
+              .where("userId", "=", event.payload.userId)
+              .execute();
+          }
+        }),
+    )
+    .define({
+      indexers: {
+        upsertUser: {
+          sourceEvent: "user.created",
+          input: Type.Object({ userId: Type.String() }),
+        },
+      },
+      queries: {
+        userById: {
+          params: Type.Object({ userId: Type.String() }),
+          result: Type.Null(),
+        },
+      },
+    });
+
+  type AppSchema = MaterializationSchemaFor<typeof materializations>;
+  type AppReadDb = MaterializationReadDatabaseFor<
+    typeof materializations,
+    typeof declaration.shape.events
+  >;
+  type AppWriteDb = MaterializationWriteDatabaseFor<typeof materializations>;
+  type AppDb = MaterializationDatabaseFor<
+    typeof materializations,
+    typeof declaration.shape.events
+  >;
+  type AppMigrationDb = MaterializationMigrationDatabaseFor<
+    typeof materializations,
+    typeof declaration.shape.events
+  >;
+  type AppImplementations = MaterializationImplementationRegistrationFor<
+    typeof materializations,
+    typeof declaration.shape.events
+  >;
+
+  const linked = linkLedgerModule(declaration, materializations);
+  const registered = linked.register({
+    indexers: { upsertUser: () => undefined },
+    queries: { userById: () => null },
+  });
+
+  return module.expose(registered, {
+    events: registered.events,
+    queries: registered.queries,
+  });
+});
 ```
 
 Semantic event refs are first-class columns and must point at real ledger
@@ -658,49 +708,24 @@ Sledge validates that materialization histories start at version 1, versions
 are unique positive integers, versions have no gaps, and later operations only
 reference schema objects available at that point in the chain.
 
-When helper code needs named types outside inline callbacks, derive them from
-the materialization value instead of restating table shapes:
-
-```ts
-import type {
-  MaterializationDatabaseFor,
-  MaterializationImplementationRegistrationFor,
-  MaterializationMigrationDatabaseFor,
-  MaterializationReadDatabaseFor,
-  MaterializationSchemaFor,
-  MaterializationWriteDatabaseFor,
-} from "@torkbot/sledge/ledger";
-
-type AppSchema = MaterializationSchemaFor<typeof materializations>;
-type AppReadDb = MaterializationReadDatabaseFor<
-  typeof materializations,
-  typeof usersDeclaration.shape.events
->;
-type AppWriteDb = MaterializationWriteDatabaseFor<typeof materializations>;
-type AppDb = MaterializationDatabaseFor<
-  typeof materializations,
-  typeof usersDeclaration.shape.events
->;
-type AppMigrationDb = MaterializationMigrationDatabaseFor<
-  typeof materializations,
-  typeof usersDeclaration.shape.events
->;
-type AppImplementations = MaterializationImplementationRegistrationFor<
-  typeof materializations,
-  typeof usersDeclaration.shape.events
->;
-```
-
-Link the declaration to its materializations with `linkLedgerModule(...)`:
-
-```ts
-const linkedUsers = linkLedgerModule(usersDeclaration, materializations);
-```
+When helper code needs named types, derive them inside the same module factory
+from its local materialization and declaration values, as above, instead of
+restating table shapes. Link the declaration to its materializations with
+`linkLedgerModule(...)` before registration.
 
 The link phase is explicit even when a module owns no projection:
 
 ```ts
-const linkedNotifications = linkLedgerModule(notificationsDeclaration, null);
+const defineNotificationsModule = defineModule(
+  "app.notifications",
+  (module) => {
+    const declaration = module.declare({ events: {} });
+    const linked = linkLedgerModule(declaration, null);
+    const registered = linked.register({});
+
+    return module.expose(registered, {});
+  },
+);
 ```
 
 `null` means the module intentionally has no materialization history. A
@@ -797,9 +822,10 @@ and `query`.
 The low-level database engine and storage scope are internal implementation
 details, not package exports.
 
-Registration returns an inert `RegisteredLedgerModule`. It exposes the exact
-event, query, and signal tokens that consumers use, but it cannot touch storage
-or start work.
+Registration returns a frozen, inert `RegisteredLedgerModule`. Its durable
+identity cannot be rewritten after contracts have been namespaced. It exposes
+the exact event, query, and signal tokens that consumers use, but it cannot
+touch storage or start work.
 
 ### 4. Reveal Modules and Define the Application
 

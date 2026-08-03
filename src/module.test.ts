@@ -27,6 +27,12 @@ test("module factories bind identity once and reveal fresh contributions", () =>
 
   assert(Object.isFrozen(defineExampleModule));
   assert(Object.isFrozen(first));
+  assert(Object.isFrozen(first.module));
+  assert.equal(
+    Reflect.set(first.module, "moduleId", "contract.rewritten-module"),
+    false,
+  );
+  assert.equal(first.module.moduleId, "contract.module-factory");
   assert.notEqual(first, second);
   assert.notEqual(first.module, second.module);
   assert.deepEqual(first.capabilities, {

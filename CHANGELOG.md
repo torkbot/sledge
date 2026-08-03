@@ -10,6 +10,9 @@
   runtime provenance as well as opaque TypeScript brands, so retained owners,
   forged or mismatched registered modules, repeated reveals, async factories,
   and hand-assembled contributions fail at their boundary.
+- Freeze registered module carriers once their contracts, implementations, and
+  private composition provenance are complete, preventing untyped callers from
+  rewriting durable module identity after registration.
 - Breaking: rename `defineSledge(...)` to `defineLedger(...)`. Sledge remains
   the conventional name of the scoped assembly port passed to the definition;
   ledger concepts no longer carry the package name in their function names.

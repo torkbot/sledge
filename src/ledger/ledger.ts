@@ -5782,7 +5782,10 @@ function createLinkedLedgerModule<
           ),
       );
 
-      return registeredWithImplementations;
+      // Registration is the final module-construction phase. Freezing the
+      // carrier keeps its durable identity aligned with its already-namespaced
+      // contracts and with contribution provenance.
+      return Object.freeze(registeredWithImplementations);
     },
   };
 }
