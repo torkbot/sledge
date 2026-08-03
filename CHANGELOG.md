@@ -8,8 +8,8 @@
   and its single `module.expose(...)` call returns the only contribution shape
   accepted by `sledge.install(...)`. Owners and contributions carry private
   runtime provenance as well as opaque TypeScript brands, so retained owners,
-  mismatched registered modules, repeated reveals, async factories, and
-  hand-assembled contributions fail at their boundary.
+  forged or mismatched registered modules, repeated reveals, async factories,
+  and hand-assembled contributions fail at their boundary.
 - Breaking: rename `defineSledge(...)` to `defineLedger(...)`. Sledge remains
   the conventional name of the scoped assembly port passed to the definition;
   ledger concepts no longer carry the package name in their function names.

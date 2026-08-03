@@ -809,8 +809,8 @@ public capabilities:
 
 - `moduleId` exposes the stable literal identity to reusable primitives.
 - `declare(contracts)` declares contracts under that identity.
-- `expose(registered, capabilities)` verifies the registered module has that
-  identity, revokes the scoped port, and returns one authentic
+- `expose(registered, capabilities)` verifies a Sledge-registered module has
+  that identity, revokes the scoped port, and returns one authentic
   `LedgerModuleContribution`.
 
 The module object is created and controlled by Sledge. Private registries bind

@@ -136,6 +136,10 @@ export function attachLedgerModuleComposer(
   ledgerModuleComposers.set(module, compose);
 }
 
+export function isRegisteredLedgerModule(module: object): boolean {
+  return ledgerModuleComposers.has(module);
+}
+
 export function composeRegisteredLedgerModules(
   first: object,
   ...rest: readonly object[]

@@ -9,13 +9,14 @@ import {
 } from "./ledger-identity.ts";
 import type { LedgerImplementations } from "./internal-storage.ts";
 import {
-  attachLedgerModuleContribution,
-  attachLedgerModuleOwner,
   attachLedgerImplementationFactory,
+  attachLedgerModuleContribution,
   attachLedgerModuleComposer,
+  attachLedgerModuleOwner,
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
   composedLedgerModulesBrand,
+  isRegisteredLedgerModule,
   readLedgerImplementations,
   registeredLedgerContractsBrand,
   registeredLedgerRuntimeBrand,
@@ -2445,6 +2446,10 @@ export function defineModule<
     ) => {
       assertDefinitionOpen();
 
+      if (!isRegisteredLedgerModule(registeredModule)) {
+        throw new Error("invalid registered ledger module");
+      }
+
       if (registeredModule.moduleId !== moduleId) {
         throw new Error(
           `ledger module ${moduleId} cannot expose registered module ${registeredModule.moduleId}`,
@@ -2460,7 +2465,6 @@ export function defineModule<
         typeof capabilities,
         typeof registeredModule
       >;
-      attachLedgerModuleContribution(contribution);
       revealed = contribution;
       definitionOpen = false;
       return contribution;
@@ -2480,12 +2484,16 @@ export function defineModule<
       const contribution = define(owner, ...args);
 
       if (revealed === undefined || contribution !== revealed) {
+        // Unsafe JavaScript can return a promise even though module factories
+        // are synchronous. Assimilation observes a rejecting thenable before
+        // reporting the construction contract violation.
+        void Promise.resolve(contribution).catch(() => undefined);
         throw new Error(
           "ledger module definition must return module.expose(...) directly",
         );
       }
 
-      return contribution;
+      return attachLedgerModuleContribution(contribution);
     } finally {
       definitionOpen = false;
     }

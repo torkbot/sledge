@@ -98,9 +98,21 @@ test("a module owner cannot reveal a differently owned registered module", () =>
     () => defineInvalidModule(),
     /cannot expose registered module contract.foreign-module/,
   );
+
+  const defineForgedModule = defineModule("contract.owning-module", (module) =>
+    module.expose(
+      {
+        moduleId: "contract.owning-module",
+      } as unknown as AnyRegisteredLedgerModule & {
+        readonly moduleId: "contract.owning-module";
+      },
+      {},
+    ),
+  );
+  assert.throws(() => defineForgedModule(), /invalid registered ledger module/);
 });
 
-test("module factories reject definitions that bypass module.expose", () => {
+test("module factories reject definitions that bypass module.expose", async () => {
   if (false) {
     // @ts-expect-error contributions must be revealed by the module owner
     defineModule("contract.raw-module", (module) => {
@@ -126,7 +138,12 @@ test("module factories reject definitions that bypass module.expose", () => {
   );
   const defineAsyncModule = unsafeDefineModule(
     "contract.async-module",
-    async () => await Promise.resolve({}),
+    async (module) => {
+      await Promise.resolve();
+      const registered = registerEmptyModule(module);
+
+      return module.expose(registered, {});
+    },
   );
 
   assert.throws(
@@ -137,6 +154,11 @@ test("module factories reject definitions that bypass module.expose", () => {
     () => defineAsyncModule(),
     /must return module\.expose\(\.\.\.\) directly/,
   );
+
+  // Let the rejected async continuation settle. Node's test runner reports an
+  // unhandled rejection as a test failure if the sync boundary did not consume
+  // it.
+  await new Promise<void>((resolve) => setImmediate(resolve));
 });
 
 test("module ids are validated when their factory is defined", () => {
