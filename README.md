@@ -831,11 +831,14 @@ touch storage or start work.
 ### 4. Reveal Modules and Define the Application
 
 `defineModule(moduleId, callback)` returns a frozen, synchronous factory. Every
-factory invocation receives a fresh `LedgerModuleDefinition` with exactly three
+factory invocation receives a fresh `LedgerModuleDefinition` with exactly four
 public capabilities:
 
 - `moduleId` exposes the stable literal identity to reusable primitives.
 - `declare(contracts)` declares contracts under that identity.
+- `link(declaration, materializations)` adds the storage contract to a
+  declaration created by that exact factory invocation and returns a new value
+  with registration capability.
 - `expose(registered, capabilities)` verifies a Sledge-registered module has
   that identity, revokes the scoped port, and returns one authentic
   `LedgerModuleContribution`.
@@ -847,10 +850,12 @@ factory returns, a second reveal fails, and `sledge.install(...)` rejects a
 hand-assembled `{ module, capabilities }` object at runtime as well as at
 compile time.
 
-Declaration, materialization, linking, and registration remain ordinary ledger
-phases rather than methods on a growing plugin API. Reusable userspace or stdlib
-primitives can accept the narrower `LedgerModuleOwner` interface when they need
-identity but should not receive declaration or reveal authority.
+Declaration, linking, registration, and exposure form a capability-narrowing
+flow. Materializations remain ordinary values passed into `module.link(...)`,
+and every phase returns a new value rather than mutating the previous one.
+Reusable userspace or stdlib primitives can accept the narrower
+`LedgerModuleOwner` interface when they need identity but should not receive
+declaration, linking, or reveal authority.
 
 `defineLedger(...)` installs revealed contributions in deterministic order and
 returns the application-level capability tree:
