@@ -39,8 +39,33 @@
   once by `defineModule(...)`. It returns immutable phases: first a result
   identity and schema, then `fromEvent(...)` returns a new capability that
   generic modules can observe without requiring producers to append a duplicate
-  generic settlement event. The curated surface is available from
-  `@torkbot/sledge/stdlib`.
+  generic settlement event. One module may define only one result protocol, so
+  its module id remains the unambiguous durable identity without a second local
+  name. Its incomplete result phase may also bind only one terminal event, and
+  private provenance requires that event to belong to the exact open module
+  definition. The curated surface is available from `@torkbot/sledge/stdlib`.
+- Breaking: successful `ResultObservation` values now carry the producer's
+  typed result value, while failed and cancelled observations remain valueless.
+  `ResultPort` also preserves its exact terminal event token instead of
+  widening away module ownership. Together these changes let generic causal
+  operators consume a result without a producer-specific query or duplicate
+  event.
+- Add a deliberately compatibility-unstable result algebra through the
+  individual `@torkbot/sledge/experimental/all`,
+  `@torkbot/sledge/experimental/race`, and
+  `@torkbot/sledge/experimental/then` exports. There is no experimental barrel.
+  `all` and `race` accept named records of refs from explicitly admitted result
+  protocols, use deterministic terminal-event ordering, support restart and
+  acyclic composition through later operators, and append only their opening
+  and terminal facts. Their private projections retain one terminal observation
+  per admitted source result so groups may open after their inputs settle.
+  `then` uses the source terminal fact as its request, propagates source failure
+  or cancellation, and gives at-least-once application code a deterministic
+  result ref, attempt, lease signal, and timeout capability. External effects
+  must use that ref as an idempotency key. Experimental APIs and durable
+  materializations may change as Harness and TorkBot pressure-test their
+  developer experience; no polling-based wait abstraction is included before
+  Sledge can provide an atomic snapshot-and-cursor boundary.
 - Breaking: make durable event `actions.enqueue(...)` asynchronous. Addressed
   work resolves to its persisted `WorkRef`, including an existing identity
   preserved by coalescing; anonymous work resolves to `null`. Export

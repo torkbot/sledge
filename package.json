@@ -44,6 +44,18 @@
     "./stdlib": {
       "types": "./dist/stdlib.d.ts",
       "default": "./dist/stdlib.js"
+    },
+    "./experimental/all": {
+      "types": "./dist/experimental/all.d.ts",
+      "default": "./dist/experimental/all.js"
+    },
+    "./experimental/race": {
+      "types": "./dist/experimental/race.d.ts",
+      "default": "./dist/experimental/race.js"
+    },
+    "./experimental/then": {
+      "types": "./dist/experimental/then.d.ts",
+      "default": "./dist/experimental/then.js"
     }
   },
   "types": "./dist/sledge.d.ts",
