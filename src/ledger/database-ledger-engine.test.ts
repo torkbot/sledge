@@ -26,8 +26,8 @@ import {
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
-  declareLedgerModule,
-  linkLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
   LedgerHistoryExpiredError,
   type EnqueueOptions,
   type LedgerTiming,

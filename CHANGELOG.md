@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Add `module.link(declaration, materializations)` to the scoped module
+  definition port. Canonical module factories no longer import their linking
+  phase from `@torkbot/sledge/ledger`, and linking rejects declarations not
+  minted by that exact factory invocation even when the durable module id
+  matches. Private provenance follows successful links into registration, so
+  exposure also rejects registered modules that bypassed the scoped phase.
+  Remove the standalone declaration, linking, and registered-module
+  construction interface from the public `@torkbot/sledge/ledger` export.
+- Breaking: rename the driver adapter exports to
+  `@torkbot/sledge/better-sqlite3` and `@torkbot/sledge/turso`. The removed
+  `-ledger` suffix implied that these adapters were alternate ledger models
+  rather than storage drivers passed to `application.open(...)`.
 - Breaking: add `defineModule(moduleId, callback)` as the canonical module
   construction boundary. Each factory invocation receives a fresh scoped
   `LedgerModuleDefinition`; `module.declare(...)` injects the stable identity,

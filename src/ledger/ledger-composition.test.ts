@@ -14,10 +14,10 @@ import {
 } from "./better-sqlite3-ledger.ts";
 import {
   createEventRef,
-  declareLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
   defineMaterialization,
   type WorkRef,
-  linkLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
 } from "./ledger.ts";
 import type { AnyComposedLedgerModel } from "./ledger-composition.ts";
 import { composeLedgerModulesForTest } from "./ledger-composition.test-support.ts";
@@ -25,9 +25,6 @@ import {
   createTursoLedger,
   createTursoStorageRuntime,
 } from "./turso-ledger.ts";
-import { createBetterSqliteDriver } from "../better-sqlite3-ledger.ts";
-import { defineLedger, defineModule } from "../sledge.ts";
-import { createTursoDriver } from "../turso-ledger.ts";
 
 const nowMs = 1_900_000_000_000;
 const runtime = new VirtualRuntimeHarness(nowMs);
@@ -468,46 +465,26 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
           },
         },
       });
-      const defineSourceModule = defineModule(source.moduleId, (module) =>
-        module.expose(source, {}),
+      const model = composeLedgerModulesForTest(
+        source,
+        consumer,
+        later,
+        failure,
       );
-      const defineConsumerModule = defineModule(consumer.moduleId, (module) =>
-        module.expose(consumer, {}),
-      );
-      const defineLaterModule = defineModule(later.moduleId, (module) =>
-        module.expose(later, {}),
-      );
-      const defineFailureModule = defineModule(failure.moduleId, (module) =>
-        module.expose(failure, {}),
-      );
-      const application = defineLedger((sledge) => {
-        const sourceCapabilities = sledge.install(defineSourceModule());
-        const consumerCapabilities = sledge.install(defineConsumerModule());
-        const laterCapabilities = sledge.install(defineLaterModule());
-        sledge.install(defineFailureModule());
-
-        return sledge.expose({
-          consumer: consumerCapabilities,
-          later: laterCapabilities,
-          source: sourceCapabilities,
-        });
-      });
       const openLedger = async () => {
         if (driver === "better-sqlite3") {
-          const opened = await application.open(
-            createBetterSqliteDriver({ databaseUrl }),
+          return await createBetterSqliteLedger({
+            databaseUrl,
+            model,
             timing,
-          );
-
-          return opened.ledger;
+          });
         }
 
-        const opened = await application.open(
-          createTursoDriver({ databaseUrl }),
+        return await createTursoLedger({
+          databaseUrl,
+          model,
           timing,
-        );
-
-        return opened.ledger;
+        });
       };
 
       phase = "open first ledger";

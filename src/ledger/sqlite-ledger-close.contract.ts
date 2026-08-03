@@ -15,8 +15,8 @@ import type {
   ComposedLedgerSignalTokens,
 } from "./ledger-composition.ts";
 import {
-  declareLedgerModule,
-  linkLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
   type Ledger,
   type LedgerTiming,
 } from "./ledger.ts";

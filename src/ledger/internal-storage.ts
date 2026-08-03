@@ -26,6 +26,10 @@ const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
 const ledgerApplicationConfigureFunctions = new WeakMap<object, unknown>();
 const ledgerDriverOpenFunctions = new WeakMap<object, LedgerDriverOpen>();
 const ledgerModuleOwnerReaders = new WeakMap<object, () => string>();
+// Scoped link provenance flows privately into the registered carrier. This
+// lets reveal validate construction ownership without adding public brands or
+// mutable owner fields to any ledger phase.
+const ledgerModuleConstructionScopes = new WeakMap<object, object>();
 const ledgerModuleContributions = new WeakSet<object>();
 const ledgerModuleComposers = new WeakMap<
   object,
@@ -112,6 +116,32 @@ export function readLedgerModuleOwnerId<TModuleId extends string>(owner: {
   }
 
   return readModuleId() as TModuleId;
+}
+
+export function attachLedgerModuleConstructionScope<TValue extends object>(
+  value: TValue,
+  scope: object,
+): TValue {
+  ledgerModuleConstructionScopes.set(value, scope);
+  return value;
+}
+
+export function inheritLedgerModuleConstructionScope(
+  source: object,
+  target: object,
+): void {
+  const scope = ledgerModuleConstructionScopes.get(source);
+
+  if (scope !== undefined) {
+    ledgerModuleConstructionScopes.set(target, scope);
+  }
+}
+
+export function belongsToLedgerModuleConstructionScope(
+  value: object,
+  scope: object,
+): boolean {
+  return ledgerModuleConstructionScopes.get(value) === scope;
 }
 
 export function attachLedgerModuleContribution<TContribution extends object>(

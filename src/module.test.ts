@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  declareLedgerModule,
-  linkLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
   type AnyRegisteredLedgerModule,
   type LedgerModuleDefinition,
 } from "./ledger/ledger.ts";
@@ -47,11 +47,14 @@ test("module factories bind identity once and reveal fresh contributions", () =>
 
 test("module owners are revoked after revealing one contribution", () => {
   let retained!: LedgerModuleDefinition<"contract.scoped-module">;
+  let retainedDeclaration!: object;
   const defineScopedModule = defineModule(
     "contract.scoped-module",
     (module) => {
       retained = module;
-      const registered = registerEmptyModule(module);
+      const declaration = module.declare({ events: {} });
+      retainedDeclaration = declaration;
+      const registered = module.link(declaration, null).register({});
       const contribution = module.expose(registered, {});
 
       assert.throws(
@@ -72,6 +75,53 @@ test("module owners are revoked after revealing one contribution", () => {
   assert.throws(
     () => retained.declare({ events: {} }),
     /ledger module definition has already closed/,
+  );
+  assert.throws(
+    () => retained.link(retainedDeclaration as never, null),
+    /ledger module definition has already closed/,
+  );
+});
+
+test("module linking accepts only declarations from the current factory invocation", () => {
+  let retainedDeclaration!: ReturnType<
+    LedgerModuleDefinition<"contract.owned-link">["declare"]
+  >;
+  const defineOwnedModule = defineModule(
+    "contract.owned-link",
+    (module, reusePreviousDeclaration: boolean) => {
+      const declaration = reusePreviousDeclaration
+        ? retainedDeclaration
+        : module.declare({ events: {} });
+
+      retainedDeclaration = declaration;
+
+      const registered = module.link(declaration, null).register({});
+      return module.expose(registered, {});
+    },
+  );
+
+  defineOwnedModule(false);
+
+  assert.throws(
+    () => defineOwnedModule(true),
+    /ledger module declaration does not belong to this definition/,
+  );
+});
+
+test("module exposure accepts only registration through the scoped link", () => {
+  const defineBypassedModule = defineModule(
+    "contract.bypassed-link",
+    (module) => {
+      const declaration = module.declare({ events: {} });
+      const registered = linkLedgerModule(declaration, null).register({});
+
+      return module.expose(registered, {});
+    },
+  );
+
+  assert.throws(
+    defineBypassedModule,
+    /registered ledger module contract\.bypassed-link does not belong to this definition/,
   );
 });
 
@@ -182,5 +232,5 @@ function registerEmptyModule<const TModuleId extends string>(
   module: LedgerModuleDefinition<TModuleId>,
 ) {
   const declaration = module.declare({ events: {} });
-  return linkLedgerModule(declaration, null).register({});
+  return module.link(declaration, null).register({});
 }

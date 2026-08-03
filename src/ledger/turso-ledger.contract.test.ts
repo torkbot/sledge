@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
-import { createTursoDriver } from "../turso-ledger.ts";
 import { createTursoLedger } from "./turso-ledger.ts";
 import {
   createLedgerContractControlledWork,
@@ -18,8 +17,8 @@ import {
   type LedgerContractHarness,
 } from "./ledger.contract.ts";
 import type { LedgerWorkers } from "./ledger.ts";
+import { composeLedgerModulesForTest } from "./ledger-composition.test-support.ts";
 import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
-import { defineLedger, defineModule } from "../sledge.ts";
 
 runSqliteLedgerCloseContract({
   suiteName: "turso ledger",
@@ -61,23 +60,16 @@ runLedgerContractSuite({
         runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
           timedWork.run(workKey, timeoutMs, leaseSignal, control),
       });
-      const defineContractModule = defineModule(model.moduleId, (module) =>
-        module.expose(model, {}),
-      );
-      const application = defineLedger((sledge) => {
-        sledge.install(defineContractModule());
-
-        return sledge.expose({});
-      });
-      const opened = await application.open(
-        createTursoDriver({ databaseUrl }),
-        {
+      const ledger = await createTursoLedger({
+        databaseUrl,
+        model: composeLedgerModulesForTest(model),
+        timing: {
           clock: runtime.clock,
           scheduler: runtime.scheduler,
         },
-      );
+      });
 
-      return createLedgerContractHarnessLedger(opened.ledger);
+      return createLedgerContractHarnessLedger(ledger);
     };
 
     let ledger = await createRuntimeLedger();

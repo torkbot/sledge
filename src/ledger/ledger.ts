@@ -10,12 +10,15 @@ import {
 import type { LedgerImplementations } from "./internal-storage.ts";
 import {
   attachLedgerImplementationFactory,
+  attachLedgerModuleConstructionScope,
   attachLedgerModuleContribution,
   attachLedgerModuleComposer,
   attachLedgerModuleOwner,
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
   composedLedgerModulesBrand,
+  belongsToLedgerModuleConstructionScope,
+  inheritLedgerModuleConstructionScope,
   isRegisteredLedgerModule,
   readLedgerImplementations,
   registeredLedgerContractsBrand,
@@ -2222,6 +2225,44 @@ export interface LedgerModuleDefinition<
     EventTokensFor<TModuleId, TEventDefinitions>
   >;
 
+  /**
+   * Adds the storage contract to a declaration owned by this exact factory
+   * invocation. The returned linked value gains registration capability while
+   * the declaration remains inert.
+   */
+  link<
+    const TEvents extends Record<string, TSchema>,
+    const TQueues extends Record<string, TSchema>,
+    const TSignals extends Record<string, TSchema>,
+    const TSignalQueues extends Record<string, TSchema>,
+    const TEventTokens extends {
+      readonly [TEventName in keyof TEvents]: AnyEventToken;
+    },
+    const TMaterializations extends Materializations<
+      AnyMaterializationHistory<TEvents>,
+      ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
+      LedgerQueryDefinitions
+    > | null,
+  >(
+    declaration: DeclaredLedgerModule<
+      TEvents,
+      TQueues,
+      TSignals,
+      TSignalQueues,
+      TModuleId,
+      TEventTokens
+    >,
+    materializations: TMaterializations,
+  ): LinkedLedgerModuleFor<
+    TEvents,
+    TQueues,
+    TSignals,
+    TSignalQueues,
+    TModuleId,
+    TEventTokens,
+    TMaterializations
+  >;
+
   expose<
     const TModule extends AnyRegisteredLedgerModule & {
       readonly moduleId: TModuleId;
@@ -2309,7 +2350,7 @@ export type LinkedLedgerModule<
   >;
 };
 
-export function declareLedgerModule<
+export function declareLedgerModuleInternal<
   const TModuleId extends string,
   const TEventDefinitions extends Record<string, EventDefinition>,
   const TQueues extends Record<string, TSchema> = {},
@@ -2372,8 +2413,9 @@ export function declareLedgerModule<
  * Defines a reusable module factory around one stable durable identity.
  *
  * Each invocation receives a fresh owner that is revoked when the callback
- * returns. Returning `module.expose(...)` proves that the registered module
- * and its public capabilities were assembled under that same owner.
+ * returns. Declarations can only be linked by the invocation that minted them,
+ * and returning `module.expose(...)` proves that the registered module and its
+ * public capabilities were assembled under that same owner.
  */
 export function defineModule<
   const TModuleId extends string,
@@ -2394,6 +2436,8 @@ export function defineModule<
   const factory = (...args: TArguments) => {
     let definitionOpen = true;
     let revealed: object | undefined;
+    const ownedDeclarations = new WeakSet<object>();
+    const constructionScope = Object.freeze({});
 
     const assertDefinitionOpen = (): void => {
       if (!definitionOpen) {
@@ -2426,7 +2470,7 @@ export function defineModule<
     > => {
       assertDefinitionOpen();
 
-      return declareLedgerModule<
+      const declaration = declareLedgerModuleInternal<
         TModuleId,
         TEventDefinitions,
         TQueues,
@@ -2439,6 +2483,26 @@ export function defineModule<
         signals: input.signals,
         signalQueues: input.signalQueues,
       });
+
+      ownedDeclarations.add(declaration);
+      return declaration;
+    };
+    const link: LedgerModuleDefinition<TModuleId>["link"] = (
+      declaration,
+      materializations,
+    ) => {
+      assertDefinitionOpen();
+
+      if (!ownedDeclarations.has(declaration)) {
+        throw new Error(
+          "ledger module declaration does not belong to this definition",
+        );
+      }
+
+      return attachLedgerModuleConstructionScope(
+        linkLedgerModuleInternal(declaration, materializations),
+        constructionScope,
+      );
     };
     const expose: LedgerModuleDefinition<TModuleId>["expose"] = (
       registeredModule,
@@ -2453,6 +2517,17 @@ export function defineModule<
       if (registeredModule.moduleId !== moduleId) {
         throw new Error(
           `ledger module ${moduleId} cannot expose registered module ${registeredModule.moduleId}`,
+        );
+      }
+
+      if (
+        !belongsToLedgerModuleConstructionScope(
+          registeredModule,
+          constructionScope,
+        )
+      ) {
+        throw new Error(
+          `registered ledger module ${moduleId} does not belong to this definition`,
         );
       }
 
@@ -2475,6 +2550,7 @@ export function defineModule<
           return readModuleId();
         },
         declare,
+        link,
         expose,
       }) as LedgerModuleDefinition<TModuleId>,
       readModuleId,
@@ -2562,7 +2638,7 @@ type LinkedLedgerModuleFor<
  * projection. Either path returns a new value with registration capability;
  * the declared value remains inert.
  */
-export function linkLedgerModule<
+export function linkLedgerModuleInternal<
   const TModuleId extends string,
   const TEvents extends Record<string, TSchema>,
   const TQueues extends Record<string, TSchema>,
@@ -5657,7 +5733,23 @@ function createLinkedLedgerModule<
           input.materializationHistory,
         );
 
-  return {
+  let linked!: LinkedLedgerModule<
+    TEvents,
+    TQueues,
+    TProjectionSchema,
+    TIndexers,
+    TQueries,
+    TSignals,
+    TSignalQueues,
+    TIndexerDefinitions,
+    TQueryDefinitions,
+    TMaterializationHistory,
+    TModuleId,
+    TEventTokens,
+    TQueryTokens
+  >;
+
+  linked = {
     moduleId: input.moduleId,
     events: input.contracts.events,
     queries: input.contracts.queries,
@@ -5782,10 +5874,19 @@ function createLinkedLedgerModule<
           ),
       );
 
+      // Preserve private factory ownership across the immutable phase change
+      // so expose can reject registration that bypassed the scoped link.
+      inheritLedgerModuleConstructionScope(
+        linked,
+        registeredWithImplementations,
+      );
+
       // Registration is the final module-construction phase. Freezing the
       // carrier keeps its durable identity aligned with its already-namespaced
       // contracts and with contribution provenance.
       return Object.freeze(registeredWithImplementations);
     },
   };
+
+  return linked;
 }

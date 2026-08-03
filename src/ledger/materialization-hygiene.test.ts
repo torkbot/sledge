@@ -12,10 +12,10 @@ import {
   type LedgerStorageStatement,
 } from "./internal-storage.ts";
 import {
-  declareLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
   defineMaterialization,
   type LedgerTiming,
-  linkLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
 } from "./ledger.ts";
 import {
   createDatabaseLedger,

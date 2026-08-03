@@ -25,14 +25,25 @@ test("package exports expose only supported public modules", async () => {
 
   assert.deepEqual(Object.keys(packageJson.exports).sort(), [
     ".",
-    "./better-sqlite3-ledger",
+    "./better-sqlite3",
     "./ledger",
     "./runtime/contracts",
     "./runtime/node-runtime",
     "./runtime/virtual-runtime",
     "./stdlib",
-    "./turso-ledger",
+    "./turso",
   ]);
+  assert.deepEqual(packageJson.exports["./ledger"], {
+    types: "./dist/ledger.d.ts",
+    default: "./dist/ledger.js",
+  });
+
+  for (const removedExportName of [
+    "./better-sqlite3-ledger",
+    "./turso-ledger",
+  ]) {
+    assert.equal(Object.hasOwn(packageJson.exports, removedExportName), false);
+  }
 
   for (const exportName of [
     "./database-ledger-engine",

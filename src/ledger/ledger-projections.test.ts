@@ -35,9 +35,9 @@ import {
 } from "./projection-sql-compiler.ts";
 import {
   createEventRef,
-  declareLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
   defineMaterialization,
-  linkLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
 } from "./ledger.ts";
 
 const UserCreatedSchema = Type.Object({
