@@ -2484,6 +2484,20 @@ export function defineModule<
         signalQueues: input.signalQueues,
       });
 
+      for (const [localName, definition] of Object.entries(input.events)) {
+        if (isLedgerContractToken(definition)) {
+          continue;
+        }
+
+        const token = declaration.events[localName];
+
+        if (token === undefined) {
+          throw new Error(`ledger module ${moduleId} lost event ${localName}`);
+        }
+
+        attachLedgerModuleConstructionScope(token, constructionScope);
+      }
+
       ownedDeclarations.add(declaration);
       return declaration;
     };
@@ -2544,16 +2558,19 @@ export function defineModule<
       definitionOpen = false;
       return contribution;
     };
-    const owner = attachLedgerModuleOwner(
-      Object.freeze({
-        get moduleId() {
-          return readModuleId();
-        },
-        declare,
-        link,
-        expose,
-      }) as LedgerModuleDefinition<TModuleId>,
-      readModuleId,
+    const owner = attachLedgerModuleConstructionScope(
+      attachLedgerModuleOwner(
+        Object.freeze({
+          get moduleId() {
+            return readModuleId();
+          },
+          declare,
+          link,
+          expose,
+        }) as LedgerModuleDefinition<TModuleId>,
+        readModuleId,
+      ),
+      constructionScope,
     );
 
     try {
@@ -5368,6 +5385,10 @@ function readLedgerContractToken<TKind extends LedgerContractMetadata["kind"]>(
   }
 
   return metadata as Extract<LedgerContractMetadata, { readonly kind: TKind }>;
+}
+
+export function readLedgerEventTokenModuleIdInternal(token: object): string {
+  return readLedgerContractToken(token, "event").moduleId;
 }
 
 function readTokenPhysicalName(

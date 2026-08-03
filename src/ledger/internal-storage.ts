@@ -144,6 +144,17 @@ export function belongsToLedgerModuleConstructionScope(
   return ledgerModuleConstructionScopes.get(value) === scope;
 }
 
+export function sharesLedgerModuleConstructionScope(
+  left: object,
+  right: object,
+): boolean {
+  const scope = ledgerModuleConstructionScopes.get(left);
+
+  return (
+    scope !== undefined && ledgerModuleConstructionScopes.get(right) === scope
+  );
+}
+
 export function attachLedgerModuleContribution<TContribution extends object>(
   contribution: TContribution,
 ): TContribution {

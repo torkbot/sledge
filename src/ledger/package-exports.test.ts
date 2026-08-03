@@ -26,6 +26,9 @@ test("package exports expose only supported public modules", async () => {
   assert.deepEqual(Object.keys(packageJson.exports).sort(), [
     ".",
     "./better-sqlite3",
+    "./experimental/all",
+    "./experimental/race",
+    "./experimental/then",
     "./ledger",
     "./runtime/contracts",
     "./runtime/node-runtime",
@@ -37,6 +40,7 @@ test("package exports expose only supported public modules", async () => {
     types: "./dist/ledger.d.ts",
     default: "./dist/ledger.js",
   });
+  assert.equal(Object.hasOwn(packageJson.exports, "./experimental"), false);
 
   for (const removedExportName of [
     "./better-sqlite3-ledger",

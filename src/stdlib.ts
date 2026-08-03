@@ -6,10 +6,15 @@ import type {
   EventToken,
   LedgerModuleOwner,
 } from "./ledger/ledger.ts";
-import { readLedgerModuleOwnerId } from "./ledger/internal-storage.ts";
+import { readLedgerEventTokenModuleIdInternal } from "./ledger/ledger.ts";
+import {
+  readLedgerModuleOwnerId,
+  sharesLedgerModuleConstructionScope,
+} from "./ledger/internal-storage.ts";
 import { ledgerIdentitySeparator } from "./ledger/ledger-identity.ts";
 
 const resultRefBrand: unique symbol = Symbol("sledge.stdlib.resultRef");
+const resultOwners = new WeakSet<object>();
 
 /**
  * Stable identity of one producer-owned durable result.
@@ -46,10 +51,16 @@ export type ResultOutcome = Static<typeof ResultOutcomeSchema>;
 export type ResultObservation<
   TResult = unknown,
   TOwnerModuleId extends string = string,
-> = {
-  readonly ref: ResultRef<TResult, TOwnerModuleId>;
-  readonly outcome: ResultOutcome;
-};
+> =
+  | {
+      readonly ref: ResultRef<TResult, TOwnerModuleId>;
+      readonly outcome: "succeeded";
+      readonly value: TResult;
+    }
+  | {
+      readonly ref: ResultRef<TResult, TOwnerModuleId>;
+      readonly outcome: "failed" | "cancelled";
+    };
 
 /**
  * Producer-owned terminal event viewed through the small contract needed by
@@ -58,8 +69,14 @@ export type ResultObservation<
 export interface ResultSource<
   TResult = unknown,
   TOwnerModuleId extends string = string,
+  TEvent extends EventToken<TOwnerModuleId, string, TSchema, null> = EventToken<
+    TOwnerModuleId,
+    string,
+    TSchema,
+    null
+  >,
 > {
-  readonly event: EventToken<string, string, TSchema, null>;
+  readonly event: TEvent;
   observe(payload: unknown): ResultObservation<TResult, TOwnerModuleId>;
 }
 
@@ -83,22 +100,29 @@ export interface DeclaredResult<
     observe: (
       payload: EventPayload<TEvent>,
     ) => ResultObservation<Static<TResultSchema>, TModuleId>,
-  ): ResultPort<TModuleId, TResultSchema>;
+  ): ResultPort<TModuleId, TResultSchema, TEvent>;
 }
 
 /** Result identity paired with the producer's one terminal event contract. */
 export interface ResultPort<
   TModuleId extends string,
   TResultSchema extends TSchema,
+  TEvent extends EventToken<TModuleId, string, TSchema, null> = EventToken<
+    TModuleId,
+    string,
+    TSchema,
+    null
+  >,
 > extends ResultIdentity<TModuleId, TResultSchema> {
-  readonly source: ResultSource<Static<TResultSchema>, TModuleId>;
+  readonly source: ResultSource<Static<TResultSchema>, TModuleId, TEvent>;
 }
 
 /**
  * Declares the result capability owned by one ledger module.
  *
- * Calling `fromEvent(...)` returns a new capability; the declaration is never
- * activated or mutated in place.
+ * Calling `fromEvent(...)` once consumes this incomplete phase and returns a
+ * new immutable capability. A single terminal contract per module keeps result
+ * identity unambiguous without adding another durable name.
  */
 export function defineResult<
   const TModuleId extends string,
@@ -110,6 +134,12 @@ export function defineResult<
   },
 ): DeclaredResult<TModuleId, TResultSchema> {
   const moduleId = readLedgerModuleOwnerId(module);
+
+  if (resultOwners.has(module)) {
+    throw new Error(`ledger module ${moduleId} already defines a result`);
+  }
+
+  resultOwners.add(module);
 
   const escapedModuleId = escapeRegularExpression(moduleId);
   const refSchema = Type.Unsafe<ResultRef<Static<TResultSchema>, TModuleId>>(
@@ -134,13 +164,40 @@ export function defineResult<
     refSchema,
     resultSchema: input.resultSchema,
   });
-  const fromEvent: DeclaredResult<TModuleId, TResultSchema>["fromEvent"] = (
-    event,
-    observe,
-  ) => {
+  let terminalEventBound = false;
+  const fromEvent = <
+    const TEvent extends EventToken<TModuleId, string, TSchema, null>,
+  >(
+    event: TEvent,
+    observe: (
+      payload: EventPayload<TEvent>,
+    ) => ResultObservation<Static<TResultSchema>, TModuleId>,
+  ): ResultPort<TModuleId, TResultSchema, TEvent> => {
+    readLedgerModuleOwnerId(module);
+
+    const eventModuleId = readLedgerEventTokenModuleIdInternal(event);
+
+    if (eventModuleId !== moduleId) {
+      throw new Error(
+        `ledger module ${moduleId} result cannot bind event owned by ${eventModuleId}`,
+      );
+    }
+
+    if (!sharesLedgerModuleConstructionScope(module, event)) {
+      throw new Error(
+        `ledger module ${moduleId} result event does not belong to this definition`,
+      );
+    }
+
+    if (terminalEventBound) {
+      throw new Error(`ledger module ${moduleId} result is already bound`);
+    }
+
+    terminalEventBound = true;
     const source: ResultSource<
       Static<TResultSchema>,
-      TModuleId
+      TModuleId,
+      TEvent
     > = Object.freeze({
       event,
       observe: (payload: unknown) => {
@@ -148,7 +205,7 @@ export function defineResult<
         // Sledge validates that token's payload before invoking an event
         // contribution; this assertion erases the existential event type
         // only after that boundary.
-        return observe(payload as EventPayload<typeof event>);
+        return observe(payload as EventPayload<TEvent>);
       },
     });
 
