@@ -1,10 +1,14 @@
 import type { TSchema } from "typebox";
 
-import { attachSledgeApplicationConfigure } from "./ledger/internal-storage.ts";
+import {
+  attachLedgerApplicationConfigure,
+  readLedgerDriverOpen,
+} from "./ledger/internal-storage.ts";
 import type {
   AnyRegisteredLedgerModule,
   EventToken,
   Ledger,
+  LedgerTiming,
   QueryParameters,
   QueryResult,
   QueryToken,
@@ -13,14 +17,19 @@ import type {
   RegisteredLedgerModuleSignalTokens,
   SignalToken,
 } from "./ledger/ledger.ts";
+import {
+  NodeRuntimeScheduler,
+  SystemRuntimeClock,
+} from "./runtime/node-runtime.ts";
 
-const sledgeApplicationTypeBrand: unique symbol = Symbol(
+const ledgerApplicationTypeBrand: unique symbol = Symbol(
   "sledge.applicationType",
 );
 declare const installedLedgerModuleTypeBrand: unique symbol;
 declare const installedLedgerTokenTypeBrand: unique symbol;
-declare const sledgeAssemblyScopeTypeBrand: unique symbol;
-declare const revealedSledgeCapabilitiesTypeBrand: unique symbol;
+declare const ledgerAssemblyScopeTypeBrand: unique symbol;
+declare const revealedLedgerCapabilitiesTypeBrand: unique symbol;
+declare const ledgerDriverTypeBrand: unique symbol;
 
 export type LedgerModuleContribution<
   TCapabilities extends object,
@@ -37,8 +46,8 @@ type InstalledLedgerToken<
   readonly [installedLedgerTokenTypeBrand]: TModule;
 };
 
-type SledgeAssemblyScope<TScope> = {
-  readonly [sledgeAssemblyScopeTypeBrand]: (scope: TScope) => TScope;
+type LedgerAssemblyScope<TScope> = {
+  readonly [ledgerAssemblyScopeTypeBrand]: (scope: TScope) => TScope;
 };
 
 type InstallLedgerTokens<
@@ -89,7 +98,7 @@ export type InstalledLedgerModuleCapabilities<
 
 type ScopeInstalledLedgerCapabilities<TCapabilities, TScope> =
   TCapabilities extends InstalledLedgerToken<unknown, AnyRegisteredLedgerModule>
-    ? TCapabilities & SledgeAssemblyScope<TScope>
+    ? TCapabilities & LedgerAssemblyScope<TScope>
     : TCapabilities extends {
           readonly [installedLedgerModuleTypeBrand]: infer TModule;
         }
@@ -98,7 +107,7 @@ type ScopeInstalledLedgerCapabilities<TCapabilities, TScope> =
           TScope
         > & {
           readonly [installedLedgerModuleTypeBrand]: TModule;
-        } & SledgeAssemblyScope<TScope>
+        } & LedgerAssemblyScope<TScope>
       : TCapabilities extends (...args: never[]) => unknown
         ? keyof TCapabilities extends never
           ? TCapabilities
@@ -119,27 +128,27 @@ type ScopeInstalledLedgerCapabilities<TCapabilities, TScope> =
               }
             : TCapabilities;
 
-type RemoveSledgeAssemblyScope<TCapabilities> = TCapabilities extends {
+type RemoveLedgerAssemblyScope<TCapabilities> = TCapabilities extends {
   readonly [installedLedgerTokenTypeBrand]: AnyRegisteredLedgerModule;
 }
-  ? Omit<TCapabilities, typeof sledgeAssemblyScopeTypeBrand>
+  ? Omit<TCapabilities, typeof ledgerAssemblyScopeTypeBrand>
   : TCapabilities extends (...args: never[]) => unknown
     ? keyof TCapabilities extends never
       ? TCapabilities
       : never
     : TCapabilities extends readonly unknown[]
       ? {
-          readonly [TKey in keyof TCapabilities]: RemoveSledgeAssemblyScope<
+          readonly [TKey in keyof TCapabilities]: RemoveLedgerAssemblyScope<
             TCapabilities[TKey]
           >;
         }
       : TCapabilities extends object
         ? {
-            readonly [TKey in keyof TCapabilities as TKey extends typeof sledgeAssemblyScopeTypeBrand
+            readonly [TKey in keyof TCapabilities as TKey extends typeof ledgerAssemblyScopeTypeBrand
               ? never
               : TKey]: TKey extends typeof installedLedgerModuleTypeBrand
               ? TCapabilities[TKey]
-              : RemoveSledgeAssemblyScope<TCapabilities[TKey]>;
+              : RemoveLedgerAssemblyScope<TCapabilities[TKey]>;
           }
         : TCapabilities;
 
@@ -150,13 +159,13 @@ type InstallableLedgerCapabilities<
 > = TCapabilities extends {
   readonly [installedLedgerTokenTypeBrand]: AnyRegisteredLedgerModule;
 }
-  ? TCapabilities extends SledgeAssemblyScope<TScope>
+  ? TCapabilities extends LedgerAssemblyScope<TScope>
     ? TCapabilities
     : never
   : TCapabilities extends {
         readonly [installedLedgerModuleTypeBrand]: AnyRegisteredLedgerModule;
       }
-    ? TCapabilities extends SledgeAssemblyScope<TScope>
+    ? TCapabilities extends LedgerAssemblyScope<TScope>
       ? TCapabilities
       : never
     : TCapabilities extends EventToken<string, string, TSchema, TSchema | null>
@@ -193,11 +202,11 @@ type InstallableLedgerCapabilities<
                   }
                 : TCapabilities;
 
-type RevealedSledgeCapabilities<
+type RevealedLedgerCapabilities<
   TCapabilities extends object,
   TScope,
 > = TCapabilities & {
-  readonly [revealedSledgeCapabilitiesTypeBrand]: (scope: TScope) => TScope;
+  readonly [revealedLedgerCapabilitiesTypeBrand]: (scope: TScope) => TScope;
 };
 
 type InstalledLedgerModules<TCapabilities> = TCapabilities extends {
@@ -226,7 +235,7 @@ type InstalledLedgerModules<TCapabilities> = TCapabilities extends {
             }[keyof TCapabilities]
           : never;
 
-export interface SledgeAssembly<TScope> {
+export interface LedgerAssembly<TScope> {
   install<
     const TModule extends AnyRegisteredLedgerModule,
     const TCapabilities extends object,
@@ -251,58 +260,88 @@ export interface SledgeAssembly<TScope> {
   expose<const TScopedCapabilities extends object>(
     capabilities: TScopedCapabilities &
       ScopeInstalledLedgerCapabilities<
-        RemoveSledgeAssemblyScope<TScopedCapabilities>,
+        RemoveLedgerAssemblyScope<TScopedCapabilities>,
         TScope
       >,
-  ): RevealedSledgeCapabilities<
-    RemoveSledgeAssemblyScope<TScopedCapabilities>,
+  ): RevealedLedgerCapabilities<
+    RemoveLedgerAssemblyScope<TScopedCapabilities>,
     TScope
   >;
 }
 
-export type SledgeApplication<
+export interface LedgerDriver {
+  readonly [ledgerDriverTypeBrand]: true;
+}
+
+export interface LedgerApplication<
   TCapabilities extends object,
   TModules extends AnyRegisteredLedgerModule = AnyRegisteredLedgerModule,
-> = {
-  readonly [sledgeApplicationTypeBrand]: TCapabilities;
+> {
+  readonly [ledgerApplicationTypeBrand]: TCapabilities;
   readonly [installedLedgerModuleTypeBrand]: TModules;
-};
 
-export type SledgeApplicationCapabilities<
-  TApplication extends SledgeApplication<object>,
-> = TApplication[typeof sledgeApplicationTypeBrand];
+  open(
+    driver: LedgerDriver,
+    timing?: LedgerTiming,
+  ): Promise<OpenedLedger<TCapabilities, TModules>>;
+}
 
-export type SledgeApplicationModules<
-  TApplication extends SledgeApplication<object>,
+export type LedgerApplicationCapabilities<
+  TApplication extends LedgerApplication<object>,
+> = TApplication[typeof ledgerApplicationTypeBrand];
+
+export type LedgerApplicationModules<
+  TApplication extends LedgerApplication<object>,
 > = TApplication[typeof installedLedgerModuleTypeBrand];
 
-export type SledgeLedger<TModules extends AnyRegisteredLedgerModule> = Ledger<
-  RegisteredLedgerModuleEventTokens<TModules>,
-  RegisteredLedgerModuleQueryTokens<TModules>,
-  RegisteredLedgerModuleSignalTokens<TModules>
->;
+export type ApplicationLedger<TModules extends AnyRegisteredLedgerModule> =
+  Ledger<
+    RegisteredLedgerModuleEventTokens<TModules>,
+    RegisteredLedgerModuleQueryTokens<TModules>,
+    RegisteredLedgerModuleSignalTokens<TModules>
+  >;
 
-export interface OpenedSledge<
+export interface OpenedLedger<
   TCapabilities extends object,
   TModules extends AnyRegisteredLedgerModule,
 > extends AsyncDisposable {
   readonly capabilities: TCapabilities;
-  readonly ledger: SledgeLedger<TModules>;
+  readonly ledger: ApplicationLedger<TModules>;
 
   close(): Promise<void>;
 }
 
-export function defineSledge<const TCapabilities extends object>(
+const defaultNodeTiming: LedgerTiming = Object.freeze({
+  clock: new SystemRuntimeClock(),
+  scheduler: new NodeRuntimeScheduler(),
+});
+
+export function defineLedger<const TCapabilities extends object>(
   configure: <TScope>(
-    assembly: SledgeAssembly<TScope>,
+    assembly: LedgerAssembly<TScope>,
   ) =>
-    | RevealedSledgeCapabilities<TCapabilities, TScope>
-    | Promise<RevealedSledgeCapabilities<TCapabilities, TScope>>,
-): SledgeApplication<TCapabilities, InstalledLedgerModules<TCapabilities>> {
-  const application = {} as SledgeApplication<
+    | RevealedLedgerCapabilities<TCapabilities, TScope>
+    | Promise<RevealedLedgerCapabilities<TCapabilities, TScope>>,
+): LedgerApplication<TCapabilities, InstalledLedgerModules<TCapabilities>> {
+  type TApplication = LedgerApplication<
     TCapabilities,
     InstalledLedgerModules<TCapabilities>
   >;
-  attachSledgeApplicationConfigure(application, configure);
+
+  let application: TApplication;
+  const open: TApplication["open"] = async (
+    driver,
+    timing = defaultNodeTiming,
+  ) => {
+    const openDriver = readLedgerDriverOpen(driver);
+
+    if (openDriver === undefined) {
+      throw new Error("invalid ledger driver");
+    }
+
+    return await openDriver({ application, timing });
+  };
+  application = { open } as TApplication;
+  attachLedgerApplicationConfigure(application, configure);
   return Object.freeze(application);
 }

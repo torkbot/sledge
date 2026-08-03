@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Breaking: rename `defineSledge(...)` to `defineLedger(...)`. Sledge remains
+  the conventional name of the scoped assembly port passed to the definition;
+  ledger concepts no longer carry the package name in their function names.
+- Breaking: invert storage construction around
+  `application.open(driver, timing?)`. `createBetterSqliteDriver(...)` and
+  `createTursoDriver(...)` now return inert driver values instead of accepting
+  an application. Node.js clock and scheduler implementations are used by
+  default; deterministic tests may pass one coherent `LedgerTiming` override.
 - Start the composable ledger standard library with owner-bound typed result
   refs and terminal event sources. `defineResult(...)` returns immutable phases:
   first a result identity and schema, then `fromEvent(...)` returns a new
@@ -13,7 +21,7 @@
   preserved by coalescing; anonymous work resolves to `null`. Export
   `WorkRefSchema` so the opaque identity can cross validated event outcome,
   payload, and projection boundaries.
-- Breaking: add `defineSledge(...)` as the single application composition
+- Breaking: add `defineLedger(...)` as the single application composition
   boundary. Its scoped `install(...)` method consumes module contributions and
   immediately reveals their bounded capabilities, so applications no longer
   retain registered module handles or perform a final composition step.
@@ -28,10 +36,9 @@
   prefixes; fresh databases must install their complete bootstrap graph without
   querying.
 - Breaking: replace public model composition and model-resolution APIs with the
-  root `SledgeApplication` API and adapter `createBetterSqliteSledge(...)` /
-  `createTursoSledge(...)` constructors. Opened values contain per-open
-  capabilities and the owning ledger runtime; adapter-owned composition and
-  storage linking remain internal.
+  root `LedgerApplication` API. Applications open with a storage driver and
+  return per-open capabilities plus the owning ledger runtime; adapter-owned
+  composition and storage linking remain internal.
 - Migration: the application API preserves the existing durable storage layout.
   Databases created by 0.24 remain valid when the application installs the same
   module ids in the same order. Changing that durable graph still requires an
@@ -77,12 +84,13 @@
   entries in nullable-column `orderByList(...)` values; use `whereNull(...)`
   and `orderByNulls(...)` for SQL null semantics.
 - Breaking: require every ledger module to declare a stable `moduleId`, install
-  registered module contributions through `defineSledge(...)`, and use opaque
+  registered module contributions through `defineLedger(...)`, and use opaque
   event, query, and signal tokens at runtime.
 - Allow unused `queues`, `signals`, and `signalQueues` shape categories to be
   omitted; omitted categories are exact empty definitions.
-- Breaking: storage adapters now accept only a `SledgeApplication`; remove the
-  uncomposed `createLedger(...)` and `LedgerEngineFactory` public seam.
+- Breaking: remove the uncomposed `createLedger(...)` and
+  `LedgerEngineFactory` public seam. Storage-specific exports now create opaque
+  drivers accepted only by `LedgerApplication.open(...)`.
 - Breaking: make `WorkRef` an opaque Sledge-generated string instead of a
   caller-constructible queue tuple. Keyed work persists its own stable identity,
   so cancellation never depends on public queue or module names.
