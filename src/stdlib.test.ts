@@ -5,8 +5,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 
 import {
-  declareLedgerModule,
-  linkLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
   type LedgerModuleOwner,
 } from "./ledger/ledger.ts";
 import { defineModule } from "./sledge.ts";
@@ -60,7 +59,7 @@ test("a declared result returns a new terminal-event capability", () => {
           outcome: "succeeded",
         }),
       );
-      const registered = linkLedgerModule(declaration, null).register({});
+      const registered = module.link(declaration, null).register({});
 
       return module.expose(registered, { completed, declared });
     },
@@ -112,7 +111,7 @@ test("result definitions require a live Sledge module owner", () => {
       retainedOwner = module;
       const result = defineResult(module, { resultSchema: OutputSchema });
       const declaration = module.declare({ events: {} });
-      const registered = linkLedgerModule(declaration, null).register({});
+      const registered = module.link(declaration, null).register({});
 
       return module.expose(registered, { result });
     },
@@ -150,7 +149,7 @@ function defineResultModule<const TModuleId extends string>(
   return defineModule(moduleId, (module) => {
     const result = defineResult(module, { resultSchema: OutputSchema });
     const declaration = module.declare({ events: {} });
-    const registered = linkLedgerModule(declaration, null).register({});
+    const registered = module.link(declaration, null).register({});
 
     return module.expose(registered, { result });
   });

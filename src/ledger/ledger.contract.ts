@@ -17,12 +17,12 @@ import type {
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
 import {
   createEventRef,
-  declareLedgerModule,
+  declareLedgerModuleInternal as declareLedgerModule,
   defineMaterialization,
   LedgerHistoryExpiredError,
   WorkRefSchema,
   WorkOperationTimeoutError,
-  linkLedgerModule,
+  linkLedgerModuleInternal as linkLedgerModule,
 } from "./ledger.ts";
 
 export const MessageReceivedSchema = Type.Object({

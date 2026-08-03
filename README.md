@@ -22,14 +22,14 @@ handles to indexer and query callbacks.
 ## The Application Model
 
 `defineModule(moduleId, callback)` creates a reusable module factory. Its scoped
-`module` port declares contracts under that identity and reveals one registered
-module plus only the bounded capabilities other code may use. The application
-definition installs those contributions in durable order and exposes one
-capability tree:
+`module` port declares contracts under that identity, links those declarations
+to storage materializations, and reveals one registered module plus only the
+bounded capabilities other code may use. The application definition installs
+those contributions in durable order and exposes one capability tree:
 
 ```ts
 import { defineLedger } from "@torkbot/sledge";
-import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
+import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3";
 
 const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
@@ -69,11 +69,8 @@ value.
 import { Type } from "typebox";
 
 import { defineLedger, defineModule } from "@torkbot/sledge";
-import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
-import {
-  defineMaterialization,
-  linkLedgerModule,
-} from "@torkbot/sledge/ledger";
+import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3";
+import { defineMaterialization } from "@torkbot/sledge/ledger";
 import { NodeRuntimeScheduler } from "@torkbot/sledge/runtime/node-runtime";
 
 const databaseUrl = "./app.sqlite";
@@ -132,7 +129,7 @@ const defineUsersModule = defineModule("app.users", (module) => {
       },
     });
 
-  const registered = linkLedgerModule(declaration, materializations).register({
+  const registered = module.link(declaration, materializations).register({
     indexers: {
       upsertUser: async ({ input, event, db }) => {
         await db
@@ -288,13 +285,20 @@ const defineUsersModule = defineModule("app.users", (module) => {
       created: Type.Object({ userId: Type.String() }),
     },
   });
-  const registered = linkLedgerModule(declaration, null).register({});
+  const registered = module.link(declaration, null).register({});
 
   return module.expose(registered, {
     events: registered.events,
   });
 });
 ```
+
+`module.link(...)` accepts only declarations minted by that exact factory
+invocation. This gives Sledge a private seam for module-owned plumbing without
+making declarations mutable or allowing values to leak between invocations.
+That private provenance follows the linked value into registration, so
+`module.expose(...)` also rejects a registered module that bypassed the scoped
+link.
 
 The callback must synchronously return its one `module.expose(...)` result.
 That call verifies the registered module's owner, revokes the construction
@@ -308,7 +312,7 @@ const defineAuditModule = defineModule(
     const declaration = module.declare({
       events: { userCreated: users.events.created },
     });
-    const registered = linkLedgerModule(declaration, null).register({
+    const registered = module.link(declaration, null).register({
       events: {
         userCreated: ({ event }) => console.log(event.payload.userId),
       },
@@ -402,8 +406,7 @@ the owner-bound ref schema can be used directly in durable payloads:
 import { Type } from "typebox";
 
 import { defineLedger, defineModule } from "@torkbot/sledge";
-import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
-import { linkLedgerModule } from "@torkbot/sledge/ledger";
+import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3";
 import { defineResult } from "@torkbot/sledge/stdlib";
 
 const CompactionResultSchema = Type.Object({
@@ -423,7 +426,7 @@ const defineCompactionsModule = defineModule("app.compactions", (module) => {
       }),
     },
   });
-  const registered = linkLedgerModule(declaration, null).register({});
+  const registered = module.link(declaration, null).register({});
 
   return module.expose(registered, {
     result: result.fromEvent(registered.events.completed, (payload) => ({
@@ -485,9 +488,9 @@ query that registry and build one final ledger model safely.
 | Phase                      | Produced by                      | Capability added                                           |
 | -------------------------- | -------------------------------- | ---------------------------------------------------------- |
 | Module factory             | `defineModule(...)`              | Reusable definition bound to one stable module identity    |
-| `LedgerModuleDefinition`   | Invoking the module factory      | Scoped identity, declaration, and one reveal capability    |
+| `LedgerModuleDefinition`   | Invoking the module factory      | Scoped identity, declaration, linking, and one reveal      |
 | `DeclaredLedgerModule`     | `module.declare(...)`            | Durable contract tokens and a typed logical shape          |
-| `LinkedLedgerModule`       | `linkLedgerModule(...)`          | A materialization contract and registration capability     |
+| `LinkedLedgerModule`       | `module.link(...)`               | A materialization contract and registration capability     |
 | `RegisteredLedgerModule`   | `linked.register(...)`           | Implementations and handlers; ready to reveal              |
 | `LedgerModuleContribution` | `module.expose(...)`             | Registered module plus the bounded capabilities it reveals |
 | `LedgerApplication`        | `defineLedger(...)`              | A reusable, storage-independent assembly definition        |
@@ -515,11 +518,9 @@ create contracts owned by that module and produce opaque event tokens such as
 `declaration.events["user.created"]`. Runtime APIs accept these tokens
 instead of string names.
 
-The lower-level `declareLedgerModule({ moduleId, ... })` export remains
-available for ledger infrastructure that deliberately constructs phases
-without an application module factory. Application modules should use
-`module.declare(...)` so identity cannot drift across their primitives and
-contracts.
+Module construction has no standalone equivalent. `module.declare(...)` and
+`module.link(...)` are scoped to the current factory invocation so identity and
+construction ownership cannot drift across primitives and contracts.
 
 An event may declare a durable result alongside its payload:
 
@@ -546,7 +547,7 @@ const defineDecisionsModule = defineModule("decisions", (module) => {
       }),
     },
   });
-  const registered = linkLedgerModule(declaration, null).register({
+  const registered = module.link(declaration, null).register({
     events: {
       recorded: () => ({ revision: 1 }),
     },
@@ -654,7 +655,7 @@ const defineUsersModule = defineModule("app.users", (module) => {
     typeof declaration.shape.events
   >;
 
-  const linked = linkLedgerModule(declaration, materializations);
+  const linked = module.link(declaration, materializations);
   const registered = linked.register({
     indexers: { upsertUser: () => undefined },
     queries: { userById: () => null },
@@ -710,8 +711,8 @@ reference schema objects available at that point in the chain.
 
 When helper code needs named types, derive them inside the same module factory
 from its local materialization and declaration values, as above, instead of
-restating table shapes. Link the declaration to its materializations with
-`linkLedgerModule(...)` before registration.
+restating table shapes. Link the declaration to its materializations with the
+scoped `module.link(...)` capability before registration.
 
 The link phase is explicit even when a module owns no projection:
 
@@ -720,7 +721,7 @@ const defineNotificationsModule = defineModule(
   "app.notifications",
   (module) => {
     const declaration = module.declare({ events: {} });
-    const linked = linkLedgerModule(declaration, null);
+    const linked = module.link(declaration, null);
     const registered = linked.register({});
 
     return module.expose(registered, {});
@@ -1078,34 +1079,50 @@ immediately emit event tokens and run query tokens referenced by the handler's
 module:
 
 ```ts
-const linkedDecisions = linkLedgerModule(decisionsShape, null);
-const decisions = linkedDecisions.register({
-  events: {
-    recorded: () => {
-      return {
-        revision: 1,
-      };
+const defineDecisionsModule = defineModule("decisions", (module) => {
+  const declaration = module.declare({
+    events: {
+      recorded: {
+        payload: Type.Object({ decisionId: Type.String() }),
+        outcome: Type.Object({
+          revision: Type.Integer({ minimum: 1 }),
+        }),
+      },
+      "decision.observed": Type.Object({
+        decisionId: Type.String(),
+        revision: Type.Integer({ minimum: 1 }),
+      }),
     },
-    "decision.observed": () => {},
-  },
-  queues: {
-    "decisions.record": async ({ work, actions, ledger }) => {
-      const committed = await ledger.emit(
-        decisionsShape.events.recorded,
-        {
-          decisionId: work.payload.decisionId,
-        },
-        {
-          dedupeKey: `decision:${work.payload.decisionId}`,
-        },
-      );
+    queues: {
+      "decisions.record": Type.Object({ decisionId: Type.String() }),
+    },
+  });
+  const registered = module.link(declaration, null).register({
+    events: {
+      recorded: () => ({ revision: 1 }),
+      "decision.observed": () => {},
+    },
+    queues: {
+      "decisions.record": async ({ work, actions, ledger }) => {
+        const committed = await ledger.emit(
+          declaration.events.recorded,
+          {
+            decisionId: work.payload.decisionId,
+          },
+          {
+            dedupeKey: `decision:${work.payload.decisionId}`,
+          },
+        );
 
-      actions.emit("decision.observed", {
-        decisionId: work.payload.decisionId,
-        revision: committed.outcome.revision,
-      });
+        actions.emit("decision.observed", {
+          decisionId: work.payload.decisionId,
+          revision: committed.outcome.revision,
+        });
+      },
     },
-  },
+  });
+
+  return module.expose(registered, { events: registered.events });
 });
 ```
 
@@ -1377,8 +1394,8 @@ without being embedded in event consumption.
 
 - `@torkbot/sledge`
 - `@torkbot/sledge/ledger`
-- `@torkbot/sledge/better-sqlite3-ledger`
-- `@torkbot/sledge/turso-ledger`
+- `@torkbot/sledge/better-sqlite3`
+- `@torkbot/sledge/turso`
 - `@torkbot/sledge/runtime/contracts`
 - `@torkbot/sledge/runtime/node-runtime`
 - `@torkbot/sledge/runtime/virtual-runtime`

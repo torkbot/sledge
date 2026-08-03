@@ -18,16 +18,16 @@
       "default": "./dist/sledge.js"
     },
     "./ledger": {
-      "types": "./dist/ledger/ledger.d.ts",
-      "default": "./dist/ledger/ledger.js"
+      "types": "./dist/ledger.d.ts",
+      "default": "./dist/ledger.js"
     },
-    "./better-sqlite3-ledger": {
-      "types": "./dist/better-sqlite3-ledger.d.ts",
-      "default": "./dist/better-sqlite3-ledger.js"
+    "./better-sqlite3": {
+      "types": "./dist/better-sqlite3.d.ts",
+      "default": "./dist/better-sqlite3.js"
     },
-    "./turso-ledger": {
-      "types": "./dist/turso-ledger.d.ts",
-      "default": "./dist/turso-ledger.js"
+    "./turso": {
+      "types": "./dist/turso.d.ts",
+      "default": "./dist/turso.js"
     },
     "./runtime/contracts": {
       "types": "./dist/runtime/contracts.d.ts",

@@ -7,10 +7,10 @@ import test from "node:test";
 import { Type } from "typebox";
 
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
-import { defineMaterialization, linkLedgerModule } from "./ledger/ledger.ts";
+import { defineMaterialization } from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
-import { createBetterSqliteDriver } from "./better-sqlite3-ledger.ts";
-import { createTursoDriver } from "./turso-ledger.ts";
+import { createBetterSqliteDriver } from "./better-sqlite3.ts";
+import { createTursoDriver } from "./turso.ts";
 import { VirtualRuntimeHarness } from "./runtime/virtual-runtime.ts";
 import {
   defineLedger,
@@ -106,7 +106,7 @@ if (false) {
       "contract.laundering",
       (module, foreign: typeof firstCapabilities) => {
         const declaration = module.declare({ events: {} });
-        const registered = linkLedgerModule(declaration, null).register({});
+        const registered = module.link(declaration, null).register({});
 
         return module.expose(registered, { foreign });
       },
@@ -125,7 +125,7 @@ if (false) {
       "contract.composed",
       (module, sourceToCompose: typeof source) => {
         const declaration = module.declare({ events: {} });
-        const registered = linkLedgerModule(declaration, null).register({});
+        const registered = module.link(declaration, null).register({});
 
         return module.expose(registered, { source: sourceToCompose });
       },
@@ -144,7 +144,7 @@ if (false) {
         query: typeof foreign.capabilities.queries.configuredModuleIds,
       ) => {
         const declaration = module.declare({ events: {} });
-        const registered = linkLedgerModule(declaration, null).register({});
+        const registered = module.link(declaration, null).register({});
 
         return module.expose(registered, { query });
       },
@@ -423,7 +423,7 @@ test("a failed module factory does not authenticate its leaked contribution", as
     "contract.failed-contribution",
     (module) => {
       const declaration = module.declare({ events: {} });
-      const registered = linkLedgerModule(declaration, null).register({});
+      const registered = module.link(declaration, null).register({});
       leaked = module.expose(registered, {});
 
       throw new Error("failure after reveal");
@@ -584,7 +584,7 @@ const defineSourceModule = defineModule(
         created: Type.Object({ id: Type.String({ minLength: 1 }) }),
       },
     });
-    const registered = linkLedgerModule(declaration, null).register({});
+    const registered = module.link(declaration, null).register({});
 
     return module.expose(registered, {
       events: registered.events,
@@ -631,7 +631,7 @@ const defineRegistryModuleFactory = defineModule(
           },
         },
       });
-    const registered = linkLedgerModule(declaration, materialization).register({
+    const registered = module.link(declaration, materialization).register({
       events: {
         configured: async ({ event, actions }) => {
           await actions.index("storeConfiguration", event.payload);
@@ -690,7 +690,7 @@ const defineDiscoveredModule = defineModule("contract.discovered", (module) => {
         },
       },
     });
-  const registered = linkLedgerModule(declaration, materialization).register({
+  const registered = module.link(declaration, materialization).register({
     queries: {
       status: () => "ready" as const,
     },
@@ -722,7 +722,7 @@ const defineUnexpectedModule = defineModule("contract.unexpected", (module) => {
         },
       },
     });
-  const registered = linkLedgerModule(declaration, materialization).register({
+  const registered = module.link(declaration, materialization).register({
     queries: { status: () => "unexpected" as const },
   });
 
@@ -750,7 +750,7 @@ const defineQueryModule = defineModule(
           },
         },
       });
-    const registered = linkLedgerModule(declaration, materialization).register({
+    const registered = module.link(declaration, materialization).register({
       queries: { status: run },
     });
 
