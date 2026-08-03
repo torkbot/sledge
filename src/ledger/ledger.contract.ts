@@ -20,6 +20,7 @@ import {
   declareLedgerModule,
   defineMaterialization,
   LedgerHistoryExpiredError,
+  WorkRefSchema,
   WorkOperationTimeoutError,
   linkLedgerModule,
 } from "./ledger.ts";
@@ -70,6 +71,15 @@ const CoalescedWorkRequestedSchema = Type.Object({
   coalescingKey: Type.String(),
   partitionKey: Type.Union([Type.Null(), Type.String()]),
   workKey: Type.String(),
+});
+
+const UnaddressedWorkRequestedSchema = Type.Object({
+  availableAtMs: Type.Number(),
+  workKey: Type.String(),
+});
+
+const EnqueuedWorkOutcomeSchema = Type.Object({
+  workRef: WorkRefSchema,
 });
 
 const ControlledWorkAttemptedSchema = Type.Object({
@@ -170,8 +180,18 @@ const ledgerContractShape = declareLedgerModule({
     "immediate-decision.observed": ImmediateDecisionObservedSchema,
     "intent.planned": IntentPlannedSchema,
     "dispatch.completed": DispatchCompletedSchema,
-    "controlled-work.requested": ControlledWorkRequestedSchema,
-    "coalesced-work.requested": CoalescedWorkRequestedSchema,
+    "controlled-work.requested": {
+      payload: ControlledWorkRequestedSchema,
+      outcome: EnqueuedWorkOutcomeSchema,
+    },
+    "coalesced-work.requested": {
+      payload: CoalescedWorkRequestedSchema,
+      outcome: EnqueuedWorkOutcomeSchema,
+    },
+    "unaddressed-work.requested": {
+      payload: UnaddressedWorkRequestedSchema,
+      outcome: Type.Null(),
+    },
     "controlled-work.attempted": ControlledWorkAttemptedSchema,
     "controlled-signal-work.requested": ControlledSignalWorkSchema,
     "timed-work.requested": TimedWorkSchema,
@@ -1062,15 +1082,17 @@ export function createLedgerContractModel(input: {
           enqueueOptions.partitionKey = event.payload.partitionKey;
         }
 
-        actions.enqueue(
+        const workRef = await actions.enqueue(
           "controlled-work.run",
           {
             workKey: event.payload.workKey,
           },
           enqueueOptions,
         );
+
+        return { workRef };
       },
-      "coalesced-work.requested": ({ event, actions }) => {
+      "coalesced-work.requested": async ({ event, actions }) => {
         const enqueueOptions: {
           availableAtMs: number;
           coalescingKey: string;
@@ -1084,12 +1106,21 @@ export function createLedgerContractModel(input: {
           enqueueOptions.partitionKey = event.payload.partitionKey;
         }
 
-        actions.enqueue(
+        const workRef = await actions.enqueue(
           "controlled-work.run",
           {
             workKey: event.payload.workKey,
           },
           enqueueOptions,
+        );
+
+        return { workRef };
+      },
+      "unaddressed-work.requested": async ({ event, actions }) => {
+        return await actions.enqueue(
+          "controlled-work.run",
+          { workKey: event.payload.workKey },
+          { availableAtMs: event.payload.availableAtMs },
         );
       },
       "controlled-signal-work.requested": ({ event, actions }) => {
@@ -2601,6 +2632,96 @@ export function runLedgerContractSuite(input: {
         });
       },
     );
+
+    await t.test("addressed enqueue returns its durable WorkRef", async () => {
+      await withHarness(input.create, async (harness) => {
+        const committed = await harness.ledger.emit(
+          "controlled-work.requested",
+          {
+            availableAtMs: harness.nowMs() + 500,
+            partitionKey: null,
+            workKey: "returned-work-ref",
+          },
+        );
+        const outcome = Value.Decode(
+          EnqueuedWorkOutcomeSchema,
+          committed.outcome,
+        );
+
+        await harness.restart();
+
+        const [work] = await harness.ledger.listWork({
+          sourceEventId: committed.eventId,
+        });
+
+        assert.equal(work?.ref, outcome.workRef);
+
+        const cancellation = await harness.ledger.cancelWork({
+          ref: outcome.workRef,
+        });
+
+        assert.equal(cancellation.status, "cancelled");
+      });
+    });
+
+    await t.test(
+      "coalesced enqueue returns the preserved WorkRef",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const first = await harness.ledger.emit("coalesced-work.requested", {
+            availableAtMs: harness.nowMs() + 500,
+            coalescingKey: "wake:returned-ref",
+            partitionKey: "returned-ref",
+            workKey: "coalesced-returned-ref",
+          });
+          const second = await harness.ledger.emit("coalesced-work.requested", {
+            availableAtMs: harness.nowMs() + 200,
+            coalescingKey: "wake:returned-ref",
+            partitionKey: "returned-ref",
+            workKey: "coalesced-returned-ref",
+          });
+          const firstOutcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            first.outcome,
+          );
+          const secondOutcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            second.outcome,
+          );
+
+          assert.equal(secondOutcome.workRef, firstOutcome.workRef);
+
+          await harness.restart();
+
+          const [work] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["delayed"],
+          });
+
+          assert.equal(work?.ref, firstOutcome.workRef);
+        });
+      },
+    );
+
+    await t.test("unaddressed enqueue returns null", async () => {
+      await withHarness(input.create, async (harness) => {
+        const committed = await harness.ledger.emit(
+          "unaddressed-work.requested",
+          {
+            availableAtMs: harness.nowMs() + 500,
+            workKey: "unaddressed-return",
+          },
+        );
+
+        assert.equal(committed.outcome, null);
+
+        const [work] = await harness.ledger.listWork({
+          sourceEventId: committed.eventId,
+        });
+
+        assert.equal(work?.ref, null);
+      });
+    });
 
     await t.test(
       "coalesced work keeps one pending row and only moves availability earlier",

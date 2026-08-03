@@ -28,7 +28,9 @@ import type {
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
   RegisteredLedgerModule,
+  AddressedEnqueueOptions,
   EmitOptions,
+  EnqueueOptions,
   EventCausationWork,
   EventEnvelope,
   EventHandlerFunction,
@@ -59,9 +61,11 @@ import type {
   MaterializationMigrationOperation,
   QueryWorkInput,
   SignalSubscription,
+  UnaddressedEnqueueOptions,
 } from "./ledger.ts";
 import {
   LedgerHistoryExpiredError,
+  WorkRefSchema,
   WorkOperationTimeoutError,
 } from "./ledger.ts";
 import type {
@@ -1077,6 +1081,7 @@ const CoalescedWorkRowSchema = Type.Object({
   partition_key: Type.Union([Type.Null(), Type.String()]),
   payload_json: Type.String(),
   work_id: Type.Number(),
+  work_ref: Type.String(),
 });
 
 const DeferredSuccessorRowSchema = Type.Object({
@@ -1086,11 +1091,6 @@ const DeferredSuccessorRowSchema = Type.Object({
 
 const CoalescingKeySchema = Type.String({ minLength: 1 });
 const PartitionKeySchema = Type.String({ minLength: 1 });
-const WorkRefSchema = Type.String({
-  pattern:
-    "^work:v1:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-});
-
 const WorkSnapshotRowSchema = Type.Object({
   work_id: Type.Number(),
   work_ref: Type.Union([Type.Null(), Type.String()]),
@@ -2500,11 +2500,16 @@ function openDatabaseLedgerEngine<
     readonly workKey: string | null;
   };
 
+  type MaterializedDurableWork = {
+    readonly changed: boolean;
+    readonly ref: WorkRef | null;
+  };
+
   async function materializeDurableWork(
     database: StorageDatabase,
     sourceEventId: number,
     work: PendingDurableWork,
-  ): Promise<boolean> {
+  ): Promise<MaterializedDurableWork> {
     const payloadJson = JSON.stringify(work.payload);
     let availableAtMs = work.availableAtMs;
 
@@ -2516,7 +2521,8 @@ function openDatabaseLedgerEngine<
              deferred_generation,
              partition_key,
              payload_json,
-             available_at_ms
+             available_at_ms,
+             work_ref
            FROM work
            WHERE queue_name = ?
              AND CASE
@@ -2532,6 +2538,7 @@ function openDatabaseLedgerEngine<
 
       if (existing !== undefined) {
         const decodedExisting = decodeRow(existing, CoalescedWorkRowSchema);
+        const existingRef = decodeWorkRef(decodedExisting.work_ref);
 
         if (decodedExisting.deferred_generation === 1) {
           await database
@@ -2590,13 +2597,24 @@ function openDatabaseLedgerEngine<
               )
               .run(availableAtMs, decodedExisting.work_id);
 
-            return promotion.changes > 0;
+            return {
+              changed: promotion.changes > 0,
+              ref: existingRef,
+            };
           }
 
-          return false;
+          return {
+            changed: false,
+            ref: existingRef,
+          };
         }
       }
     }
+
+    const workRef =
+      work.workKey === null && work.coalescingKey === null
+        ? null
+        : createWorkRef();
 
     await database
       .prepare(
@@ -2619,9 +2637,7 @@ function openDatabaseLedgerEngine<
           ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, NULL, NULL, NULL, NULL)`,
       )
       .run(
-        work.workKey === null && work.coalescingKey === null
-          ? null
-          : createWorkRef(),
+        workRef,
         work.queueName,
         work.workKey,
         work.coalescingKey,
@@ -2631,7 +2647,10 @@ function openDatabaseLedgerEngine<
         availableAtMs,
       );
 
-    return true;
+    return {
+      changed: true,
+      ref: workRef,
+    };
   }
 
   async function appendEventInTransaction(
@@ -2833,18 +2852,13 @@ function openDatabaseLedgerEngine<
         `result-bearing event ${String(eventName)} has no owning handler`,
       );
     }
-    const queued: {
-      queueName: string;
-      workKey: string | null;
-      coalescingKey: string | null;
-      partitionKey: string | null;
-      payload: unknown;
-      availableAtMs: number;
-    }[] = [];
+    let workChanged = false;
 
     if (eventHandler !== undefined) {
       let actionScopeOpen = true;
       const pendingActions = new Set<Promise<unknown>>();
+      const enqueueOperations: Promise<MaterializedDurableWork>[] = [];
+      let enqueueTail = Promise.resolve();
 
       const assertActionScopeOpen = () => {
         if (!actionScopeOpen) {
@@ -2879,6 +2893,99 @@ function openDatabaseLedgerEngine<
         );
       };
 
+      const settleEnqueues = async (): Promise<void> => {
+        const settled = await Promise.allSettled(enqueueOperations);
+        const failed = settled.find(
+          (result): result is PromiseRejectedResult =>
+            result.status === "rejected",
+        );
+
+        if (failed !== undefined) {
+          throw failed.reason;
+        }
+      };
+
+      function enqueue<const TQueueName extends keyof TQueues>(
+        queueName: TQueueName,
+        payload: Static<TQueues[TQueueName]>,
+        options: AddressedEnqueueOptions,
+      ): Promise<WorkRef>;
+      function enqueue<const TQueueName extends keyof TQueues>(
+        queueName: TQueueName,
+        payload: Static<TQueues[TQueueName]>,
+        options?: UnaddressedEnqueueOptions,
+      ): Promise<null>;
+      function enqueue<const TQueueName extends keyof TQueues>(
+        queueName: TQueueName,
+        payload: Static<TQueues[TQueueName]>,
+        options: EnqueueOptions,
+      ): Promise<WorkRef | null>;
+      function enqueue<const TQueueName extends keyof TQueues>(
+        queueName: TQueueName,
+        payload: Static<TQueues[TQueueName]>,
+        options?: EnqueueOptions,
+      ): Promise<WorkRef | null> {
+        assertActionScopeOpen();
+        const queueSchema = model.queues[queueName];
+
+        if (queueSchema === undefined) {
+          throw new Error(`unknown queue: ${String(queueName)}`);
+        }
+
+        const decodedQueuePayload = decodeValue(queueSchema, payload);
+
+        if (options?.workKey !== undefined) {
+          validateWorkKey(options.workKey);
+        }
+
+        if (options?.coalescingKey !== undefined) {
+          validateCoalescingKey(options.coalescingKey);
+        }
+
+        if (
+          options?.workKey !== undefined &&
+          options.coalescingKey !== undefined
+        ) {
+          throw new Error("workKey and coalescingKey are mutually exclusive");
+        }
+
+        if (options?.partitionKey !== undefined) {
+          validatePartitionKey(options.partitionKey);
+        }
+
+        const work: PendingDurableWork = {
+          queueName: String(queueName),
+          workKey: options?.workKey ?? null,
+          coalescingKey: options?.coalescingKey ?? null,
+          partitionKey: options?.partitionKey ?? null,
+          payload: decodedQueuePayload,
+          availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
+        };
+        const operation = enqueueTail.then(async () => {
+          const materialized = await materializeDurableWork(
+            database,
+            eventId,
+            work,
+          );
+
+          workChanged = workChanged || materialized.changed;
+
+          return materialized;
+        });
+
+        enqueueTail = operation.then(
+          () => undefined,
+          () => undefined,
+        );
+        enqueueOperations.push(operation);
+
+        const result = operation.then((materialized) => materialized.ref);
+
+        void result.catch(() => undefined);
+
+        return result;
+      }
+
       let handlerFailed = false;
       let handlerError: unknown;
 
@@ -2897,46 +3004,7 @@ function openDatabaseLedgerEngine<
                 );
               });
             },
-            enqueue: (queueName, payload, options) => {
-              assertActionScopeOpen();
-              const queueSchema = model.queues[queueName as keyof TQueues];
-
-              if (queueSchema === undefined) {
-                throw new Error(`unknown queue: ${String(queueName)}`);
-              }
-
-              const decodedQueuePayload = decodeValue(queueSchema, payload);
-
-              if (options?.workKey !== undefined) {
-                validateWorkKey(options.workKey);
-              }
-
-              if (options?.coalescingKey !== undefined) {
-                validateCoalescingKey(options.coalescingKey);
-              }
-
-              if (
-                options?.workKey !== undefined &&
-                options.coalescingKey !== undefined
-              ) {
-                throw new Error(
-                  "workKey and coalescingKey are mutually exclusive",
-                );
-              }
-
-              if (options?.partitionKey !== undefined) {
-                validatePartitionKey(options.partitionKey);
-              }
-
-              queued.push({
-                queueName: String(queueName),
-                workKey: options?.workKey ?? null,
-                coalescingKey: options?.coalescingKey ?? null,
-                partitionKey: options?.partitionKey ?? null,
-                payload: decodedQueuePayload,
-                availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
-              });
-            },
+            enqueue,
             query: (queryName, params) => {
               return trackAction(async () => {
                 return await tx.query(queryName, params);
@@ -2954,6 +3022,10 @@ function openDatabaseLedgerEngine<
         () => null,
         (error: unknown) => error,
       );
+      const enqueueError = await settleEnqueues().then(
+        () => null,
+        (error: unknown) => error,
+      );
 
       if (handlerFailed) {
         throw handlerError;
@@ -2961,6 +3033,10 @@ function openDatabaseLedgerEngine<
 
       if (actionScopeError !== null) {
         throw actionScopeError;
+      }
+
+      if (enqueueError !== null) {
+        throw enqueueError;
       }
     }
 
@@ -2986,13 +3062,6 @@ function openDatabaseLedgerEngine<
           `event ${String(eventName)} outcome updated ${outcomeUpdate.changes} rows`,
         );
       }
-    }
-
-    let workChanged = false;
-
-    for (const work of queued) {
-      const changed = await materializeDurableWork(database, eventId, work);
-      workChanged = workChanged || changed;
     }
 
     const commit: {

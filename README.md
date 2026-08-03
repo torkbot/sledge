@@ -136,7 +136,7 @@ const usersModule = linkedUsers.register({
         email: event.payload.email,
       });
 
-      actions.enqueue(
+      await actions.enqueue(
         "welcome-email.send",
         {
           userId: event.payload.userId,
@@ -875,7 +875,7 @@ const deadlineAtMs = event.payload.oldestPendingAtMs + 5_000;
 const availableAtMs =
   event.payload.pendingCount >= 20 ? event.tsMs : deadlineAtMs;
 
-actions.enqueue(
+const workRef = await actions.enqueue(
   "agent-lane.wake",
   { laneId: event.payload.laneId },
   {
@@ -892,6 +892,10 @@ creates it; later requests preserve its original payload, source event, and
 `WorkRef` while setting `availableAtMs` to the earlier of the stored and
 requested times. A request with a different decoded payload or
 `partitionKey` fails its enclosing event transaction.
+
+Because coalescing may reuse an identity already stored by an earlier event,
+`actions.enqueue(...)` is asynchronous. The resolved `workRef` above is the
+identity of the physical work that actually won, not a speculative candidate.
 
 Claiming work ends that coalescing generation. Requests arriving after claim
 create or promote one unattempted successor instead of changing the active
@@ -911,7 +915,7 @@ partition-blocked coalesced work remains non-idle and survives restart.
 Use `partitionKey` when work belongs to an ordered logical stream:
 
 ```ts
-actions.enqueue(
+await actions.enqueue(
   "agent-lane.wake",
   { laneId: event.payload.laneId },
   { partitionKey: event.payload.laneId },
@@ -936,32 +940,45 @@ of its work becomes terminal starts a fresh stream.
 Sledge stores durable work rows for queued, leased, delayed-retry,
 dead-lettered, and cancelled work. Successful work is deleted when it acks.
 
-Use `workKey` when enqueueing independently addressable work to get a durable
-`WorkRef` for cancellation:
+Use `workKey` or `coalescingKey` when enqueueing addressable work. Awaiting the
+enqueue returns its durable `WorkRef` directly:
 
 ```ts
-actions.enqueue(
-  "welcome-email.send",
-  { userId: event.payload.userId, email: event.payload.email },
-  { workKey: `welcome-email:${event.payload.userId}` },
-);
-
-const work = await ledger.listWork({
-  states: ["pending", "delayed", "leased"],
-  limit: 100,
+const WelcomeEmailScheduledOutcomeSchema = Type.Object({
+  workRef: WorkRefSchema,
 });
 
-const target = work.find((item) => item.ref !== null);
+// In the owning event handler:
+const workRef = await actions.enqueue("welcome-email.send", event.payload, {
+  workKey: `welcome-email:${event.payload.userId}`,
+});
 
-if (target?.ref === undefined || target.ref === null) {
-  throw new Error("no keyed work to cancel");
-}
+return { workRef };
+
+// In application or queue orchestration code, after emitting that
+// result-bearing event:
+const scheduled = await ledger.emit(
+  emailModule.events["welcome-email.requested"],
+  request,
+);
 
 await ledger.cancelWork({
-  ref: target.ref,
+  ref: scheduled.outcome.workRef,
   reason: "user requested cancellation",
 });
 ```
+
+Declare `WelcomeEmailScheduledOutcomeSchema` as the event's outcome. Event
+handlers cannot call the public ledger recursively, so carry the `WorkRef` out
+through an outcome or projection and cancel it from ordinary application or
+queue orchestration code. The exported `WorkRefSchema` lets TypeBox validation
+preserve the opaque `WorkRef` type at that ledger boundary.
+
+An enqueue with neither `workKey` nor `coalescingKey` resolves to `null`. Its
+work is intentionally anonymous and cannot later be cancelled by identity.
+Sledge transaction-tracks enqueue promises even when a handler does not use
+the result, but await the operation whenever its `WorkRef` contributes to an
+event outcome or projection.
 
 `WorkRef` is an opaque string generated and persisted by Sledge. Store and
 round-trip the value exactly as returned; do not construct or parse it. Its
