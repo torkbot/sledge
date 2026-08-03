@@ -19,7 +19,7 @@ import {
 } from "./ledger.contract.ts";
 import type { LedgerWorkers } from "./ledger.ts";
 import { runSqliteLedgerCloseContract } from "./sqlite-ledger-close.contract.ts";
-import { defineLedger } from "../sledge.ts";
+import { defineLedger, defineModule } from "../sledge.ts";
 
 runSqliteLedgerCloseContract({
   suiteName: "turso ledger",
@@ -61,8 +61,11 @@ runLedgerContractSuite({
         runTimedWork: (workKey, timeoutMs, leaseSignal, control) =>
           timedWork.run(workKey, timeoutMs, leaseSignal, control),
       });
+      const defineContractModule = defineModule(model.moduleId, (module) =>
+        module.expose(model, {}),
+      );
       const application = defineLedger((sledge) => {
-        sledge.install({ module: model, capabilities: {} });
+        sledge.install(defineContractModule());
 
         return sledge.expose({});
       });

@@ -8,6 +8,7 @@ import type {
   AnyRegisteredLedgerModule,
   EventToken,
   Ledger,
+  LedgerModuleContribution,
   LedgerTiming,
   QueryParameters,
   QueryResult,
@@ -22,6 +23,13 @@ import {
   SystemRuntimeClock,
 } from "./runtime/node-runtime.ts";
 
+export { defineModule } from "./ledger/ledger.ts";
+export type {
+  LedgerModuleContribution,
+  LedgerModuleDefinition,
+  LedgerModuleOwner,
+} from "./ledger/ledger.ts";
+
 const ledgerApplicationTypeBrand: unique symbol = Symbol(
   "sledge.applicationType",
 );
@@ -30,14 +38,6 @@ declare const installedLedgerTokenTypeBrand: unique symbol;
 declare const ledgerAssemblyScopeTypeBrand: unique symbol;
 declare const revealedLedgerCapabilitiesTypeBrand: unique symbol;
 declare const ledgerDriverTypeBrand: unique symbol;
-
-export type LedgerModuleContribution<
-  TCapabilities extends object,
-  TModule extends AnyRegisteredLedgerModule = AnyRegisteredLedgerModule,
-> = {
-  readonly module: TModule;
-  readonly capabilities: TCapabilities;
-};
 
 type InstalledLedgerToken<
   TToken,

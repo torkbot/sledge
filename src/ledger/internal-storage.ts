@@ -25,6 +25,8 @@ const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
 );
 const ledgerApplicationConfigureFunctions = new WeakMap<object, unknown>();
 const ledgerDriverOpenFunctions = new WeakMap<object, LedgerDriverOpen>();
+const ledgerModuleOwnerReaders = new WeakMap<object, () => string>();
+const ledgerModuleContributions = new WeakSet<object>();
 const ledgerModuleComposers = new WeakMap<
   object,
   (first: object, ...rest: readonly object[]) => object
@@ -90,6 +92,37 @@ export function readLedgerDriverOpen(
   driver: object,
 ): LedgerDriverOpen | undefined {
   return ledgerDriverOpenFunctions.get(driver);
+}
+
+export function attachLedgerModuleOwner<TModuleOwner extends object>(
+  owner: TModuleOwner,
+  readModuleId: () => string,
+): TModuleOwner {
+  ledgerModuleOwnerReaders.set(owner, readModuleId);
+  return owner;
+}
+
+export function readLedgerModuleOwnerId<TModuleId extends string>(owner: {
+  readonly moduleId: TModuleId;
+}): TModuleId {
+  const readModuleId = ledgerModuleOwnerReaders.get(owner);
+
+  if (readModuleId === undefined) {
+    throw new Error("invalid ledger module owner");
+  }
+
+  return readModuleId() as TModuleId;
+}
+
+export function attachLedgerModuleContribution<TContribution extends object>(
+  contribution: TContribution,
+): TContribution {
+  ledgerModuleContributions.add(contribution);
+  return contribution;
+}
+
+export function isLedgerModuleContribution(contribution: object): boolean {
+  return ledgerModuleContributions.has(contribution);
 }
 
 /**

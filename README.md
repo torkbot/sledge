@@ -21,10 +21,11 @@ handles to indexer and query callbacks.
 
 ## The Application Model
 
-A Sledge module factory returns one installable contribution: a registered
-ledger module plus the bounded capabilities that other code may use. The
-application definition installs those contributions in durable order and
-exposes one capability tree:
+`defineModule(moduleId, callback)` creates a reusable module factory. Its scoped
+`module` port declares contracts under that identity and reveals one registered
+module plus only the bounded capabilities other code may use. The application
+definition installs those contributions in durable order and exposes one
+capability tree:
 
 ```ts
 import { defineLedger } from "@torkbot/sledge";
@@ -67,10 +68,9 @@ value.
 ```ts
 import { Type } from "typebox";
 
-import { defineLedger } from "@torkbot/sledge";
+import { defineLedger, defineModule } from "@torkbot/sledge";
 import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
 import {
-  declareLedgerModule,
   defineMaterialization,
   linkLedgerModule,
 } from "@torkbot/sledge/ledger";
@@ -78,130 +78,128 @@ import { NodeRuntimeScheduler } from "@torkbot/sledge/runtime/node-runtime";
 
 const databaseUrl = "./app.sqlite";
 
-const usersDeclaration = declareLedgerModule({
-  moduleId: "app.users",
-  events: {
-    "user.created": Type.Object({
-      userId: Type.String(),
-      email: Type.String(),
-    }),
-  },
-  queues: {
-    "welcome-email.send": Type.Object({
-      userId: Type.String(),
-      email: Type.String(),
-    }),
-  },
-});
-
-const materializations = defineMaterialization(usersDeclaration, {
-  namespace: "app",
-})
-  .version(1, "create app tables", (s) =>
-    s.createTable("users", (t) =>
-      t
-        .columns({
-          userId: t.text().notNull(),
-          email: t.text().notNull(),
-          source: t.eventRef("user.created").notNull(),
-        })
-        .primaryKey(["userId"]),
-    ),
-  )
-  .define({
-    indexers: {
-      upsertUser: {
-        sourceEvent: "user.created",
-        input: Type.Object({
-          userId: Type.String(),
-          email: Type.String(),
-        }),
-      },
+const defineUsersModule = defineModule("app.users", (module) => {
+  const declaration = module.declare({
+    events: {
+      "user.created": Type.Object({
+        userId: Type.String(),
+        email: Type.String(),
+      }),
     },
-    queries: {
-      userById: {
-        params: Type.Object({ userId: Type.String() }),
-        result: Type.Union([
-          Type.Null(),
-          Type.Object({
+    queues: {
+      "welcome-email.send": Type.Object({
+        userId: Type.String(),
+        email: Type.String(),
+      }),
+    },
+  });
+
+  const materializations = defineMaterialization(declaration, {
+    namespace: "app",
+  })
+    .version(1, "create app tables", (s) =>
+      s.createTable("users", (t) =>
+        t
+          .columns({
+            userId: t.text().notNull(),
+            email: t.text().notNull(),
+            source: t.eventRef("user.created").notNull(),
+          })
+          .primaryKey(["userId"]),
+      ),
+    )
+    .define({
+      indexers: {
+        upsertUser: {
+          sourceEvent: "user.created",
+          input: Type.Object({
             userId: Type.String(),
             email: Type.String(),
           }),
-        ]),
+        },
+      },
+      queries: {
+        userById: {
+          params: Type.Object({ userId: Type.String() }),
+          result: Type.Union([
+            Type.Null(),
+            Type.Object({
+              userId: Type.String(),
+              email: Type.String(),
+            }),
+          ]),
+        },
+      },
+    });
+
+  const registered = linkLedgerModule(declaration, materializations).register({
+    indexers: {
+      upsertUser: async ({ input, event, db }) => {
+        await db
+          .insertInto("users")
+          .values({
+            userId: input.userId,
+            email: input.email,
+            source: event.ref,
+          })
+          .onConflict(["userId"])
+          .doUpdateSet({
+            email: input.email,
+            source: event.ref,
+          })
+          .execute();
+      },
+    },
+    queries: {
+      userById: async ({ params, db }) => {
+        const row = await db
+          .selectFrom("users")
+          .select(["userId", "email"])
+          .where("userId", "=", params.userId)
+          .executeTakeFirst();
+
+        if (row === undefined) {
+          return null;
+        }
+
+        return {
+          userId: row.userId,
+          email: row.email,
+        };
+      },
+    },
+    events: {
+      "user.created": async ({ event, actions }) => {
+        await actions.index("upsertUser", {
+          userId: event.payload.userId,
+          email: event.payload.email,
+        });
+
+        await actions.enqueue(
+          "welcome-email.send",
+          {
+            userId: event.payload.userId,
+            email: event.payload.email,
+          },
+          { workKey: `welcome-email:${event.payload.userId}` },
+        );
+      },
+    },
+    queues: {
+      "welcome-email.send": async ({ work }) => {
+        console.log("sending welcome email", work.payload.email);
       },
     },
   });
 
-const linkedUsers = linkLedgerModule(usersDeclaration, materializations);
-
-const usersModule = linkedUsers.register({
-  indexers: {
-    upsertUser: async ({ input, event, db }) => {
-      await db
-        .insertInto("users")
-        .values({
-          userId: input.userId,
-          email: input.email,
-          source: event.ref,
-        })
-        .onConflict(["userId"])
-        .doUpdateSet({
-          email: input.email,
-          source: event.ref,
-        })
-        .execute();
-    },
-  },
-  queries: {
-    userById: async ({ params, db }) => {
-      const row = await db
-        .selectFrom("users")
-        .select(["userId", "email"])
-        .where("userId", "=", params.userId)
-        .executeTakeFirst();
-
-      if (row === undefined) {
-        return null;
-      }
-
-      return {
-        userId: row.userId,
-        email: row.email,
-      };
-    },
-  },
-  events: {
-    "user.created": async ({ event, actions }) => {
-      await actions.index("upsertUser", {
-        userId: event.payload.userId,
-        email: event.payload.email,
-      });
-
-      await actions.enqueue(
-        "welcome-email.send",
-        {
-          userId: event.payload.userId,
-          email: event.payload.email,
-        },
-        { workKey: `welcome-email:${event.payload.userId}` },
-      );
-    },
-  },
-  queues: {
-    "welcome-email.send": async ({ work }) => {
-      console.log("sending welcome email", work.payload.email);
-    },
-  },
+  return module.expose(registered, {
+    events: registered.events,
+    queries: registered.queries,
+  });
 });
 
 const application = defineLedger((sledge) => {
-  const users = sledge.install({
-    module: usersModule,
-    capabilities: {
-      events: usersModule.events,
-      queries: usersModule.queries,
-    },
-  });
+  const users = sledge.install(defineUsersModule());
 
   return sledge.expose({ users });
 });
@@ -253,9 +251,9 @@ await using ledger = await createBetterSqliteLedger({
 await ledger.emit(usersModule.events.created, payload);
 ```
 
-Module factories return `{ module, capabilities }`. Install them inside
-`defineLedger(...)`, expose the application capability tree, then ask that
-application to open with a driver:
+Define modules with `defineModule(...)`. Install their revealed contributions
+inside `defineLedger(...)`, expose the application capability tree, then ask
+that application to open with a driver:
 
 ```ts
 const application = defineLedger((sledge) => {
@@ -276,6 +274,60 @@ The application owns the registered module handles. Consumers receive only the
 capabilities deliberately returned through `expose(...)`; they do not need to
 retain or propagate a parallel model graph.
 
+### Replace hand-built module contributions
+
+In 0.25, each factory repeated its module id across primitives and declaration,
+then returned a structural `{ module, capabilities }` object. In 0.26,
+`defineModule(...)` binds that identity once and passes a fresh scoped owner to
+the factory:
+
+```ts
+const defineUsersModule = defineModule("app.users", (module) => {
+  const declaration = module.declare({
+    events: {
+      created: Type.Object({ userId: Type.String() }),
+    },
+  });
+  const registered = linkLedgerModule(declaration, null).register({});
+
+  return module.expose(registered, {
+    events: registered.events,
+  });
+});
+```
+
+The callback must synchronously return its one `module.expose(...)` result.
+That call verifies the registered module's owner, revokes the construction
+port, and produces the only value accepted by `sledge.install(...)`. Module
+dependencies remain ordinary, explicit factory arguments:
+
+```ts
+const defineAuditModule = defineModule(
+  "app.audit",
+  (module, users: UsersPort) => {
+    const declaration = module.declare({
+      events: { userCreated: users.events.created },
+    });
+    const registered = linkLedgerModule(declaration, null).register({
+      events: {
+        userCreated: ({ event }) => console.log(event.payload.userId),
+      },
+    });
+
+    return module.expose(registered, { events: registered.events });
+  },
+);
+
+const users = sledge.install(defineUsersModule());
+const audit = sledge.install(defineAuditModule(users));
+```
+
+Reusable primitives take the narrower `LedgerModuleOwner` capability. For
+example, replace `defineResult({ moduleId, resultSchema })` with
+`defineResult(module, { resultSchema })`. The primitive receives identity and
+private lifetime validation without gaining declaration, linking, or
+registration authority.
+
 ### Replace prepared-model resolution with assembly queries
 
 `defineLedgerModel(...)`, `prepare(...)`, and `extend(...)` are removed. Install
@@ -292,7 +344,8 @@ const application = defineLedger(async (sledge) => {
   const configured = [];
 
   for (const descriptor of descriptors) {
-    configured.push(sledge.install(await loadModule(descriptor)));
+    const defineConfiguredModule = await loadModule(descriptor);
+    configured.push(sledge.install(defineConfiguredModule()));
   }
 
   return sledge.expose({ configured, registry });
@@ -311,6 +364,8 @@ opening the final runtime, and an abandoned query failure rejects the open.
 | `defineLedgerModel(...)`                         | An async `defineLedger(...)` callback                 |
 | `prepare(...)` / `extend(...)`                   | `sledge.query(...)` / `sledge.install(...)`           |
 | `defineSledge(...)`                              | `defineLedger(...)`                                   |
+| `{ module, capabilities }`                       | `defineModule(...)` plus `module.expose(...)`         |
+| `defineResult({ moduleId, resultSchema })`       | `defineResult(module, { resultSchema })`              |
 | `createBetterSqliteSledge({ application, ... })` | `application.open(createBetterSqliteDriver({ ... }))` |
 | `createTursoSledge({ application, ... })`        | `application.open(createTursoDriver({ ... }))`        |
 | A required production `timing` input             | Node timing by default; an optional test override     |
@@ -340,15 +395,15 @@ independently defined modules a common way to name and observe eventual results
 without making `WorkRef` a domain identity or appending a second generic
 settlement event.
 
-Declare the result before declaring the producer module so its owner-bound ref
-schema can be used directly in durable payloads:
+Declare the result inside the producer's module factory before its events, so
+the owner-bound ref schema can be used directly in durable payloads:
 
 ```ts
 import { Type } from "typebox";
 
-import { defineLedger } from "@torkbot/sledge";
+import { defineLedger, defineModule } from "@torkbot/sledge";
 import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3-ledger";
-import { declareLedgerModule, linkLedgerModule } from "@torkbot/sledge/ledger";
+import { linkLedgerModule } from "@torkbot/sledge/ledger";
 import { defineResult } from "@torkbot/sledge/stdlib";
 
 const CompactionResultSchema = Type.Object({
@@ -356,14 +411,11 @@ const CompactionResultSchema = Type.Object({
   removedRevisions: Type.Integer({ minimum: 0 }),
 });
 
-function defineCompactionsModule() {
-  const moduleId = "app.compactions";
-  const result = defineResult({
-    moduleId,
+const defineCompactionsModule = defineModule("app.compactions", (module) => {
+  const result = defineResult(module, {
     resultSchema: CompactionResultSchema,
   });
-  const declaration = declareLedgerModule({
-    moduleId,
+  const declaration = module.declare({
     events: {
       completed: Type.Object({
         ref: result.refSchema,
@@ -371,18 +423,15 @@ function defineCompactionsModule() {
       }),
     },
   });
-  const module = linkLedgerModule(declaration, null).register({});
+  const registered = linkLedgerModule(declaration, null).register({});
 
-  return {
-    module,
-    capabilities: {
-      result: result.fromEvent(module.events.completed, (payload) => ({
-        ref: payload.ref,
-        outcome: "succeeded",
-      })),
-    },
-  };
-}
+  return module.expose(registered, {
+    result: result.fromEvent(registered.events.completed, (payload) => ({
+      ref: payload.ref,
+      outcome: "succeeded",
+    })),
+  });
+});
 
 const application = defineLedger((sledge) =>
   sledge.expose({
@@ -419,11 +468,14 @@ untrusted I/O must still enter through declared ledger schemas.
 
 ## Module and Application Phases
 
-Sledge separates module construction, application assembly, and the opened
-runtime. Module construction returns new values as capabilities become valid.
-Application assembly uses one small scoped interface: install a module, query
-the installed prefix when discovery needs durable state, and expose the
-capabilities the opened application should reveal.
+Sledge separates module definition, module construction, application assembly,
+and the opened runtime. `defineModule(...)` creates a reusable factory around
+one stable identity. Each invocation receives a fresh library-owned port,
+returns new values as capabilities become valid, and finishes by revealing one
+installable contribution. Application assembly then uses a second small scoped
+interface: install a module, query the installed prefix when discovery needs
+durable state, and expose the capabilities the opened application should
+reveal.
 
 Sledge does not define plugins, plugin manifests, or module loading policy. A
 userspace registry may store plugin descriptors, package ids, feature flags, or
@@ -432,10 +484,12 @@ query that registry and build one final ledger model safely.
 
 | Phase                      | Produced by                      | Capability added                                           |
 | -------------------------- | -------------------------------- | ---------------------------------------------------------- |
-| `DeclaredLedgerModule`     | `declareLedgerModule(...)`       | Durable contract tokens and a typed logical shape          |
+| Module factory             | `defineModule(...)`              | Reusable definition bound to one stable module identity    |
+| `LedgerModuleDefinition`   | Invoking the module factory      | Scoped identity, declaration, and one reveal capability    |
+| `DeclaredLedgerModule`     | `module.declare(...)`            | Durable contract tokens and a typed logical shape          |
 | `LinkedLedgerModule`       | `linkLedgerModule(...)`          | A materialization contract and registration capability     |
-| `RegisteredLedgerModule`   | `linked.register(...)`           | Implementations and handlers; ready to install             |
-| `LedgerModuleContribution` | A module factory                 | Registered module plus the bounded capabilities it reveals |
+| `RegisteredLedgerModule`   | `linked.register(...)`           | Implementations and handlers; ready to reveal              |
+| `LedgerModuleContribution` | `module.expose(...)`             | Registered module plus the bounded capabilities it reveals |
 | `LedgerApplication`        | `defineLedger(...)`              | A reusable, storage-independent assembly definition        |
 | `OpenedLedger`             | `await application.open(driver)` | Per-open capabilities plus the owning ledger runtime       |
 
@@ -447,7 +501,7 @@ installed graph.
 
 ### 1. Declare Durable Contracts
 
-`declareLedgerModule(...)` requires a stable `moduleId` and declares durable
+`module.declare(...)` uses the factory's stable `moduleId` and declares durable
 boundary contracts with TypeBox:
 
 - `events`: facts appended to the event stream
@@ -458,33 +512,47 @@ boundary contracts with TypeBox:
 `events` is required. Omit `queues`, `signals`, or `signalQueues` when the
 module does not define contracts in that category. Plain event definitions
 create contracts owned by that module and produce opaque event tokens such as
-`usersDeclaration.events["user.created"]`. Runtime APIs accept these tokens
+`declaration.events["user.created"]`. Runtime APIs accept these tokens
 instead of string names.
+
+The lower-level `declareLedgerModule({ moduleId, ... })` export remains
+available for ledger infrastructure that deliberately constructs phases
+without an application module factory. Application modules should use
+`module.declare(...)` so identity cannot drift across their primitives and
+contracts.
 
 An event may declare a durable result alongside its payload:
 
 ```ts
-const decisionsShape = declareLedgerModule({
-  moduleId: "decisions",
-  events: {
-    recorded: {
-      payload: Type.Object({
+const defineDecisionsModule = defineModule("decisions", (module) => {
+  const declaration = module.declare({
+    events: {
+      recorded: {
+        payload: Type.Object({
+          decisionId: Type.String(),
+        }),
+        outcome: Type.Object({
+          revision: Type.Integer({ minimum: 1 }),
+        }),
+      },
+      "decision.observed": Type.Object({
         decisionId: Type.String(),
-      }),
-      outcome: Type.Object({
         revision: Type.Integer({ minimum: 1 }),
       }),
     },
-    "decision.observed": Type.Object({
-      decisionId: Type.String(),
-      revision: Type.Integer({ minimum: 1 }),
-    }),
-  },
-  queues: {
-    "decisions.record": Type.Object({
-      decisionId: Type.String(),
-    }),
-  },
+    queues: {
+      "decisions.record": Type.Object({
+        decisionId: Type.String(),
+      }),
+    },
+  });
+  const registered = linkLedgerModule(declaration, null).register({
+    events: {
+      recorded: () => ({ revision: 1 }),
+    },
+  });
+
+  return module.expose(registered, { events: registered.events });
 });
 ```
 
@@ -733,12 +801,32 @@ Registration returns an inert `RegisteredLedgerModule`. It exposes the exact
 event, query, and signal tokens that consumers use, but it cannot touch storage
 or start work.
 
-### 4. Define the Application
+### 4. Reveal Modules and Define the Application
 
-A module factory returns one `LedgerModuleContribution`: its registered module
-and only the capabilities consumers should see. `defineLedger(...)` installs
-those contributions in deterministic order and returns the application-level
-capability tree:
+`defineModule(moduleId, callback)` returns a frozen, synchronous factory. Every
+factory invocation receives a fresh `LedgerModuleDefinition` with exactly three
+public capabilities:
+
+- `moduleId` exposes the stable literal identity to reusable primitives.
+- `declare(contracts)` declares contracts under that identity.
+- `expose(registered, capabilities)` verifies the registered module has that
+  identity, revokes the scoped port, and returns one authentic
+  `LedgerModuleContribution`.
+
+The module object is created and controlled by Sledge. Private registries bind
+its identity, lifetime, and the provenance of its revealed contribution without
+adding public plumbing methods. A retained module object is unusable after the
+factory returns, a second reveal fails, and `sledge.install(...)` rejects a
+hand-assembled `{ module, capabilities }` object at runtime as well as at
+compile time.
+
+Declaration, materialization, linking, and registration remain ordinary ledger
+phases rather than methods on a growing plugin API. Reusable userspace or stdlib
+primitives can accept the narrower `LedgerModuleOwner` interface when they need
+identity but should not receive declaration or reveal authority.
+
+`defineLedger(...)` installs revealed contributions in deterministic order and
+returns the application-level capability tree:
 
 ```ts
 import { defineLedger } from "@torkbot/sledge";
@@ -758,9 +846,10 @@ handles nor perform a final composition step. The same application definition
 is reusable: every open runs it again and receives the capability tree returned
 by that run. Concurrent opens never share assembly state.
 
-Module factories may consume capabilities installed earlier in the same
-assembly, as `defineAuditModule(users)` does above. Passing those dependencies
-through another contribution preserves their original module ownership.
+Module factories may declare ordinary arguments after the injected module
+owner and consume capabilities installed earlier in the same assembly, as
+`defineAuditModule(users)` does above. Passing those dependencies through
+another contribution preserves their original module ownership.
 Capabilities from another application cannot be rebound through `install(...)`.
 Any raw event, query, or signal token exposed by a contribution must also be a
 contract of that contribution's registered module, including an explicit alias.
@@ -809,7 +898,8 @@ const application = defineLedger(async (sledge) => {
   );
 
   for (const descriptor of descriptors) {
-    sledge.install(await loadConfiguredModule(descriptor));
+    const defineConfiguredModule = await loadConfiguredModule(descriptor);
+    sledge.install(defineConfiguredModule());
   }
 
   return sledge.expose({ registry });

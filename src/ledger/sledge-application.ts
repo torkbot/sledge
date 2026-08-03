@@ -2,6 +2,7 @@ import type { TSchema } from "typebox";
 
 import type {
   AnyRegisteredLedgerModule,
+  LedgerModuleContribution,
   LedgerTiming,
   QueryParameters,
   QueryResult,
@@ -15,6 +16,7 @@ import {
 } from "./database-ledger-engine.ts";
 import {
   composeRegisteredLedgerModules,
+  isLedgerModuleContribution,
   readLedgerApplicationConfigure,
   storageRuntimeIdentityBrand,
 } from "./internal-storage.ts";
@@ -26,7 +28,6 @@ import type {
   LedgerApplicationCapabilities,
   LedgerApplicationModules,
   LedgerAssembly,
-  LedgerModuleContribution,
   OpenedLedger,
 } from "../sledge.ts";
 
@@ -165,6 +166,10 @@ async function resolveLedgerApplication<
     contribution: LedgerModuleContribution<TCapabilities, TModule>,
   ): InstalledLedgerModuleCapabilities<TModule, TCapabilities> => {
     assertAssemblyOpen();
+
+    if (!isLedgerModuleContribution(contribution)) {
+      throw new Error("invalid ledger module contribution");
+    }
 
     const moduleId = contribution.module.moduleId.toLowerCase();
 

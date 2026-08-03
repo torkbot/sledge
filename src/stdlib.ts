@@ -1,11 +1,13 @@
 import { Type, type Static, type TSchema, type TUnsafe } from "typebox";
 import { Value } from "typebox/value";
 
-import type { EventPayload, EventToken } from "./ledger/ledger.ts";
-import {
-  ledgerIdentitySeparator,
-  validateLedgerModuleId,
-} from "./ledger/ledger-identity.ts";
+import type {
+  EventPayload,
+  EventToken,
+  LedgerModuleOwner,
+} from "./ledger/ledger.ts";
+import { readLedgerModuleOwnerId } from "./ledger/internal-storage.ts";
+import { ledgerIdentitySeparator } from "./ledger/ledger-identity.ts";
 
 const resultRefBrand: unique symbol = Symbol("sledge.stdlib.resultRef");
 
@@ -101,16 +103,18 @@ export interface ResultPort<
 export function defineResult<
   const TModuleId extends string,
   const TResultSchema extends TSchema,
->(input: {
-  readonly moduleId: TModuleId;
-  readonly resultSchema: TResultSchema;
-}): DeclaredResult<TModuleId, TResultSchema> {
-  validateLedgerModuleId(input.moduleId);
+>(
+  module: LedgerModuleOwner<TModuleId>,
+  input: {
+    readonly resultSchema: TResultSchema;
+  },
+): DeclaredResult<TModuleId, TResultSchema> {
+  const moduleId = readLedgerModuleOwnerId(module);
 
-  const escapedModuleId = escapeRegularExpression(input.moduleId);
+  const escapedModuleId = escapeRegularExpression(moduleId);
   const refSchema = Type.Unsafe<ResultRef<Static<TResultSchema>, TModuleId>>(
     Type.String({
-      minLength: input.moduleId.length + ledgerIdentitySeparator.length + 1,
+      minLength: moduleId.length + ledgerIdentitySeparator.length + 1,
       pattern: `^${escapedModuleId}${ledgerIdentitySeparator}[\\s\\S]+$`,
     }),
   );
@@ -121,11 +125,11 @@ export function defineResult<
 
     return Value.Decode(
       refSchema,
-      `${input.moduleId}${ledgerIdentitySeparator}${key}`,
+      `${moduleId}${ledgerIdentitySeparator}${key}`,
     );
   };
   const identity: ResultIdentity<TModuleId, TResultSchema> = Object.freeze({
-    moduleId: input.moduleId,
+    moduleId,
     ref,
     refSchema,
     resultSchema: input.resultSchema,
