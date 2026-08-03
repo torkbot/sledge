@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Breaking: make durable event `actions.enqueue(...)` asynchronous. Addressed
+  work resolves to its persisted `WorkRef`, including an existing identity
+  preserved by coalescing; anonymous work resolves to `null`. Export
+  `WorkRefSchema` so the opaque identity can cross validated event outcome,
+  payload, and projection boundaries.
 - Add immutable ledger-module construction phases: declare contracts with
   `declareLedgerModule(...)`, link materializations with
   `linkLedgerModule(...)`, register implementations, and compose static roots

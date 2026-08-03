@@ -330,6 +330,26 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
         },
         events: {
           created: async ({ event, actions }) => {
+            if (false) {
+              const keyed: Promise<WorkRef> = actions.enqueue(
+                "deliver",
+                { eventId: event.eventId },
+                { workKey: "typed-key" },
+              );
+              const coalesced: Promise<WorkRef> = actions.enqueue(
+                "deliver",
+                { eventId: event.eventId },
+                { coalescingKey: "typed-coalescing-key" },
+              );
+              const unaddressed: Promise<null> = actions.enqueue("deliver", {
+                eventId: event.eventId,
+              });
+
+              void keyed;
+              void coalesced;
+              void unaddressed;
+            }
+
             await actions.index("store", {
               eventId: event.eventId,
             });

@@ -1,4 +1,4 @@
-import type { Static, TSchema } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
 
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import { createEventRef, type EventRef } from "./event-ref.ts";
@@ -377,10 +377,7 @@ export type EmitOptions = {
   readonly dedupeKey?: string;
 };
 
-/**
- * Optional knobs for event->work materialization.
- */
-export type EnqueueOptions = {
+type EnqueueSchedulingOptions = {
   readonly availableAtMs?: number;
   /**
    * Serializes work in enqueue order with other work for the same queue and
@@ -388,23 +385,44 @@ export type EnqueueOptions = {
    * leased, or retrying.
    */
   readonly partitionKey?: string;
-} & (
-  | {
-      /**
-       * Coalesces requests for the same physical queue and logical identity
-       * while work remains live and unattempted. Repeated requests must have
-       * the same decoded payload and partition, preserve the first request's
-       * causation and WorkRef, and can only move availability earlier. Once
-       * claimed, later requests create one independently coalesced successor.
-       */
-      readonly coalescingKey: string;
-      readonly workKey?: never;
-    }
-  | {
-      readonly coalescingKey?: never;
-      readonly workKey?: string;
-    }
-);
+};
+
+/**
+ * Options for work whose durable identity is returned to the producer.
+ */
+export type AddressedEnqueueOptions = EnqueueSchedulingOptions &
+  (
+    | {
+        /**
+         * Coalesces requests for the same physical queue and logical identity
+         * while work remains live and unattempted. Repeated requests must have
+         * the same decoded payload and partition, preserve the first request's
+         * causation and WorkRef, and can only move availability earlier. Once
+         * claimed, later requests create one independently coalesced successor.
+         */
+        readonly coalescingKey: string;
+        readonly workKey?: never;
+      }
+    | {
+        readonly coalescingKey?: never;
+        readonly workKey: string;
+      }
+  );
+
+/**
+ * Options for anonymous work that cannot be addressed after enqueue.
+ */
+export type UnaddressedEnqueueOptions = EnqueueSchedulingOptions & {
+  readonly coalescingKey?: never;
+  readonly workKey?: never;
+};
+
+/**
+ * Optional knobs for event->work materialization.
+ */
+export type EnqueueOptions =
+  | AddressedEnqueueOptions
+  | UnaddressedEnqueueOptions;
 
 /**
  * Optional knobs for signal->signal-queue materialization.
@@ -844,17 +862,38 @@ export type EventHandlerFunction<
       Extract<TEventName, string>
     >
   > & {
-    readonly enqueue: <const TQueueName extends keyof TQueues>(
-      queueName: TQueueName,
-      payload: Static<TQueues[TQueueName]>,
-      options?: EnqueueOptions,
-    ) => void;
+    readonly enqueue: EventEnqueueAction<TQueues>;
     readonly query: <const TQueryName extends keyof TQueries>(
       queryName: TQueryName,
       params: Static<TQueries[TQueryName]["params"]>,
     ) => Promise<Static<TQueries[TQueryName]["result"]>>;
   };
 }) => TResult | Promise<TResult>;
+
+/**
+ * Materializes durable work atomically with its source event. Addressed work
+ * resolves to its opaque durable identity; anonymous work resolves to null.
+ * Await the result when it participates in the handler's outcome or indexing.
+ */
+export interface EventEnqueueAction<TQueues extends Record<string, TSchema>> {
+  <const TQueueName extends keyof TQueues>(
+    queueName: TQueueName,
+    payload: Static<TQueues[TQueueName]>,
+    options: AddressedEnqueueOptions,
+  ): Promise<WorkRef>;
+
+  <const TQueueName extends keyof TQueues>(
+    queueName: TQueueName,
+    payload: Static<TQueues[TQueueName]>,
+    options?: UnaddressedEnqueueOptions,
+  ): Promise<null>;
+
+  <const TQueueName extends keyof TQueues>(
+    queueName: TQueueName,
+    payload: Static<TQueues[TQueueName]>,
+    options: EnqueueOptions,
+  ): Promise<WorkRef | null>;
+}
 
 type EventHandlerResult<
   TModuleId extends string,
@@ -1144,6 +1183,17 @@ declare const workRefBrand: unique symbol;
 export type WorkRef = string & {
   readonly [workRefBrand]: true;
 };
+
+/**
+ * Validates WorkRef values at ledger payload, outcome, and projection
+ * boundaries while preserving their opaque branded type.
+ */
+export const WorkRefSchema = Type.Unsafe<WorkRef>(
+  Type.String({
+    pattern:
+      "^work:v1:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+  }),
+);
 
 export type WorkSnapshot = {
   readonly workId: number;
@@ -4210,7 +4260,7 @@ type RuntimeEventHandlerInput = {
       queueName: string,
       payload: unknown,
       options?: EnqueueOptions,
-    ): void;
+    ): Promise<WorkRef | null>;
     query(queryName: string, params: unknown): Promise<unknown>;
   };
 };
@@ -4714,7 +4764,7 @@ async function runEventContribution(
           throw new Error("event actions are only valid during event handling");
         }
 
-        physicalInput.actions.enqueue(
+        return physicalInput.actions.enqueue(
           names.queueName(queueName),
           payload,
           options,
