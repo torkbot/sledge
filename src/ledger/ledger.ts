@@ -2,10 +2,15 @@ import { Type, type Static, type TSchema } from "typebox";
 
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import { createEventRef, type EventRef } from "./event-ref.ts";
+import {
+  ledgerIdentitySeparator,
+  validateLedgerModuleId,
+  validateLedgerPhysicalNamePart,
+} from "./ledger-identity.ts";
 import type { LedgerImplementations } from "./internal-storage.ts";
 import {
-  attachLedgerModelResolver,
   attachLedgerImplementationFactory,
+  attachLedgerModuleComposer,
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
   composedLedgerModulesBrand,
@@ -33,6 +38,7 @@ import {
   type ProjectionWriteResult,
 } from "./projection-access.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
+import type { ComposedLedgerModel } from "./ledger-composition.ts";
 import {
   createProjectionRelationBuilder,
   defineProjectionSchemaForEvents,
@@ -73,13 +79,10 @@ declare const queryTokenTypeBrand: unique symbol;
 declare const queueTokenTypeBrand: unique symbol;
 declare const signalTokenTypeBrand: unique symbol;
 declare const signalQueueTokenTypeBrand: unique symbol;
-declare const preparedLedgerModelTypeBrand: unique symbol;
-declare const ledgerModelDefinitionTypeBrand: unique symbol;
 const ledgerContractTokenMetadata = new WeakMap<
   object,
   LedgerContractMetadata
 >();
-const physicalNameSeparator = "::";
 const reservedMaterializationSqliteObjectNames = [
   "events",
   "idx_work_coalescing_pending",
@@ -2250,7 +2253,7 @@ export function declareLedgerModule<
   TModuleId,
   EventTokensFor<TModuleId, TEventDefinitions>
 > {
-  validateModuleId(input.moduleId);
+  validateLedgerModuleId(input.moduleId);
   const queueDefinitions = (input.queues ?? {}) as TQueues;
   const signalDefinitions = (input.signals ?? {}) as TSignals;
   const signalQueueDefinitions = (input.signalQueues ?? {}) as TSignalQueues;
@@ -2567,135 +2570,22 @@ export type AnyRegisteredLedgerModule = {
 type ContractValues<TContracts extends Readonly<Record<string, object>>> =
   TContracts[keyof TContracts];
 
-type ModuleEventTokens<TModule> = TModule extends AnyRegisteredLedgerModule
-  ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["events"]>
-  : never;
+export type RegisteredLedgerModuleEventTokens<TModule> =
+  TModule extends AnyRegisteredLedgerModule
+    ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["events"]>
+    : never;
 
-type ModuleSignalTokens<TModule> = TModule extends AnyRegisteredLedgerModule
-  ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["signals"]>
-  : never;
+export type RegisteredLedgerModuleSignalTokens<TModule> =
+  TModule extends AnyRegisteredLedgerModule
+    ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["signals"]>
+    : never;
 
-type ModuleQueryTokens<TModule> = TModule extends AnyRegisteredLedgerModule
-  ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["queries"]>
-  : never;
+export type RegisteredLedgerModuleQueryTokens<TModule> =
+  TModule extends AnyRegisteredLedgerModule
+    ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["queries"]>
+    : never;
 
-export type ComposedLedgerModel<
-  TModules extends readonly AnyRegisteredLedgerModule[],
-> = {
-  readonly [composedLedgerModelBrand]: true;
-  readonly [composedLedgerModulesBrand]: TModules;
-  readonly [registeredLedgerContractsBrand]: AnyRegisteredLedgerModule[typeof registeredLedgerContractsBrand];
-  readonly [registeredLedgerRuntimeBrand]: AnyRegisteredLedgerModule[typeof registeredLedgerRuntimeBrand];
-};
-
-export type AnyComposedLedgerModel = ComposedLedgerModel<
-  readonly AnyRegisteredLedgerModule[]
->;
-
-export type ComposedLedgerEventTokens<TModel extends AnyComposedLedgerModel> =
-  ModuleEventTokens<TModel[typeof composedLedgerModulesBrand][number]>;
-
-export type ComposedLedgerSignalTokens<TModel extends AnyComposedLedgerModel> =
-  ModuleSignalTokens<TModel[typeof composedLedgerModulesBrand][number]>;
-
-export type ComposedLedgerQueryTokens<TModel extends AnyComposedLedgerModel> =
-  ModuleQueryTokens<TModel[typeof composedLedgerModulesBrand][number]>;
-
-export type PreparedLedgerModel<
-  TModules extends readonly AnyRegisteredLedgerModule[],
-> = {
-  readonly [preparedLedgerModelTypeBrand]: TModules;
-
-  /**
-   * Executes a storage-local, schema-decoded query against the modules already
-   * present in this prepared value. Append and worker capabilities do not
-   * exist until the model definition is opened.
-   */
-  query<const TQuery extends ModuleQueryTokens<TModules[number]>>(
-    query: TQuery,
-    params: QueryParameters<TQuery>,
-  ): Promise<QueryResult<TQuery>>;
-};
-
-export type AnyPreparedLedgerModel = PreparedLedgerModel<
-  readonly AnyRegisteredLedgerModule[]
->;
-
-type PreparedLedgerModules<TPrepared extends AnyPreparedLedgerModel> =
-  TPrepared[typeof preparedLedgerModelTypeBrand];
-
-/**
- * Capabilities scoped to one adapter-owned model resolution.
- *
- * Every transition returns a new value. In particular, `extend` does not
- * mutate or activate the prepared value it receives.
- */
-export interface LedgerModelResolutionPorts {
-  prepare<
-    const TFirst extends AnyRegisteredLedgerModule,
-    const TRest extends readonly AnyRegisteredLedgerModule[],
-  >(
-    first: TFirst,
-    ...rest: TRest
-  ): Promise<PreparedLedgerModel<readonly [TFirst, ...TRest]>>;
-
-  extend<
-    const TPrepared extends AnyPreparedLedgerModel,
-    const TFirst extends AnyRegisteredLedgerModule,
-    const TRest extends readonly AnyRegisteredLedgerModule[],
-  >(
-    prepared: TPrepared,
-    first: TFirst,
-    ...rest: TRest
-  ): Promise<
-    PreparedLedgerModel<
-      readonly [...PreparedLedgerModules<TPrepared>, TFirst, ...TRest]
-    >
-  >;
-}
-
-export type LedgerModelDefinition<
-  TModules extends readonly AnyRegisteredLedgerModule[] =
-    readonly AnyRegisteredLedgerModule[],
-> = {
-  readonly [ledgerModelDefinitionTypeBrand]: TModules;
-};
-
-export type LedgerModelSource = AnyComposedLedgerModel | LedgerModelDefinition;
-
-export type ComposedLedgerModelFor<TSource extends LedgerModelSource> =
-  TSource extends LedgerModelDefinition<infer TModules>
-    ? ComposedLedgerModel<TModules>
-    : TSource extends AnyComposedLedgerModel
-      ? TSource
-      : never;
-
-type LedgerModelResolver<TPrepared extends AnyPreparedLedgerModel> = (
-  phases: LedgerModelResolutionPorts,
-) => Promise<TPrepared>;
-
-/**
- * Defines a storage-backed model resolution without giving the resolver a
- * ledger runtime. The callback can prepare closed module sets, query them, and
- * extend them in explicit waves. Returning a prepared value marks the graph
- * complete; the adapter claims its durable identity while opening the ledger.
- */
-export function defineLedgerModel<
-  const TPrepared extends AnyPreparedLedgerModel,
->(
-  resolve: LedgerModelResolver<TPrepared>,
-): LedgerModelDefinition<PreparedLedgerModules<TPrepared>> {
-  const definition = {} as LedgerModelDefinition<
-    PreparedLedgerModules<TPrepared>
-  >;
-  return attachLedgerModelResolver(definition, resolve);
-}
-
-/**
- * Builds and validates a storage-independent model when its complete module
- * set is already known. No database is opened and no runtime is activated.
- */
-export function composeLedgerModules<
+function composeLedgerModules<
   const TFirst extends AnyRegisteredLedgerModule,
   const TRest extends readonly AnyRegisteredLedgerModule[],
 >(
@@ -4914,10 +4804,6 @@ function namespaceLedgerImplementations(
   };
 }
 
-function validateModuleId(moduleId: string): void {
-  validatePhysicalNamePart("ledger module id", moduleId);
-}
-
 function validatePrivateSchemaDefinitions(
   kind: string,
   definitions: Readonly<Record<string, unknown>>,
@@ -4929,26 +4815,14 @@ function validatePrivateSchemaDefinitions(
   }
 }
 
-function validatePhysicalNamePart(context: string, value: string): void {
-  if (value.length === 0) {
-    throw new Error(`${context} must not be empty`);
-  }
-
-  if (value.includes(physicalNameSeparator)) {
-    throw new Error(
-      `${context} must not contain reserved separator ${physicalNameSeparator}`,
-    );
-  }
-}
-
 function createPhysicalName(
   moduleId: string,
   kind: LedgerContractKind,
   localName: string,
 ): string {
-  validateModuleId(moduleId);
-  validatePhysicalNamePart(`${kind} name`, localName);
-  return `sledge${physicalNameSeparator}${moduleId}${physicalNameSeparator}${kind}${physicalNameSeparator}${localName}`;
+  validateLedgerModuleId(moduleId);
+  validateLedgerPhysicalNamePart(`${kind} name`, localName);
+  return `sledge${ledgerIdentitySeparator}${moduleId}${ledgerIdentitySeparator}${kind}${ledgerIdentitySeparator}${localName}`;
 }
 
 function createEventTokens<
@@ -5656,7 +5530,7 @@ function createLinkedLedgerModule<
         },
       );
 
-      return attachLedgerImplementationFactory(
+      const registeredWithImplementations = attachLedgerImplementationFactory(
         registeredWithCompiler,
         (factory) => {
           const statementCompiler = createModuleProjectionStatementCompiler(
@@ -5682,6 +5556,20 @@ function createLinkedLedgerModule<
           ) as LedgerImplementations<TIndexers, TQueries, TEvents>;
         },
       );
+
+      // The object-typed bridge prevents internal storage from depending back
+      // on this module. Registration and assembly enforce the module type
+      // before graph construction reaches this closure.
+      attachLedgerModuleComposer(
+        registeredWithImplementations,
+        (first, ...rest) =>
+          composeLedgerModules(
+            first as AnyRegisteredLedgerModule,
+            ...(rest as readonly AnyRegisteredLedgerModule[]),
+          ),
+      );
+
+      return registeredWithImplementations;
     },
   };
 }

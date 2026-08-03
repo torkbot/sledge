@@ -26,7 +26,6 @@ import {
   type LedgerImplementations,
 } from "./internal-storage.ts";
 import {
-  composeLedgerModules,
   declareLedgerModule,
   linkLedgerModule,
   LedgerHistoryExpiredError,
@@ -38,6 +37,7 @@ import {
   type RegisterFunction,
   type SignalEnqueueOptions,
 } from "./ledger.ts";
+import { composeLedgerModulesForTest } from "./ledger-composition.test-support.ts";
 import type { DatabaseLedger } from "./database-ledger-engine.ts";
 import type {
   AnyProjectionSchema,
@@ -2890,7 +2890,7 @@ test("queue emissions require an unexpired authenticated lease", async () => {
 
   await using ledger = await createPublicBetterSqliteLedger({
     databaseUrl,
-    model: composeLedgerModules(module),
+    model: composeLedgerModulesForTest(module),
     timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
   await using workers = await ledger.startWorkers({

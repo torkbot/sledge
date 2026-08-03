@@ -24,11 +24,13 @@ test("package exports expose only supported public modules", async () => {
   );
 
   assert.deepEqual(Object.keys(packageJson.exports).sort(), [
+    ".",
     "./better-sqlite3-ledger",
     "./ledger",
     "./runtime/contracts",
     "./runtime/node-runtime",
     "./runtime/virtual-runtime",
+    "./stdlib",
     "./turso-ledger",
   ]);
 

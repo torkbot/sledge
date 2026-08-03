@@ -12,8 +12,11 @@ const registeredLedgerProjectionCompilerFactoryBrand: unique symbol = Symbol(
 const registeredLedgerProjectionSchemasBrand: unique symbol = Symbol(
   "sledge.registeredLedgerProjectionSchemas",
 );
-const ledgerModelResolvers = new WeakMap<object, unknown>();
-const preparedLedgerModelStates = new WeakMap<object, unknown>();
+const sledgeApplicationConfigureFunctions = new WeakMap<object, unknown>();
+const ledgerModuleComposers = new WeakMap<
+  object,
+  (first: object, ...rest: readonly object[]) => object
+>();
 export const registeredLedgerContractsBrand: unique symbol = Symbol(
   "sledge.registeredLedgerContracts",
 );
@@ -23,46 +26,49 @@ export const composedLedgerModulesBrand: unique symbol = Symbol(
 export const registeredLedgerRuntimeBrand: unique symbol = Symbol(
   "sledge.registeredLedgerRuntime",
 );
+
+export function attachSledgeApplicationConfigure<
+  TApplication extends object,
+  TConfigure,
+>(application: TApplication, configure: TConfigure): TApplication {
+  sledgeApplicationConfigureFunctions.set(application, configure);
+  return application;
+}
+
+export function readSledgeApplicationConfigure<TConfigure>(
+  application: object,
+): TConfigure | undefined {
+  return sledgeApplicationConfigureFunctions.get(application) as
+    | TConfigure
+    | undefined;
+}
+
+/**
+ * Gives each registered module the internal graph-construction capability
+ * needed by adapter-owned assembly without exposing another public API.
+ */
+export function attachLedgerModuleComposer(
+  module: object,
+  compose: (first: object, ...rest: readonly object[]) => object,
+): void {
+  ledgerModuleComposers.set(module, compose);
+}
+
+export function composeRegisteredLedgerModules(
+  first: object,
+  ...rest: readonly object[]
+): object {
+  const compose = ledgerModuleComposers.get(first);
+
+  if (compose === undefined) {
+    throw new Error("registered ledger module cannot compose a graph");
+  }
+
+  return compose(first, ...rest);
+}
 export const storageRuntimeIdentityBrand: unique symbol = Symbol(
   "sledge.storageRuntimeIdentity",
 );
-
-/**
- * Keeps model-resolution behavior out of the public definition value. The
- * weak association also makes definitions opaque and non-serializable: they
- * are process-local construction plans, never durable ledger state.
- */
-export function attachLedgerModelResolver<
-  TDefinition extends object,
-  TResolver,
->(definition: TDefinition, resolver: TResolver): TDefinition {
-  ledgerModelResolvers.set(definition, resolver);
-  return definition;
-}
-
-export function readLedgerModelResolver<TResolver>(
-  definition: object,
-): TResolver | undefined {
-  return ledgerModelResolvers.get(definition) as TResolver | undefined;
-}
-
-/**
- * Associates a prepared model capability with the adapter-owned runtime that
- * produced it. Resolution ports reject values from another resolution run.
- */
-export function attachPreparedLedgerModelState<
-  TPrepared extends object,
-  TState,
->(prepared: TPrepared, state: TState): TPrepared {
-  preparedLedgerModelStates.set(prepared, state);
-  return prepared;
-}
-
-export function readPreparedLedgerModelState<TState>(
-  prepared: object,
-): TState | undefined {
-  return preparedLedgerModelStates.get(prepared) as TState | undefined;
-}
 
 export type LedgerStorageRow = Record<string, unknown>;
 

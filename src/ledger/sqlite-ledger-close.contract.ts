@@ -9,16 +9,18 @@ import Database from "better-sqlite3";
 import { Type } from "typebox";
 
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
+import type {
+  ComposedLedgerEventTokens,
+  ComposedLedgerQueryTokens,
+  ComposedLedgerSignalTokens,
+} from "./ledger-composition.ts";
 import {
-  composeLedgerModules,
-  type ComposedLedgerEventTokens,
-  type ComposedLedgerQueryTokens,
-  type ComposedLedgerSignalTokens,
   declareLedgerModule,
   linkLedgerModule,
   type Ledger,
   type LedgerTiming,
 } from "./ledger.ts";
+import { composeLedgerModulesForTest } from "./ledger-composition.test-support.ts";
 
 const closeContractShape = declareLedgerModule({
   moduleId: "sqlite-ledger-close.contract",
@@ -38,7 +40,7 @@ const closeContractModule = linkLedgerModule(closeContractShape, null).register(
     },
   },
 );
-const closeContractModel = composeLedgerModules(closeContractModule);
+const closeContractModel = composeLedgerModulesForTest(closeContractModule);
 const closeContractRuntime = new VirtualRuntimeHarness(1_900_000_000_000);
 const closeContractTiming: LedgerTiming = {
   clock: closeContractRuntime.clock,

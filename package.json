@@ -13,17 +13,21 @@
     "access": "public"
   },
   "exports": {
+    ".": {
+      "types": "./dist/sledge.d.ts",
+      "default": "./dist/sledge.js"
+    },
     "./ledger": {
       "types": "./dist/ledger/ledger.d.ts",
       "default": "./dist/ledger/ledger.js"
     },
     "./better-sqlite3-ledger": {
-      "types": "./dist/ledger/better-sqlite3-ledger.d.ts",
-      "default": "./dist/ledger/better-sqlite3-ledger.js"
+      "types": "./dist/better-sqlite3-ledger.d.ts",
+      "default": "./dist/better-sqlite3-ledger.js"
     },
     "./turso-ledger": {
-      "types": "./dist/ledger/turso-ledger.d.ts",
-      "default": "./dist/ledger/turso-ledger.js"
+      "types": "./dist/turso-ledger.d.ts",
+      "default": "./dist/turso-ledger.js"
     },
     "./runtime/contracts": {
       "types": "./dist/runtime/contracts.d.ts",
@@ -36,9 +40,13 @@
     "./runtime/virtual-runtime": {
       "types": "./dist/runtime/virtual-runtime.d.ts",
       "default": "./dist/runtime/virtual-runtime.js"
+    },
+    "./stdlib": {
+      "types": "./dist/stdlib.d.ts",
+      "default": "./dist/stdlib.js"
     }
   },
-  "types": "./dist/ledger/ledger.d.ts",
+  "types": "./dist/sledge.d.ts",
   "files": [
     "dist",
     "README.md",
@@ -46,9 +54,9 @@
   ],
   "scripts": {
     "build": "rm -rf dist && tsgo --project tsconfig.build.json --pretty",
-    "test": "node --test src/**/*.test.ts",
+    "test": "node --test src/*.test.ts src/**/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty",
-    "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/**/*.ts",
+    "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/*.ts src/**/*.ts",
     "prepublishOnly": "node --run build"
   },
   "dependencies": {

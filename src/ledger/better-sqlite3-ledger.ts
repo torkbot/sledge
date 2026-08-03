@@ -3,21 +3,18 @@ import { realpathSync } from "node:fs";
 import Database from "better-sqlite3";
 
 import type {
+  AnyComposedLedgerModel,
   ComposedLedgerEventTokens,
   ComposedLedgerQueryTokens,
   ComposedLedgerSignalTokens,
-  Ledger,
-  LedgerModelSource,
-  LedgerTiming,
-  ComposedLedgerModelFor,
-} from "./ledger.ts";
+} from "./ledger-composition.ts";
+import type { Ledger, LedgerTiming } from "./ledger.ts";
 import {
   createComposedDatabaseLedger,
   type StorageDatabase,
   type StorageRuntime,
 } from "./database-ledger-engine.ts";
 import { storageRuntimeIdentityBrand } from "./internal-storage.ts";
-import { resolveLedgerModelSource } from "./ledger-model-resolution.ts";
 import { createRuntimeKyselySqliteProjectionStatementCompiler } from "./projection-kysely-runtime.ts";
 import { assertWalCheckpointTruncated } from "./sqlite-wal-checkpoint.ts";
 
@@ -25,21 +22,21 @@ const connectionOptions = {
   timeout: 0,
 } satisfies Database.Options;
 
-type CreateBetterSqliteLedgerInput<TSource extends LedgerModelSource> = {
+type CreateBetterSqliteLedgerInput<TModel extends AnyComposedLedgerModel> = {
   readonly databaseUrl: string;
-  readonly model: TSource;
+  readonly model: TModel;
   readonly timing: LedgerTiming;
 };
 
 export async function createBetterSqliteLedger<
-  const TSource extends LedgerModelSource,
+  const TModel extends AnyComposedLedgerModel,
 >(
-  input: CreateBetterSqliteLedgerInput<TSource>,
+  input: CreateBetterSqliteLedgerInput<TModel>,
 ): Promise<
   Ledger<
-    ComposedLedgerEventTokens<ComposedLedgerModelFor<TSource>>,
-    ComposedLedgerQueryTokens<ComposedLedgerModelFor<TSource>>,
-    ComposedLedgerSignalTokens<ComposedLedgerModelFor<TSource>>
+    ComposedLedgerEventTokens<TModel>,
+    ComposedLedgerQueryTokens<TModel>,
+    ComposedLedgerSignalTokens<TModel>
   >
 > {
   const storage = createBetterSqliteStorageRuntime(input.databaseUrl);
@@ -48,16 +45,9 @@ export async function createBetterSqliteLedger<
   let storageTransferred = false;
 
   try {
-    const model = await resolveLedgerModelSource({
-      source: input.model,
-      storage,
-      projectionCompiler,
-      timing: input.timing,
-    });
-
     const ledger = createComposedDatabaseLedger({
       storage,
-      model,
+      model: input.model,
       projectionCompiler,
       timing: input.timing,
     });
