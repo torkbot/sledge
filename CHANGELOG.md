@@ -81,7 +81,10 @@
   `InstalledLedgerModuleCapabilities`, and `LedgerApplicationModules`.
   Composition validates imported contracts against the exact owning modules;
   assembly queries and opened-ledger operations reject unknown or cross-open
-  tokens at runtime while preserving token-specific payload and result types.
+  token identities at runtime while preserving token-specific payload and
+  result types. Reused contributions deliberately reuse token identities.
+  Graph-wide application event streams are broadly typed because they have no
+  token argument from which to infer an installed event union.
 - Add storage-backed application discovery through scoped `query(...)` phase
   boundaries. Queries observe the installed module prefix, later installs form
   another prefix, and returning from the definition revokes assembly before

@@ -1087,13 +1087,19 @@ Ledger ownership is enforced where Sledge has authoritative information. When
 a module declares an imported event or query token, final graph composition
 requires the exact owning module and token. Assembly queries and opened-ledger
 operations resolve tokens against the exact runtime graph and reject unknown
-tokens, including tokens retained from another opening. The callback may return
-any deliberately selected capability subtree without changing those rules.
+token identities. Contributions normally created inside the callback receive
+fresh token identities on every open, so those tokens cannot cross openings. A
+contribution deliberately created outside the callback and reused across opens
+also deliberately reuses its token identities. The callback may return any
+selected capability subtree without changing those rules.
 
 TypeScript still infers event payloads, outcomes, query parameters, and query
 results from the token passed to an operation. Application membership itself is
 a runtime graph invariant rather than a recursive property of every capability
-value.
+value. Graph-wide `tailEvents(...)` and `resumeEvents(...)` streams have no
+token argument from which to infer a narrower installed event union, so their
+application-level event payloads are broadly typed. Modules retain their exact
+event tokens for typed emits, queries, outcomes, and application-side narrowing.
 
 Installation order is durable and semantic. For one append, Sledge runs module
 contributions from left to right in that order inside one atomic transaction.
