@@ -47,15 +47,17 @@ await opened.ledger.emit(opened.capabilities.users.events.created, {
 });
 ```
 
-The callback runs once for every open. Its three methods are the complete
+The callback runs once for every open. Its two methods are the complete
 assembly vocabulary:
 
 - `install(contribution)` adds one registered module and immediately returns
-  its capabilities, scoped to this assembly.
+  its exact capabilities unchanged.
 - `query(token, params)` reads the immutable installed prefix when later module
   choices depend on durable ledger state.
-- `expose(capabilities)` selects what consumers receive and proves that its
-  installed capabilities belong to this assembly.
+
+The object returned by the callback selects what consumers receive. Sledge
+enforces application membership against the composed runtime graph rather than
+rewriting that object in the type system.
 
 The application owns assembly and opening. Its driver owns storage compilation,
 connections, and migrations. Together they create temporary query-only prefix
