@@ -17,6 +17,29 @@ import { defineThen } from "./then.ts";
 
 const OutputSchema = Type.Object({ value: Type.String({ minLength: 1 }) });
 
+type AlphaResultPort = ReturnType<
+  ReturnType<typeof defineProducer<"experimental.contract.alpha">>
+>["capabilities"]["result"];
+
+function defineAlphaGroup(source: AlphaResultPort) {
+  return defineAll("experimental.contract.alpha-group", [source]);
+}
+
+if (false) {
+  defineLedger(async (sledge) => {
+    const alpha = sledge.install(
+      defineProducer("experimental.contract.alpha")(),
+    );
+    const group = sledge.install(defineAlphaGroup(alpha.result)());
+    await sledge.query(group.queries.state, {
+      // @ts-expect-error query parameter inference remains anchored to the token
+      memberRef: alpha.result.ref("alpha"),
+    });
+
+    return { alpha, group };
+  });
+}
+
 const adapters: readonly {
   readonly name: string;
   createDriver(databaseUrl: string): LedgerDriver;
@@ -582,7 +605,7 @@ function createAlgebraApplication(attempts: Map<string, number>) {
       })(),
     );
 
-    return sledge.expose({
+    return {
       all,
       alpha,
       beta,
@@ -590,7 +613,7 @@ function createAlgebraApplication(attempts: Map<string, number>) {
       foreign,
       nestedAll,
       race,
-    });
+    };
   });
 }
 

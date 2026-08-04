@@ -74,11 +74,14 @@
 - Breaking: add `defineLedger(...)` as the single application composition
   boundary. Its scoped `install(...)` method consumes module contributions and
   immediately reveals their bounded capabilities, so applications no longer
-  retain registered module handles or perform a final composition step.
-  `expose(...)` binds the returned capability tree to that exact assembly
-  invocation. Installed token and module ownership flows into assembly queries
-  and the opened ledger type, rejecting uninstalled and cross-application
-  contracts at compile time.
+  retain registered module handles or perform a final composition step. The
+  callback returns the public capability tree directly, and `install(...)`
+  preserves each module's exact capability type instead of recursively branding
+  arbitrary objects. Remove `sledge.expose(...)`,
+  `InstalledLedgerModuleCapabilities`, and `LedgerApplicationModules`.
+  Composition validates imported contracts against the exact owning modules;
+  assembly queries and opened-ledger operations reject unknown or cross-open
+  tokens at runtime while preserving token-specific payload and result types.
 - Add storage-backed application discovery through scoped `query(...)` phase
   boundaries. Queries observe the installed module prefix, later installs form
   another prefix, and returning from the definition revokes assembly before

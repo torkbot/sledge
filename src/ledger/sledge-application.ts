@@ -23,19 +23,14 @@ import {
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
   ApplicationLedger,
-  InstalledLedgerModuleCapabilities,
   LedgerApplication,
   LedgerApplicationCapabilities,
-  LedgerApplicationModules,
   LedgerAssembly,
   OpenedLedger,
 } from "../sledge.ts";
 
-declare const runtimeLedgerAssemblyScope: unique symbol;
-type RuntimeLedgerAssemblyScope = typeof runtimeLedgerAssemblyScope;
-
 type RuntimeLedgerConfigure<TCapabilities extends object> = (
-  assembly: LedgerAssembly<RuntimeLedgerAssemblyScope>,
+  assembly: LedgerAssembly,
 ) => TCapabilities | Promise<TCapabilities>;
 
 type PreparedLedger = ReturnType<
@@ -164,7 +159,7 @@ async function resolveLedgerApplication<
     TCapabilities extends object,
   >(
     contribution: LedgerModuleContribution<TCapabilities, TModule>,
-  ): InstalledLedgerModuleCapabilities<TModule, TCapabilities> => {
+  ): TCapabilities => {
     assertAssemblyOpen();
 
     if (!isLedgerModuleContribution(contribution)) {
@@ -181,18 +176,13 @@ async function resolveLedgerApplication<
 
     moduleIds.add(moduleId);
     modules.push(contribution.module);
-    // Installation brands capabilities and their tokens only in the type
-    // system. Runtime ownership is validated by the composed graph.
-    return contribution.capabilities as InstalledLedgerModuleCapabilities<
-      TModule,
-      TCapabilities
-    >;
+    return contribution.capabilities;
   };
   const query = <
     const TQuery extends QueryToken<string, string, TSchema, TSchema>,
   >(
     queryToken: TQuery,
-    params: QueryParameters<TQuery>,
+    params: QueryParameters<NoInfer<TQuery>>,
   ): Promise<QueryResult<TQuery>> =>
     runQuery(async () => {
       const [first, ...rest] = modules;
@@ -206,19 +196,10 @@ async function resolveLedgerApplication<
       const ledger = await prepareModules([first, ...rest]);
       return await ledger.query(queryToken, params);
     });
-  const expose = <TCapabilities extends object>(
-    capabilities: TCapabilities,
-  ): TCapabilities => {
-    assertAssemblyOpen();
-    return capabilities;
-  };
-  // Scope and reveal markers are intentionally type-only. This one cast is
-  // the runtime bridge that binds every installed value to this invocation.
   const assembly = Object.freeze({
     install,
     query,
-    expose,
-  }) as LedgerAssembly<RuntimeLedgerAssemblyScope>;
+  });
 
   let configuration:
     | {
@@ -291,12 +272,7 @@ export async function openLedgerApplication<
   readonly storage: StorageRuntime;
   readonly projectionCompiler: ProjectionStatementCompiler;
   readonly timing: LedgerTiming;
-}): Promise<
-  OpenedLedger<
-    LedgerApplicationCapabilities<TApplication>,
-    LedgerApplicationModules<TApplication>
-  >
-> {
+}): Promise<OpenedLedger<LedgerApplicationCapabilities<TApplication>>> {
   let storageTransferred = false;
 
   try {
@@ -326,11 +302,7 @@ export async function openLedgerApplication<
 
     const close = async (): Promise<void> => await ledger.close();
 
-    // The application capability brands carry the exact installed module
-    // union. Resolution has just validated and opened that same runtime graph.
-    const typedLedger = ledger as ApplicationLedger<
-      LedgerApplicationModules<TApplication>
-    >;
+    const typedLedger = ledger as ApplicationLedger;
 
     return Object.freeze({
       capabilities: resolved.capabilities,

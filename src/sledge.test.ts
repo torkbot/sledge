@@ -18,7 +18,6 @@ import {
   type OpenedLedger,
   type LedgerApplication,
   type LedgerApplicationCapabilities,
-  type LedgerApplicationModules,
 } from "./sledge.ts";
 
 const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
@@ -29,11 +28,9 @@ const timing = {
 
 if (false) {
   void (async () => {
-    const application = defineLedger((sledge) =>
-      sledge.expose({
-        source: sledge.install(defineSourceModule()),
-      }),
-    );
+    const application = defineLedger((sledge) => ({
+      source: sledge.install(defineSourceModule()),
+    }));
     const opened = await application.open(
       createBetterSqliteDriver({ databaseUrl: "typecheck-only.sqlite" }),
       timing,
@@ -43,7 +40,6 @@ if (false) {
     await opened.ledger.emit(opened.capabilities.source.events.created, {
       id: "owned",
     });
-    // @ts-expect-error opened ledgers accept tokens only from installed modules
     await opened.ledger.emit(foreign.capabilities.events.configured, {
       moduleIds: [],
     });
@@ -51,7 +47,7 @@ if (false) {
     const reshapedApplication = defineLedger((sledge) => {
       const source = sledge.install(defineSourceModule());
 
-      return sledge.expose({ events: source.events });
+      return { events: source.events };
     });
     const reshaped = await reshapedApplication.open(
       createBetterSqliteDriver({
@@ -62,62 +58,12 @@ if (false) {
     await reshaped.ledger.emit(reshaped.capabilities.events.created, {
       id: "owned-through-subtree",
     });
-  })();
 
-  const firstApplication = defineLedger((sledge) =>
-    sledge.expose({
-      source: sledge.install(defineSourceModule()),
-    }),
-  );
-  const firstCapabilities = null as unknown as LedgerApplicationCapabilities<
-    typeof firstApplication
-  >;
-
-  defineLedger((sledge) => {
-    const source = sledge.install(defineSourceModule());
-
-    // @ts-expect-error capabilities installed by another application cannot be revealed
-    return sledge.expose({ firstCapabilities, source });
-  });
-
-  defineLedger((sledge) => {
-    const source = sledge.install(defineSourceModule());
-    const schemaLike = {
-      "~kind": "custom" as const,
-      foreign: firstCapabilities,
-    };
-
-    // @ts-expect-error schema-like wrappers cannot hide another application's capabilities
-    return sledge.expose({ schemaLike, source });
-  });
-
-  defineLedger((sledge) => {
-    const source = sledge.install(defineSourceModule());
-    const callable = Object.assign(() => "ready", {
-      foreign: firstCapabilities,
+    await reshaped.ledger.emit(reshaped.capabilities.events.created, {
+      // @ts-expect-error payload inference remains anchored to the exact token
+      moduleIds: [],
     });
-
-    // @ts-expect-error callable leaves cannot carry hidden capability properties
-    return sledge.expose({ callable, source });
-  });
-
-  defineLedger((sledge) => {
-    const defineLaunderingModule = defineModule(
-      "contract.laundering",
-      (module, foreign: typeof firstCapabilities) => {
-        const declaration = module.declare({ events: {} });
-        const registered = module.link(declaration, null).register({});
-
-        return module.expose(registered, { foreign });
-      },
-    );
-    const laundering = sledge.install(
-      // @ts-expect-error install cannot rebind capabilities from another application
-      defineLaunderingModule(firstCapabilities),
-    );
-
-    return sledge.expose({ laundering });
-  });
+  })();
 
   defineLedger((sledge) => {
     const source = sledge.install(defineSourceModule());
@@ -132,7 +78,7 @@ if (false) {
     );
     const composed = sledge.install(defineComposedModule(source));
 
-    return sledge.expose({ composed });
+    return { composed };
   });
 
   defineLedger((sledge) => {
@@ -150,13 +96,12 @@ if (false) {
       },
     );
     const installed = sledge.install(
-      // @ts-expect-error raw tokens must belong to the contributed module
       defineForeignTokenModule(
         foreign.capabilities.queries.configuredModuleIds,
       ),
     );
 
-    return sledge.expose({ installed });
+    return { installed };
   });
 }
 
@@ -166,7 +111,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     const application = defineLedger((sledge) => {
       const source = sledge.install(defineSourceModule());
 
-      return sledge.expose({ source });
+      return { source };
     });
 
     await using opened = await fixture.open(application);
@@ -187,7 +132,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     const application = defineLedger((sledge) => {
       const source = sledge.install(defineSourceModule());
 
-      return sledge.expose({ source });
+      return { source };
     });
     const [first, second] = await Promise.all([
       firstFixture.open(application),
@@ -196,6 +141,12 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 
     try {
       assert.notEqual(first.capabilities.source, second.capabilities.source);
+      await assert.rejects(
+        first.ledger.emit(second.capabilities.source.events.created, {
+          id: "foreign",
+        }),
+        /unknown event token/,
+      );
       await Promise.all([
         first.ledger.emit(first.capabilities.source.events.created, {
           id: "first",
@@ -215,7 +166,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const registry = sledge.install(defineRegistryModule());
       const discovered = sledge.install(defineDiscoveredModule());
 
-      return sledge.expose({ discovered, registry });
+      return { discovered, registry };
     });
 
     {
@@ -227,7 +178,6 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 
     let queryAfterDefinition!: () => Promise<readonly string[] | null>;
     let installAfterDefinition!: () => void;
-    let exposeAfterDefinition!: () => void;
     const application = defineLedger(async (sledge) => {
       const registry = sledge.install(defineRegistryModule());
       queryAfterDefinition = async () =>
@@ -235,10 +185,6 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       installAfterDefinition = () => {
         sledge.install(defineUnexpectedModule());
       };
-      exposeAfterDefinition = () => {
-        sledge.expose({});
-      };
-
       const moduleIds = await sledge.query(
         registry.queries.configuredModuleIds,
         {},
@@ -249,13 +195,12 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       assert.equal(moduleIds.includes(discovered.moduleId), true);
       assert.equal(await sledge.query(discovered.queries.status, {}), "ready");
 
-      return sledge.expose({ discovered, registry });
+      return { discovered, registry };
     });
 
     await using opened = await fixture.open(application);
     await assert.rejects(queryAfterDefinition(), /assembly has already closed/);
     assert.throws(installAfterDefinition, /assembly has already closed/);
-    assert.throws(exposeAfterDefinition, /assembly has already closed/);
 
     const invoked = await opened.ledger.emit(
       opened.capabilities.discovered.events.invoked,
@@ -270,7 +215,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const registry = sledge.install(defineRegistryModule());
       await sledge.query(registry.queries.configuredModuleIds, {});
 
-      return sledge.expose({ registry });
+      return { registry };
     });
 
     await assert.rejects(
@@ -285,7 +230,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const registry = sledge.install(defineRegistryModule());
       const discovered = sledge.install(defineDiscoveredModule());
 
-      return sledge.expose({ discovered, registry });
+      return { discovered, registry };
     });
 
     {
@@ -296,7 +241,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     const incompleteApplication = defineLedger((sledge) => {
       const registry = sledge.install(defineRegistryModule());
 
-      return sledge.expose({ registry });
+      return { registry };
     });
 
     await assert.rejects(
@@ -307,12 +252,10 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 
   test(`${driver} rejects a non-prefix discovery graph before migrations`, async () => {
     await using fixture = await createFixture(driver, "invalid-prefix");
-    const owningApplication = defineLedger((sledge) =>
-      sledge.expose({
-        discovered: sledge.install(defineDiscoveredModule()),
-        registry: sledge.install(defineRegistryModule()),
-      }),
-    );
+    const owningApplication = defineLedger((sledge) => ({
+      discovered: sledge.install(defineDiscoveredModule()),
+      registry: sledge.install(defineRegistryModule()),
+    }));
 
     {
       await using opened = await fixture.open(owningApplication);
@@ -323,7 +266,7 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const unexpected = sledge.install(defineUnexpectedModule());
       await sledge.query(unexpected.queries.status, {});
 
-      return sledge.expose({ unexpected });
+      return { unexpected };
     });
 
     await assert.rejects(
@@ -344,11 +287,9 @@ test("an application opens through an inert driver with Node timing by default",
   const driver = createBetterSqliteDriver({
     databaseUrl: fixture.databaseUrl,
   });
-  const application = defineLedger((sledge) =>
-    sledge.expose({
-      source: sledge.install(defineSourceModule()),
-    }),
-  );
+  const application = defineLedger((sledge) => ({
+    source: sledge.install(defineSourceModule()),
+  }));
 
   assert(Object.isFrozen(application));
   assert(Object.isFrozen(driver));
@@ -364,7 +305,7 @@ test("an application opens through an inert driver with Node timing by default",
 
 test("a Sledge application requires at least one installed module", async () => {
   await using fixture = await createFixture("better-sqlite3", "empty");
-  const application = defineLedger((sledge) => sledge.expose({}));
+  const application = defineLedger(() => ({}));
 
   await assert.rejects(
     fixture.open(application),
@@ -378,7 +319,7 @@ test("a Sledge application rejects duplicate module ids", async () => {
     sledge.install(defineSourceModule());
     sledge.install(defineSourceModule());
 
-    return sledge.expose({});
+    return {};
   });
 
   await assert.rejects(
@@ -404,7 +345,7 @@ test("a Sledge application rejects hand-assembled module contributions", async (
       capabilities: source.capabilities,
     });
 
-    return sledge.expose({});
+    return {};
   });
 
   await assert.rejects(
@@ -440,7 +381,7 @@ test("a failed module factory does not authenticate its leaked contribution", as
     ) => object;
     unsafeInstall(leakedContribution);
 
-    return sledge.expose({});
+    return {};
   });
 
   await assert.rejects(
@@ -453,10 +394,9 @@ test("a Sledge application must install a module before querying", async () => {
   await using fixture = await createFixture("better-sqlite3", "query-empty");
   const registry = defineRegistryModule();
   const application = defineLedger(async (sledge) => {
-    // @ts-expect-error query tokens become valid only after their contribution is installed
     await sledge.query(registry.capabilities.queries.configuredModuleIds, {});
 
-    return sledge.expose({});
+    return {};
   });
 
   await assert.rejects(
@@ -470,11 +410,9 @@ test("assembly queries accept tokens only from installed modules", async () => {
     "better-sqlite3",
     "query-ownership",
   );
-  const owningApplication = defineLedger((sledge) =>
-    sledge.expose({
-      source: sledge.install(defineSourceModule()),
-    }),
-  );
+  const owningApplication = defineLedger((sledge) => ({
+    source: sledge.install(defineSourceModule()),
+  }));
 
   {
     await using opened = await fixture.open(owningApplication);
@@ -485,12 +423,11 @@ test("assembly queries accept tokens only from installed modules", async () => {
   const invalidApplication = defineLedger(async (sledge) => {
     const source = sledge.install(defineSourceModule());
     await sledge.query(
-      // @ts-expect-error the registry contribution was never installed
       foreignRegistry.capabilities.queries.configuredModuleIds,
       {},
     );
 
-    return sledge.expose({ source });
+    return { source };
   });
 
   await assert.rejects(fixture.open(invalidApplication), /unknown query token/);
@@ -501,11 +438,9 @@ test("an abandoned assembly query failure rejects the open", async () => {
     "better-sqlite3",
     "abandoned-query-failure",
   );
-  const bootstrap = defineLedger((sledge) =>
-    sledge.expose({
-      query: sledge.install(defineQueryModule(() => "ready")),
-    }),
-  );
+  const bootstrap = defineLedger((sledge) => ({
+    query: sledge.install(defineQueryModule(() => "ready")),
+  }));
 
   {
     await using opened = await fixture.open(bootstrap);
@@ -520,7 +455,7 @@ test("an abandoned assembly query failure rejects the open", async () => {
     );
     void sledge.query(query.queries.status, {});
 
-    return sledge.expose({ query });
+    return { query };
   });
 
   await assert.rejects(fixture.open(application), /configured query failure/);
@@ -531,11 +466,9 @@ test("opening waits for an abandoned in-flight assembly query", async () => {
     "better-sqlite3",
     "abandoned-query-settlement",
   );
-  const bootstrap = defineLedger((sledge) =>
-    sledge.expose({
-      query: sledge.install(defineQueryModule(() => "ready")),
-    }),
-  );
+  const bootstrap = defineLedger((sledge) => ({
+    query: sledge.install(defineQueryModule(() => "ready")),
+  }));
 
   {
     await using opened = await fixture.open(bootstrap);
@@ -554,7 +487,7 @@ test("opening waits for an abandoned in-flight assembly query", async () => {
     );
     void sledge.query(query.queries.status, {});
 
-    return sledge.expose({ query });
+    return { query };
   });
   const opening = fixture.open(application);
   let settled = false;
@@ -767,12 +700,7 @@ async function createFixture(
   hasTable(tableName: string): Promise<boolean>;
   open<TApplication extends LedgerApplication<object>>(
     application: TApplication,
-  ): Promise<
-    OpenedLedger<
-      LedgerApplicationCapabilities<TApplication>,
-      LedgerApplicationModules<TApplication>
-    >
-  >;
+  ): Promise<OpenedLedger<LedgerApplicationCapabilities<TApplication>>>;
 }> {
   const directory = await mkdtemp(
     join(tmpdir(), `sledge-application-${driver}-${name}-`),

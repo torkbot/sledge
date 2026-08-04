@@ -1263,13 +1263,13 @@ export interface Ledger<
 > extends AsyncDisposable {
   emit<const TEvent extends TEvents>(
     event: TEvent,
-    payload: EventPayload<TEvent>,
+    payload: EventPayload<NoInfer<TEvent>>,
     options?: EmitOptions,
   ): Promise<LedgerEventCommit<TEvent>>;
 
   query<const TQuery extends TQueries>(
     query: TQuery,
-    params: QueryParameters<TQuery>,
+    params: QueryParameters<NoInfer<TQuery>>,
   ): Promise<QueryResult<TQuery>>;
 
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
