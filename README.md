@@ -35,7 +35,7 @@ const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
   const audit = sledge.install(defineAuditModule(users));
 
-  return sledge.expose({ audit, users });
+  return { audit, users };
 });
 
 await using opened = await application.open(
@@ -47,15 +47,17 @@ await opened.ledger.emit(opened.capabilities.users.events.created, {
 });
 ```
 
-The callback runs once for every open. Its three methods are the complete
+The callback runs once for every open. Its two methods are the complete
 assembly vocabulary:
 
 - `install(contribution)` adds one registered module and immediately returns
-  its capabilities, scoped to this assembly.
+  its exact capabilities unchanged.
 - `query(token, params)` reads the immutable installed prefix when later module
   choices depend on durable ledger state.
-- `expose(capabilities)` selects what consumers receive and proves that its
-  installed capabilities belong to this assembly.
+
+The object returned by the callback selects what consumers receive. Sledge
+enforces application membership against the composed runtime graph rather than
+rewriting that object in the type system.
 
 The application owns assembly and opening. Its driver owns storage compilation,
 connections, and migrations. Together they create temporary query-only prefix
@@ -198,7 +200,7 @@ const defineUsersModule = defineModule("app.users", (module) => {
 const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
 
-  return sledge.expose({ users });
+  return { users };
 });
 const runtimeScheduler = new NodeRuntimeScheduler();
 
@@ -249,7 +251,7 @@ await ledger.emit(usersModule.events.created, payload);
 ```
 
 Define modules with `defineModule(...)`. Install their revealed contributions
-inside `defineLedger(...)`, expose the application capability tree, then ask
+inside `defineLedger(...)`, return the application capability tree, then ask
 that application to open with a driver:
 
 ```ts
@@ -257,7 +259,7 @@ const application = defineLedger((sledge) => {
   const users = sledge.install(defineUsersModule());
   const audit = sledge.install(defineAuditModule(users));
 
-  return sledge.expose({ audit, users });
+  return { audit, users };
 });
 
 await using opened = await application.open(
@@ -268,8 +270,8 @@ await opened.ledger.emit(opened.capabilities.users.events.created, payload);
 ```
 
 The application owns the registered module handles. Consumers receive only the
-capabilities deliberately returned through `expose(...)`; they do not need to
-retain or propagate a parallel model graph.
+capabilities deliberately returned by the callback; they do not need to retain
+or propagate a parallel model graph.
 
 ### Replace hand-built module contributions
 
@@ -352,7 +354,7 @@ const application = defineLedger(async (sledge) => {
     configured.push(sledge.install(defineConfiguredModule()));
   }
 
-  return sledge.expose({ configured, registry });
+  return { configured, registry };
 });
 ```
 
@@ -451,11 +453,9 @@ const defineCompactionsModule = defineModule("app.compactions", (module) => {
   });
 });
 
-const application = defineLedger((sledge) =>
-  sledge.expose({
-    compactions: sledge.install(defineCompactionsModule()),
-  }),
-);
+const application = defineLedger((sledge) => ({
+  compactions: sledge.install(defineCompactionsModule()),
+}));
 
 declare const databaseUrl: string;
 
@@ -560,7 +560,7 @@ const application = defineLedger((sledge) => {
     defineAll("app.epoch-inputs", [dreaming.result, compactions.result])(),
   );
 
-  return sledge.expose({ compactions, dreaming, publishReady });
+  return { compactions, dreaming, publishReady };
 });
 ```
 
@@ -639,7 +639,7 @@ const application = defineLedger((sledge) => {
     ])(),
   );
 
-  return sledge.expose({ compactionRace });
+  return { compactionRace };
 });
 
 await opened.ledger.emit(opened.capabilities.compactionRace.events.opened, {
@@ -697,9 +697,8 @@ query that registry and build one final ledger model safely.
 | `OpenedLedger`             | `await application.open(driver)` | Per-open capabilities plus the owning ledger runtime       |
 
 There is no public composed, prepared, sealed, or activated model. Those are
-adapter-owned implementation phases. `sledge.expose(...)` proves that the
-returned capability tree belongs to this assembly. Returning it finishes
-assembly, revokes the scoped methods, and lets the adapter open the exact
+adapter-owned implementation phases. Returning from the callback finishes
+assembly, revokes its scoped methods, and lets the adapter open the exact
 installed graph.
 
 ### 1. Declare Durable Contracts
@@ -1068,7 +1067,7 @@ const application = defineLedger((sledge) => {
   const audit = sledge.install(defineAuditModule(users));
   const delivery = sledge.install(defineDeliveryModule(users));
 
-  return sledge.expose({ audit, delivery, users });
+  return { audit, delivery, users };
 });
 ```
 
@@ -1080,30 +1079,27 @@ by that run. Concurrent opens never share assembly state.
 
 Module factories may declare ordinary arguments after the injected module
 owner and consume capabilities installed earlier in the same assembly, as
-`defineAuditModule(users)` does above. Passing those dependencies through
-another contribution preserves their original module ownership.
-Capabilities from another application cannot be rebound through `install(...)`.
-Any raw event, query, or signal token exposed by a contribution must also be a
-contract of that contribution's registered module, including an explicit alias.
+`defineAuditModule(users)` does above. Capabilities remain the exact userspace
+types returned by their modules; Sledge does not recursively rewrite arbitrary
+objects to encode application membership.
 
-`expose(...)` is a type-only ownership boundary, not a composition step. It
-returns the same object while proving that every installed capability in the
-tree came from this invocation. A capability retained from another application
-cannot be exposed or queried through this assembly, even when both applications
-use the same module factory.
+Ledger ownership is enforced where Sledge has authoritative information. When
+a module declares an imported event or query token, final graph composition
+requires the exact owning module and token. Assembly queries and opened-ledger
+operations resolve tokens against the exact runtime graph and reject unknown
+token identities. Contributions normally created inside the callback receive
+fresh token identities on every open, so those tokens cannot cross openings. A
+contribution deliberately created outside the callback and reused across opens
+also deliberately reuses its token identities. The callback may return any
+selected capability subtree without changing those rules.
 
-Installed tokens retain their module identity independently of the surrounding
-object, so applications can expose a selected subtree such as
-`sledge.expose({ events: users.events })` without also revealing the rest of the
-module's capabilities. Callable capability values are leaves; represent
-metadata or related installed capabilities as sibling object fields rather than
-properties attached to the function.
-
-Installed capabilities carry graph membership only in the type system.
-`sledge.query(...)` rejects tokens that did not come through `install(...)`, and
-the opened ledger accepts tokens only from modules reachable through the
-returned application capability tree. Runtime validation enforces the same
-ownership boundary for untyped callers.
+TypeScript still infers event payloads, outcomes, query parameters, and query
+results from the token passed to an operation. Application membership itself is
+a runtime graph invariant rather than a recursive property of every capability
+value. Graph-wide `tailEvents(...)` and `resumeEvents(...)` streams have no
+token argument from which to infer a narrower installed event union, so their
+application-level event payloads are broadly typed. Modules retain their exact
+event tokens for typed emits, queries, outcomes, and application-side narrowing.
 
 Installation order is durable and semantic. For one append, Sledge runs module
 contributions from left to right in that order inside one atomic transaction.
@@ -1134,7 +1130,7 @@ const application = defineLedger(async (sledge) => {
     sledge.install(defineConfiguredModule());
   }
 
-  return sledge.expose({ registry });
+  return { registry };
 });
 ```
 

@@ -1,15 +1,10 @@
 import type { Static, TSchema } from "typebox";
 
-import type {
-  AnyRegisteredLedgerModule,
-  LedgerIndexerContext,
-  LedgerTiming,
-} from "./ledger.ts";
+import type { LedgerIndexerContext, LedgerTiming } from "./ledger.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
   LedgerApplication,
   LedgerApplicationCapabilities,
-  LedgerApplicationModules,
   LedgerDriver,
   OpenedLedger,
 } from "../sledge.ts";
@@ -62,19 +57,11 @@ export function readLedgerApplicationConfigure<TConfigure>(
 }
 
 export type LedgerDriverOpen = <
-  const TApplication extends LedgerApplication<
-    object,
-    AnyRegisteredLedgerModule
-  >,
+  const TApplication extends LedgerApplication<object>,
 >(input: {
   readonly application: TApplication;
   readonly timing: LedgerTiming;
-}) => Promise<
-  OpenedLedger<
-    LedgerApplicationCapabilities<TApplication>,
-    LedgerApplicationModules<TApplication>
-  >
->;
+}) => Promise<OpenedLedger<LedgerApplicationCapabilities<TApplication>>>;
 
 export function attachLedgerDriverOpen<TDriver extends object>(
   driver: TDriver,
