@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- Add `ledger.querySnapshot(query, params)`, which returns a decoded projection
+  result and resumable event cursor from one SQLite read snapshot. Both storage
+  adapters pin the WAL snapshot before running the query, allowing public
+  runtime code to move from current state to future events without a missed
+  settlement race.
+- Breaking: make `ResultPort` readable as well as observable. Producers now
+  complete `defineResult(...)` through immutable `fromEvent(...).readFrom(...)`
+  phases. The reader binds the producer's authoritative `{ ref }` state query;
+  `readResult(...)` hydrates one typed ref, and cancellation-aware
+  `waitForResult(...)` combines the reader with `querySnapshot(...)` and
+  `resumeEvents(...)` without polling. Explicit history expiry restarts from a
+  fresh authoritative snapshot.
+- Add experimental standalone invocation, external-value, and deadline
+  producers through their individual subpath exports. Invocation execution is
+  at-least-once, exposes attempt, lease cancellation, deterministic timeouts,
+  and an attempt-scoped ledger port containing only explicitly imported event
+  and query capabilities. Thrown failures retry; explicit succeeded, typed
+  failed, and cancelled resolutions settle. Deadlines intentionally do not
+  infer loser cancellation from a race.
+- Add experimental `defineEventInvocation(...)` for event-derived fan-out. It
+  turns an existing plain source event into private retryable work and emits an
+  existing plain domain terminal event atomically with attempt acknowledgement,
+  adding no protocol events of its own. Execution receives only explicitly
+  imported event and query capabilities. An optional async, query-only filter
+  acknowledges obsolete work before a total execution callback returns the
+  terminal payload.
+- Add linked-module `eventToWork(...)` and `workToEvent(...)` helpers for small
+  private async maps. Source derivation and enqueue commit atomically;
+  successful mapping and its output event commit atomically. A query-only
+  filter may acknowledge obsolete work, while throws preserve ordinary retry.
+- Let `module.declare(...)` import exact query tokens independently of storage
+  materialization. Stateless modules can now perform bounded cross-module
+  queries without fake tables or migrations. Linking merges those imports with
+  locally materialized query definitions and rejects duplicate local aliases.
+- Breaking: give experimental `then` one attempt-scoped `ledger` port. Exact
+  `reads` are available through `ledger.read(result, ref)`, while an optional
+  `access` declaration admits exact domain events and queries through
+  `ledger.emit(...)` and `ledger.query(...)`. Downstream stages can hydrate
+  member values or recover caller-owned request context without copying those
+  values through aggregate events, and the entire port is revoked when the
+  attempt returns.
+
 - Add `module.link(declaration, materializations)` to the scoped module
   definition port. Canonical module factories no longer import their linking
   phase from `@torkbot/sledge/ledger`, and linking rejects declarations not
@@ -37,19 +79,21 @@
   refs and terminal event sources. `defineResult(module, ...)` consumes the
   narrower `LedgerModuleOwner` capability, so producer identity is supplied
   once by `defineModule(...)`. It returns immutable phases: first a result
-  identity and schema, then `fromEvent(...)` returns a new capability that
-  generic modules can observe without requiring producers to append a duplicate
+  identity and schema, `fromEvent(...)` binds its terminal fact, and
+  `readFrom(...)` binds its authoritative state query. Generic modules can
+  observe or hydrate results without requiring producers to append a duplicate
   generic settlement event. One module may define only one result protocol, so
   its module id remains the unambiguous durable identity without a second local
-  name. Its incomplete result phase may also bind only one terminal event, and
-  private provenance requires that event to belong to the exact open module
-  definition. The curated surface is available from `@torkbot/sledge/stdlib`.
-- Breaking: successful `ResultObservation` values now carry the producer's
-  typed result value, while failed and cancelled observations remain valueless.
-  `ResultPort` also preserves its exact terminal event token instead of
-  widening away module ownership. Together these changes let generic causal
-  operators consume a result without a producer-specific query or duplicate
-  event.
+  name. Each phase may bind exactly once, and private provenance requires both
+  tokens to belong to the exact open module definition. The curated surface is
+  available from `@torkbot/sledge/stdlib`.
+- Breaking: `ResultObservation` now carries the producer's typed success value
+  or typed terminal failure value; cancellation remains valueless.
+  `defineResult(...)` requires both schemas, with `Type.Never()` representing
+  an infallible producer. `ResultPort` also preserves its exact terminal event
+  token instead of widening away module ownership. Together these changes let
+  generic causal operators consume a result without a producer-specific query
+  or duplicate event.
 - Add a deliberately compatibility-unstable result algebra through the
   individual `@torkbot/sledge/experimental/all`,
   `@torkbot/sledge/experimental/race`, and
@@ -59,13 +103,14 @@
   acyclic composition through later operators, and append only their opening
   and terminal facts. Their private projections retain one terminal observation
   per admitted source result so groups may open after their inputs settle.
-  `then` uses the source terminal fact as its request, propagates source failure
-  or cancellation, and gives at-least-once application code a deterministic
-  result ref, attempt, lease signal, and timeout capability. External effects
-  must use that ref as an idempotency key. Experimental APIs and durable
-  materializations may change as Harness and TorkBot pressure-test their
-  developer experience; no polling-based wait abstraction is included before
-  Sledge can provide an atomic snapshot-and-cursor boundary.
+  `then` uses the source terminal fact as its request, unions and propagates the
+  source's typed failure with its own declared failure, propagates cancellation,
+  and gives at-least-once application code a deterministic result ref, attempt,
+  lease signal, and timeout capability. External effects must use that ref as
+  an idempotency key. Experimental APIs and durable materializations may change
+  as Harness and TorkBot pressure-test their developer experience. Stable
+  result waiting is provided by the atomic snapshot-and-cursor boundary
+  described above rather than by polling.
 - Breaking: make durable event `actions.enqueue(...)` asynchronous. Addressed
   work resolves to its persisted `WorkRef`, including an existing identity
   preserved by coalescing; anonymous work resolves to `null`. Export

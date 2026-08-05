@@ -56,6 +56,22 @@
     "./experimental/then": {
       "types": "./dist/experimental/then.d.ts",
       "default": "./dist/experimental/then.js"
+    },
+    "./experimental/invocation": {
+      "types": "./dist/experimental/invocation.d.ts",
+      "default": "./dist/experimental/invocation.js"
+    },
+    "./experimental/external-value": {
+      "types": "./dist/experimental/external-value.d.ts",
+      "default": "./dist/experimental/external-value.js"
+    },
+    "./experimental/deadline": {
+      "types": "./dist/experimental/deadline.d.ts",
+      "default": "./dist/experimental/deadline.js"
+    },
+    "./experimental/event-invocation": {
+      "types": "./dist/experimental/event-invocation.d.ts",
+      "default": "./dist/experimental/event-invocation.js"
     }
   },
   "types": "./dist/sledge.d.ts",
@@ -74,6 +90,7 @@
   "dependencies": {
     "@tursodatabase/database": "^0.5.1",
     "better-sqlite3": "^12.6.2",
+    "effect": "^3.22.1",
     "kysely": "^0.29.2",
     "sqids": "0.3.0",
     "typebox": "^1.1.33"
