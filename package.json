@@ -90,6 +90,7 @@
   "dependencies": {
     "@tursodatabase/database": "^0.5.1",
     "better-sqlite3": "^12.6.2",
+    "effect": "^3.22.1",
     "kysely": "^0.29.2",
     "sqids": "0.3.0",
     "typebox": "^1.1.33"
