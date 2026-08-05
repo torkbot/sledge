@@ -330,7 +330,7 @@ const audit = sledge.install(defineAuditModule(users));
 
 Reusable primitives take the narrower `LedgerModuleOwner` capability. For
 example, replace `defineResult({ moduleId, resultSchema })` with
-`defineResult(module, { resultSchema })`. The primitive receives identity and
+`defineResult(module, { resultSchema, failureSchema })`. The primitive receives identity and
 private lifetime validation without gaining declaration, linking, or
 registration authority.
 
@@ -364,18 +364,18 @@ opening the final runtime, and an abandoned query failure rejects the open.
 
 ### Update imports and opened values
 
-| Before                                           | 0.26                                                  |
-| ------------------------------------------------ | ----------------------------------------------------- |
-| `composeLedgerModules(...)`                      | `defineLedger(...)` plus `sledge.install(...)`        |
-| `defineLedgerModel(...)`                         | An async `defineLedger(...)` callback                 |
-| `prepare(...)` / `extend(...)`                   | `sledge.query(...)` / `sledge.install(...)`           |
-| `defineSledge(...)`                              | `defineLedger(...)`                                   |
-| `{ module, capabilities }`                       | `defineModule(...)` plus `module.expose(...)`         |
-| `defineResult({ moduleId, resultSchema })`       | `defineResult(module, { resultSchema })`              |
-| `createBetterSqliteSledge({ application, ... })` | `application.open(createBetterSqliteDriver({ ... }))` |
-| `createTursoSledge({ application, ... })`        | `application.open(createTursoDriver({ ... }))`        |
-| A required production `timing` input             | Node timing by default; an optional test override     |
-| Registered module handles used as public API     | `OpenedLedger.capabilities`                           |
+| Before                                           | 0.26                                                    |
+| ------------------------------------------------ | ------------------------------------------------------- |
+| `composeLedgerModules(...)`                      | `defineLedger(...)` plus `sledge.install(...)`          |
+| `defineLedgerModel(...)`                         | An async `defineLedger(...)` callback                   |
+| `prepare(...)` / `extend(...)`                   | `sledge.query(...)` / `sledge.install(...)`             |
+| `defineSledge(...)`                              | `defineLedger(...)`                                     |
+| `{ module, capabilities }`                       | `defineModule(...)` plus `module.expose(...)`           |
+| `defineResult({ moduleId, resultSchema })`       | `defineResult(module, { resultSchema, failureSchema })` |
+| `createBetterSqliteSledge({ application, ... })` | `application.open(createBetterSqliteDriver({ ... }))`   |
+| `createTursoSledge({ application, ... })`        | `application.open(createTursoDriver({ ... }))`          |
+| A required production `timing` input             | Node timing by default; an optional test override       |
+| Registered module handles used as public API     | `OpenedLedger.capabilities`                             |
 
 The root `defineLedger` export is now the application entry point. Low-level
 ledger declarations remain under `@torkbot/sledge/ledger`, the two driver
@@ -423,7 +423,8 @@ import { Type } from "typebox";
 
 import { defineLedger, defineModule } from "@torkbot/sledge";
 import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3";
-import { defineResult } from "@torkbot/sledge/stdlib";
+import { defineMaterialization } from "@torkbot/sledge/ledger";
+import { defineResult, waitForResult } from "@torkbot/sledge/stdlib";
 
 const CompactionResultSchema = Type.Object({
   keptRevision: Type.String(),
@@ -433,23 +434,85 @@ const CompactionResultSchema = Type.Object({
 const defineCompactionsModule = defineModule("app.compactions", (module) => {
   const result = defineResult(module, {
     resultSchema: CompactionResultSchema,
+    failureSchema: Type.Never(),
+  });
+  const CompletedSchema = Type.Object({
+    ref: result.refSchema,
+    output: CompactionResultSchema,
   });
   const declaration = module.declare({
+    events: { completed: CompletedSchema },
+  });
+  const materialization = defineMaterialization(declaration, {
+    namespace: "compactions",
+  })
+    .version(1, "record completed compactions", (schema) =>
+      schema.createTable("results", (table) =>
+        table
+          .columns({
+            ref: table.text().notNull(),
+            source: table.eventRef("completed").notNull(),
+          })
+          .primaryKey(["ref"]),
+      ),
+    )
+    .define({
+      indexers: {
+        complete: { sourceEvent: "completed", input: CompletedSchema },
+      },
+      queries: {
+        result: {
+          params: Type.Object({ ref: result.refSchema }),
+          result: Type.Union([Type.Null(), CompletedSchema]),
+        },
+      },
+    });
+  const registered = module.link(declaration, materialization).register({
     events: {
-      completed: Type.Object({
-        ref: result.refSchema,
-        output: CompactionResultSchema,
-      }),
+      completed: async ({ event, actions }) => {
+        await actions.index("complete", event.payload);
+      },
+    },
+    indexers: {
+      complete: async ({ input, event, db }) => {
+        await db
+          .insertInto("results")
+          .values({ ref: input.ref, source: event.ref })
+          .execute();
+      },
+    },
+    queries: {
+      result: async ({ params, db }) => {
+        const row = await db
+          .selectFrom("results")
+          .selectEvent("source")
+          .where("ref", "=", params.ref)
+          .executeTakeFirst();
+
+        return row?.payload ?? null;
+      },
     },
   });
-  const registered = module.link(declaration, null).register({});
-
-  return module.expose(registered, {
-    result: result.fromEvent(registered.events.completed, (payload) => ({
+  const resultPort = result
+    .fromEvent(registered.events.completed, (payload) => ({
       ref: payload.ref,
       outcome: "succeeded",
       value: payload.output,
-    })),
+    }))
+    .readFrom(registered.queries.result, {
+      observe: (state) =>
+        state === null
+          ? null
+          : {
+              ref: state.ref,
+              outcome: "succeeded",
+              value: state.output,
+            },
+    });
+
+  return module.expose(registered, {
+    events: { completed: registered.events.completed },
+    result: resultPort,
   });
 });
 
@@ -463,6 +526,18 @@ await using opened = await application.open(
   createBetterSqliteDriver({ databaseUrl }),
 );
 const ref = opened.capabilities.compactions.result.ref("document-42");
+
+await opened.ledger.emit(opened.capabilities.compactions.events.completed, {
+  ref,
+  output: { keptRevision: "r9", removedRevisions: 8 },
+});
+
+const observation = await waitForResult(
+  opened.ledger,
+  opened.capabilities.compactions.result,
+  ref,
+  AbortSignal.timeout(30_000),
+);
 ```
 
 `ResultRef<TResult, TModuleId>` carries both the result type and its producing
@@ -480,25 +555,45 @@ incomplete result declaration may bind exactly one terminal event and must do
 so while its module factory is open.
 
 `fromEvent(...)` accepts only a plain event token owned by the same module and
-consumes the declaration's one binding capability. It returns a new immutable
-`ResultPort` rather than activating or mutating a capability in place. Its
-runtime provenance check also requires that token to come from the exact open
-module-factory invocation, not merely another module with the same durable id.
-Its `source` pairs that exact terminal event with a normalized
-`succeeded | failed | cancelled` observation. A join or race module can
-contribute a handler to the original typed event, update its own projection,
-and wake dependents in the same append transaction. The typed terminal event
-therefore remains the only durable fact.
+returns a new immutable observed-result phase. `readFrom(...)` then binds the
+producer's authoritative state query and returns the complete `ResultPort`.
+Readable-result queries have one conventional parameter, `{ ref }`; their
+state shape remains producer-specific, and the supplied observer maps only a
+terminal state into the normalized result observation.
+
+Both bindings enforce exact module-factory provenance at runtime, not merely a
+matching durable module id. The port's `source` lets a join or race observe the
+original terminal event in the same append transaction, while its `reader`
+hydrates an already settled ref without copying values into aggregate events.
+The typed producer event remains the only terminal durable fact.
+
+Every result declares both its success and terminal-failure schemas. Use
+`Type.Never()` when failure is impossible. A producer that can fail must expose
+the error as durable typed data; thrown exceptions remain attempt failures and
+retain the queue's retry semantics.
 
 `ResultSource.observe(...)` is a composition-time adapter for payloads already
 decoded by the paired Sledge event token. It is not an input-validation API;
 untrusted I/O must still enter through declared ledger schemas.
 
-## Experimental Result Algebra
+`readResult(ledger, result, ref)` performs one authoritative projection read.
+`waitForResult(ledger, result, ref, signal)` first reads that projection and an
+event cursor from one SQLite snapshot, then follows only later terminal events.
+Settlement cannot fall between the check and subscription. If an operator
+explicitly expires the cursor before it is consumed, the wait starts again
+from a fresh snapshot; caller cancellation always aborts the stream.
 
-Three small operators build on `ResultPort` without introducing a workflow
-interpreter or a second generic settlement stream:
+## Experimental Durable Algebra
 
+Small producers and operators build on `ResultPort` without introducing a
+workflow interpreter or a second generic settlement stream:
+
+- `defineInvocation(...)` turns an independently requested effect into a
+  durable request/result protocol.
+- `defineEventInvocation(...)` derives private retryable work from an existing
+  domain source event and reuses an existing terminal event.
+- `defineExternalValue(...)` represents a result supplied by another actor.
+- `defineDeadline(...)` represents an absolute one-shot deadline.
 - `defineThen(...)` derives one durable result from another result.
 - `defineAll(...)` settles after every named member settles.
 - `defineRace(...)` settles from the member whose terminal event was committed
@@ -510,6 +605,140 @@ and restart recovery stay private. The stable `stdlib` path is the curated
 foundation; each `experimental/*` path is deliberately independent and may
 change incompatibly as real applications pressure-test its semantics and DX.
 There is no experimental barrel that silently grows into a second SDK.
+
+### Start independently requested work with `invocation`
+
+`defineInvocation(...)` owns one request event, private retryable work, one
+terminal event, and one readable result projection:
+
+```ts
+import { Type } from "typebox";
+
+import { defineInvocation } from "@torkbot/sledge/experimental/invocation";
+
+const CompactionFailureSchema = Type.Object({
+  code: Type.Literal("attempts-exhausted"),
+});
+
+const compactions = sledge.install(
+  defineInvocation("app.compactions", {
+    inputSchema: CompactionInputSchema,
+    resultSchema: CompactionResultSchema,
+    failureSchema: CompactionFailureSchema,
+    execute: async ({ input, ref, attempt, signal, withTimeout }) => {
+      try {
+        const value = await withTimeout(30_000, (operationSignal) =>
+          compact(input, { idempotencyKey: ref, signal: operationSignal }),
+        );
+
+        return { outcome: "succeeded", value };
+      } catch (error: unknown) {
+        signal.throwIfAborted();
+
+        if (attempt < 3) {
+          throw error;
+        }
+
+        return {
+          outcome: "failed",
+          error: { code: "attempts-exhausted" },
+        };
+      }
+    },
+  })(),
+);
+
+const ref = compactions.result.ref("epoch-42");
+
+await ledger.emit(
+  compactions.events.requested,
+  { ref, input: compactionInput },
+  { dedupeKey: `compaction:${ref}:requested` },
+);
+```
+
+Throwing requests ordinary durable retry. Returning `failed` records a value
+decoded by `failureSchema`; `cancelled` has no error payload. The stable result
+ref, rather than a queue lease or work id, is the idempotency identity for
+external effects. An invocation may explicitly import event and query
+capabilities through its `access` option; execution then receives an
+attempt-scoped ledger port that rejects every unimported token and is revoked
+as soon as the callback returns.
+
+Use this producer when the request is itself a meaningful new fact.
+
+### Derive work from an existing event
+
+When another domain event already is the durable request,
+`defineEventInvocation(...)` avoids copying it into a generic invocation
+protocol. It derives one or more private work items and emits an existing plain
+domain event as each terminal fact:
+
+```ts
+import { defineEventInvocation } from "@torkbot/sledge/experimental/event-invocation";
+
+sledge.install(
+  defineEventInvocation("app.tool-execution", {
+    source: turns.events.committed,
+    terminal: turns.events.toolResultRecorded,
+    inputSchema: ToolExecutionSchema,
+    derive: ({ payload }) =>
+      payload.toolCalls.map((call) => ({
+        key: `${payload.turnId}:${call.id}`,
+        input: {
+          turnId: payload.turnId,
+          toolCallId: call.id,
+        },
+      })),
+    access: {
+      events: toolDomain.events,
+      queries: {
+        callState: turns.queries.toolCallState,
+      },
+    },
+    filter: async ({ input, ledger }) => {
+      const state = await ledger.query(turns.queries.toolCallState, input);
+
+      return state.result === null;
+    },
+    execute: async ({ input, key, ledger, signal }) => {
+      const state = await ledger.query(turns.queries.toolCallState, input);
+
+      if (state.result !== null) {
+        throw new Error(`admitted tool call ${input.toolCallId} is obsolete`);
+      }
+
+      const result = await executeTool(state.call, {
+        idempotencyKey: key,
+        ledger,
+        signal,
+      });
+
+      return {
+        turnId: input.turnId,
+        toolCallId: input.toolCallId,
+        result,
+      };
+    },
+  })(),
+);
+```
+
+The primitive appends no source, opening, or generic result events. Source
+handling only creates private durable queue work; successful execution emits
+the supplied terminal token in the same transaction that acknowledges the
+attempt. Throwing retries. An optional async `filter` receives only query
+capabilities; `false` acknowledges obsolete work without running `execute` or
+emitting a terminal event. `execute` is therefore total over admitted work and
+must return the terminal payload. Because state may change after filtering,
+execution should re-read correctness-sensitive state and throw if its admitted
+precondition no longer holds. Derivation is synchronous and storage-local,
+while execution receives only the event and query capabilities listed in
+`access`; that port is revoked when the attempt returns.
+
+Source and terminal tokens are deliberately limited to plain events. Durable
+event outcomes belong to the event owner's handler and cannot be manufactured
+by a different invocation module.
 
 ### Sequence work with `then`
 
@@ -534,6 +763,7 @@ const application = defineLedger((sledge) => {
   const compactions = sledge.install(
     defineThen("app.memory-aware-compactions", dreaming.result, {
       resultSchema: CompactedPrefixSchema,
+      failureSchema: CompactionFailureSchema,
       execute: async ({ value, ref, attempt, signal, withTimeout }) => {
         try {
           const compacted = await withTimeout(30_000, async (operationSignal) =>
@@ -551,7 +781,10 @@ const application = defineLedger((sledge) => {
             throw error;
           }
 
-          return { outcome: "failed" };
+          return {
+            outcome: "failed",
+            error: { code: "attempts-exhausted" },
+          };
         }
       },
     })(),
@@ -565,12 +798,14 @@ const application = defineLedger((sledge) => {
 ```
 
 Returning a `succeeded`, `failed`, or `cancelled` resolution settles the
-derived result. Throwing leaves it pending and requests the queue's ordinary
+derived result. A failed resolution must carry a value matching
+`failureSchema`. Throwing leaves it pending and requests the queue's ordinary
 durable retry. The callback receives the current attempt, the active lease
 signal, and Sledge's deterministic `withTimeout(...)` primitive, so retry and
 deadline policy remains explicit application code rather than a fixed operator
-option bag. A failed or cancelled source propagates directly and never invokes
-the callback.
+option bag. A failed source propagates its typed error directly and never
+invokes the callback; the derived result's failure schema is the union of the
+source and local failure schemas. Cancellation propagates without an error.
 
 `execute` is at-least-once. It can run again after an exception, lease loss, or
 a crash after an external effect but before the terminal event commits. Use the
@@ -581,6 +816,42 @@ cooperative cancellation; it cannot undo an effect that already happened.
 `compactions.refFor(dreamRef)` deterministically names the result derived from
 one source ref. Its `queries.state` capability reports `pending`, `succeeded`,
 `failed`, or `cancelled` without exposing the private queue identity.
+
+When a source value contains refs rather than copied payloads, admit the exact
+result protocols that the derived operation may hydrate:
+
+```ts
+import { Value } from "typebox/value";
+
+const publishedEpochs = sledge.install(
+  defineThen("app.published-epochs", publishReady.result, {
+    resultSchema: PublishedEpochSchema,
+    failureSchema: Type.Never(),
+    reads: [dreaming.result, compactions.result],
+    execute: async ({ value, ledger }) => {
+      const memory = await ledger.read(
+        dreaming.result,
+        Value.Decode(dreaming.result.refSchema, value.members.memory.ref),
+      );
+      const context = await ledger.read(
+        compactions.result,
+        Value.Decode(compactions.result.refSchema, value.members.context.ref),
+      );
+
+      return publishEpoch(memory, context);
+    },
+  })(),
+);
+```
+
+The execution callback receives one attempt-scoped `ledger` port. `reads`
+admits exact result protocols to `ledger.read(result, ref)`. An optional
+`access` declaration admits exact domain events and queries to `ledger.emit(...)`
+and `ledger.query(...)`, matching standalone and event-derived invocations.
+Every other token is rejected, and the port is revoked when execution returns.
+This lets a derived operation recover caller-owned context without copying the
+original request through its source result. Readiness stays compact in the
+`all` event while large member values remain in their producing protocols.
 
 ### Join named results with `all`
 
@@ -610,7 +881,11 @@ The record accepts multiple refs from the same admitted producer, rejects refs
 from other producers at compile time, and rejects duplicate refs at runtime.
 An `all` result contains every member's ref and normalized outcome. Its overall
 outcome is `failed` if any member failed, otherwise `cancelled` if any member
-was cancelled, otherwise `succeeded`.
+was cancelled, otherwise `succeeded`. A failed aggregate exposes that same
+typed status summary as its error. It does not currently copy heterogeneous
+member error payloads; consumers that need a particular error can read the
+producer result explicitly. This is an intentional experimental boundary, not
+an assertion that status-only joins will be sufficient for every flow.
 
 To nest compositions, install a later `all` or `race` operator whose admitted
 sources include the earlier operator's result port. The earlier port does not
@@ -663,11 +938,12 @@ reuse one operator module across many groups. This projection cost is part of
 the experimental pressure test; restricting groups to open-before-settlement
 would save rows but could leave late discovery permanently pending.
 
-`all`, `race`, and `then` require an active Sledge worker runtime to reconcile
-and execute their private durable work. Their state queries are snapshots, not
-race-free wait handles. Sledge does not yet expose the atomic query-plus-cursor
-snapshot needed for a correct blocking `wait`, so the experimental SDK does not
-paper over that gap with process-local notifications or unbounded polling.
+The experimental producers and operators require an active Sledge worker
+runtime to execute private durable work. Their state queries remain ordinary
+point-in-time reads. Use the stable `waitForResult(...)` helper when runtime
+code must block: it builds the race-free handoff from the result's reader,
+`ledger.querySnapshot(...)`, and the resumable event stream without polling or
+process-local notification state.
 
 ## Module and Application Phases
 
@@ -689,7 +965,7 @@ query that registry and build one final ledger model safely.
 | -------------------------- | -------------------------------- | ---------------------------------------------------------- |
 | Module factory             | `defineModule(...)`              | Reusable definition bound to one stable module identity    |
 | `LedgerModuleDefinition`   | Invoking the module factory      | Scoped identity, declaration, linking, and one reveal      |
-| `DeclaredLedgerModule`     | `module.declare(...)`            | Durable contract tokens and a typed logical shape          |
+| `DeclaredLedgerModule`     | `module.declare(...)`            | Owned contracts, imported query tokens, and logical shape  |
 | `LinkedLedgerModule`       | `module.link(...)`               | A materialization contract and registration capability     |
 | `RegisteredLedgerModule`   | `linked.register(...)`           | Implementations and handlers; ready to reveal              |
 | `LedgerModuleContribution` | `module.expose(...)`             | Registered module plus the bounded capabilities it reveals |
@@ -707,15 +983,19 @@ installed graph.
 boundary contracts with TypeBox:
 
 - `events`: facts appended to the event stream
+- `queries`: exact query capabilities imported from other modules
 - `queues`: durable work payloads
 - `signals`: process-local, short-lived records emitted by queue handlers
 - `signalQueues`: retryable work materialized from signals
 
-`events` is required. Omit `queues`, `signals`, or `signalQueues` when the
-module does not define contracts in that category. Plain event definitions
-create contracts owned by that module and produce opaque event tokens such as
-`declaration.events["user.created"]`. Runtime APIs accept these tokens
-instead of string names.
+`events` is required. Omit `queries`, `queues`, `signals`, or `signalQueues`
+when the module does not define contracts in that category. Plain event
+definitions create contracts owned by that module and produce opaque event
+tokens such as `declaration.events["user.created"]`. Query entries must be
+opaque tokens produced by another declared module; owned query schemas still
+belong in `defineMaterialization(...).define(...)`. This lets a stateless
+module use bounded imported queries without inventing a table or migration.
+Runtime APIs accept tokens instead of string names.
 
 Module construction has no standalone equivalent. `module.declare(...)` and
 `module.link(...)` are scoped to the current factory invocation so identity and

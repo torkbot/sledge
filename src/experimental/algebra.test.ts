@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Type } from "typebox";
+import { IsUnion, Type } from "typebox";
+import { Value } from "typebox/value";
 
 import { createBetterSqliteDriver } from "../better-sqlite3.ts";
+import { defineMaterialization } from "../ledger.ts";
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { defineLedger, defineModule, type LedgerDriver } from "../sledge.ts";
 import { defineResult } from "../stdlib.ts";
@@ -16,6 +18,13 @@ import { defineRace } from "./race.ts";
 import { defineThen } from "./then.ts";
 
 const OutputSchema = Type.Object({ value: Type.String({ minLength: 1 }) });
+const FailureSchema = Type.Object({ reason: Type.String({ minLength: 1 }) });
+const DerivedFailureSchema = Type.Object({
+  reason: Type.String({ minLength: 1 }),
+});
+const FinalFailureSchema = Type.Object({
+  reason: Type.String({ minLength: 1 }),
+});
 
 type AlphaResultPort = ReturnType<
   ReturnType<typeof defineProducer<"experimental.contract.alpha">>
@@ -74,6 +83,23 @@ for (const adapter of adapters) {
         defaultRetryDelayMs: 10,
         maxInFlight: 8,
       });
+      const failureSchema = opened.capabilities.flattened.result.failureSchema;
+
+      assert.equal(IsUnion(failureSchema), true);
+
+      if (!IsUnion(failureSchema)) {
+        throw new Error("chained then failure schema was not a union");
+      }
+
+      assert.equal(
+        failureSchema.anyOf.length,
+        3,
+        JSON.stringify(failureSchema),
+      );
+      assert.equal(
+        failureSchema.anyOf.some((schema) => IsUnion(schema)),
+        false,
+      );
       const alphaOneRef = opened.capabilities.alpha.result.ref("one");
       const betaOneRef = opened.capabilities.beta.result.ref("one");
       const restartAllRef = opened.capabilities.all.result.ref("restart");
@@ -192,6 +218,7 @@ for (const adapter of adapters) {
           },
         },
       });
+      await drainWorkers(runtime, workers);
 
       const historicalRaceRef = opened.capabilities.race.result.ref("history");
 
@@ -262,6 +289,7 @@ for (const adapter of adapters) {
       await opened.ledger.emit(opened.capabilities.beta.events.settled, {
         ref: lateBetaRef,
         outcome: "failed",
+        error: { reason: "late beta failed" },
       });
       const raceBeforeLoser = await waitForState(
         runtime,
@@ -306,6 +334,7 @@ for (const adapter of adapters) {
         opened.ledger.emit(opened.capabilities.beta.events.settled, {
           ref: concurrentBetaRef,
           outcome: "failed",
+          error: { reason: "concurrent beta failed" },
         }),
       ]);
       const alphaWon = concurrentAlpha.eventId < concurrentBeta.eventId;
@@ -357,6 +386,69 @@ for (const adapter of adapters) {
       assert.equal(
         mixedAll?.kind === "settled" ? mixedAll.result.outcome : null,
         "failed",
+      );
+
+      const hydratedAlphaRef =
+        opened.capabilities.alpha.result.ref("hydrated-alpha");
+      const hydratedBetaRef =
+        opened.capabilities.beta.result.ref("hydrated-beta");
+      const hydratedGroupRef = opened.capabilities.all.result.ref("hydrated");
+
+      await opened.ledger.emit(opened.capabilities.all.events.opened, {
+        ref: hydratedGroupRef,
+        members: {
+          alpha: hydratedAlphaRef,
+          beta: hydratedBetaRef,
+        },
+      });
+      await opened.ledger.emit(opened.capabilities.alpha.events.settled, {
+        ref: hydratedAlphaRef,
+        outcome: "succeeded",
+        value: { value: "alpha-value" },
+      });
+      await opened.ledger.emit(opened.capabilities.beta.events.settled, {
+        ref: hydratedBetaRef,
+        outcome: "succeeded",
+        value: { value: "beta-value" },
+      });
+
+      assert.deepEqual(
+        await waitForState(
+          runtime,
+          () =>
+            opened.ledger.query(opened.capabilities.hydrated.queries.state, {
+              ref: opened.capabilities.hydrated.refFor(hydratedGroupRef),
+            }),
+          "succeeded",
+        ),
+        {
+          kind: "succeeded",
+          sourceRef: hydratedGroupRef,
+          output: { value: "alpha-value+beta-value" },
+        },
+      );
+
+      const accessSourceRef = opened.capabilities.alpha.result.ref("access");
+
+      await opened.ledger.emit(opened.capabilities.alpha.events.settled, {
+        ref: accessSourceRef,
+        outcome: "succeeded",
+        value: { value: "access" },
+      });
+      assert.deepEqual(
+        await waitForState(
+          runtime,
+          () =>
+            opened.ledger.query(opened.capabilities.derived.queries.state, {
+              ref: opened.capabilities.derived.refFor(accessSourceRef),
+            }),
+          "succeeded",
+        ),
+        {
+          kind: "succeeded",
+          sourceRef: accessSourceRef,
+          output: { value: "ACCESS" },
+        },
       );
 
       const retrySourceRef = opened.capabilities.alpha.result.ref("retry");
@@ -412,7 +504,11 @@ for (const adapter of adapters) {
             }),
           "failed",
         ),
-        { kind: "failed", sourceRef: timeoutSourceRef },
+        {
+          kind: "failed",
+          sourceRef: timeoutSourceRef,
+          error: { reason: "operation timed out" },
+        },
       );
 
       const terminalSourceRef =
@@ -432,7 +528,11 @@ for (const adapter of adapters) {
             }),
           "failed",
         ),
-        { kind: "failed", sourceRef: terminalSourceRef },
+        {
+          kind: "failed",
+          sourceRef: terminalSourceRef,
+          error: { reason: "terminal rejection" },
+        },
       );
 
       const failedSourceRef = opened.capabilities.alpha.result.ref("failed");
@@ -440,6 +540,7 @@ for (const adapter of adapters) {
       await opened.ledger.emit(opened.capabilities.alpha.events.settled, {
         ref: failedSourceRef,
         outcome: "failed",
+        error: { reason: "source failed" },
       });
       assert.deepEqual(
         await waitForState(
@@ -450,7 +551,11 @@ for (const adapter of adapters) {
             }),
           "failed",
         ),
-        { kind: "failed", sourceRef: failedSourceRef },
+        {
+          kind: "failed",
+          sourceRef: failedSourceRef,
+          error: { reason: "source failed" },
+        },
       );
       assert.equal(attempts.has("failed"), false);
 
@@ -552,6 +657,23 @@ function createAlgebraApplication(attempts: Map<string, number>) {
     const foreign = sledge.install(
       defineProducer("experimental.contract.foreign")(),
     );
+    const schemaSource = sledge.install(
+      defineProducer("experimental.contract.schema-source")(),
+    );
+    const schemaMiddle = sledge.install(
+      defineThen("experimental.contract.schema-middle", schemaSource.result, {
+        resultSchema: OutputSchema,
+        failureSchema: DerivedFailureSchema,
+        execute: async ({ value }) => ({ outcome: "succeeded", value }),
+      })(),
+    );
+    const flattened = sledge.install(
+      defineThen("experimental.contract.flattened-then", schemaMiddle.result, {
+        resultSchema: OutputSchema,
+        failureSchema: FinalFailureSchema,
+        execute: async ({ value }) => ({ outcome: "succeeded", value }),
+      })(),
+    );
     const all = sledge.install(
       defineAll("experimental.contract.all", [alpha.result, beta.result])(),
     );
@@ -564,12 +686,76 @@ function createAlgebraApplication(attempts: Map<string, number>) {
         alpha.result,
       ])(),
     );
+    const hydrated = sledge.install(
+      defineThen("experimental.contract.hydrated-all", all.result, {
+        resultSchema: OutputSchema,
+        failureSchema: Type.Never(),
+        reads: [alpha.result, beta.result],
+        execute: async ({ value, ledger }) => {
+          const alphaMember = value.members.alpha;
+          const betaMember = value.members.beta;
+
+          if (alphaMember === undefined || betaMember === undefined) {
+            throw new Error("hydration group lost a named member");
+          }
+
+          const [alphaResult, betaResult] = await Promise.all([
+            ledger.read(
+              alpha.result,
+              Value.Decode(alpha.result.refSchema, alphaMember.ref),
+            ),
+            ledger.read(
+              beta.result,
+              Value.Decode(beta.result.refSchema, betaMember.ref),
+            ),
+          ]);
+
+          if (
+            alphaResult?.outcome !== "succeeded" ||
+            betaResult?.outcome !== "succeeded"
+          ) {
+            throw new Error("successful all result lost a member value");
+          }
+
+          return {
+            outcome: "succeeded",
+            value: {
+              value: `${alphaResult.value.value}+${betaResult.value.value}`,
+            },
+          };
+        },
+      })(),
+    );
     const derived = sledge.install(
       defineThen("experimental.contract.then", alpha.result, {
         resultSchema: OutputSchema,
-        execute: async ({ value, attempt, signal, withTimeout }) => {
+        failureSchema: DerivedFailureSchema,
+        access: {
+          events: {},
+          queries: { sourceState: alpha.result.reader.query },
+        },
+        execute: async ({
+          sourceRef,
+          value,
+          attempt,
+          signal,
+          ledger,
+          withTimeout,
+        }) => {
           attempts.set(value.value, attempt);
           signal.throwIfAborted();
+          if (value.value === "access") {
+            const sourceState = await ledger.query(
+              alpha.result.reader.query,
+              alpha.result.reader.params(sourceRef),
+            );
+            const sourceObservation = alpha.result.reader.observe(
+              sourceState,
+              sourceRef,
+            );
+
+            assert.equal(sourceObservation?.outcome, "succeeded");
+          }
 
           if (
             (value.value === "retry" || value.value === "restart-retry") &&
@@ -579,7 +765,10 @@ function createAlgebraApplication(attempts: Map<string, number>) {
           }
 
           if (value.value === "terminal") {
-            return { outcome: "failed" };
+            return {
+              outcome: "failed",
+              error: { reason: "terminal rejection" },
+            };
           }
 
           if (value.value === "timeout") {
@@ -589,7 +778,10 @@ function createAlgebraApplication(attempts: Map<string, number>) {
               });
             } catch {
               signal.throwIfAborted();
-              return { outcome: "failed" };
+              return {
+                outcome: "failed",
+                error: { reason: "operation timed out" },
+              };
             }
 
             throw new Error("timed operation completed without aborting");
@@ -604,13 +796,14 @@ function createAlgebraApplication(attempts: Map<string, number>) {
         },
       })(),
     );
-
     return {
       all,
       alpha,
       beta,
       derived,
+      flattened,
       foreign,
+      hydrated,
       nestedAll,
       race,
     };
@@ -619,7 +812,10 @@ function createAlgebraApplication(attempts: Map<string, number>) {
 
 function defineProducer<const TModuleId extends string>(moduleId: TModuleId) {
   return defineModule(moduleId, (module) => {
-    const result = defineResult(module, { resultSchema: OutputSchema });
+    const result = defineResult(module, {
+      resultSchema: OutputSchema,
+      failureSchema: FailureSchema,
+    });
     const SettledSchema = Type.Union([
       Type.Object({
         ref: result.refSchema,
@@ -629,26 +825,112 @@ function defineProducer<const TModuleId extends string>(moduleId: TModuleId) {
       Type.Object({
         ref: result.refSchema,
         outcome: Type.Literal("failed"),
+        error: FailureSchema,
       }),
       Type.Object({
         ref: result.refSchema,
         outcome: Type.Literal("cancelled"),
       }),
     ]);
+    const StateParamsSchema = Type.Object({ ref: result.refSchema });
+    const StateResultSchema = Type.Union([Type.Null(), SettledSchema]);
     const declaration = module.declare({ events: { settled: SettledSchema } });
-    const registered = module.link(declaration, null).register({});
+    const materialization = defineMaterialization(declaration, {
+      namespace: "producer",
+    })
+      .version(1, "record terminal results", (schema) =>
+        schema.createTable("results", (table) =>
+          table
+            .columns({
+              ref: table.text().notNull(),
+              source: table.eventRef("settled").notNull(),
+            })
+            .primaryKey(["ref"]),
+        ),
+      )
+      .define({
+        indexers: {
+          settle: { sourceEvent: "settled", input: SettledSchema },
+        },
+        queries: {
+          state: { params: StateParamsSchema, result: StateResultSchema },
+        },
+      });
+    const registered = module.link(declaration, materialization).register({
+      events: {
+        settled: async ({ event, actions }) => {
+          await actions.index("settle", event.payload);
+        },
+      },
+      indexers: {
+        settle: async ({ input: settlement, event, db }) => {
+          await db
+            .insertInto("results")
+            .values({ ref: settlement.ref, source: event.ref })
+            .execute();
+        },
+      },
+      queries: {
+        state: async ({ params, db }) => {
+          const result = await db
+            .selectFrom("results")
+            .selectEvent("source")
+            .where("ref", "=", params.ref)
+            .executeTakeFirst();
+
+          return result?.payload ?? null;
+        },
+      },
+    });
+    const resultPort = result
+      .fromEvent(registered.events.settled, (payload) => {
+        if (payload.outcome === "succeeded") {
+          return {
+            ref: payload.ref,
+            outcome: payload.outcome,
+            value: payload.value,
+          };
+        }
+
+        if (payload.outcome === "failed") {
+          return {
+            ref: payload.ref,
+            outcome: payload.outcome,
+            error: payload.error,
+          };
+        }
+
+        return { ref: payload.ref, outcome: payload.outcome };
+      })
+      .readFrom(registered.queries.state, {
+        observe: (state) => {
+          if (state === null) {
+            return null;
+          }
+
+          if (state.outcome === "succeeded") {
+            return {
+              ref: state.ref,
+              outcome: state.outcome,
+              value: state.value,
+            };
+          }
+
+          if (state.outcome === "failed") {
+            return {
+              ref: state.ref,
+              outcome: state.outcome,
+              error: state.error,
+            };
+          }
+
+          return { ref: state.ref, outcome: state.outcome };
+        },
+      });
 
     return module.expose(registered, {
       events: { settled: registered.events.settled },
-      result: result.fromEvent(registered.events.settled, (payload) =>
-        payload.outcome === "succeeded"
-          ? {
-              ref: payload.ref,
-              outcome: payload.outcome,
-              value: payload.value,
-            }
-          : { ref: payload.ref, outcome: payload.outcome },
-      ),
+      result: resultPort,
     });
   });
 }

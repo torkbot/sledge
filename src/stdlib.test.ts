@@ -14,6 +14,7 @@ import { defineResult, type ResultRef } from "./stdlib.ts";
 const OutputSchema = Type.Object({
   value: Type.String({ minLength: 1 }),
 });
+const NoFailureSchema = Type.Never();
 
 test("result refs are bound to their producing module", () => {
   const jobs = defineResultModule("contract.jobs")().capabilities.result;
@@ -43,7 +44,10 @@ test("a declared result returns a new terminal-event capability", () => {
   const defineOperationsModule = defineModule(
     "contract.operations",
     (module) => {
-      const declared = defineResult(module, { resultSchema: OutputSchema });
+      const declared = defineResult(module, {
+        resultSchema: OutputSchema,
+        failureSchema: NoFailureSchema,
+      });
       const declaration = module.declare({
         events: {
           completed: Type.Object({
@@ -123,10 +127,17 @@ test("one ledger module owns at most one result protocol", () => {
   const defineSingleResultModule = defineModule(
     "contract.single-result",
     (module) => {
-      const result = defineResult(module, { resultSchema: OutputSchema });
+      const result = defineResult(module, {
+        resultSchema: OutputSchema,
+        failureSchema: NoFailureSchema,
+      });
 
       assert.throws(
-        () => defineResult(module, { resultSchema: OutputSchema }),
+        () =>
+          defineResult(module, {
+            resultSchema: OutputSchema,
+            failureSchema: NoFailureSchema,
+          }),
         /ledger module contract.single-result already defines a result/,
       );
 
@@ -149,7 +160,10 @@ test("result terminal events belong to the exact module definition", () => {
   const defineScopedTerminalModule = defineModule(
     "contract.scoped-terminal",
     (module) => {
-      const result = defineResult(module, { resultSchema: OutputSchema });
+      const result = defineResult(module, {
+        resultSchema: OutputSchema,
+        failureSchema: NoFailureSchema,
+      });
       const declaration = module.declare({
         events: {
           completed: Type.Object({
@@ -198,7 +212,10 @@ test("result definitions require a live Sledge module owner", () => {
     "contract.scoped-result",
     (module) => {
       retainedOwner = module;
-      const result = defineResult(module, { resultSchema: OutputSchema });
+      const result = defineResult(module, {
+        resultSchema: OutputSchema,
+        failureSchema: NoFailureSchema,
+      });
       const declaration = module.declare({ events: {} });
       const registered = module.link(declaration, null).register({});
 
@@ -209,7 +226,11 @@ test("result definitions require a live Sledge module owner", () => {
   defineScopedResultModule();
 
   assert.throws(
-    () => defineResult(retainedOwner, { resultSchema: OutputSchema }),
+    () =>
+      defineResult(retainedOwner, {
+        resultSchema: OutputSchema,
+        failureSchema: NoFailureSchema,
+      }),
     /ledger module definition has already closed/,
   );
 
@@ -217,7 +238,7 @@ test("result definitions require a live Sledge module owner", () => {
     defineResult(
       // @ts-expect-error plain objects are not Sledge-owned module identities
       { moduleId: "contract.forged" },
-      { resultSchema: OutputSchema },
+      { resultSchema: OutputSchema, failureSchema: NoFailureSchema },
     );
   }
 
@@ -227,7 +248,11 @@ test("result definitions require a live Sledge module owner", () => {
     moduleId: "contract.forged",
   } as unknown as LedgerModuleOwner<"contract.forged">;
   assert.throws(
-    () => defineResult(forged, { resultSchema: OutputSchema }),
+    () =>
+      defineResult(forged, {
+        resultSchema: OutputSchema,
+        failureSchema: NoFailureSchema,
+      }),
     /invalid ledger module owner/,
   );
 });
@@ -236,7 +261,10 @@ function defineResultModule<const TModuleId extends string>(
   moduleId: TModuleId,
 ) {
   return defineModule(moduleId, (module) => {
-    const result = defineResult(module, { resultSchema: OutputSchema });
+    const result = defineResult(module, {
+      resultSchema: OutputSchema,
+      failureSchema: NoFailureSchema,
+    });
     const declaration = module.declare({ events: {} });
     const registered = module.link(declaration, null).register({});
 

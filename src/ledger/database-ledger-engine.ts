@@ -122,6 +122,14 @@ export interface DatabaseLedger<
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>>;
 
+  querySnapshot<const TQueryName extends keyof TQueries>(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<{
+    readonly result: Static<TQueries[TQueryName]["result"]>;
+    readonly cursor: LedgerCursor;
+  }>;
+
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
   queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
@@ -580,6 +588,21 @@ function createLedgerContractFacade<
           );
 
           return await target.query(
+            physicalName as keyof TQueries,
+            params as Static<TQueries[keyof TQueries]["params"]>,
+          );
+        };
+      }
+
+      if (property === "querySnapshot") {
+        return async (token: object, params: unknown) => {
+          const physicalName = findPhysicalContractName(
+            contracts.queries,
+            token,
+            "query",
+          );
+
+          return await target.querySnapshot(
             physicalName as keyof TQueries,
             params as Static<TQueries[keyof TQueries]["params"]>,
           );
@@ -2454,6 +2477,53 @@ function openDatabaseLedgerEngine<
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
     return await storage.read(async (database) => {
       return await runQueryImplementation(database, queryName, params);
+    });
+  }
+
+  async function runLedgerQuerySnapshot<
+    const TQueryName extends keyof TQueries,
+  >(
+    queryName: TQueryName,
+    params: Static<TQueries[TQueryName]["params"]>,
+  ): Promise<{
+    readonly result: Static<TQueries[TQueryName]["result"]>;
+    readonly cursor: LedgerCursor;
+  }> {
+    return await storage.read(async (database) => {
+      let began = false;
+
+      try {
+        // A deferred read transaction pins one WAL snapshot without taking the
+        // writer reservation used by append transactions. Reading the stream
+        // boundary first fixes the snapshot before the projection query runs.
+        await database.exec("BEGIN");
+        began = true;
+
+        const stream = await readStoredStreamState(database);
+        const result = await runQueryImplementation(
+          database,
+          queryName,
+          params,
+        );
+
+        await database.exec("COMMIT");
+        began = false;
+
+        return {
+          result,
+          cursor: encodeCursor(stream.latestEventId),
+        };
+      } catch (error: unknown) {
+        if (began) {
+          try {
+            await database.exec("ROLLBACK");
+          } catch {
+            // Suppress rollback failures to preserve the root cause.
+          }
+        }
+
+        throw error;
+      }
     });
   }
 
@@ -4946,6 +5016,10 @@ function openDatabaseLedgerEngine<
     query: async (queryName, params) => {
       await startup;
       return await runLedgerQuery(queryName, params);
+    },
+    querySnapshot: async (queryName, params) => {
+      await startup;
+      return await runLedgerQuerySnapshot(queryName, params);
     },
     cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
       await startup;

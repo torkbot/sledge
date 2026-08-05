@@ -1,12 +1,5 @@
-import { Type, type Static, type TSchema } from "typebox";
-import { Value } from "typebox/value";
-
-import {
-  defineMaterialization,
-  type EventToken,
-  type QueryToken,
-} from "../ledger.ts";
-import { defineModule } from "../sledge.ts";
+import { defineModule } from "@torkbot/sledge";
+import { defineMaterialization, type EventToken } from "@torkbot/sledge/ledger";
 import {
   AnyResultRefSchema,
   defineResult,
@@ -15,60 +8,43 @@ import {
   type ResultOutcome,
   type ResultRef,
   type ResultSource,
-} from "../stdlib.ts";
+} from "@torkbot/sledge/stdlib";
+import { Type, type Static, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 
-type CompositionMode = "all" | "race";
+export const CompositionModeSchema = Type.Union([
+  Type.Literal("all"),
+  Type.Literal("race"),
+]);
 
-type ResultPortShape = {
-  readonly moduleId: string;
-  readonly resultSchema: TSchema;
-  readonly failureSchema: TSchema;
-  readonly refSchema: TSchema;
-  readonly source: {
-    readonly event: EventToken<string, string, TSchema, null>;
-    observe(payload: unknown): ResultObservation;
-  };
-  readonly reader: {
-    readonly query: QueryToken<string, string, TSchema, TSchema>;
-    params(ref: string): unknown;
-    observe(result: unknown, ref: string): ResultObservation | null;
-  };
-};
+const SettledMemberSchema = Type.Object({
+  key: Type.String({ minLength: 1 }),
+  ref: AnyResultRefSchema,
+  outcome: ResultOutcomeSchema,
+});
 
-type RuntimeResultPort = {
-  readonly moduleId: string;
-  readonly failureSchema: TSchema;
-  readonly refSchema: TSchema;
-  readonly source: ResultSource;
-};
+export const CompositionResultSchema = Type.Object({
+  mode: CompositionModeSchema,
+  outcome: ResultOutcomeSchema,
+  winner: Type.Union([Type.Null(), Type.String({ minLength: 1 })]),
+  members: Type.Array(SettledMemberSchema, { minItems: 1 }),
+});
 
-type ResultRefForPort<TPort> = TPort extends {
+export type CompositionResult = Static<typeof CompositionResultSchema>;
+
+type RefForResultPort<TPort> = TPort extends {
   readonly moduleId: infer TModuleId extends string;
   readonly resultSchema: infer TResultSchema extends TSchema;
 }
   ? ResultRef<Static<TResultSchema>, TModuleId>
   : never;
 
-type CompositionMemberRef<TSources extends readonly ResultPortShape[]> =
-  ResultRefForPort<TSources[number]>;
-
-export type SettledMember<
-  TRef extends ResultRef<unknown> = ResultRef<unknown>,
-> = {
-  readonly ref: TRef;
-  readonly outcome: ResultOutcome;
-};
-
-export type AllResult<TRef extends ResultRef<unknown> = ResultRef<unknown>> = {
-  readonly outcome: ResultOutcome;
-  readonly members: Readonly<Record<string, SettledMember<TRef>>>;
-};
-
-export type RaceResult<TRef extends ResultRef<unknown> = ResultRef<unknown>> = {
-  readonly winner: string;
-  readonly ref: TRef;
-  readonly outcome: ResultOutcome;
-};
+type CompositionMemberRef<
+  TSources extends Record<string, unknown>,
+  TModuleId extends string,
+> =
+  | RefForResultPort<TSources[keyof TSources]>
+  | ResultRef<CompositionResult, TModuleId>;
 
 type SourceBinding = {
   readonly eventName: string;
@@ -76,139 +52,113 @@ type SourceBinding = {
   readonly source: ResultSource;
 };
 
-type SettledObservation = {
-  readonly member: {
-    readonly key: string;
-    readonly ref: ResultRef<unknown>;
-  };
-  readonly status: {
-    readonly eventId: number;
-    readonly outcome: ResultOutcome;
+type ResultPortShape = {
+  readonly moduleId: string;
+  readonly resultSchema: TSchema;
+  readonly refSchema: TSchema;
+  readonly source: {
+    readonly event: EventToken<string, string, TSchema, null>;
+    readonly observe: (payload: unknown) => unknown;
   };
 };
 
-/**
- * Defines a durable finite join over independently owned result protocols.
- *
- * Callers name each joined ref when opening a group. The generated module owns
- * source aliases, settlement indexes, reconciliation work, restart recovery,
- * and the aggregate terminal event.
- */
-export function defineAll<
-  const TModuleId extends string,
-  const TSources extends readonly [ResultPortShape, ...ResultPortShape[]],
->(moduleId: TModuleId, sources: TSources) {
-  return defineComposition("all", moduleId, sources);
-}
+type ResultPortRecord<TSources extends Record<string, unknown>> = {
+  readonly [TKey in keyof TSources]: TSources[TKey] extends ResultPortShape
+    ? TSources[TKey]
+    : never;
+};
+
+type RuntimeResultPort = {
+  readonly refSchema: TSchema;
+  readonly source: ResultSource;
+};
 
 /**
- * Defines a durable first-settled race over independently owned results.
+ * Pressure-test implementation of heterogeneous, nestable result composition.
  *
- * The winner is the member with the lowest terminal event id, so replay and a
- * delayed reconciliation worker make the same choice.
+ * Source-specific event aliases and indexers are generated inside this deep
+ * module. The public capability contains only one typed group ref, one opening
+ * event, one state query, and the resulting ResultPort.
  */
-export function defineRace<
+export function defineComposition<
   const TModuleId extends string,
-  const TSources extends readonly [ResultPortShape, ...ResultPortShape[]],
->(moduleId: TModuleId, sources: TSources) {
-  return defineComposition("race", moduleId, sources);
-}
+  const TSources extends Record<string, unknown>,
+>(input: {
+  readonly moduleId: TModuleId;
+  readonly sources: TSources & ResultPortRecord<TSources>;
+}) {
+  // Object.entries erases the per-key ResultPort generics. Validation remains
+  // on the public mapped type above; the runtime algorithm needs only these two
+  // structural fields.
+  const sourceEntries = Object.entries(
+    input.sources,
+  ) as unknown as readonly (readonly [string, RuntimeResultPort])[];
 
-function defineComposition<
-  const TMode extends CompositionMode,
-  const TModuleId extends string,
-  const TSources extends readonly [ResultPortShape, ...ResultPortShape[]],
->(mode: TMode, moduleId: TModuleId, sources: TSources) {
-  const runtimeSources = sources as readonly RuntimeResultPort[];
-
-  if (runtimeSources.length === 0) {
-    throw new Error(`${mode} requires at least one result source`);
-  }
-
-  const uniqueSourceModules = new Set(
-    runtimeSources.map((port) => port.moduleId),
-  );
-
-  if (uniqueSourceModules.size !== runtimeSources.length) {
-    throw new Error(`${mode} result sources must come from distinct modules`);
+  if (sourceEntries.length === 0) {
+    throw new Error("composition requires at least one result source");
   }
 
   const uniqueTerminalEvents = new Set(
-    runtimeSources.map((port) => port.source.event),
+    sourceEntries.map(([, port]) => port.source.event),
   );
 
-  if (uniqueTerminalEvents.size !== runtimeSources.length) {
-    throw new Error(`${mode} result sources must have unique terminal events`);
+  if (uniqueTerminalEvents.size !== sourceEntries.length) {
+    throw new Error(
+      "composition result sources must have unique terminal events",
+    );
   }
 
-  return defineModule(moduleId, (module) => {
-    const MemberKeySchema = Type.String({ pattern: "^.+$" });
-    type MemberRef = CompositionMemberRef<TSources>;
-    const memberRefSchemas = runtimeSources.map((port) => port.refSchema);
-    const MemberRefSchema = Type.Unsafe<MemberRef>(
-      memberRefSchemas.length === 1
-        ? memberRefSchemas[0]!
-        : Type.Union(
-            memberRefSchemas as unknown as [TSchema, TSchema, ...TSchema[]],
-          ),
-    );
-    const SettledMemberSchema = Type.Object({
-      ref: MemberRefSchema,
-      outcome: ResultOutcomeSchema,
-    });
-    const AllResultSchema = Type.Unsafe<AllResult<MemberRef>>(
-      Type.Object({
-        outcome: ResultOutcomeSchema,
-        members: Type.Record(MemberKeySchema, SettledMemberSchema, {
-          additionalProperties: false,
-          minProperties: 1,
-        }),
-      }),
-    );
-    const RaceResultSchema = Type.Unsafe<RaceResult<MemberRef>>(
-      Type.Object({
-        winner: Type.String({ minLength: 1 }),
-        ref: MemberRefSchema,
-        outcome: ResultOutcomeSchema,
-      }),
-    );
-    type ResultValue = TMode extends "all"
-      ? AllResult<MemberRef>
-      : RaceResult<MemberRef>;
-    const ResultSchema = Type.Unsafe<ResultValue>(
-      mode === "all" ? AllResultSchema : RaceResultSchema,
-    );
+  return defineModule(input.moduleId, (module) => {
     const result = defineResult(module, {
-      resultSchema: ResultSchema,
-      failureSchema: ResultSchema,
+      resultSchema: CompositionResultSchema,
     });
-    const MembersSchema = Type.Record(MemberKeySchema, MemberRefSchema, {
-      additionalProperties: false,
-      minProperties: 1,
+    const memberRefSchemas = [
+      result.refSchema,
+      ...sourceEntries.map(([, port]) => port.refSchema),
+    ];
+
+    // TypeBox requires a tuple to preserve a union's static members. The
+    // non-empty source check above proves this runtime-generated collection has
+    // at least the two schemas represented by this tuple type.
+    const MemberRefSchema = Type.Unsafe<
+      CompositionMemberRef<TSources, TModuleId>
+    >(
+      Type.Union(
+        memberRefSchemas as unknown as [TSchema, TSchema, ...TSchema[]],
+      ),
+    );
+    const MemberSchema = Type.Object({
+      key: Type.String({ minLength: 1 }),
+      ref: MemberRefSchema,
     });
     const OpenedSchema = Type.Object({
       ref: result.refSchema,
-      members: MembersSchema,
+      mode: CompositionModeSchema,
+      members: Type.Array(MemberSchema, { minItems: 1 }),
     });
     const SettledSchema = Type.Object({
       ref: result.refSchema,
-      result: ResultSchema,
+      result: CompositionResultSchema,
     });
     const SettlementRecordSchema = Type.Object({
       ref: AnyResultRefSchema,
       outcome: ResultOutcomeSchema,
       eventId: Type.Integer({ minimum: 1 }),
+      settledAtMs: Type.Number(),
     });
-    const StateParamsSchema = Type.Object({ ref: result.refSchema });
+    const StateParamsSchema = Type.Object({
+      ref: result.refSchema,
+    });
     const StateResultSchema = Type.Union([
       Type.Null(),
       Type.Object({
         kind: Type.Literal("pending"),
-        members: MembersSchema,
+        mode: CompositionModeSchema,
+        members: Type.Array(MemberSchema, { minItems: 1 }),
       }),
       Type.Object({
         kind: Type.Literal("settled"),
-        result: ResultSchema,
+        result: CompositionResultSchema,
       }),
     ]);
     const GroupsForMemberParamsSchema = Type.Object({
@@ -225,8 +175,14 @@ function defineComposition<
         outcome: ResultOutcomeSchema,
       }),
     ]);
-    const sourceBindings: SourceBinding[] = runtimeSources.map(
-      (port, index) => ({
+    const MetricsResultSchema = Type.Object({
+      completions: Type.Integer({ minimum: 0 }),
+      groups: Type.Integer({ minimum: 0 }),
+      members: Type.Integer({ minimum: 0 }),
+      settlements: Type.Integer({ minimum: 0 }),
+    });
+    const sourceBindings: SourceBinding[] = sourceEntries.map(
+      ([, port], index) => ({
         eventName: `source_${index}`,
         indexerName: `recordSource_${index}`,
         source: port.source,
@@ -256,11 +212,13 @@ function defineComposition<
         ...sourceEventDefinitions,
       },
       queues: {
-        reconcile: Type.Object({ ref: result.refSchema }),
+        reconcile: Type.Object({
+          ref: result.refSchema,
+        }),
       },
     });
     const materializations = defineMaterialization(declaration, {
-      namespace: mode,
+      namespace: "composition",
     })
       .version(1, "record groups and terminal observations", (schema) =>
         schema
@@ -269,7 +227,6 @@ function defineComposition<
               .columns({
                 ref: table.text().notNull(),
                 source: table.eventRef("opened").notNull(),
-                settlement: table.eventRef("settled"),
               })
               .primaryKey(["ref"]),
           )
@@ -284,24 +241,50 @@ function defineComposition<
               .primaryKey(["groupRef", "key"]),
           )
           .createIndex("groups-by-member", "members", ["memberRef"])
+          .createTable("completions", (table) =>
+            table
+              .columns({
+                ref: table.text().notNull(),
+                source: table.eventRef("settled").notNull(),
+              })
+              .primaryKey(["ref"]),
+          )
           .createTable("settlements", (table) =>
             table
               .columns({
                 ref: table.text().notNull(),
                 eventId: table.integer().notNull(),
                 outcome: table.json<ResultOutcome>().notNull(),
+                settledAtMs: table.integer().notNull(),
               })
               .primaryKey(["ref"]),
           ),
       )
       .define({
         indexers: {
-          open: { sourceEvent: "opened", input: OpenedSchema },
-          complete: { sourceEvent: "settled", input: SettledSchema },
+          open: {
+            sourceEvent: "opened",
+            input: OpenedSchema,
+          },
+          complete: {
+            sourceEvent: "settled",
+            input: SettledSchema,
+          },
+          recordOwnSettlement: {
+            sourceEvent: "settled",
+            input: SettlementRecordSchema,
+          },
           ...sourceIndexerDefinitions,
         },
         queries: {
-          state: { params: StateParamsSchema, result: StateResultSchema },
+          metrics: {
+            params: Type.Object({}),
+            result: MetricsResultSchema,
+          },
+          state: {
+            params: StateParamsSchema,
+            result: StateResultSchema,
+          },
           groupsForMember: {
             params: GroupsForMemberParamsSchema,
             result: GroupsForMemberResultSchema,
@@ -322,6 +305,7 @@ function defineComposition<
     type SettledHandler = NonNullable<EventRegistrations["settled"]>;
     type OpenIndexer = IndexerRegistrations["open"];
     type CompleteIndexer = IndexerRegistrations["complete"];
+    type MetricsQuery = QueryRegistrations["metrics"];
     type StateQuery = QueryRegistrations["state"];
     type GroupsForMemberQuery = QueryRegistrations["groupsForMember"];
     type SettlementStatusQuery = QueryRegistrations["settlementStatus"];
@@ -329,14 +313,14 @@ function defineComposition<
     type OwnSettlementContext = Parameters<
       NonNullable<EventRegistrations["settled"]>
     >[0];
-    type SettlementIndexerContext = {
-      readonly input: Static<typeof SettlementRecordSchema>;
-      readonly db: Parameters<OpenIndexer>[0]["db"];
-    };
+    type OwnSettlementIndexerContext = Parameters<
+      IndexerRegistrations["recordOwnSettlement"]
+    >[0];
 
     const recordAndWake = async (input: {
       readonly observation: ResultObservation;
       readonly eventId: number;
+      readonly settledAtMs: number;
       readonly indexerName: string;
       readonly actions: OwnSettlementContext["actions"];
     }): Promise<void> => {
@@ -349,6 +333,7 @@ function defineComposition<
         ref: input.observation.ref,
         outcome: input.observation.outcome,
         eventId: input.eventId,
+        settledAtMs: input.settledAtMs,
       });
       const groups = await input.actions.query("groupsForMember", {
         memberRef: input.observation.ref,
@@ -358,7 +343,10 @@ function defineComposition<
         await input.actions.enqueue(
           "reconcile",
           { ref },
-          { coalescingKey: ref, partitionKey: ref },
+          {
+            coalescingKey: ref,
+            partitionKey: ref,
+          },
         );
       }
     };
@@ -366,13 +354,15 @@ function defineComposition<
 
     for (const binding of sourceBindings) {
       sourceEventHandlers[binding.eventName] = async (context: unknown) => {
-        // The generated alias and observation adapter originate from the same
-        // source binding. Object iteration erases that correlation, so the
-        // runtime callback shape is restored only inside this implementation.
+        // Object iteration erases the correlation between each generated event
+        // alias and its source token. Both came from the same binding above;
+        // this cast stays inside the implementation and restores only the
+        // runtime callback shape needed to call the paired source adapter.
         const sourceContext = context as {
           readonly event: {
             readonly payload: unknown;
             readonly eventId: number;
+            readonly tsMs: number;
           };
           readonly actions: OwnSettlementContext["actions"];
         };
@@ -381,6 +371,7 @@ function defineComposition<
         await recordAndWake({
           observation,
           eventId: sourceContext.event.eventId,
+          settledAtMs: sourceContext.event.tsMs,
           indexerName: binding.indexerName,
           actions: sourceContext.actions,
         });
@@ -390,7 +381,7 @@ function defineComposition<
     const recordSettlement = async ({
       input: settlement,
       db,
-    }: SettlementIndexerContext): Promise<void> => {
+    }: OwnSettlementIndexerContext): Promise<void> => {
       await db.insertInto("settlements").values(settlement).execute();
     };
     const sourceIndexerHandlers: Record<string, unknown> = {};
@@ -399,13 +390,14 @@ function defineComposition<
       sourceIndexerHandlers[binding.indexerName] = recordSettlement;
     }
 
-    // All computed registration keys are generated from sourceBindings above.
-    // The type erasure needed for heterogeneous aliases stays behind the
-    // operator boundary rather than leaking into application wiring.
+    // The generated declarations, event handlers, and indexers are all derived
+    // from sourceBindings. TypeScript cannot retain those computed key
+    // correlations through Object.entries, so the one erased registration seam
+    // is contained here rather than exported to primitive users.
     const registration = {
       events: {
         opened: async ({ event, actions }: Parameters<OpenedHandler>[0]) => {
-          assertUniqueMemberRefs(event.payload.members);
+          assertUniqueMembers(event.payload.members);
           await actions.index("open", event.payload);
           await actions.enqueue(
             "reconcile",
@@ -418,6 +410,23 @@ function defineComposition<
         },
         settled: async ({ event, actions }: Parameters<SettledHandler>[0]) => {
           await actions.index("complete", event.payload);
+          await recordAndWake({
+            observation:
+              event.payload.result.outcome === "succeeded"
+                ? {
+                    ref: event.payload.ref,
+                    outcome: event.payload.result.outcome,
+                    value: event.payload.result,
+                  }
+                : {
+                    ref: event.payload.ref,
+                    outcome: event.payload.result.outcome,
+                  },
+            eventId: event.eventId,
+            settledAtMs: event.tsMs,
+            indexerName: "recordOwnSettlement",
+            actions,
+          });
         },
         ...sourceEventHandlers,
       },
@@ -429,18 +438,19 @@ function defineComposition<
         }: Parameters<OpenIndexer>[0]) => {
           await db
             .insertInto("groups")
-            .values({ ref: group.ref, source: event.ref, settlement: null })
+            .values({
+              ref: group.ref,
+              source: event.ref,
+            })
             .execute();
 
-          for (const [position, [key, memberRef]] of Object.entries(
-            group.members,
-          ).entries()) {
+          for (const [position, member] of group.members.entries()) {
             await db
               .insertInto("members")
               .values({
                 groupRef: group.ref,
-                key,
-                memberRef,
+                key: member.key,
+                memberRef: member.ref,
                 position,
               })
               .execute();
@@ -459,24 +469,43 @@ function defineComposition<
 
           if (group === null) {
             throw new Error(
-              `${mode} ${completion.ref} settled without opening`,
+              `composition ${completion.ref} settled without opening`,
             );
           }
 
           await db
-            .updateTable("groups")
-            .set({ settlement: event.ref })
-            .where("ref", "=", completion.ref)
-            .whereNull("settlement")
+            .insertInto("completions")
+            .values({
+              ref: completion.ref,
+              source: event.ref,
+            })
             .execute();
         },
+        recordOwnSettlement: recordSettlement,
         ...sourceIndexerHandlers,
       },
       queries: {
+        metrics: async ({ db }: Parameters<MetricsQuery>[0]) => {
+          const [completions, groups, members, settlements] = await Promise.all(
+            [
+              db.selectFrom("completions").aggregate().count("count").execute(),
+              db.selectFrom("groups").aggregate().count("count").execute(),
+              db.selectFrom("members").aggregate().count("count").execute(),
+              db.selectFrom("settlements").aggregate().count("count").execute(),
+            ],
+          );
+
+          return {
+            completions: completions.count,
+            groups: groups.count,
+            members: members.count,
+            settlements: settlements.count,
+          };
+        },
         state: async ({ params, db }: Parameters<StateQuery>[0]) => {
           const group = await db
             .selectFrom("groups")
-            .select(["settlement"])
+            .selectEvent("source")
             .where("ref", "=", params.ref)
             .executeTakeFirst();
 
@@ -484,16 +513,17 @@ function defineComposition<
             return null;
           }
 
-          if (group.settlement !== null) {
-            const settlement = await db.readEvent(group.settlement);
+          const completion = await db
+            .selectFrom("completions")
+            .selectEvent("source")
+            .where("ref", "=", params.ref)
+            .executeTakeFirst();
 
-            if (settlement === null) {
-              throw new Error(
-                `${mode} ${params.ref} lost its settlement event`,
-              );
-            }
-
-            return { kind: "settled", result: settlement.payload.result };
+          if (completion !== null) {
+            return {
+              kind: "settled",
+              result: completion.payload.result,
+            };
           }
 
           const members = await db
@@ -505,12 +535,11 @@ function defineComposition<
 
           return {
             kind: "pending",
-            members: Object.fromEntries(
-              members.map((member) => [
-                member.key,
-                Value.Decode(MemberRefSchema, member.memberRef),
-              ]),
-            ),
+            mode: group.payload.mode,
+            members: members.map((member) => ({
+              key: member.key,
+              ref: Value.Decode(MemberRefSchema, member.memberRef),
+            })),
           };
         },
         groupsForMember: async ({
@@ -543,11 +572,13 @@ function defineComposition<
           work,
           actions,
         }: Parameters<ReconcileHandler>[0]) => {
-          const state = await actions.query("state", { ref: work.payload.ref });
+          const state = await actions.query("state", {
+            ref: work.payload.ref,
+          });
 
           if (state === null) {
             throw new Error(
-              `${mode} ${work.payload.ref} reconciled before opening`,
+              `composition ${work.payload.ref} reconciled before opening`,
             );
           }
 
@@ -556,9 +587,11 @@ function defineComposition<
           }
 
           const observations = await Promise.all(
-            Object.entries(state.members).map(async ([key, ref]) => ({
-              member: { key, ref },
-              status: await actions.query("settlementStatus", { ref }),
+            state.members.map(async (member) => ({
+              member,
+              status: await actions.query("settlementStatus", {
+                ref: member.ref,
+              }),
             })),
           );
           const settled = observations.filter(
@@ -569,103 +602,92 @@ function defineComposition<
             } => observation.status !== null,
           );
 
-          if (mode === "all" && settled.length !== observations.length) {
+          if (state.mode === "all" && settled.length !== observations.length) {
             return;
           }
 
-          if (mode === "race" && settled.length === 0) {
+          if (state.mode === "race" && settled.length === 0) {
             return;
           }
 
-          const resultValue = Value.Decode(
-            ResultSchema,
-            mode === "all" ? allResult(settled) : raceResult(settled),
-          );
+          const resultValue =
+            state.mode === "all" ? allResult(settled) : raceResult(settled);
 
           actions.emit(
             "settled",
-            { ref: work.payload.ref, result: resultValue },
-            { dedupeKey: `composition:${work.payload.ref}:settled` },
+            {
+              ref: work.payload.ref,
+              result: resultValue,
+            },
+            {
+              dedupeKey: `composition:${work.payload.ref}:settled`,
+            },
           );
         },
       },
-    } satisfies Registration;
+    } as unknown as Registration;
     const registered = linked.register(registration);
-    const resultPort = result
-      .fromEvent(registered.events.settled, (payload) => {
-        if (payload.result.outcome === "succeeded") {
-          return {
+    const resultPort = result.fromEvent(registered.events.settled, (payload) =>
+      payload.result.outcome === "succeeded"
+        ? {
             ref: payload.ref,
             outcome: payload.result.outcome,
             value: payload.result,
-          };
-        }
-
-        if (payload.result.outcome === "failed") {
-          return {
+          }
+        : {
             ref: payload.ref,
             outcome: payload.result.outcome,
-            error: payload.result,
-          };
-        }
-
-        return {
-          ref: payload.ref,
-          outcome: payload.result.outcome,
-        };
-      })
-      .readFrom(registered.queries.state, {
-        observe: (state, ref) => {
-          if (state === null || state.kind === "pending") {
-            return null;
-          }
-
-          if (state.result.outcome === "succeeded") {
-            return {
-              ref,
-              outcome: state.result.outcome,
-              value: state.result,
-            };
-          }
-
-          if (state.result.outcome === "failed") {
-            return {
-              ref,
-              outcome: state.result.outcome,
-              error: state.result,
-            };
-          }
-
-          return {
-            ref,
-            outcome: state.result.outcome,
-          };
-        },
-      });
+          },
+    );
 
     return module.expose(registered, {
-      events: { opened: registered.events.opened },
-      queries: { state: registered.queries.state },
+      events: {
+        opened: registered.events.opened,
+      },
+      queries: {
+        metrics: registered.queries.metrics,
+        state: registered.queries.state,
+      },
       result: resultPort,
     });
   });
 }
 
-function assertUniqueMemberRefs(
-  members: Readonly<Record<string, ResultRef<unknown>>>,
+function assertUniqueMembers(
+  members: readonly {
+    readonly key: string;
+    readonly ref: ResultRef<unknown>;
+  }[],
 ): void {
+  const keys = new Set<string>();
   const refs = new Set<string>();
 
-  for (const ref of Object.values(members)) {
-    if (refs.has(ref)) {
-      throw new Error(`composition member ref ${ref} is duplicated`);
+  for (const member of members) {
+    if (keys.has(member.key)) {
+      throw new Error(`composition member key ${member.key} is duplicated`);
     }
 
-    refs.add(ref);
+    if (refs.has(member.ref)) {
+      throw new Error(`composition member ref ${member.ref} is duplicated`);
+    }
+
+    keys.add(member.key);
+    refs.add(member.ref);
   }
 }
 
-function allResult(settled: readonly SettledObservation[]): AllResult {
+type SettledObservation = {
+  readonly member: {
+    readonly key: string;
+    readonly ref: ResultRef<unknown>;
+  };
+  readonly status: {
+    readonly eventId: number;
+    readonly outcome: ResultOutcome;
+  };
+};
+
+function allResult(settled: readonly SettledObservation[]): CompositionResult {
   const outcomes = settled.map(({ status }) => status.outcome);
   const outcome = outcomes.includes("failed")
     ? "failed"
@@ -674,17 +696,18 @@ function allResult(settled: readonly SettledObservation[]): AllResult {
       : "succeeded";
 
   return {
+    mode: "all",
     outcome,
-    members: Object.fromEntries(
-      settled.map(({ member, status }) => [
-        member.key,
-        { ref: member.ref, outcome: status.outcome },
-      ]),
-    ),
+    winner: null,
+    members: settled.map(({ member, status }) => ({
+      key: member.key,
+      ref: member.ref,
+      outcome: status.outcome,
+    })),
   };
 }
 
-function raceResult(settled: readonly SettledObservation[]): RaceResult {
+function raceResult(settled: readonly SettledObservation[]): CompositionResult {
   const winner = settled.toSorted(
     (left, right) => left.status.eventId - right.status.eventId,
   )[0];
@@ -694,8 +717,15 @@ function raceResult(settled: readonly SettledObservation[]): RaceResult {
   }
 
   return {
-    winner: winner.member.key,
-    ref: winner.member.ref,
+    mode: "race",
     outcome: winner.status.outcome,
+    winner: winner.member.key,
+    members: [
+      {
+        key: winner.member.key,
+        ref: winner.member.ref,
+        outcome: winner.status.outcome,
+      },
+    ],
   };
 }

@@ -4,9 +4,19 @@ import { Value } from "typebox/value";
 import type {
   EventPayload,
   EventToken,
+  LedgerCursor,
+  LedgerQuerySnapshot,
+  LedgerStreamEvent,
   LedgerModuleOwner,
+  QueryParameters,
+  QueryResult,
+  QueryToken,
 } from "./ledger/ledger.ts";
-import { readLedgerEventTokenModuleIdInternal } from "./ledger/ledger.ts";
+import {
+  LedgerHistoryExpiredError,
+  readLedgerEventTokenModuleIdInternal,
+  readLedgerQueryTokenModuleIdInternal,
+} from "./ledger/ledger.ts";
 import {
   readLedgerModuleOwnerId,
   sharesLedgerModuleConstructionScope,
@@ -51,6 +61,7 @@ export type ResultOutcome = Static<typeof ResultOutcomeSchema>;
 export type ResultObservation<
   TResult = unknown,
   TOwnerModuleId extends string = string,
+  TFailure = unknown,
 > =
   | {
       readonly ref: ResultRef<TResult, TOwnerModuleId>;
@@ -59,7 +70,12 @@ export type ResultObservation<
     }
   | {
       readonly ref: ResultRef<TResult, TOwnerModuleId>;
-      readonly outcome: "failed" | "cancelled";
+      readonly outcome: "failed";
+      readonly error: TFailure;
+    }
+  | {
+      readonly ref: ResultRef<TResult, TOwnerModuleId>;
+      readonly outcome: "cancelled";
     };
 
 /**
@@ -75,17 +91,42 @@ export interface ResultSource<
     TSchema,
     null
   >,
+  TFailure = never,
 > {
   readonly event: TEvent;
-  observe(payload: unknown): ResultObservation<TResult, TOwnerModuleId>;
+  observe(
+    payload: unknown,
+  ): ResultObservation<TResult, TOwnerModuleId, TFailure>;
+}
+
+/** Projection reader paired with the result identity it resolves. */
+export interface ResultReader<
+  TResult = unknown,
+  TOwnerModuleId extends string = string,
+  TQuery extends QueryToken<string, string, TSchema, TSchema> = QueryToken<
+    string,
+    string,
+    TSchema,
+    TSchema
+  >,
+  TFailure = never,
+> {
+  readonly query: TQuery;
+  params(ref: ResultRef<TResult, TOwnerModuleId>): QueryParameters<TQuery>;
+  observe(
+    result: QueryResult<TQuery>,
+    ref: ResultRef<TResult, TOwnerModuleId>,
+  ): ResultObservation<TResult, TOwnerModuleId, TFailure> | null;
 }
 
 interface ResultIdentity<
   TModuleId extends string,
   TResultSchema extends TSchema,
+  TFailureSchema extends TSchema,
 > {
   readonly moduleId: TModuleId;
   readonly resultSchema: TResultSchema;
+  readonly failureSchema: TFailureSchema;
   readonly refSchema: TUnsafe<ResultRef<Static<TResultSchema>, TModuleId>>;
   ref(key: string): ResultRef<Static<TResultSchema>, TModuleId>;
 }
@@ -94,27 +135,83 @@ interface ResultIdentity<
 export interface DeclaredResult<
   TModuleId extends string,
   TResultSchema extends TSchema,
-> extends ResultIdentity<TModuleId, TResultSchema> {
+  TFailureSchema extends TSchema,
+> extends ResultIdentity<TModuleId, TResultSchema, TFailureSchema> {
   fromEvent<const TEvent extends EventToken<TModuleId, string, TSchema, null>>(
     event: TEvent,
     observe: (
       payload: EventPayload<TEvent>,
-    ) => ResultObservation<Static<TResultSchema>, TModuleId>,
-  ): ResultPort<TModuleId, TResultSchema, TEvent>;
+    ) => ResultObservation<
+      Static<TResultSchema>,
+      TModuleId,
+      Static<TFailureSchema>
+    >,
+  ): ObservedResult<TModuleId, TResultSchema, TFailureSchema, TEvent>;
 }
 
-/** Result identity paired with the producer's one terminal event contract. */
+/** Result identity after its terminal event is known but before it is readable. */
+export interface ObservedResult<
+  TModuleId extends string,
+  TResultSchema extends TSchema,
+  TFailureSchema extends TSchema,
+  TEvent extends EventToken<TModuleId, string, TSchema, null>,
+> extends ResultIdentity<TModuleId, TResultSchema, TFailureSchema> {
+  readonly source: ResultSource<
+    Static<TResultSchema>,
+    TModuleId,
+    TEvent,
+    Static<TFailureSchema>
+  >;
+
+  readFrom<
+    const TQuery extends QueryToken<TModuleId, string, TSchema, TSchema>,
+  >(
+    query: TQuery,
+    input: {
+      observe(
+        result: QueryResult<TQuery>,
+        ref: ResultRef<Static<TResultSchema>, TModuleId>,
+      ): ResultObservation<
+        Static<TResultSchema>,
+        TModuleId,
+        Static<TFailureSchema>
+      > | null;
+    },
+  ): ResultPort<TModuleId, TResultSchema, TFailureSchema, TEvent, TQuery>;
+}
+
+/**
+ * Result identity paired with its terminal event and authoritative state read.
+ */
 export interface ResultPort<
   TModuleId extends string,
   TResultSchema extends TSchema,
+  TFailureSchema extends TSchema,
   TEvent extends EventToken<TModuleId, string, TSchema, null> = EventToken<
     TModuleId,
     string,
     TSchema,
     null
   >,
-> extends ResultIdentity<TModuleId, TResultSchema> {
-  readonly source: ResultSource<Static<TResultSchema>, TModuleId, TEvent>;
+  TQuery extends QueryToken<TModuleId, string, TSchema, TSchema> = QueryToken<
+    TModuleId,
+    string,
+    TSchema,
+    TSchema
+  >,
+> extends ResultIdentity<TModuleId, TResultSchema, TFailureSchema> {
+  readonly source: ResultSource<
+    Static<TResultSchema>,
+    TModuleId,
+    TEvent,
+    Static<TFailureSchema>
+  >;
+  readonly reader: ResultReader<
+    Static<TResultSchema>,
+    TModuleId,
+    TQuery,
+    Static<TFailureSchema>
+  >;
 }
 
 /**
@@ -127,12 +224,14 @@ export interface ResultPort<
 export function defineResult<
   const TModuleId extends string,
   const TResultSchema extends TSchema,
+  const TFailureSchema extends TSchema,
 >(
   module: LedgerModuleOwner<TModuleId>,
   input: {
     readonly resultSchema: TResultSchema;
+    readonly failureSchema: TFailureSchema;
   },
-): DeclaredResult<TModuleId, TResultSchema> {
+): DeclaredResult<TModuleId, TResultSchema, TFailureSchema> {
   const moduleId = readLedgerModuleOwnerId(module);
 
   if (resultOwners.has(module)) {
@@ -158,12 +257,14 @@ export function defineResult<
       `${moduleId}${ledgerIdentitySeparator}${key}`,
     );
   };
-  const identity: ResultIdentity<TModuleId, TResultSchema> = Object.freeze({
-    moduleId,
-    ref,
-    refSchema,
-    resultSchema: input.resultSchema,
-  });
+  const identity: ResultIdentity<TModuleId, TResultSchema, TFailureSchema> =
+    Object.freeze({
+      moduleId,
+      ref,
+      refSchema,
+      resultSchema: input.resultSchema,
+      failureSchema: input.failureSchema,
+    });
   let terminalEventBound = false;
   const fromEvent = <
     const TEvent extends EventToken<TModuleId, string, TSchema, null>,
@@ -171,8 +272,12 @@ export function defineResult<
     event: TEvent,
     observe: (
       payload: EventPayload<TEvent>,
-    ) => ResultObservation<Static<TResultSchema>, TModuleId>,
-  ): ResultPort<TModuleId, TResultSchema, TEvent> => {
+    ) => ResultObservation<
+      Static<TResultSchema>,
+      TModuleId,
+      Static<TFailureSchema>
+    >,
+  ): ObservedResult<TModuleId, TResultSchema, TFailureSchema, TEvent> => {
     readLedgerModuleOwnerId(module);
 
     const eventModuleId = readLedgerEventTokenModuleIdInternal(event);
@@ -197,7 +302,8 @@ export function defineResult<
     const source: ResultSource<
       Static<TResultSchema>,
       TModuleId,
-      TEvent
+      TEvent,
+      Static<TFailureSchema>
     > = Object.freeze({
       event,
       observe: (payload: unknown) => {
@@ -209,17 +315,213 @@ export function defineResult<
       },
     });
 
+    let readerBound = false;
+    const readFrom = <
+      const TQuery extends QueryToken<TModuleId, string, TSchema, TSchema>,
+    >(
+      query: TQuery,
+      input: {
+        observe(
+          result: QueryResult<TQuery>,
+          ref: ResultRef<Static<TResultSchema>, TModuleId>,
+        ): ResultObservation<
+          Static<TResultSchema>,
+          TModuleId,
+          Static<TFailureSchema>
+        > | null;
+      },
+    ): ResultPort<TModuleId, TResultSchema, TFailureSchema, TEvent, TQuery> => {
+      readLedgerModuleOwnerId(module);
+
+      const queryModuleId = readLedgerQueryTokenModuleIdInternal(query);
+
+      if (queryModuleId !== moduleId) {
+        throw new Error(
+          `ledger module ${moduleId} result cannot bind query owned by ${queryModuleId}`,
+        );
+      }
+
+      if (!sharesLedgerModuleConstructionScope(module, query)) {
+        throw new Error(
+          `ledger module ${moduleId} result query does not belong to this definition`,
+        );
+      }
+
+      if (readerBound) {
+        throw new Error(
+          `ledger module ${moduleId} result reader is already bound`,
+        );
+      }
+
+      readerBound = true;
+      const reader: ResultReader<
+        Static<TResultSchema>,
+        TModuleId,
+        TQuery,
+        Static<TFailureSchema>
+      > = Object.freeze({
+        query,
+        // Readable-result queries use the one canonical `{ ref }` parameter.
+        // TypeBox's conditional Static type does not reduce through a generic
+        // query token, so this is the single internal assertion at that seam.
+        params: (ref: ResultRef<Static<TResultSchema>, TModuleId>) =>
+          ({ ref }) as QueryParameters<TQuery>,
+        observe: input.observe,
+      });
+
+      return Object.freeze({
+        ...identity,
+        source,
+        reader,
+      });
+    };
+
     return Object.freeze({
       ...identity,
       source,
+      readFrom,
     });
   };
-  const declared: DeclaredResult<TModuleId, TResultSchema> = Object.freeze({
-    ...identity,
-    fromEvent,
-  });
+  const declared: DeclaredResult<TModuleId, TResultSchema, TFailureSchema> =
+    Object.freeze({
+      ...identity,
+      fromEvent,
+    });
 
   return declared;
+}
+
+type ResultQueryLedger<
+  TQuery extends QueryToken<string, string, TSchema, TSchema>,
+> = {
+  query(
+    query: TQuery,
+    params: QueryParameters<TQuery>,
+  ): Promise<QueryResult<TQuery>>;
+};
+
+type ResultWaitLedger<
+  TQuery extends QueryToken<string, string, TSchema, TSchema>,
+> = {
+  querySnapshot(
+    query: TQuery,
+    params: QueryParameters<TQuery>,
+  ): Promise<LedgerQuerySnapshot<TQuery>>;
+
+  resumeEvents(input: {
+    readonly cursor: LedgerCursor;
+    readonly signal: AbortSignal;
+  }): AsyncIterable<
+    LedgerStreamEvent<EventToken<string, string, TSchema, TSchema | null>>
+  >;
+};
+
+/** Reads the current terminal observation for one typed result, if any. */
+export async function readResult<
+  const TModuleId extends string,
+  const TResultSchema extends TSchema,
+  const TFailureSchema extends TSchema,
+  const TEvent extends EventToken<TModuleId, string, TSchema, null>,
+  const TQuery extends QueryToken<TModuleId, string, TSchema, TSchema>,
+>(
+  ledger: ResultQueryLedger<TQuery>,
+  result: ResultPort<TModuleId, TResultSchema, TFailureSchema, TEvent, TQuery>,
+  ref: ResultRef<Static<TResultSchema>, TModuleId>,
+): Promise<ResultObservation<
+  Static<TResultSchema>,
+  TModuleId,
+  Static<TFailureSchema>
+> | null> {
+  const observation = result.reader.observe(
+    await ledger.query(result.reader.query, result.reader.params(ref)),
+    ref,
+  );
+
+  assertRequestedObservation(ref, observation);
+  return observation;
+}
+
+/**
+ * Waits for one typed result without a check-then-subscribe race.
+ *
+ * The initial state read and stream cursor come from one storage snapshot. A
+ * terminal event is therefore either represented by that state or appears
+ * after the returned cursor. Explicit history expiry simply restarts from a
+ * fresh authoritative snapshot.
+ */
+export async function waitForResult<
+  const TModuleId extends string,
+  const TResultSchema extends TSchema,
+  const TFailureSchema extends TSchema,
+  const TEvent extends EventToken<TModuleId, string, TSchema, null>,
+  const TQuery extends QueryToken<TModuleId, string, TSchema, TSchema>,
+>(
+  ledger: ResultWaitLedger<TQuery>,
+  result: ResultPort<TModuleId, TResultSchema, TFailureSchema, TEvent, TQuery>,
+  ref: ResultRef<Static<TResultSchema>, TModuleId>,
+  signal: AbortSignal,
+): Promise<
+  ResultObservation<Static<TResultSchema>, TModuleId, Static<TFailureSchema>>
+> {
+  signal.throwIfAborted();
+
+  for (;;) {
+    const snapshot = await ledger.querySnapshot(
+      result.reader.query,
+      result.reader.params(ref),
+    );
+    signal.throwIfAborted();
+
+    const existing = result.reader.observe(snapshot.result, ref);
+    assertRequestedObservation(ref, existing);
+
+    if (existing !== null) {
+      return existing;
+    }
+
+    try {
+      for await (const item of ledger.resumeEvents({
+        cursor: snapshot.cursor,
+        signal,
+      })) {
+        if (item.event.event !== result.source.event) {
+          continue;
+        }
+
+        const observation = result.source.observe(item.event.payload);
+
+        if (observation.ref === ref) {
+          return observation;
+        }
+      }
+    } catch (error: unknown) {
+      if (error instanceof LedgerHistoryExpiredError) {
+        continue;
+      }
+
+      throw error;
+    }
+
+    signal.throwIfAborted();
+    throw new Error(
+      `ledger event stream ended while waiting for result ${ref}`,
+    );
+  }
+}
+
+function assertRequestedObservation<
+  TResult,
+  TModuleId extends string,
+  TFailure,
+>(
+  ref: ResultRef<TResult, TModuleId>,
+  observation: ResultObservation<TResult, TModuleId, TFailure> | null,
+): void {
+  if (observation !== null && observation.ref !== ref) {
+    throw new Error(
+      `result reader returned ${observation.ref} while reading ${ref}`,
+    );
+  }
 }
 
 function escapeRegularExpression(value: string): string {
