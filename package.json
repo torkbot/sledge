@@ -85,6 +85,7 @@
     "test": "node --test src/*.test.ts src/**/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty",
     "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/*.ts src/**/*.ts",
+    "prototype:settlement": "node experiments/settlement-algebra-prototype/run.ts",
     "prepublishOnly": "node --run build"
   },
   "dependencies": {

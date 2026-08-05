@@ -13,12 +13,7 @@ import {
   type QueueLedger,
 } from "../ledger.ts";
 import { defineModule } from "../sledge.ts";
-import { defineResult, type ResultRef } from "../stdlib.ts";
-
-export type InvocationResolution<TResult, TFailure> =
-  | { readonly outcome: "succeeded"; readonly value: TResult }
-  | { readonly outcome: "failed"; readonly error: TFailure }
-  | { readonly outcome: "cancelled" };
+import { defineResult, type ResultRef, type Settlement } from "../stdlib.ts";
 
 export type InvocationExecution<
   TInput,
@@ -40,7 +35,7 @@ export type InvocationExecution<
     timeoutMs: number,
     operation: (signal: AbortSignal) => Promise<TValue>,
   ) => Promise<TValue>;
-}) => Promise<InvocationResolution<TResult, TFailure>>;
+}) => Promise<Settlement<TResult, TFailure>>;
 
 /** Attempt-scoped ledger access explicitly imported by an invocation. */
 export interface InvocationLedgerPort<
@@ -110,22 +105,7 @@ export function defineInvocation<
       ref: result.refSchema,
       input: InputSchema,
     });
-    const SettledSchema = Type.Union([
-      Type.Object({
-        ref: result.refSchema,
-        outcome: Type.Literal("succeeded"),
-        value: ResultSchema,
-      }),
-      Type.Object({
-        ref: result.refSchema,
-        outcome: Type.Literal("failed"),
-        error: FailureSchema,
-      }),
-      Type.Object({
-        ref: result.refSchema,
-        outcome: Type.Literal("cancelled"),
-      }),
-    ]);
+    const SettledSchema = result.observationSchema;
     const StateParamsSchema = Type.Object({ ref: result.refSchema });
     const StateResultSchema = Type.Union([
       Type.Null(),
@@ -249,10 +229,7 @@ export function defineInvocation<
           allowedEvents,
           allowedQueries,
         );
-        let resolution: InvocationResolution<
-          InvocationResult,
-          InvocationFailure
-        >;
+        let resolution: Settlement<InvocationResult, InvocationFailure>;
 
         try {
           resolution = await input.execute({
@@ -404,28 +381,7 @@ export function defineInvocation<
       queues: { execute },
     } satisfies Registration);
     const resultPort = result
-      .fromEvent(registered.events.settled, (payload) => {
-        if (payload.outcome === "succeeded") {
-          return {
-            ref: payload.ref,
-            outcome: payload.outcome,
-            value: payload.value,
-          };
-        }
-
-        if (payload.outcome === "failed") {
-          return {
-            ref: payload.ref,
-            outcome: payload.outcome,
-            error: payload.error,
-          };
-        }
-
-        return {
-          ref: payload.ref,
-          outcome: payload.outcome,
-        };
-      })
+      .fromEvent(registered.events.settled, (payload) => payload)
       .readFrom(registered.queries.state, {
         observe: (state, ref) => {
           if (state === null || state.kind === "pending") {

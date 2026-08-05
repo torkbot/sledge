@@ -58,25 +58,59 @@ export const ResultOutcomeSchema = Type.Union([
 
 export type ResultOutcome = Static<typeof ResultOutcomeSchema>;
 
+/**
+ * Complete terminal state of a durable computation.
+ *
+ * Throwing is deliberately absent: an exception belongs to the current work
+ * attempt and normally requests retry. A settlement is a durable program fact.
+ */
+export type Settlement<TResult, TFailure> =
+  | { readonly outcome: "succeeded"; readonly value: TResult }
+  | { readonly outcome: "failed"; readonly error: TFailure }
+  | { readonly outcome: "cancelled" };
+
+/** Constructors for the three mutually exclusive terminal states. */
+export const Settlement = Object.freeze({
+  succeeded<TResult>(value: TResult): Settlement<TResult, never> {
+    return { outcome: "succeeded", value };
+  },
+
+  failed<TFailure>(error: TFailure): Settlement<never, TFailure> {
+    return { outcome: "failed", error };
+  },
+
+  cancelled(): Settlement<never, never> {
+    return { outcome: "cancelled" };
+  },
+});
+
+/** Exhaustively translates a settlement into ordinary program code. */
+export function matchSettlement<TResult, TFailure, TOutput>(
+  settlement: Settlement<TResult, TFailure>,
+  cases: {
+    readonly succeeded: (value: TResult) => TOutput;
+    readonly failed: (error: TFailure) => TOutput;
+    readonly cancelled: () => TOutput;
+  },
+): TOutput {
+  if (settlement.outcome === "succeeded") {
+    return cases.succeeded(settlement.value);
+  }
+
+  if (settlement.outcome === "failed") {
+    return cases.failed(settlement.error);
+  }
+
+  return cases.cancelled();
+}
+
 export type ResultObservation<
   TResult = unknown,
   TOwnerModuleId extends string = string,
   TFailure = unknown,
-> =
-  | {
-      readonly ref: ResultRef<TResult, TOwnerModuleId>;
-      readonly outcome: "succeeded";
-      readonly value: TResult;
-    }
-  | {
-      readonly ref: ResultRef<TResult, TOwnerModuleId>;
-      readonly outcome: "failed";
-      readonly error: TFailure;
-    }
-  | {
-      readonly ref: ResultRef<TResult, TOwnerModuleId>;
-      readonly outcome: "cancelled";
-    };
+> = Settlement<TResult, TFailure> & {
+  readonly ref: ResultRef<TResult, TOwnerModuleId>;
+};
 
 /**
  * Producer-owned terminal event viewed through the small contract needed by
@@ -128,6 +162,9 @@ interface ResultIdentity<
   readonly resultSchema: TResultSchema;
   readonly failureSchema: TFailureSchema;
   readonly refSchema: TUnsafe<ResultRef<Static<TResultSchema>, TModuleId>>;
+  readonly observationSchema: TUnsafe<
+    ResultObservation<Static<TResultSchema>, TModuleId, Static<TFailureSchema>>
+  >;
   ref(key: string): ResultRef<Static<TResultSchema>, TModuleId>;
 }
 
@@ -215,6 +252,31 @@ export interface ResultPort<
 }
 
 /**
+ * Type-erased result protocol accepted by generic composition operators.
+ *
+ * Concrete result ports retain their exact schemas and branded refs. This
+ * shape is the common structural boundary that lets an operator consume any
+ * such port and expose another port with the same terminal protocol.
+ */
+export interface ResultPortShape {
+  readonly moduleId: string;
+  readonly resultSchema: TSchema;
+  readonly failureSchema: TSchema;
+  readonly refSchema: TSchema;
+  readonly observationSchema: TSchema;
+  ref(key: string): string;
+  readonly source: {
+    readonly event: EventToken<string, string, TSchema, null>;
+    observe(payload: unknown): ResultObservation;
+  };
+  readonly reader: {
+    readonly query: QueryToken<string, string, TSchema, TSchema>;
+    params(ref: string): unknown;
+    observe(result: unknown, ref: string): ResultObservation | null;
+  };
+}
+
+/**
  * Declares the result capability owned by one ledger module.
  *
  * Calling `fromEvent(...)` once consumes this incomplete phase and returns a
@@ -257,6 +319,26 @@ export function defineResult<
       `${moduleId}${ledgerIdentitySeparator}${key}`,
     );
   };
+  const observationSchema = Type.Unsafe<
+    ResultObservation<Static<TResultSchema>, TModuleId, Static<TFailureSchema>>
+  >(
+    Type.Union([
+      Type.Object({
+        ref: refSchema,
+        outcome: Type.Literal("succeeded"),
+        value: input.resultSchema,
+      }),
+      Type.Object({
+        ref: refSchema,
+        outcome: Type.Literal("failed"),
+        error: input.failureSchema,
+      }),
+      Type.Object({
+        ref: refSchema,
+        outcome: Type.Literal("cancelled"),
+      }),
+    ]),
+  );
   const identity: ResultIdentity<TModuleId, TResultSchema, TFailureSchema> =
     Object.freeze({
       moduleId,
@@ -264,6 +346,7 @@ export function defineResult<
       refSchema,
       resultSchema: input.resultSchema,
       failureSchema: input.failureSchema,
+      observationSchema,
     });
   let terminalEventBound = false;
   const fromEvent = <

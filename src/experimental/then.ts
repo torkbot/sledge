@@ -14,25 +14,10 @@ import { defineModule } from "../sledge.ts";
 import {
   defineResult,
   type ResultObservation,
+  type ResultPortShape,
   type ResultRef,
+  type Settlement,
 } from "../stdlib.ts";
-
-type ResultPortShape = {
-  readonly moduleId: string;
-  readonly resultSchema: TSchema;
-  readonly failureSchema: TSchema;
-  readonly refSchema: TSchema;
-  ref(key: string): string;
-  readonly source: {
-    readonly event: EventToken<string, string, TSchema, null>;
-    observe(payload: unknown): ResultObservation;
-  };
-  readonly reader: {
-    readonly query: QueryToken<string, string, TSchema, TSchema>;
-    params(ref: string): unknown;
-    observe(result: unknown, ref: string): ResultObservation | null;
-  };
-};
 
 type RuntimeResultPort = ResultPortShape;
 
@@ -83,11 +68,6 @@ export interface ThenLedgerPort<
   ): Promise<Static<TResultSchema>>;
 }
 
-export type ThenResolution<TResult, TFailure> =
-  | { readonly outcome: "succeeded"; readonly value: TResult }
-  | { readonly outcome: "failed"; readonly error: TFailure }
-  | { readonly outcome: "cancelled" };
-
 export type ThenExecution<
   TSource extends ResultPortShape,
   TOutputModuleId extends string,
@@ -111,7 +91,7 @@ export type ThenExecution<
     timeoutMs: number,
     operation: (signal: AbortSignal) => Promise<TResult>,
   ) => Promise<TResult>;
-}) => Promise<ThenResolution<Static<TOutputSchema>, Static<TFailureSchema>>>;
+}) => Promise<Settlement<Static<TOutputSchema>, Static<TFailureSchema>>>;
 
 /**
  * Defines one durable result derived causally from another typed result.
@@ -196,25 +176,7 @@ export function defineThen<
         outcome: Type.Literal("cancelled"),
       }),
     ]);
-    const SettledSchema = Type.Union([
-      Type.Object({
-        ref: result.refSchema,
-        sourceRef: SourceRefSchema,
-        outcome: Type.Literal("succeeded"),
-        output: OutputValueSchema,
-      }),
-      Type.Object({
-        ref: result.refSchema,
-        sourceRef: SourceRefSchema,
-        outcome: Type.Literal("failed"),
-        error: OutputFailureSchema,
-      }),
-      Type.Object({
-        ref: result.refSchema,
-        sourceRef: SourceRefSchema,
-        outcome: Type.Literal("cancelled"),
-      }),
-    ]);
+    const SettledSchema = result.observationSchema;
     const StateParamsSchema = Type.Object({ ref: result.refSchema });
     const StateResultSchema = Type.Union([
       Type.Null(),
@@ -414,22 +376,22 @@ export function defineThen<
           if (settlement.payload.outcome === "succeeded") {
             return {
               kind: "succeeded",
-              sourceRef: settlement.payload.sourceRef,
-              output: settlement.payload.output,
+              sourceRef: Value.Decode(SourceRefSchema, derivation.sourceRef),
+              output: settlement.payload.value,
             };
           }
 
           if (settlement.payload.outcome === "failed") {
             return {
               kind: settlement.payload.outcome,
-              sourceRef: settlement.payload.sourceRef,
+              sourceRef: Value.Decode(SourceRefSchema, derivation.sourceRef),
               error: settlement.payload.error,
             };
           }
 
           return {
             kind: settlement.payload.outcome,
-            sourceRef: settlement.payload.sourceRef,
+            sourceRef: Value.Decode(SourceRefSchema, derivation.sourceRef),
           };
         },
       },
@@ -446,13 +408,14 @@ export function defineThen<
               work.payload.outcome === "failed"
                 ? {
                     ref: work.payload.ref,
-                    sourceRef: work.payload.sourceRef,
                     outcome: work.payload.outcome,
-                    error: work.payload.error,
+                    error: Value.Decode(
+                      OutputFailureSchema,
+                      work.payload.error,
+                    ),
                   }
                 : {
                     ref: work.payload.ref,
-                    sourceRef: work.payload.sourceRef,
                     outcome: work.payload.outcome,
                   };
 
@@ -472,7 +435,7 @@ export function defineThen<
             allowedEvents,
             allowedQueries,
           );
-          let resolution: ThenResolution<OutputValue, LocalFailure>;
+          let resolution: Settlement<OutputValue, LocalFailure>;
 
           try {
             resolution = await input.execute({
@@ -496,9 +459,8 @@ export function defineThen<
               "settled",
               {
                 ref: work.payload.ref,
-                sourceRef: work.payload.sourceRef,
                 outcome: resolution.outcome,
-                output: Value.Decode(OutputValueSchema, resolution.value),
+                value: Value.Decode(OutputValueSchema, resolution.value),
               },
               { dedupeKey: `then:${work.payload.ref}:settled` },
             );
@@ -510,7 +472,6 @@ export function defineThen<
             resolution.outcome === "failed"
               ? {
                   ref: work.payload.ref,
-                  sourceRef: work.payload.sourceRef,
                   outcome: resolution.outcome,
                   error: Value.Decode(
                     OutputFailureSchema,
@@ -519,7 +480,6 @@ export function defineThen<
                 }
               : {
                   ref: work.payload.ref,
-                  sourceRef: work.payload.sourceRef,
                   outcome: resolution.outcome,
                 },
             { dedupeKey: `then:${work.payload.ref}:settled` },
@@ -529,25 +489,7 @@ export function defineThen<
     } satisfies Registration;
     const registered = linked.register(registration);
     const resultPort = result
-      .fromEvent(registered.events.settled, (payload) => {
-        if (payload.outcome === "succeeded") {
-          return {
-            ref: payload.ref,
-            outcome: payload.outcome,
-            value: payload.output,
-          };
-        }
-
-        if (payload.outcome === "failed") {
-          return {
-            ref: payload.ref,
-            outcome: payload.outcome,
-            error: payload.error,
-          };
-        }
-
-        return { ref: payload.ref, outcome: payload.outcome };
-      })
+      .fromEvent(registered.events.settled, (payload) => payload)
       .readFrom(registered.queries.state, {
         observe: (state, ref) => {
           if (state === null || state.kind === "pending") {

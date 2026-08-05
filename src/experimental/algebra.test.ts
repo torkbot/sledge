@@ -210,12 +210,9 @@ for (const adapter of adapters) {
 
       assert.deepEqual(restartedAll, {
         kind: "settled",
-        result: {
+        settlement: {
+          ref: restartAllRef,
           outcome: "cancelled",
-          members: {
-            alpha: { ref: alphaOneRef, outcome: "succeeded" },
-            beta: { ref: betaOneRef, outcome: "cancelled" },
-          },
         },
       });
       await drainWorkers(runtime, workers);
@@ -240,10 +237,13 @@ for (const adapter of adapters) {
 
       assert.deepEqual(historicalRace, {
         kind: "settled",
-        result: {
-          winner: "alpha",
-          ref: alphaOneRef,
+        settlement: {
+          ref: historicalRaceRef,
           outcome: "succeeded",
+          value: {
+            winner: "alpha",
+            ref: alphaOneRef,
+          },
         },
       });
       assert.equal(
@@ -269,12 +269,9 @@ for (const adapter of adapters) {
 
       assert.deepEqual(nestedAll, {
         kind: "settled",
-        result: {
+        settlement: {
+          ref: nestedAllRef,
           outcome: "cancelled",
-          members: {
-            previous: { ref: restartAllRef, outcome: "cancelled" },
-            alpha: { ref: alphaOneRef, outcome: "succeeded" },
-          },
         },
       });
 
@@ -350,16 +347,22 @@ for (const adapter of adapters) {
         ),
         {
           kind: "settled",
-          result: alphaWon
+          settlement: alphaWon
             ? {
-                winner: "alpha",
-                ref: concurrentAlphaRef,
+                ref: concurrentRaceRef,
                 outcome: "succeeded",
+                value: {
+                  winner: "alpha",
+                  ref: concurrentAlphaRef,
+                },
               }
             : {
-                winner: "beta",
-                ref: concurrentBetaRef,
+                ref: concurrentRaceRef,
                 outcome: "failed",
+                error: {
+                  winner: "beta",
+                  ref: concurrentBetaRef,
+                },
               },
         },
       );
@@ -384,7 +387,7 @@ for (const adapter of adapters) {
       );
 
       assert.equal(
-        mixedAll?.kind === "settled" ? mixedAll.result.outcome : null,
+        mixedAll?.kind === "settled" ? mixedAll.settlement.outcome : null,
         "failed",
       );
 

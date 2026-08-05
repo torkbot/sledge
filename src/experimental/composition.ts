@@ -11,29 +11,15 @@ import {
   AnyResultRefSchema,
   defineResult,
   ResultOutcomeSchema,
+  Settlement,
   type ResultObservation,
   type ResultOutcome,
+  type ResultPortShape,
   type ResultRef,
   type ResultSource,
 } from "../stdlib.ts";
 
 type CompositionMode = "all" | "race";
-
-type ResultPortShape = {
-  readonly moduleId: string;
-  readonly resultSchema: TSchema;
-  readonly failureSchema: TSchema;
-  readonly refSchema: TSchema;
-  readonly source: {
-    readonly event: EventToken<string, string, TSchema, null>;
-    observe(payload: unknown): ResultObservation;
-  };
-  readonly reader: {
-    readonly query: QueryToken<string, string, TSchema, TSchema>;
-    params(ref: string): unknown;
-    observe(result: unknown, ref: string): ResultObservation | null;
-  };
-};
 
 type RuntimeResultPort = {
   readonly moduleId: string;
@@ -60,14 +46,12 @@ export type SettledMember<
 };
 
 export type AllResult<TRef extends ResultRef<unknown> = ResultRef<unknown>> = {
-  readonly outcome: ResultOutcome;
   readonly members: Readonly<Record<string, SettledMember<TRef>>>;
 };
 
 export type RaceResult<TRef extends ResultRef<unknown> = ResultRef<unknown>> = {
   readonly winner: string;
   readonly ref: TRef;
-  readonly outcome: ResultOutcome;
 };
 
 type SourceBinding = {
@@ -158,7 +142,6 @@ function defineComposition<
     });
     const AllResultSchema = Type.Unsafe<AllResult<MemberRef>>(
       Type.Object({
-        outcome: ResultOutcomeSchema,
         members: Type.Record(MemberKeySchema, SettledMemberSchema, {
           additionalProperties: false,
           minProperties: 1,
@@ -169,7 +152,6 @@ function defineComposition<
       Type.Object({
         winner: Type.String({ minLength: 1 }),
         ref: MemberRefSchema,
-        outcome: ResultOutcomeSchema,
       }),
     );
     type ResultValue = TMode extends "all"
@@ -190,10 +172,7 @@ function defineComposition<
       ref: result.refSchema,
       members: MembersSchema,
     });
-    const SettledSchema = Type.Object({
-      ref: result.refSchema,
-      result: ResultSchema,
-    });
+    const SettledSchema = result.observationSchema;
     const SettlementRecordSchema = Type.Object({
       ref: AnyResultRefSchema,
       outcome: ResultOutcomeSchema,
@@ -208,7 +187,7 @@ function defineComposition<
       }),
       Type.Object({
         kind: Type.Literal("settled"),
-        result: ResultSchema,
+        settlement: SettledSchema,
       }),
     ]);
     const GroupsForMemberParamsSchema = Type.Object({
@@ -493,7 +472,7 @@ function defineComposition<
               );
             }
 
-            return { kind: "settled", result: settlement.payload.result };
+            return { kind: "settled", settlement: settlement.payload };
           }
 
           const members = await db
@@ -577,14 +556,20 @@ function defineComposition<
             return;
           }
 
-          const resultValue = Value.Decode(
-            ResultSchema,
-            mode === "all" ? allResult(settled) : raceResult(settled),
-          );
+          const candidate =
+            mode === "all" ? settleAll(settled) : settleRace(settled);
+          const settlement: Settlement<ResultValue, ResultValue> =
+            candidate.outcome === "succeeded"
+              ? Settlement.succeeded(
+                  Value.Decode(ResultSchema, candidate.value),
+                )
+              : candidate.outcome === "failed"
+                ? Settlement.failed(Value.Decode(ResultSchema, candidate.error))
+                : Settlement.cancelled();
 
           actions.emit(
             "settled",
-            { ref: work.payload.ref, result: resultValue },
+            observeSettlement(work.payload.ref, settlement),
             { dedupeKey: `composition:${work.payload.ref}:settled` },
           );
         },
@@ -592,54 +577,14 @@ function defineComposition<
     } satisfies Registration;
     const registered = linked.register(registration);
     const resultPort = result
-      .fromEvent(registered.events.settled, (payload) => {
-        if (payload.result.outcome === "succeeded") {
-          return {
-            ref: payload.ref,
-            outcome: payload.result.outcome,
-            value: payload.result,
-          };
-        }
-
-        if (payload.result.outcome === "failed") {
-          return {
-            ref: payload.ref,
-            outcome: payload.result.outcome,
-            error: payload.result,
-          };
-        }
-
-        return {
-          ref: payload.ref,
-          outcome: payload.result.outcome,
-        };
-      })
+      .fromEvent(registered.events.settled, (payload) => payload)
       .readFrom(registered.queries.state, {
         observe: (state, ref) => {
           if (state === null || state.kind === "pending") {
             return null;
           }
 
-          if (state.result.outcome === "succeeded") {
-            return {
-              ref,
-              outcome: state.result.outcome,
-              value: state.result,
-            };
-          }
-
-          if (state.result.outcome === "failed") {
-            return {
-              ref,
-              outcome: state.result.outcome,
-              error: state.result,
-            };
-          }
-
-          return {
-            ref,
-            outcome: state.result.outcome,
-          };
+          return state.settlement;
         },
       });
 
@@ -665,16 +610,11 @@ function assertUniqueMemberRefs(
   }
 }
 
-function allResult(settled: readonly SettledObservation[]): AllResult {
+function settleAll(
+  settled: readonly SettledObservation[],
+): Settlement<AllResult, AllResult> {
   const outcomes = settled.map(({ status }) => status.outcome);
-  const outcome = outcomes.includes("failed")
-    ? "failed"
-    : outcomes.includes("cancelled")
-      ? "cancelled"
-      : "succeeded";
-
-  return {
-    outcome,
+  const result = {
     members: Object.fromEntries(
       settled.map(({ member, status }) => [
         member.key,
@@ -682,9 +622,21 @@ function allResult(settled: readonly SettledObservation[]): AllResult {
       ]),
     ),
   };
+
+  if (outcomes.includes("failed")) {
+    return Settlement.failed(result);
+  }
+
+  if (outcomes.includes("cancelled")) {
+    return Settlement.cancelled();
+  }
+
+  return Settlement.succeeded(result);
 }
 
-function raceResult(settled: readonly SettledObservation[]): RaceResult {
+function settleRace(
+  settled: readonly SettledObservation[],
+): Settlement<RaceResult, RaceResult> {
   const winner = settled.toSorted(
     (left, right) => left.status.eventId - right.status.eventId,
   )[0];
@@ -693,9 +645,33 @@ function raceResult(settled: readonly SettledObservation[]): RaceResult {
     throw new Error("race result requires one terminal observation");
   }
 
-  return {
+  const result = {
     winner: winner.member.key,
     ref: winner.member.ref,
-    outcome: winner.status.outcome,
   };
+
+  if (winner.status.outcome === "succeeded") {
+    return Settlement.succeeded(result);
+  }
+
+  if (winner.status.outcome === "failed") {
+    return Settlement.failed(result);
+  }
+
+  return Settlement.cancelled();
+}
+
+function observeSettlement<TResult, TFailure, TModuleId extends string>(
+  ref: ResultRef<TResult, TModuleId>,
+  settlement: Settlement<TResult, TFailure>,
+): ResultObservation<TResult, TModuleId, TFailure> {
+  if (settlement.outcome === "succeeded") {
+    return { ref, outcome: settlement.outcome, value: settlement.value };
+  }
+
+  if (settlement.outcome === "failed") {
+    return { ref, outcome: settlement.outcome, error: settlement.error };
+  }
+
+  return { ref, outcome: settlement.outcome };
 }
