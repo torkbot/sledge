@@ -316,6 +316,70 @@ for (const adapter of adapters) {
       42,
     );
   });
+
+  test(`${adapter.name} invalid mapped output retries without failing the worker`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-invalid-operator-output-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(30_000);
+    const attempts: number[] = [];
+    const mapExternalValue = new MapAsync("map-external-value", {
+      input: Type.String(),
+      output: Type.String(),
+      map: (_input, context) => {
+        attempts.push(context.attempt);
+
+        // Simulate an untrusted integration returning a value that disagrees
+        // with its declared TypeBox output contract.
+        const externalValue: unknown = context.attempt === 1 ? 42 : "valid";
+        return externalValue as string;
+      },
+    });
+    const defineFlow = defineModule(
+      "experimental.contract.invalid-operator-output",
+      (module) => {
+        const requested = module.event("requested", Type.String());
+        const mapped = module.bind(
+          "map-external-value",
+          requested,
+          mapExternalValue,
+        );
+        const declaration = module.declare({ events: {} });
+        const registered = module.link(declaration, null).register({});
+
+        return module.expose(registered, { requested, mapped });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "invalid-output.sqlite")),
+      runtime,
+    );
+    await opened.ledger.emit(opened.capabilities.flow.requested, "input");
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+      defaultRetryDelayMs: 1,
+    });
+
+    for (let step = 0; step < 20 && attempts.length === 0; step += 1) {
+      await runtime.advanceByMs(1);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    assert.deepEqual(attempts, [1]);
+    await driveUntilIdle(runtime, workers);
+
+    assert.deepEqual(attempts, [1, 2]);
+    const events = await readEvents(opened.ledger, 2);
+    assert.equal(
+      events.find((entry) => entry.event === opened.capabilities.flow.mapped)
+        ?.payload,
+      "valid",
+    );
+  });
 }
 
 test("operator graph rejects ambiguous ownership before opening storage", () => {

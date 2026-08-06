@@ -1,4 +1,5 @@
 import { type Static, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 
 import type { EventToken } from "./ledger.ts";
 
@@ -400,7 +401,11 @@ export function createOperatorBindingCompiler(moduleId: string): {
                 context,
               );
               input.lease.signal.throwIfAborted();
-              input.actions.emit(binding.output.localName, output);
+              Value.Assert(binding.operator.output, output);
+              input.actions.emit(
+                binding.output.localName,
+                Value.Decode(binding.operator.output, output),
+              );
             } else {
               await binding.operator.run(input.work.payload, context);
               input.lease.signal.throwIfAborted();
