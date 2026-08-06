@@ -378,7 +378,11 @@ export function createOperatorBindingCompiler(moduleId: string): {
                 binding.bindingId,
                 input.event.payload,
                 {
-                  workKey: `${moduleId}:${binding.bindingId}:${input.event.eventId}`,
+                  workKey: createOperatorAttemptKey(
+                    moduleId,
+                    binding.bindingId,
+                    input.event.eventId,
+                  ),
                 },
               );
             }),
@@ -389,7 +393,11 @@ export function createOperatorBindingCompiler(moduleId: string): {
       for (const binding of bindings) {
         queues[binding.bindingId] = async (input) => {
           const context: AsyncOperatorContext = {
-            key: `${moduleId}:${binding.bindingId}:${input.work.sourceEventId}`,
+            key: createOperatorAttemptKey(
+              moduleId,
+              binding.bindingId,
+              input.work.sourceEventId,
+            ),
             attempt: input.work.attempt,
             signal: input.lease.signal,
           };
@@ -424,6 +432,14 @@ export function createOperatorBindingCompiler(moduleId: string): {
     reveal: (value, events, preserve) =>
       ports.size === 0 ? value : mapRevealed(value, events, preserve).value,
   };
+}
+
+function createOperatorAttemptKey(
+  moduleId: string,
+  bindingId: string,
+  sourceEventId: number,
+): string {
+  return JSON.stringify([moduleId, bindingId, sourceEventId]);
 }
 
 function readPort<TSchemaValue extends TSchema>(

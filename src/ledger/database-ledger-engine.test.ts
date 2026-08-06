@@ -4416,6 +4416,59 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   assert.deepEqual(await ledger.listWork(), []);
 });
 
+test("workers make persisted work for a removed queue terminal", async () => {
+  const runtime = new VirtualRuntimeHarness(1_910_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const Event = Type.Object({ id: Type.Number() });
+  const original = defineEngineFixtureModel({
+    events: { "job.requested": Event },
+    queues: { "job.removed": Event },
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue("job.removed", event.payload);
+        },
+      },
+    },
+  });
+
+  {
+    await using ledger = createBetterSqliteLedger({
+      databaseUrl,
+      model: original.withImplementations({ indexers: {}, queries: {} }),
+      timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+    });
+    await ledger.emit("job.requested", { id: 1 });
+  }
+
+  const current = defineEngineFixtureModel({
+    events: { "job.requested": Event },
+    queues: {},
+    register: {},
+  });
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: current.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+  });
+  await using workers = await ledger.startWorkers({
+    configureQueue: () => {
+      assert.fail("removed queues are not configurable");
+    },
+    scheduler: runtime.scheduler,
+  });
+
+  await waitFor(runtime, async () => {
+    return (await ledger.listWork({ states: ["dead"] })).length === 1;
+  });
+  await workers.waitForIdle({ signal: new AbortController().signal });
+
+  assert.match(
+    (await ledger.listWork({ states: ["dead"] }))[0]?.lastError ?? "",
+    /no handler for queue job\.removed/,
+  );
+});
+
 test("listWork applies state filters before limit", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();

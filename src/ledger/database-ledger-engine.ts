@@ -3491,21 +3491,36 @@ function openDatabaseLedgerEngine<
   }
 
   function createCandidateQueuePredicate(
-    queues: readonly WorkerQueueRuntime[],
+    queuesWithCapacity: readonly WorkerQueueRuntime[],
+    knownQueues: readonly WorkerQueueRuntime[],
   ): {
     readonly sql: string;
     readonly params: readonly (number | string)[];
   } {
-    if (queues.length === 0) {
-      return { sql: "0 = 1", params: [] };
-    }
-
     const clauses: string[] = [];
     const params: (number | string)[] = [];
 
-    for (const queue of queues) {
+    for (const queue of queuesWithCapacity) {
       clauses.push("(candidate.signal = ? AND candidate.queue_name = ?)");
       params.push(queue.signal ? 1 : 0, queue.queueName);
+    }
+
+    if (knownQueues.length === 0) {
+      clauses.push("1 = 1");
+    } else {
+      const knownClauses: string[] = [];
+
+      for (const queue of knownQueues) {
+        knownClauses.push(
+          "(candidate.signal = ? AND candidate.queue_name = ?)",
+        );
+        params.push(queue.signal ? 1 : 0, queue.queueName);
+      }
+
+      // Persisted work may outlive a removed queue contract. It must remain
+      // claimable so the no-handler path can make it terminal instead of
+      // leaving waitForIdle() blocked forever.
+      clauses.push(`NOT (${knownClauses.join(" OR ")})`);
     }
 
     return {
@@ -3519,6 +3534,7 @@ function openDatabaseLedgerEngine<
   ): Promise<void> {
     const queuePredicate = createCandidateQueuePredicate(
       readWorkerQueuesWithCapacity(worker),
+      worker.queues,
     );
     const row = await storage.read(async (database) => {
       return await database
@@ -3951,11 +3967,8 @@ function openDatabaseLedgerEngine<
   ): Promise<PersistedWorkLease | null> {
     const queuePredicate = createCandidateQueuePredicate(
       readWorkerQueuesWithCapacity(worker),
+      worker.queues,
     );
-
-    if (queuePredicate.params.length === 0) {
-      return null;
-    }
 
     return await runInTransaction(async (database) => {
       const nowMs = clock.nowMs();
@@ -5504,10 +5517,11 @@ function openDatabaseLedgerEngine<
         );
       }
 
+      const dispatchCapacity = Math.max(1, combinedQueueMaxInFlight);
       const maxInFlight =
         options.maxInFlight === undefined
-          ? combinedQueueMaxInFlight
-          : Math.min(options.maxInFlight, combinedQueueMaxInFlight);
+          ? dispatchCapacity
+          : Math.min(options.maxInFlight, dispatchCapacity);
 
       if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
         throw new Error(

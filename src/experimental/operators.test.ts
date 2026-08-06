@@ -221,10 +221,17 @@ for (const adapter of adapters) {
     );
     assert.equal(effectKeys.length, 2);
     assert.equal(effectKeys[0], effectKeys[1]);
-    assert.match(
-      effectKeys[0] ?? "",
-      /^experimental\.contract\.operator-bindings:observe_b:\d+$/,
-    );
+    const AttemptKey = Type.Tuple([
+      Type.String(),
+      Type.String(),
+      Type.Integer(),
+    ]);
+    const parsedAttemptKey: unknown = JSON.parse(effectKeys[0] ?? "");
+    Value.Assert(AttemptKey, parsedAttemptKey);
+    assert.deepEqual(Value.Decode(AttemptKey, parsedAttemptKey).slice(0, 2), [
+      "experimental.contract.operator-bindings",
+      "observe_b",
+    ]);
 
     const events = await readEvents(reopened.ledger, 6);
     assert.deepEqual(
@@ -257,10 +264,14 @@ for (const adapter of adapters) {
       join(tmpdir(), `sledge-imported-operators-${adapter.name}-`),
     );
     const runtime = new VirtualRuntimeHarness(20_000);
+    const keys: string[] = [];
     const double = new MapAsync("double", {
       input: Type.Integer(),
       output: Type.Integer(),
-      map: (input) => input * 2,
+      map: (input, context) => {
+        keys.push(context.key);
+        return input * 2;
+      },
     });
     const defineSource = defineModule(
       "experimental.contract.operator-source",
@@ -277,24 +288,34 @@ for (const adapter of adapters) {
     );
     const application = defineLedger((sledge) => {
       const source = sledge.install(defineSource());
-      const flow = sledge.install(
-        defineModule(
-          "experimental.contract.imported-operator-graph",
-          (module) => {
-            const doubled = module.bind(
-              "double_requested",
-              module.import(source.requested),
-              double,
-            );
-            const declaration = module.declare({ events: {} });
-            const registered = module.link(declaration, null).register({});
+      const firstFlow = sledge.install(
+        defineModule("a:b", (module) => {
+          const doubled = module.bind(
+            "c",
+            module.import(source.requested),
+            double,
+          );
+          const declaration = module.declare({ events: {} });
+          const registered = module.link(declaration, null).register({});
 
-            return module.expose(registered, { doubled });
-          },
-        )(),
+          return module.expose(registered, { doubled });
+        })(),
+      );
+      const secondFlow = sledge.install(
+        defineModule("a", (module) => {
+          const doubled = module.bind(
+            "b:c",
+            module.import(source.requested),
+            double,
+          );
+          const declaration = module.declare({ events: {} });
+          const registered = module.link(declaration, null).register({});
+
+          return module.expose(registered, { doubled });
+        })(),
       );
 
-      return { source, flow };
+      return { source, firstFlow, secondFlow };
     });
     await using opened = await application.open(
       adapter.createDriver(join(directory.path, "imported.sqlite")),
@@ -309,12 +330,18 @@ for (const adapter of adapters) {
     await opened.ledger.emit(opened.capabilities.source.requested, 21);
     await driveUntilIdle(runtime, workers);
 
-    const events = await readEvents(opened.ledger, 2);
-    assert.equal(
-      events.find((entry) => entry.event === opened.capabilities.flow.doubled)
-        ?.payload,
-      42,
+    const events = await readEvents(opened.ledger, 3);
+    assert.deepEqual(
+      events
+        .filter(
+          (entry) =>
+            entry.event === opened.capabilities.firstFlow.doubled ||
+            entry.event === opened.capabilities.secondFlow.doubled,
+        )
+        .map((entry) => entry.payload),
+      [42, 42],
     );
+    assert.equal(new Set(keys).size, 2);
   });
 
   test(`${adapter.name} invalid mapped output retries without failing the worker`, async () => {
