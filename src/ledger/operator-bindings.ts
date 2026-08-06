@@ -345,15 +345,15 @@ export function createOperatorBindingCompiler(moduleId: string): {
             );
           }
 
-          events[localName] = port.definition;
+          setOwn(events, localName, port.definition);
         } else {
-          events[localName] = definition;
+          setOwn(events, localName, definition);
         }
       }
 
       for (const port of ports.values()) {
         if (!Object.hasOwn(events, port.localName)) {
-          events[port.localName] = port.definition;
+          setOwn(events, port.localName, port.definition);
         }
       }
 
@@ -362,7 +362,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
           throw new Error(`duplicate ledger queue ${binding.bindingId}`);
         }
 
-        queues[binding.bindingId] = binding.operator.input;
+        setOwn(queues, binding.bindingId, binding.operator.input);
       }
 
       return { events, queues };
@@ -377,8 +377,10 @@ export function createOperatorBindingCompiler(moduleId: string): {
       const queues = { ...existing.queues };
 
       for (const [sourceName, downstream] of downstreamBySource) {
-        const existingHandler = events[sourceName];
-        events[sourceName] = async (input) => {
+        const existingHandler = Object.hasOwn(events, sourceName)
+          ? events[sourceName]
+          : undefined;
+        setOwn(events, sourceName, async (input: EventHandlerInput) => {
           await existingHandler?.(input);
           await Promise.all(
             downstream.map(async (binding) => {
@@ -395,11 +397,11 @@ export function createOperatorBindingCompiler(moduleId: string): {
               );
             }),
           );
-        };
+        });
       }
 
       for (const binding of bindings) {
-        queues[binding.bindingId] = async (input) => {
+        setOwn(queues, binding.bindingId, async (input: QueueHandlerInput) => {
           const context: AsyncOperatorContext = {
             key: createOperatorAttemptKey(
               moduleId,
@@ -432,7 +434,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
               { cause },
             );
           }
-        };
+        });
       }
 
       return { ...existing, events, queues } as TRegistration;
@@ -542,11 +544,7 @@ function mapRevealed(
     return result;
   }
 
-  const prototype = Object.getPrototypeOf(value) as unknown;
-
-  if (prototype !== Object.prototype && prototype !== null) {
-    return { value, changed: false };
-  }
+  const prototype = Object.getPrototypeOf(value) as object | null;
 
   const clone = Object.create(prototype) as object;
   const result: MutableRevealResult = {
@@ -574,6 +572,19 @@ function mapRevealed(
 
   Object.freeze(clone);
   return result;
+}
+
+function setOwn<TValue>(
+  target: Record<string, TValue>,
+  key: string,
+  value: TValue,
+): void {
+  Object.defineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
 }
 
 type MutableRevealResult = {

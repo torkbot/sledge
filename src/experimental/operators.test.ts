@@ -559,7 +559,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     "experimental.contract.inherited-binding-name",
     (module) => {
       const input = module.event("toString", Type.String());
-      module.bind("constructor", input, identity);
+      module.bind("__proto__", input, identity);
       const declaration = module.declare({ events: { toString: input } });
       const registered = module.link(declaration, null).register({});
 
@@ -568,6 +568,30 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
   );
 
   assert.doesNotThrow(() => inheritedNameModule());
+
+  class ClassCapabilities {
+    readonly input: EventPort<ReturnType<typeof Type.String>>;
+
+    constructor(input: EventPort<ReturnType<typeof Type.String>>) {
+      this.input = input;
+    }
+  }
+
+  let classPort!: EventPort<ReturnType<typeof Type.String>>;
+  const classModule = defineModule(
+    "experimental.contract.class-capability",
+    (module) => {
+      classPort = module.event("input", Type.String());
+      const declaration = module.declare({ events: { input: classPort } });
+      const registered = module.link(declaration, null).register({});
+
+      return module.expose(registered, new ClassCapabilities(classPort));
+    },
+  )();
+  const classEvent: EventToken = classModule.capabilities.input;
+
+  assert(classModule.capabilities instanceof ClassCapabilities);
+  assert.notEqual(classEvent, classPort);
 
   const cyclicModule = defineModule(
     "experimental.contract.cyclic-capability",
