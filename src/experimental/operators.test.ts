@@ -518,12 +518,49 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
 
   assert(arrayEvent);
 
+  interface InterfaceCapabilities {
+    readonly input: EventPort<ReturnType<typeof Type.String>>;
+  }
+
+  const interfaceModule = defineModule(
+    "experimental.contract.interface-capability",
+    (module) => {
+      const input = module.event("input", Type.String());
+      const declaration = module.declare({ events: { input } });
+      const registered = module.link(declaration, null).register({});
+      const capabilities: InterfaceCapabilities = { input };
+
+      return module.expose(registered, capabilities);
+    },
+  )();
+  const interfaceEvent: EventToken = interfaceModule.capabilities.input;
+
+  assert(interfaceEvent);
+
+  let accessorPort!: EventPort<ReturnType<typeof Type.String>>;
+  const accessorModule = defineModule(
+    "experimental.contract.accessor-capability",
+    (module) => {
+      accessorPort = module.event("input", Type.String());
+      const declaration = module.declare({ events: { input: accessorPort } });
+      const registered = module.link(declaration, null).register({});
+
+      return module.expose(registered, {
+        get input() {
+          return accessorPort;
+        },
+      });
+    },
+  )();
+
+  assert.notEqual(accessorModule.capabilities.input, accessorPort);
+
   const inheritedNameModule = defineModule(
     "experimental.contract.inherited-binding-name",
     (module) => {
-      const input = module.event("input", Type.String());
-      module.bind("toString", input, identity);
-      const declaration = module.declare({ events: { input } });
+      const input = module.event("toString", Type.String());
+      module.bind("constructor", input, identity);
+      const declaration = module.declare({ events: { toString: input } });
       const registered = module.link(declaration, null).register({});
 
       return module.expose(registered, {});

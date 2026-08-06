@@ -85,13 +85,15 @@ export type RevealedModuleCapabilities<TValue> =
             TValue[TKey]
           >;
         }
-      : TValue extends Readonly<Record<string, unknown>>
-        ? {
-            readonly [TKey in keyof TValue]: RevealedModuleCapabilities<
-              TValue[TKey]
-            >;
-          }
-        : TValue;
+      : TValue extends (...args: never[]) => unknown
+        ? TValue
+        : TValue extends object
+          ? {
+              readonly [TKey in keyof TValue]: RevealedModuleCapabilities<
+                TValue[TKey]
+              >;
+            }
+          : TValue;
 
 export type SchemaOfEvent<TEvent extends EventToken> =
   TEvent extends EventToken<string, string, infer TSchemaValue, TSchema | null>
@@ -350,7 +352,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
       }
 
       for (const port of ports.values()) {
-        if (events[port.localName] === undefined) {
+        if (!Object.hasOwn(events, port.localName)) {
           events[port.localName] = port.definition;
         }
       }
@@ -603,20 +605,22 @@ function copyRevealedProperties(
       throw new Error("ledger module capability property disappeared");
     }
 
-    if (!("value" in descriptor)) {
-      Object.defineProperty(target, key, descriptor);
-      continue;
-    }
-
+    const propertyValue =
+      "value" in descriptor ? properties[key] : descriptor.get?.call(source);
     const mapped = mapRevealed(
-      properties[key],
+      propertyValue,
       events,
       preserve,
       ownedPorts,
       mappedObjects,
     );
     result.changed ||= mapped.changed;
-    Object.defineProperty(target, key, { ...descriptor, value: mapped.value });
+    Object.defineProperty(target, key, {
+      configurable: descriptor.configurable,
+      enumerable: descriptor.enumerable,
+      value: mapped.value,
+      writable: "value" in descriptor && descriptor.writable,
+    });
   }
 }
 
