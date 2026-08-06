@@ -71,7 +71,7 @@ if (false) {
       "contract.composed",
       (module, sourceToCompose: typeof source) => {
         const declaration = module.declare({ events: {} });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
 
         return module.expose(registered, { source: sourceToCompose });
       },
@@ -90,7 +90,7 @@ if (false) {
         query: typeof foreign.capabilities.queries.configuredModuleIds,
       ) => {
         const declaration = module.declare({ events: {} });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
 
         return module.expose(registered, { query });
       },
@@ -341,7 +341,6 @@ test("a Sledge application rejects hand-assembled module contributions", async (
       contribution: object,
     ) => object;
     unsafeInstall({
-      module: source.module,
       capabilities: source.capabilities,
     });
 
@@ -364,8 +363,8 @@ test("a failed module factory does not authenticate its leaked contribution", as
     "contract.failed-contribution",
     (module) => {
       const declaration = module.declare({ events: {} });
-      const registered = module.link(declaration, null).register({});
-      leaked = module.expose(registered, {});
+      const implemented = module.link(declaration, null, {});
+      leaked = module.expose(implemented, {});
 
       throw new Error("failure after reveal");
     },
@@ -517,7 +516,7 @@ const defineSourceModule = defineModule(
         created: Type.Object({ id: Type.String({ minLength: 1 }) }),
       },
     });
-    const registered = module.link(declaration, null).register({});
+    const registered = module.link(declaration, null, {});
 
     return module.expose(registered, {
       events: registered.events,
@@ -564,7 +563,7 @@ const defineRegistryModuleFactory = defineModule(
           },
         },
       });
-    const registered = module.link(declaration, materialization).register({
+    const registered = module.link(declaration, materialization, {
       events: {
         configured: async ({ event, actions }) => {
           await actions.index("storeConfiguration", event.payload);
@@ -623,7 +622,7 @@ const defineDiscoveredModule = defineModule("contract.discovered", (module) => {
         },
       },
     });
-  const registered = module.link(declaration, materialization).register({
+  const registered = module.link(declaration, materialization, {
     queries: {
       status: () => "ready" as const,
     },
@@ -655,7 +654,7 @@ const defineUnexpectedModule = defineModule("contract.unexpected", (module) => {
         },
       },
     });
-  const registered = module.link(declaration, materialization).register({
+  const registered = module.link(declaration, materialization, {
     queries: { status: () => "unexpected" as const },
   });
 
@@ -683,7 +682,7 @@ const defineQueryModule = defineModule(
           },
         },
       });
-    const registered = module.link(declaration, materialization).register({
+    const registered = module.link(declaration, materialization, {
       queries: { status: run },
     });
 

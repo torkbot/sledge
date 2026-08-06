@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Hide the implemented ledger module carried by `LedgerModuleContribution`.
+  Contributions now expose only their bounded capabilities while Sledge keeps
+  installation provenance and the implemented module in a library-owned
+  carrier with a private field.
 - Breaking: replace default global worker concurrency with required per-queue
   `configureQueue({ moduleId, name, kind })`. Each queue receives its own
   positive `maxInFlight`; saturated queues are excluded from claim selection.
@@ -9,14 +13,17 @@
   Workers never claim queues absent from their model, and `waitForIdle(...)`
   measures only queues known to that worker version so rolling deployments
   preserve newer durable work.
-- Add `module.link(declaration, materializations)` to the scoped module
-  definition port. Canonical module factories no longer import their linking
-  phase from `@torkbot/sledge/ledger`, and linking rejects declarations not
-  minted by that exact factory invocation even when the durable module id
-  matches. Private provenance follows successful links into registration, so
-  exposure also rejects registered modules that bypassed the scoped phase.
-  Remove the standalone declaration, linking, and registered-module
-  construction interface from the public `@torkbot/sledge/ledger` export.
+- Add `module.link(declaration, materializations, registration)` to the scoped
+  module definition port. Linking installs the storage contract and its
+  implementations atomically instead of returning an intermediate value whose
+  only purpose is a subsequent `register(...)` call. Canonical module factories
+  no longer import their linking phase from `@torkbot/sledge/ledger`, and
+  linking rejects declarations not minted by that exact factory invocation
+  even when the durable module id matches. Private provenance follows
+  successful links into exposure, so exposure also rejects registered modules
+  that bypassed the scoped phase. Remove the standalone declaration, linking,
+  and registered-module construction interface from the public
+  `@torkbot/sledge/ledger` export.
 - Breaking: rename the driver adapter exports to
   `@torkbot/sledge/better-sqlite3` and `@torkbot/sledge/turso`. The removed
   `-ledger` suffix implied that these adapters were alternate ledger models

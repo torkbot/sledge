@@ -16,12 +16,13 @@ import type { LedgerImplementations } from "./internal-storage.ts";
 import {
   attachLedgerImplementationFactory,
   attachLedgerModuleConstructionScope,
-  attachLedgerModuleContribution,
   attachLedgerModuleComposer,
   attachLedgerModuleOwner,
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
   composedLedgerModulesBrand,
+  completeLedgerModuleContribution,
+  createLedgerModuleContribution,
   belongsToLedgerModuleConstructionScope,
   inheritLedgerModuleConstructionScope,
   isRegisteredLedgerModule,
@@ -2192,16 +2193,12 @@ export type DeclaredLedgerModule<
 };
 
 /**
- * A registered module and the bounded capabilities its definition reveals.
- * Contributions can only be created by the scoped owner passed to
- * `defineModule(...)`.
+ * The bounded capabilities a module definition reveals for installation.
+ * The implemented ledger module is private construction state carried by
+ * Sledge rather than part of this interface.
  */
-export type LedgerModuleContribution<
-  TCapabilities extends object,
-  TModule extends AnyRegisteredLedgerModule = AnyRegisteredLedgerModule,
-> = {
+export type LedgerModuleContribution<TCapabilities extends object> = {
   readonly [ledgerModuleContributionTypeBrand]: true;
-  readonly module: TModule;
   readonly capabilities: TCapabilities;
 };
 
@@ -2252,9 +2249,8 @@ export interface LedgerModuleDefinition<TModuleId extends string>
   >;
 
   /**
-   * Adds the storage contract to a declaration owned by this exact factory
-   * invocation. The returned linked value gains registration capability while
-   * the declaration remains inert.
+   * Adds the storage contract and implementations to a declaration owned by
+   * this exact factory invocation. The declaration remains inert.
    */
   link<
     const TEvents extends Record<string, TSchema>,
@@ -2279,14 +2275,27 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       TEventTokens
     >,
     materializations: TMaterializations,
-  ): LinkedLedgerModuleFor<
-    TEvents,
-    TQueues,
-    TSignals,
-    TSignalQueues,
-    TModuleId,
-    TEventTokens,
-    TMaterializations
+    registration: Parameters<
+      LinkedLedgerModuleFor<
+        TEvents,
+        TQueues,
+        TSignals,
+        TSignalQueues,
+        TModuleId,
+        TEventTokens,
+        TMaterializations
+      >["register"]
+    >[0],
+  ): ReturnType<
+    LinkedLedgerModuleFor<
+      TEvents,
+      TQueues,
+      TSignals,
+      TSignalQueues,
+      TModuleId,
+      TEventTokens,
+      TMaterializations
+    >["register"]
   >;
 
   expose<
@@ -2297,10 +2306,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
   >(
     module: TModule,
     capabilities: TCapabilities,
-  ): LedgerModuleContribution<
-    RevealedModuleCapabilities<TCapabilities>,
-    TModule
-  >;
+  ): LedgerModuleContribution<RevealedModuleCapabilities<TCapabilities>>;
 }
 
 /**
@@ -2450,21 +2456,19 @@ export function defineModule<
   const TModuleId extends string,
   const TArguments extends readonly unknown[],
   const TCapabilities extends object,
-  const TModule extends AnyRegisteredLedgerModule & {
-    readonly moduleId: TModuleId;
-  },
 >(
   moduleId: TModuleId,
   define: (
     module: LedgerModuleDefinition<TModuleId>,
     ...args: TArguments
-  ) => LedgerModuleContribution<TCapabilities, TModule>,
-): (...args: TArguments) => LedgerModuleContribution<TCapabilities, TModule> {
+  ) => LedgerModuleContribution<TCapabilities>,
+): (...args: TArguments) => LedgerModuleContribution<TCapabilities> {
   validateLedgerModuleId(moduleId);
 
   const factory = (...args: TArguments) => {
     let definitionOpen = true;
     let revealed: object | undefined;
+    let revealedModule: AnyRegisteredLedgerModule | undefined;
     const ownedDeclarations = new WeakSet<object>();
     const constructionScope = Object.freeze({});
     const operatorBindings = createOperatorBindingCompiler(moduleId);
@@ -2535,10 +2539,11 @@ export function defineModule<
       ownedDeclarations.add(declaration);
       return declaration;
     };
-    const link: LedgerModuleDefinition<TModuleId>["link"] = (
-      declaration,
-      materializations,
+    const link = ((
+      ...args: Parameters<LedgerModuleDefinition<TModuleId>["link"]>
     ) => {
+      const [declaration, materializations, registration] = args;
+
       assertDefinitionOpen();
 
       if (!ownedDeclarations.has(declaration)) {
@@ -2551,17 +2556,16 @@ export function defineModule<
         linkLedgerModuleInternal(declaration, materializations),
         constructionScope,
       );
-      const register = ((registration: unknown) =>
+      // Parameters<T> erases the correlations within a generic call signature.
+      // The public signature restores them after this runtime ownership check
+      // and the typed low-level linker has constructed the exact result.
+      return attachLedgerModuleConstructionScope(
         linked.register(
           operatorBindings.augmentRegistration(registration) as never,
-        )) as typeof linked.register;
-      const integrated = Object.freeze({ ...linked, register });
-
-      return attachLedgerModuleConstructionScope(
-        integrated as typeof linked,
+        ),
         constructionScope,
       );
-    };
+    }) as LedgerModuleDefinition<TModuleId>["link"];
     const expose: LedgerModuleDefinition<TModuleId>["expose"] = (
       registeredModule,
       capabilities,
@@ -2596,14 +2600,9 @@ export function defineModule<
         registeredModule.events,
         isLedgerContractToken,
       ) as RevealedModuleCapabilities<typeof capabilities>;
-      const contribution = Object.freeze({
-        module: registeredModule,
-        capabilities: publicCapabilities,
-      }) as LedgerModuleContribution<
-        RevealedModuleCapabilities<typeof capabilities>,
-        typeof registeredModule
-      >;
+      const contribution = createLedgerModuleContribution(publicCapabilities);
       revealed = contribution;
+      revealedModule = registeredModule;
       definitionOpen = false;
       return contribution;
     };
@@ -2636,7 +2635,11 @@ export function defineModule<
         );
       }
 
-      return attachLedgerModuleContribution(contribution);
+      if (revealedModule === undefined) {
+        throw new Error("ledger module definition did not reveal a module");
+      }
+
+      return completeLedgerModuleContribution(contribution, revealedModule);
     } finally {
       definitionOpen = false;
     }

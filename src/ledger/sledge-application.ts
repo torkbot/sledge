@@ -16,7 +16,8 @@ import {
 } from "./database-ledger-engine.ts";
 import {
   composeRegisteredLedgerModules,
-  isLedgerModuleContribution,
+  isRegisteredLedgerModule,
+  readLedgerModuleContribution,
   readLedgerApplicationConfigure,
   storageRuntimeIdentityBrand,
 } from "./internal-storage.ts";
@@ -154,28 +155,28 @@ async function resolveLedgerApplication<
     return result;
   };
 
-  const install = <
-    TModule extends AnyRegisteredLedgerModule,
-    TCapabilities extends object,
-  >(
-    contribution: LedgerModuleContribution<TCapabilities, TModule>,
+  const install = <TCapabilities extends object>(
+    contribution: LedgerModuleContribution<TCapabilities>,
   ): TCapabilities => {
     assertAssemblyOpen();
 
-    if (!isLedgerModuleContribution(contribution)) {
+    const module = readLedgerModuleContribution(contribution);
+
+    if (module === undefined || !isRegisteredLedgerModule(module)) {
       throw new Error("invalid ledger module contribution");
     }
 
-    const moduleId = contribution.module.moduleId.toLowerCase();
+    const registeredModule = module as AnyRegisteredLedgerModule;
+    const moduleId = registeredModule.moduleId.toLowerCase();
 
     if (moduleIds.has(moduleId)) {
       throw new Error(
-        `duplicate ledger module id ${contribution.module.moduleId}`,
+        `duplicate ledger module id ${registeredModule.moduleId}`,
       );
     }
 
     moduleIds.add(moduleId);
-    modules.push(contribution.module);
+    modules.push(registeredModule);
     return contribution.capabilities;
   };
   const query = <
