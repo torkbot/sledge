@@ -3508,9 +3508,36 @@ function openDatabaseLedgerEngine<
     }
 
     return {
-      sql: clauses.length === 0 ? "0 = 1" : clauses.join(" OR "),
+      sql: combineSqlOr(clauses),
       params,
     };
+  }
+
+  function combineSqlOr(clauses: readonly string[]): string {
+    if (clauses.length === 0) {
+      return "0 = 1";
+    }
+
+    let level = [...clauses];
+
+    while (level.length > 1) {
+      const next: string[] = [];
+
+      for (let index = 0; index < level.length; index += 2) {
+        const left = level[index];
+        const right = level[index + 1];
+
+        if (left === undefined) {
+          throw new Error("queue predicate lost an expression");
+        }
+
+        next.push(right === undefined ? left : `(${left} OR ${right})`);
+      }
+
+      level = next;
+    }
+
+    return level[0] ?? "0 = 1";
   }
 
   async function scheduleNextDispatchFromStore(

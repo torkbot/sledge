@@ -2552,6 +2552,32 @@ test("a saturated queue does not block a later queue with free capacity", async 
   await waitFor(runtime, () => slowStarted.length === 2);
 });
 
+test("worker queue selection remains bounded for large composed models", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const Queue = Type.Object({ id: Type.Number() });
+  const queues = Object.fromEntries(
+    Array.from({ length: 1_100 }, (_, index) => [`queue.${index}`, Queue]),
+  );
+  const model = defineEngineFixtureModel({
+    events: {},
+    queues,
+    register: {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+  });
+  await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 1 }),
+    scheduler: runtime.scheduler,
+  });
+
+  await workers.waitForIdle({ signal: new AbortController().signal });
+});
+
 test("deduped emit does not replay projections or materialization", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databasePath = join(tmpdir(), `ledger-r1-${randomUUID()}.sqlite`);

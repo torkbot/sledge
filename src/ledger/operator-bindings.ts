@@ -440,7 +440,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
       return { ...existing, events, queues } as TRegistration;
     },
     reveal: (value, events, preserve) =>
-      mapRevealed(value, events, preserve, ports),
+      mapRevealed(value, events, preserve, ports).value,
   };
 }
 
@@ -472,9 +472,9 @@ function mapRevealed(
   events: Readonly<Record<string, EventToken>>,
   preserve: (value: object) => boolean,
   ownedPorts: ReadonlyMap<string, RuntimePort>,
-): unknown {
+): RevealResult {
   if (typeof value !== "object" || value === null) {
-    return value;
+    return { value, changed: false };
   }
 
   if (eventPortBrand in value) {
@@ -491,36 +491,59 @@ function mapRevealed(
       throw new Error(`ledger module lost operator event ${localName}`);
     }
 
-    return event;
+    return { value: event, changed: true };
   }
 
   if (preserve(value)) {
-    return value;
+    return { value, changed: false };
   }
 
   if (Array.isArray(value)) {
-    return Object.freeze(
-      value.map((entry) => mapRevealed(entry, events, preserve, ownedPorts)),
+    const entries = value.map((entry) =>
+      mapRevealed(entry, events, preserve, ownedPorts),
     );
+
+    if (!entries.some((entry) => entry.changed)) {
+      return { value, changed: false };
+    }
+
+    return {
+      value: Object.freeze(entries.map((entry) => entry.value)),
+      changed: true,
+    };
   }
 
   const prototype = Object.getPrototypeOf(value) as object | null;
 
   if (prototype !== Object.prototype && prototype !== null) {
-    return value;
+    return { value, changed: false };
+  }
+
+  const entries = Object.entries(value).map(([key, entry]) => ({
+    key,
+    mapped: mapRevealed(entry, events, preserve, ownedPorts),
+  }));
+
+  if (!entries.some((entry) => entry.mapped.changed)) {
+    return { value, changed: false };
   }
 
   const clone = {
     ...(value as Readonly<Record<PropertyKey, unknown>>),
   };
 
-  for (const [key, entry] of Object.entries(value)) {
-    setOwn(clone, key, mapRevealed(entry, events, preserve, ownedPorts));
+  for (const entry of entries) {
+    setOwn(clone, entry.key, entry.mapped.value);
   }
 
   Object.freeze(clone);
-  return clone;
+  return { value: clone, changed: true };
 }
+
+type RevealResult = {
+  readonly value: unknown;
+  readonly changed: boolean;
+};
 
 function setOwn<TValue>(
   target: Record<string, TValue>,
