@@ -528,6 +528,21 @@ for (const adapter of adapters) {
   });
 }
 
+test("MapAsync requires a bounded positive integer timeout", () => {
+  for (const timeoutMs of [0, -1, 1.5, 2_147_483_648]) {
+    assert.throws(
+      () =>
+        new MapAsync("invalid-timeout", {
+          input: Type.String(),
+          output: Type.String(),
+          timeoutMs,
+          map: (input) => input,
+        }),
+      /operator timeoutMs must be a positive integer no greater than 2,147,483,647/,
+    );
+  }
+});
+
 test("operator graph rejects ambiguous ownership before opening storage", () => {
   const identity = new MapAsync("identity", {
     input: Type.String(),
