@@ -514,7 +514,9 @@ function mapRevealed(
     return { value, changed: false };
   }
 
-  const entries = Object.entries(value).map(([key, nested]) => {
+  const properties = value as Readonly<Record<PropertyKey, unknown>>;
+  const entries = Reflect.ownKeys(value).map((key) => {
+    const nested = properties[key];
     const mapped = mapRevealed(nested, events, preserve, ownedPorts);
     return { key, ...mapped };
   });

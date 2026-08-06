@@ -485,6 +485,23 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
       })(),
     /event port does not belong to this ledger module/,
   );
+
+  const symbolCapability = Symbol("symbol capability");
+  const symbolModule = defineModule(
+    "experimental.contract.symbol-capability",
+    (module) => {
+      const input = module.event("input", Type.String());
+      const declaration = module.declare({ events: { input } });
+      const registered = module.link(declaration, null).register({});
+
+      return module.expose(registered, {
+        input,
+        [symbolCapability]: "preserved",
+      });
+    },
+  )();
+
+  assert.equal(symbolModule.capabilities[symbolCapability], "preserved");
   assert(Object.isFrozen(identity));
 });
 
