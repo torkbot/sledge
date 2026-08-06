@@ -526,6 +526,75 @@ for (const adapter of adapters) {
       );
     }
   });
+
+  test(`${adapter.name} chained values satisfy the downstream runtime schema`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-operator-chain-schema-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(50_000);
+    let downstreamCalls = 0;
+    const produceEmpty = new MapAsync("produce-empty", {
+      input: Type.String(),
+      output: Type.String(),
+      timeoutMs: 1_000,
+      map: () => "",
+    });
+    const requireContent = new MapAsync("require-content", {
+      input: Type.String({ minLength: 1 }),
+      output: Type.String(),
+      timeoutMs: 1_000,
+      map: (input) => {
+        downstreamCalls += 1;
+        return input;
+      },
+    });
+    const defineFlow = defineModule(
+      "experimental.contract.operator-chain-schema",
+      (module) => {
+        const requested = module.event("requested", Type.String());
+        const produced = module.bind("produce-empty", requested, produceEmpty);
+        const validated = module.bind(
+          "require-content",
+          produced,
+          requireContent,
+        );
+        const declaration = module.declare({ events: {} });
+        const registered = module.link(declaration, null, {});
+        return module.expose(registered, { requested, produced, validated });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "chain-schema.sqlite")),
+      runtime,
+    );
+    await opened.ledger.emit(opened.capabilities.flow.requested, "input");
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+
+    await driveUntilIdle(runtime, workers);
+
+    const events = await readEvents(opened.ledger, 3);
+    assert.equal(downstreamCalls, 0);
+    assert.deepEqual(
+      events.find((entry) => entry.event === opened.capabilities.flow.produced)
+        ?.payload,
+      { outcome: "succeeded", value: "" },
+    );
+    assert.equal(
+      Value.Decode(
+        SettlementSchema(Type.String()),
+        events.find(
+          (entry) => entry.event === opened.capabilities.flow.validated,
+        )?.payload,
+      ).outcome,
+      "failed",
+    );
+  });
 }
 
 test("MapAsync requires a bounded positive integer timeout", () => {

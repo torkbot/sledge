@@ -696,12 +696,16 @@ export function createOperatorBindingCompiler(moduleId: string): {
               return;
             }
 
-            const operatorInput =
+            const rawOperatorInput =
               sourceSettlement?.outcome === "succeeded"
                 ? sourceSettlement.value
                 : input.work.payload;
 
             try {
+              const operatorInput = Value.Decode(
+                binding.operator.input,
+                rawOperatorInput,
+              );
               const output = await input.control.withTimeout(
                 binding.operator.timeoutMs,
                 async (signal) =>
@@ -750,12 +754,16 @@ export function createOperatorBindingCompiler(moduleId: string): {
             return;
           }
 
-          const operatorInput =
+          const rawOperatorInput =
             sourceSettlement?.outcome === "succeeded"
               ? sourceSettlement.value
               : input.work.payload;
 
           try {
+            const operatorInput = Value.Decode(
+              binding.operator.input,
+              rawOperatorInput,
+            );
             await binding.operator.run(operatorInput, context);
             input.lease.signal.throwIfAborted();
           } catch (cause: unknown) {
