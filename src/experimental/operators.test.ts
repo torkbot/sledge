@@ -362,6 +362,31 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
       )(),
     /duplicate operator binding id duplicate/,
   );
+  assert.throws(
+    () =>
+      defineModule("experimental.contract.source-event-collision", (module) => {
+        module.event("input", Type.String());
+        const declaration = module.declare({
+          events: { input: Type.Integer() },
+        });
+        const registered = module.link(declaration, null).register({});
+        return module.expose(registered, {});
+      })(),
+    /ledger event input conflicts with an operator port/,
+  );
+  assert.throws(
+    () =>
+      defineModule("experimental.contract.output-event-collision", (module) => {
+        const source = module.event("input", Type.String());
+        module.bind("mapped", source, identity);
+        const declaration = module.declare({
+          events: { mapped: Type.Integer() },
+        });
+        const registered = module.link(declaration, null).register({});
+        return module.expose(registered, {});
+      })(),
+    /ledger event mapped conflicts with an operator port/,
+  );
   assert(Object.isFrozen(identity));
 });
 

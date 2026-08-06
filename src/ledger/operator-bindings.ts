@@ -316,6 +316,14 @@ export function createOperatorBindingCompiler(moduleId: string): {
       const queues = { ...input.queues };
 
       for (const [localName, definition] of Object.entries(input.events)) {
+        const ownedPort = ports.get(localName);
+
+        if (ownedPort !== undefined && definition !== ownedPort) {
+          throw new Error(
+            `ledger event ${localName} conflicts with an operator port`,
+          );
+        }
+
         if (typeof definition === "object" && eventPortBrand in definition) {
           const port = readPort(definition as EventPort<TSchema>);
 
