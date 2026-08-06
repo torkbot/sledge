@@ -440,9 +440,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
       return { ...existing, events, queues } as TRegistration;
     },
     reveal: (value, events, preserve) =>
-      ports.size === 0
-        ? value
-        : mapRevealed(value, events, preserve, ports).value,
+      mapRevealed(value, events, preserve, ports).value,
   };
 }
 
@@ -569,6 +567,19 @@ function mapRevealed(
     mappedObjects,
     result,
   );
+
+  if (prototype !== Object.prototype && prototype !== null) {
+    copyRevealedPrototypeAccessors(
+      value,
+      clone,
+      prototype,
+      events,
+      preserve,
+      ownedPorts,
+      mappedObjects,
+      result,
+    );
+  }
   result.complete = true;
 
   if (!result.changed) {
@@ -632,12 +643,72 @@ function copyRevealedProperties(
       mappedObjects,
     );
     result.changed ||= mapped.changed;
+
+    if (target === source && !mapped.changed) {
+      continue;
+    }
+
     Object.defineProperty(target, key, {
       configurable: descriptor.configurable,
       enumerable: descriptor.enumerable,
       value: mapped.value,
       writable: "value" in descriptor && descriptor.writable,
     });
+  }
+}
+
+function copyRevealedPrototypeAccessors(
+  source: object,
+  target: object,
+  initialPrototype: object,
+  events: Readonly<Record<string, EventToken>>,
+  preserve: (value: object) => boolean,
+  ownedPorts: ReadonlyMap<string, RuntimePort>,
+  mappedObjects: Map<object, MutableRevealResult>,
+  result: MutableRevealResult,
+): void {
+  const visitedKeys = new Set<PropertyKey>();
+  let prototype: object | null = initialPrototype;
+
+  while (prototype !== null && prototype !== Object.prototype) {
+    for (const key of Reflect.ownKeys(prototype)) {
+      if (
+        key === "constructor" ||
+        visitedKeys.has(key) ||
+        Object.hasOwn(source, key)
+      ) {
+        continue;
+      }
+
+      visitedKeys.add(key);
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+
+      if (descriptor?.get === undefined) {
+        continue;
+      }
+
+      const mapped = mapRevealed(
+        descriptor.get.call(source),
+        events,
+        preserve,
+        ownedPorts,
+        mappedObjects,
+      );
+
+      if (!mapped.changed) {
+        continue;
+      }
+
+      result.changed = true;
+      Object.defineProperty(target, key, {
+        configurable: true,
+        enumerable: descriptor.enumerable,
+        value: mapped.value,
+        writable: false,
+      });
+    }
+
+    prototype = Object.getPrototypeOf(prototype) as object | null;
   }
 }
 

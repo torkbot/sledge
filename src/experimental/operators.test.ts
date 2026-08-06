@@ -436,6 +436,16 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
   );
   assert.throws(
     () =>
+      defineModule("experimental.contract.foreign-port-only", (module) => {
+        const declaration = module.declare({ events: {} });
+        const registered = module.link(declaration, null).register({});
+
+        return module.expose(registered, { input: foreignPort });
+      })(),
+    /event port does not belong to this ledger module/,
+  );
+  assert.throws(
+    () =>
       defineModule(
         "experimental.contract.duplicate-operator-binding",
         (module) => {
@@ -571,10 +581,14 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
 
   class ClassCapabilities {
     readonly #label = "class capability";
-    readonly input: EventPort<ReturnType<typeof Type.String>>;
+    readonly #input: EventPort<ReturnType<typeof Type.String>>;
 
     constructor(input: EventPort<ReturnType<typeof Type.String>>) {
-      this.input = input;
+      this.#input = input;
+    }
+
+    get input(): EventPort<ReturnType<typeof Type.String>> {
+      return this.#input;
     }
 
     readLabel(): string {
