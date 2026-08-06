@@ -145,7 +145,16 @@ export function sharesLedgerModuleConstructionScope(
   );
 }
 
-class LedgerModuleContributionCarrier<TCapabilities extends object> {
+class PendingLedgerModuleContributionCarrier<TCapabilities extends object> {
+  readonly capabilities: TCapabilities;
+
+  constructor(capabilities: TCapabilities) {
+    this.capabilities = capabilities;
+    Object.freeze(this);
+  }
+}
+
+class CompleteLedgerModuleContributionCarrier<TCapabilities extends object> {
   readonly capabilities: TCapabilities;
   readonly #module: object;
 
@@ -156,7 +165,7 @@ class LedgerModuleContributionCarrier<TCapabilities extends object> {
   }
 
   static readModule(value: object): object | undefined {
-    return value instanceof LedgerModuleContributionCarrier
+    return value instanceof CompleteLedgerModuleContributionCarrier
       ? value.#module
       : undefined;
   }
@@ -164,12 +173,27 @@ class LedgerModuleContributionCarrier<TCapabilities extends object> {
 
 export function createLedgerModuleContribution<TCapabilities extends object>(
   capabilities: TCapabilities,
+): LedgerModuleContribution<TCapabilities> {
+  // The pending value lets the factory prove that it returned the exact value
+  // produced by expose without authenticating a contribution from a factory
+  // that subsequently fails.
+  return new PendingLedgerModuleContributionCarrier(
+    capabilities,
+  ) as unknown as LedgerModuleContribution<TCapabilities>;
+}
+
+export function completeLedgerModuleContribution<TCapabilities extends object>(
+  contribution: LedgerModuleContribution<TCapabilities>,
   module: object,
 ): LedgerModuleContribution<TCapabilities> {
-  // The public brand is type-only. The private class supplies the independent
+  if (!(contribution instanceof PendingLedgerModuleContributionCarrier)) {
+    throw new Error("invalid pending ledger module contribution");
+  }
+
+  // The public brand is type-only. The completed private class supplies
   // runtime authenticity and carries the implementation without exposing it.
-  return new LedgerModuleContributionCarrier(
-    capabilities,
+  return new CompleteLedgerModuleContributionCarrier(
+    contribution.capabilities,
     module,
   ) as unknown as LedgerModuleContribution<TCapabilities>;
 }
@@ -177,7 +201,7 @@ export function createLedgerModuleContribution<TCapabilities extends object>(
 export function readLedgerModuleContribution(
   contribution: object,
 ): object | undefined {
-  return LedgerModuleContributionCarrier.readModule(contribution);
+  return CompleteLedgerModuleContributionCarrier.readModule(contribution);
 }
 
 /**

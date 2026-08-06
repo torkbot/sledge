@@ -353,6 +353,42 @@ test("a Sledge application rejects hand-assembled module contributions", async (
   );
 });
 
+test("a failed module factory does not authenticate its leaked contribution", async () => {
+  await using fixture = await createFixture(
+    "better-sqlite3",
+    "failed-contribution",
+  );
+  let leaked: object | undefined;
+  const defineFailingModule = defineModule(
+    "contract.failed-contribution",
+    (module) => {
+      const declaration = module.declare({ events: {} });
+      const implemented = module.link(declaration, null, {});
+      leaked = module.expose(implemented, {});
+
+      throw new Error("failure after reveal");
+    },
+  );
+
+  assert.throws(defineFailingModule, /failure after reveal/);
+  const leakedContribution = leaked;
+  assert(leakedContribution !== undefined);
+
+  const application = defineLedger((sledge) => {
+    const unsafeInstall = sledge.install as unknown as (
+      contribution: object,
+    ) => object;
+    unsafeInstall(leakedContribution);
+
+    return {};
+  });
+
+  await assert.rejects(
+    fixture.open(application),
+    /invalid ledger module contribution/,
+  );
+});
+
 test("a Sledge application must install a module before querying", async () => {
   await using fixture = await createFixture("better-sqlite3", "query-empty");
   const registry = defineRegistryModule();

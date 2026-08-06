@@ -21,6 +21,7 @@ import {
   attachLedgerProjectionCompilerFactory,
   attachLedgerProjectionSchemas,
   composedLedgerModulesBrand,
+  completeLedgerModuleContribution,
   createLedgerModuleContribution,
   belongsToLedgerModuleConstructionScope,
   inheritLedgerModuleConstructionScope,
@@ -2467,6 +2468,7 @@ export function defineModule<
   const factory = (...args: TArguments) => {
     let definitionOpen = true;
     let revealed: object | undefined;
+    let revealedModule: AnyRegisteredLedgerModule | undefined;
     const ownedDeclarations = new WeakSet<object>();
     const constructionScope = Object.freeze({});
     const operatorBindings = createOperatorBindingCompiler(moduleId);
@@ -2598,11 +2600,9 @@ export function defineModule<
         registeredModule.events,
         isLedgerContractToken,
       ) as RevealedModuleCapabilities<typeof capabilities>;
-      const contribution = createLedgerModuleContribution(
-        publicCapabilities,
-        registeredModule,
-      );
+      const contribution = createLedgerModuleContribution(publicCapabilities);
       revealed = contribution;
+      revealedModule = registeredModule;
       definitionOpen = false;
       return contribution;
     };
@@ -2635,7 +2635,11 @@ export function defineModule<
         );
       }
 
-      return contribution;
+      if (revealedModule === undefined) {
+        throw new Error("ledger module definition did not reveal a module");
+      }
+
+      return completeLedgerModuleContribution(contribution, revealedModule);
     } finally {
       definitionOpen = false;
     }
