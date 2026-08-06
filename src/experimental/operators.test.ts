@@ -128,7 +128,7 @@ for (const adapter of adapters) {
               },
             },
           });
-        const registered = module.link(declaration, materialization).register({
+        const registered = module.link(declaration, materialization, {
           events: {
             requested_a: ({ event }) => {
               ordinaryHandlers.push(event.payload);
@@ -273,7 +273,7 @@ for (const adapter of adapters) {
         const declaration = module.declare({
           events: { requested: Type.Integer() },
         });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
 
         return module.expose(registered, {
           requested: registered.events.requested,
@@ -290,7 +290,7 @@ for (const adapter of adapters) {
             double,
           );
           const declaration = module.declare({ events: {} });
-          const registered = module.link(declaration, null).register({});
+          const registered = module.link(declaration, null, {});
 
           return module.expose(registered, { doubled });
         })(),
@@ -303,7 +303,7 @@ for (const adapter of adapters) {
             double,
           );
           const declaration = module.declare({ events: {} });
-          const registered = module.link(declaration, null).register({});
+          const registered = module.link(declaration, null, {});
 
           return module.expose(registered, { doubled });
         })(),
@@ -368,7 +368,15 @@ for (const adapter of adapters) {
           mapExternalValue,
         );
         const declaration = module.declare({ events: {} });
-        const registered = module.link(declaration, null).register({});
+
+        if (false) {
+          // Private operator events execute in the compiled graph but do not
+          // become typed ordinary event tokens unless declaration promotes them.
+          // @ts-expect-error mapped is private to the operator graph
+          declaration.events["map-external-value"];
+        }
+
+        const registered = module.link(declaration, null, {});
 
         return module.expose(registered, { requested, mapped });
       },
@@ -417,7 +425,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     (module) => {
       foreignPort = module.event("input", Type.String());
       const declaration = module.declare({ events: {} });
-      const registered = module.link(declaration, null).register({});
+      const registered = module.link(declaration, null, {});
       return module.expose(registered, { input: foreignPort });
     },
   );
@@ -429,7 +437,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
       defineModule("experimental.contract.invalid-operator-graph", (module) => {
         module.bind("duplicate", foreignPort, identity);
         const declaration = module.declare({ events: {} });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
         return module.expose(registered, {});
       })(),
     /event port does not belong to this ledger module/,
@@ -438,7 +446,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     () =>
       defineModule("experimental.contract.foreign-port-only", (module) => {
         const declaration = module.declare({ events: {} });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
 
         return module.expose(registered, { input: foreignPort });
       })(),
@@ -453,7 +461,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
           module.bind("duplicate", source, identity);
           module.bind("duplicate", source, identity);
           const declaration = module.declare({ events: {} });
-          const registered = module.link(declaration, null).register({});
+          const registered = module.link(declaration, null, {});
           return module.expose(registered, {});
         },
       )(),
@@ -466,7 +474,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
         const declaration = module.declare({
           events: { input: Type.Integer() },
         });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
         return module.expose(registered, {});
       })(),
     /ledger event input conflicts with an operator port/,
@@ -479,7 +487,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
         const declaration = module.declare({
           events: { mapped: Type.Integer() },
         });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
         return module.expose(registered, {});
       })(),
     /ledger event mapped conflicts with an operator port/,
@@ -491,7 +499,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
         const declaration = module.declare({
           events: { input: localPort },
         });
-        const registered = module.link(declaration, null).register({});
+        const registered = module.link(declaration, null, {});
         return module.expose(registered, { input: foreignPort });
       })(),
     /event port does not belong to this ledger module/,
@@ -502,7 +510,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     (module) => {
       const input = module.event("input", Type.String());
       const declaration = module.declare({ events: { input } });
-      const registered = module.link(declaration, null).register({});
+      const registered = module.link(declaration, null, {});
 
       return module.expose(registered, [input] as const);
     },
@@ -520,7 +528,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     (module) => {
       const input = module.event("input", Type.String());
       const declaration = module.declare({ events: { input } });
-      const registered = module.link(declaration, null).register({});
+      const registered = module.link(declaration, null, {});
       const capabilities: InterfaceCapabilities = { input };
 
       return module.expose(registered, capabilities);
@@ -536,7 +544,7 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
       const input = module.event("toString", Type.String());
       module.bind("__proto__", input, identity);
       const declaration = module.declare({ events: { toString: input } });
-      const registered = module.link(declaration, null).register({});
+      const registered = module.link(declaration, null, {});
 
       return module.expose(registered, {});
     },

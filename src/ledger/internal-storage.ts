@@ -1,6 +1,10 @@
 import type { Static, TSchema } from "typebox";
 
-import type { LedgerIndexerContext, LedgerTiming } from "./ledger.ts";
+import type {
+  LedgerIndexerContext,
+  LedgerModuleContribution,
+  LedgerTiming,
+} from "./ledger.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
 import type {
   LedgerApplication,
@@ -25,7 +29,6 @@ const ledgerModuleOwnerReaders = new WeakMap<object, () => string>();
 // lets reveal validate construction ownership without adding public brands or
 // mutable owner fields to any ledger phase.
 const ledgerModuleConstructionScopes = new WeakMap<object, object>();
-const ledgerModuleContributions = new WeakSet<object>();
 const ledgerModuleComposers = new WeakMap<
   object,
   (first: object, ...rest: readonly object[]) => object
@@ -142,15 +145,39 @@ export function sharesLedgerModuleConstructionScope(
   );
 }
 
-export function attachLedgerModuleContribution<TContribution extends object>(
-  contribution: TContribution,
-): TContribution {
-  ledgerModuleContributions.add(contribution);
-  return contribution;
+class LedgerModuleContributionCarrier<TCapabilities extends object> {
+  readonly capabilities: TCapabilities;
+  readonly #module: object;
+
+  constructor(capabilities: TCapabilities, module: object) {
+    this.capabilities = capabilities;
+    this.#module = module;
+    Object.freeze(this);
+  }
+
+  static readModule(value: object): object | undefined {
+    return value instanceof LedgerModuleContributionCarrier
+      ? value.#module
+      : undefined;
+  }
 }
 
-export function isLedgerModuleContribution(contribution: object): boolean {
-  return ledgerModuleContributions.has(contribution);
+export function createLedgerModuleContribution<TCapabilities extends object>(
+  capabilities: TCapabilities,
+  module: object,
+): LedgerModuleContribution<TCapabilities> {
+  // The public brand is type-only. The private class supplies the independent
+  // runtime authenticity and carries the implementation without exposing it.
+  return new LedgerModuleContributionCarrier(
+    capabilities,
+    module,
+  ) as unknown as LedgerModuleContribution<TCapabilities>;
+}
+
+export function readLedgerModuleContribution(
+  contribution: object,
+): object | undefined {
+  return LedgerModuleContributionCarrier.readModule(contribution);
 }
 
 /**

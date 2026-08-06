@@ -15,6 +15,11 @@ test("module factories bind identity once and reveal fresh contributions", () =>
     (module, label: string) => {
       const registered = registerEmptyModule(module);
 
+      if (false) {
+        // @ts-expect-error scoped linking returns the implemented module directly
+        registered.register({});
+      }
+
       return module.expose(registered, {
         label,
         moduleId: module.moduleId,
@@ -27,14 +32,8 @@ test("module factories bind identity once and reveal fresh contributions", () =>
 
   assert(Object.isFrozen(defineExampleModule));
   assert(Object.isFrozen(first));
-  assert(Object.isFrozen(first.module));
-  assert.equal(
-    Reflect.set(first.module, "moduleId", "contract.rewritten-module"),
-    false,
-  );
-  assert.equal(first.module.moduleId, "contract.module-factory");
+  assert.equal("module" in first, false);
   assert.notEqual(first, second);
-  assert.notEqual(first.module, second.module);
   assert.deepEqual(first.capabilities, {
     label: "first",
     moduleId: "contract.module-factory",
@@ -54,7 +53,7 @@ test("module owners are revoked after revealing one contribution", () => {
       retained = module;
       const declaration = module.declare({ events: {} });
       retainedDeclaration = declaration;
-      const registered = module.link(declaration, null).register({});
+      const registered = module.link(declaration, null, {});
       const contribution = module.expose(registered, {});
 
       assert.throws(
@@ -77,7 +76,7 @@ test("module owners are revoked after revealing one contribution", () => {
     /ledger module definition has already closed/,
   );
   assert.throws(
-    () => retained.link(retainedDeclaration as never, null),
+    () => retained.link(retainedDeclaration as never, null, {}),
     /ledger module definition has already closed/,
   );
 });
@@ -95,7 +94,7 @@ test("module linking accepts only declarations from the current factory invocati
 
       retainedDeclaration = declaration;
 
-      const registered = module.link(declaration, null).register({});
+      const registered = module.link(declaration, null, {});
       return module.expose(registered, {});
     },
   );
@@ -108,7 +107,7 @@ test("module linking accepts only declarations from the current factory invocati
   );
 });
 
-test("module exposure accepts only registration through the scoped link", () => {
+test("module exposure accepts only modules produced by the scoped link", () => {
   const defineBypassedModule = defineModule(
     "contract.bypassed-link",
     (module) => {
@@ -240,5 +239,5 @@ function registerEmptyModule<const TModuleId extends string>(
   module: LedgerModuleDefinition<TModuleId>,
 ) {
   const declaration = module.declare({ events: {} });
-  return module.link(declaration, null).register({});
+  return module.link(declaration, null, {});
 }

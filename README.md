@@ -23,9 +23,9 @@ handles to indexer and query callbacks.
 
 `defineModule(moduleId, callback)` creates a reusable module factory. Its scoped
 `module` port declares contracts under that identity, links those declarations
-to storage materializations, and reveals one registered module plus only the
-bounded capabilities other code may use. The application definition installs
-those contributions in durable order and exposes one capability tree:
+to storage materializations and implementations, and reveals only the bounded
+capabilities other code may use. The application definition installs those
+contributions in durable order and exposes one capability tree:
 
 ```ts
 import { defineLedger } from "@torkbot/sledge";
@@ -50,8 +50,8 @@ await opened.ledger.emit(opened.capabilities.users.events.created, {
 The callback runs once for every open. Its two methods are the complete
 assembly vocabulary:
 
-- `install(contribution)` adds one registered module and immediately returns
-  its exact capabilities unchanged.
+- `install(contribution)` installs one module and immediately returns its exact
+  capabilities unchanged.
 - `query(token, params)` reads the immutable installed prefix when later module
   choices depend on durable ledger state.
 
@@ -131,7 +131,7 @@ const defineUsersModule = defineModule("app.users", (module) => {
       },
     });
 
-  const registered = module.link(declaration, materializations).register({
+  const registered = module.link(declaration, materializations, {
     indexers: {
       upsertUser: async ({ input, event, db }) => {
         await db
@@ -288,7 +288,7 @@ const defineUsersModule = defineModule("app.users", (module) => {
       created: Type.Object({ userId: Type.String() }),
     },
   });
-  const registered = module.link(declaration, null).register({});
+  const registered = module.link(declaration, null, {});
 
   return module.expose(registered, {
     events: registered.events,
@@ -315,7 +315,7 @@ const defineAuditModule = defineModule(
     const declaration = module.declare({
       events: { userCreated: users.events.created },
     });
-    const registered = module.link(declaration, null).register({
+    const registered = module.link(declaration, null, {
       events: {
         userCreated: ({ event }) => console.log(event.payload.userId),
       },
@@ -430,7 +430,7 @@ const defineCompactionFlow = defineModule("app.compaction-flow", (module) => {
     // private but are still compiled into the ledger model.
     events: { requested, "extract-compaction-memory": memory },
   });
-  const registered = module.link(declaration, null).register({});
+  const registered = module.link(declaration, null, {});
 
   return module.expose(registered, { requested, memory });
 });
@@ -469,16 +469,15 @@ userspace registry may store plugin descriptors, package ids, feature flags, or
 any other configuration. Sledge only supplies the phase boundaries needed to
 query that registry and build one final ledger model safely.
 
-| Phase                      | Produced by                      | Capability added                                           |
-| -------------------------- | -------------------------------- | ---------------------------------------------------------- |
-| Module factory             | `defineModule(...)`              | Reusable definition bound to one stable module identity    |
-| `LedgerModuleDefinition`   | Invoking the module factory      | Scoped identity, declaration, linking, and one reveal      |
-| `DeclaredLedgerModule`     | `module.declare(...)`            | Durable contract tokens and a typed logical shape          |
-| `LinkedLedgerModule`       | `module.link(...)`               | A materialization contract and registration capability     |
-| `RegisteredLedgerModule`   | `linked.register(...)`           | Implementations and handlers; ready to reveal              |
-| `LedgerModuleContribution` | `module.expose(...)`             | Registered module plus the bounded capabilities it reveals |
-| `LedgerApplication`        | `defineLedger(...)`              | A reusable, storage-independent assembly definition        |
-| `OpenedLedger`             | `await application.open(driver)` | Per-open capabilities plus the owning ledger runtime       |
+| Phase                      | Produced by                      | Capability added                                          |
+| -------------------------- | -------------------------------- | --------------------------------------------------------- |
+| Module factory             | `defineModule(...)`              | Reusable definition bound to one stable module identity   |
+| `LedgerModuleDefinition`   | Invoking the module factory      | Scoped identity, declaration, linking, and one reveal     |
+| `DeclaredLedgerModule`     | `module.declare(...)`            | Durable contract tokens and a typed logical shape         |
+| Linked implementation      | `module.link(...)`               | Storage contract and implementations; ready to reveal     |
+| `LedgerModuleContribution` | `module.expose(...)`             | Bounded capabilities with private installation provenance |
+| `LedgerApplication`        | `defineLedger(...)`              | A reusable, storage-independent assembly definition       |
+| `OpenedLedger`             | `await application.open(driver)` | Per-open capabilities plus the owning ledger runtime      |
 
 There is no public composed, prepared, sealed, or activated model. Those are
 adapter-owned implementation phases. Returning from the callback finishes
@@ -530,7 +529,7 @@ const defineDecisionsModule = defineModule("decisions", (module) => {
       }),
     },
   });
-  const registered = module.link(declaration, null).register({
+  const registered = module.link(declaration, null, {
     events: {
       recorded: () => ({ revision: 1 }),
     },
@@ -638,8 +637,7 @@ const defineUsersModule = defineModule("app.users", (module) => {
     typeof declaration.shape.events
   >;
 
-  const linked = module.link(declaration, materializations);
-  const registered = linked.register({
+  const registered = module.link(declaration, materializations, {
     indexers: { upsertUser: () => undefined },
     queries: { userById: () => null },
   });
@@ -694,8 +692,9 @@ reference schema objects available at that point in the chain.
 
 When helper code needs named types, derive them inside the same module factory
 from its local materialization and declaration values, as above, instead of
-restating table shapes. Link the declaration to its materializations with the
-scoped `module.link(...)` capability before registration.
+restating table shapes. `module.link(...)` binds the declaration,
+materializations, and their implementations as one operation. There is no
+intermediate public value that exists only to accept registration.
 
 The link phase is explicit even when a module owns no projection:
 
@@ -704,22 +703,22 @@ const defineNotificationsModule = defineModule(
   "app.notifications",
   (module) => {
     const declaration = module.declare({ events: {} });
-    const linked = module.link(declaration, null);
-    const registered = linked.register({});
+    const registered = module.link(declaration, null, {});
 
     return module.expose(registered, {});
   },
 );
 ```
 
-`null` means the module intentionally has no materialization history. A
-declaration cannot register handlers or participate in a model until it has
+`null` means the module intentionally has no materialization history. The empty
+registration says that this module has no handlers. A declaration cannot
+participate in a model until its storage contract and implementations have
 been linked.
 
-### 3. Register Orchestration
+### 3. Link Implementations
 
-Call `linked.register(...)` to attach indexer implementations, query
-implementations, event handlers, queue handlers, signal handlers, and
+Pass the registration to `module.link(...)` to attach indexer implementations,
+query implementations, event handlers, queue handlers, signal handlers, and
 signal-queue handlers.
 
 Indexer and query implementations receive sledge-owned facades:
@@ -806,10 +805,9 @@ and `query`.
 The low-level database engine and storage scope are internal implementation
 details, not package exports.
 
-Registration returns a frozen, inert `RegisteredLedgerModule`. Its durable
-identity cannot be rewritten after contracts have been namespaced. It exposes
-the exact event, query, and signal tokens that consumers use, but it cannot
-touch storage or start work.
+Linking returns a frozen, inert module. Its durable identity cannot be rewritten
+after contracts have been namespaced. It exposes the exact event, query, and
+signal tokens that consumers use, but it cannot touch storage or start work.
 
 ### 4. Reveal Modules and Define the Application
 
@@ -819,23 +817,22 @@ public capabilities:
 
 - `moduleId` exposes the stable literal identity to reusable primitives.
 - `declare(contracts)` declares contracts under that identity.
-- `link(declaration, materializations)` adds the storage contract to a
-  declaration created by that exact factory invocation and returns a new value
-  with registration capability.
+- `link(declaration, materializations, implementations)` adds the storage
+  contract and implementations to a declaration created by that exact factory
+  invocation.
 - `expose(registered, capabilities)` verifies a Sledge-registered module has
   that identity, revokes the scoped port, and returns one authentic
   `LedgerModuleContribution`.
 
-The module object is created and controlled by Sledge. Private registries bind
-its identity, lifetime, and the provenance of its revealed contribution without
-adding public plumbing methods. A retained module object is unusable after the
-factory returns, a second reveal fails, and `sledge.install(...)` rejects a
-hand-assembled `{ module, capabilities }` object at runtime as well as at
-compile time.
+The module object is created and controlled by Sledge. A library-owned
+contribution carrier keeps the implementation in a private field while exposing
+only its capabilities. A retained module object is unusable after the factory
+returns, a second reveal fails, and `sledge.install(...)` rejects a
+hand-assembled contribution at runtime as well as at compile time.
 
-Declaration, linking, registration, and exposure form a capability-narrowing
-flow. Materializations remain ordinary values passed into `module.link(...)`,
-and every phase returns a new value rather than mutating the previous one.
+Declaration, linking, and exposure form a capability-narrowing flow.
+Materializations remain ordinary values passed into `module.link(...)`, and
+every phase returns a new value rather than mutating the previous one.
 Reusable userspace primitives can accept the narrower
 `LedgerModuleOwner` interface when they need identity but should not receive
 declaration, linking, or reveal authority.
@@ -1091,7 +1088,7 @@ const defineDecisionsModule = defineModule("decisions", (module) => {
       "decisions.record": Type.Object({ decisionId: Type.String() }),
     },
   });
-  const registered = module.link(declaration, null).register({
+  const registered = module.link(declaration, null, {
     events: {
       recorded: () => ({ revision: 1 }),
       "decision.observed": () => {},
