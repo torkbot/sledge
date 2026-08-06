@@ -546,7 +546,13 @@ function mapRevealed(
 
   const prototype = Object.getPrototypeOf(value) as object | null;
 
-  const clone = Object.create(prototype) as object;
+  // Custom-prototype objects must retain their original receiver so methods
+  // backed by private fields keep their runtime brand. Module capabilities are
+  // sealed after reveal, so replacing their own port fields in place is safe.
+  const clone =
+    prototype === Object.prototype || prototype === null
+      ? (Object.create(prototype) as object)
+      : value;
   const result: MutableRevealResult = {
     value: clone,
     changed: false,

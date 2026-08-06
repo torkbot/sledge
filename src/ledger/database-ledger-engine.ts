@@ -3492,7 +3492,7 @@ function openDatabaseLedgerEngine<
 
   function createCandidateQueuePredicate(
     queuesWithCapacity: readonly WorkerQueueRuntime[],
-    knownQueues: readonly WorkerQueueRuntime[],
+    tableAlias: "candidate" | "work" = "candidate",
   ): {
     readonly sql: string;
     readonly params: readonly (number | string)[];
@@ -3501,30 +3501,14 @@ function openDatabaseLedgerEngine<
     const params: (number | string)[] = [];
 
     for (const queue of queuesWithCapacity) {
-      clauses.push("(candidate.signal = ? AND candidate.queue_name = ?)");
+      clauses.push(
+        `(${tableAlias}.signal = ? AND ${tableAlias}.queue_name = ?)`,
+      );
       params.push(queue.signal ? 1 : 0, queue.queueName);
     }
 
-    if (knownQueues.length === 0) {
-      clauses.push("1 = 1");
-    } else {
-      const knownClauses: string[] = [];
-
-      for (const queue of knownQueues) {
-        knownClauses.push(
-          "(candidate.signal = ? AND candidate.queue_name = ?)",
-        );
-        params.push(queue.signal ? 1 : 0, queue.queueName);
-      }
-
-      // Persisted work may outlive a removed queue contract. It must remain
-      // claimable so the no-handler path can make it terminal instead of
-      // leaving waitForIdle() blocked forever.
-      clauses.push(`NOT (${knownClauses.join(" OR ")})`);
-    }
-
     return {
-      sql: clauses.join(" OR "),
+      sql: clauses.length === 0 ? "0 = 1" : clauses.join(" OR "),
       params,
     };
   }
@@ -3534,7 +3518,6 @@ function openDatabaseLedgerEngine<
   ): Promise<void> {
     const queuePredicate = createCandidateQueuePredicate(
       readWorkerQueuesWithCapacity(worker),
-      worker.queues,
     );
     const row = await storage.read(async (database) => {
       return await database
@@ -3617,7 +3600,10 @@ function openDatabaseLedgerEngine<
     }
   }
 
-  async function hasNonterminalWork(): Promise<boolean> {
+  async function hasNonterminalWork(
+    queues: readonly WorkerQueueRuntime[],
+  ): Promise<boolean> {
+    const queuePredicate = createCandidateQueuePredicate(queues, "work");
     const row = await storage.read(async (database) => {
       return await database
         .prepare(
@@ -3625,9 +3611,10 @@ function openDatabaseLedgerEngine<
            FROM work
            WHERE dead = 0
              AND cancelled = 0
+             AND (${queuePredicate.sql})
            LIMIT 1`,
         )
-        .get();
+        .get(...queuePredicate.params);
     });
 
     return row !== undefined;
@@ -3647,7 +3634,7 @@ function openDatabaseLedgerEngine<
 
       const observedState = worker.stateChanges.snapshot();
       const durableWorkResult = await raceWithSignal(
-        hasNonterminalWork(),
+        hasNonterminalWork(worker.queues),
         waitSignal,
       );
 
@@ -3967,7 +3954,6 @@ function openDatabaseLedgerEngine<
   ): Promise<PersistedWorkLease | null> {
     const queuePredicate = createCandidateQueuePredicate(
       readWorkerQueuesWithCapacity(worker),
-      worker.queues,
     );
 
     return await runInTransaction(async (database) => {

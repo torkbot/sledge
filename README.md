@@ -1040,10 +1040,13 @@ safety ceiling.
 
 The handle returned by `startWorkers(...)` exposes
 `waitForIdle({ signal })`. It resolves once no pending, delayed, leased, or
-executing work remains, including work blocked behind a partition head.
+executing work remains for a queue known to that worker version, including work
+blocked behind a partition head. Work for an unknown queue remains durable and
+does not prevent that worker from becoming idle; this keeps older processes
+from claiming or terminalizing work introduced by a newer rolling deployment.
 Retained dead and cancelled work does not prevent idle. The result describes
-one instant; later emissions can make the workers active again. The wait rejects
-if its signal aborts or the worker runtime closes or fails.
+one instant; later emissions can make the workers active again. The wait
+rejects if its signal aborts or the worker runtime closes or fails.
 
 ## Work and Retries
 

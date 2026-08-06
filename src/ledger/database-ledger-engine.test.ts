@@ -4416,7 +4416,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   assert.deepEqual(await ledger.listWork(), []);
 });
 
-test("workers make persisted work for a removed queue terminal", async () => {
+test("workers leave unknown persisted queues untouched and idle within their known graph", async () => {
   const runtime = new VirtualRuntimeHarness(1_910_000_000_000);
   const databaseUrl = createTempDatabasePath();
   const Event = Type.Object({ id: Type.Number() });
@@ -4458,15 +4458,13 @@ test("workers make persisted work for a removed queue terminal", async () => {
     scheduler: runtime.scheduler,
   });
 
-  await waitFor(runtime, async () => {
-    return (await ledger.listWork({ states: ["dead"] })).length === 1;
-  });
   await workers.waitForIdle({ signal: new AbortController().signal });
 
-  assert.match(
-    (await ledger.listWork({ states: ["dead"] }))[0]?.lastError ?? "",
-    /no handler for queue job\.removed/,
-  );
+  const work = await ledger.listWork({ states: ["pending"] });
+
+  assert.equal(work.length, 1);
+  assert.equal(work[0]?.queueName, "job.removed");
+  assert.equal(work[0]?.lastError, null);
 });
 
 test("listWork applies state filters before limit", async () => {

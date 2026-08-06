@@ -6,6 +6,9 @@
   `configureQueue({ moduleId, name, kind })`. Each queue receives its own
   positive `maxInFlight`; saturated queues are excluded from claim selection.
   Optional top-level `maxInFlight` remains a combined process safety ceiling.
+  Workers never claim queues absent from their model, and `waitForIdle(...)`
+  measures only queues known to that worker version so rolling deployments
+  preserve newer durable work.
 - Add `module.link(declaration, materializations)` to the scoped module
   definition port. Canonical module factories no longer import their linking
   phase from `@torkbot/sledge/ledger`, and linking rejects declarations not

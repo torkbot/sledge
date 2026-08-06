@@ -570,10 +570,15 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
   assert.doesNotThrow(() => inheritedNameModule());
 
   class ClassCapabilities {
+    readonly #label = "class capability";
     readonly input: EventPort<ReturnType<typeof Type.String>>;
 
     constructor(input: EventPort<ReturnType<typeof Type.String>>) {
       this.input = input;
+    }
+
+    readLabel(): string {
+      return this.#label;
     }
   }
 
@@ -592,6 +597,8 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
 
   assert(classModule.capabilities instanceof ClassCapabilities);
   assert.notEqual(classEvent, classPort);
+  assert.equal(classModule.capabilities.readLabel(), "class capability");
+  assert(Object.isFrozen(classModule.capabilities));
 
   const cyclicModule = defineModule(
     "experimental.contract.cyclic-capability",
