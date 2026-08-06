@@ -10,6 +10,7 @@ import { Value } from "typebox/value";
 import { createBetterSqliteDriver } from "../better-sqlite3.ts";
 import {
   defineMaterialization,
+  type EventToken,
   type LedgerWorkerQueue,
 } from "../ledger/ledger.ts";
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
@@ -502,6 +503,50 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
   )();
 
   assert.equal(symbolModule.capabilities[symbolCapability], "preserved");
+
+  const arrayModule = defineModule(
+    "experimental.contract.array-capability",
+    (module) => {
+      const input = module.event("input", Type.String());
+      const declaration = module.declare({ events: { input } });
+      const registered = module.link(declaration, null).register({});
+
+      return module.expose(registered, [input] as const);
+    },
+  )();
+  const arrayEvent: EventToken = arrayModule.capabilities[0];
+
+  assert(arrayEvent);
+
+  const inheritedNameModule = defineModule(
+    "experimental.contract.inherited-binding-name",
+    (module) => {
+      const input = module.event("input", Type.String());
+      module.bind("toString", input, identity);
+      const declaration = module.declare({ events: { input } });
+      const registered = module.link(declaration, null).register({});
+
+      return module.expose(registered, {});
+    },
+  );
+
+  assert.doesNotThrow(() => inheritedNameModule());
+
+  const cyclicModule = defineModule(
+    "experimental.contract.cyclic-capability",
+    (module) => {
+      const input = module.event("input", Type.String());
+      const declaration = module.declare({ events: { input } });
+      const registered = module.link(declaration, null).register({});
+      const capabilities: { input: typeof input; self?: unknown } = { input };
+      capabilities.self = capabilities;
+
+      return module.expose(registered, capabilities);
+    },
+  )();
+
+  assert.equal(cyclicModule.capabilities.self, cyclicModule.capabilities);
+  assert(Object.isFrozen(cyclicModule.capabilities));
   assert(Object.isFrozen(identity));
 });
 

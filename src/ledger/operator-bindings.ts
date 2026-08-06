@@ -79,13 +79,19 @@ export interface Sink {
 export type RevealedModuleCapabilities<TValue> =
   TValue extends EventPort<infer TSchemaValue>
     ? EventToken<string, string, TSchemaValue, null>
-    : TValue extends Readonly<Record<string, unknown>>
+    : TValue extends readonly unknown[]
       ? {
           readonly [TKey in keyof TValue]: RevealedModuleCapabilities<
             TValue[TKey]
           >;
         }
-      : TValue;
+      : TValue extends Readonly<Record<string, unknown>>
+        ? {
+            readonly [TKey in keyof TValue]: RevealedModuleCapabilities<
+              TValue[TKey]
+            >;
+          }
+        : TValue;
 
 export type SchemaOfEvent<TEvent extends EventToken> =
   TEvent extends EventToken<string, string, infer TSchemaValue, TSchema | null>
@@ -350,7 +356,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
       }
 
       for (const binding of bindings) {
-        if (queues[binding.bindingId] !== undefined) {
+        if (Object.hasOwn(queues, binding.bindingId)) {
           throw new Error(`duplicate ledger queue ${binding.bindingId}`);
         }
 
@@ -464,6 +470,7 @@ function mapRevealed(
   events: Readonly<Record<string, EventToken>>,
   preserve: (value: object) => boolean,
   ownedPorts: ReadonlyMap<string, RuntimePort>,
+  mappedObjects: Map<object, MutableRevealResult> = new Map(),
 ): { readonly value: unknown; readonly changed: boolean } {
   if (typeof value !== "object" || value === null) {
     return { value, changed: false };
@@ -493,19 +500,44 @@ function mapRevealed(
     return { value, changed: false };
   }
 
-  if (Array.isArray(value)) {
-    const nested = value.map((entry) =>
-      mapRevealed(entry, events, preserve, ownedPorts),
-    );
+  const existing = mappedObjects.get(value);
 
-    if (!nested.some((entry) => entry.changed)) {
-      return { value, changed: false };
+  if (existing !== undefined) {
+    if (!existing.complete) {
+      existing.changed = true;
     }
 
-    return {
-      value: Object.freeze(nested.map((entry) => entry.value)),
-      changed: true,
+    return existing;
+  }
+
+  if (Array.isArray(value)) {
+    const clone: unknown[] = new Array(value.length);
+    const result: MutableRevealResult = {
+      value: clone,
+      changed: false,
+      complete: false,
     };
+    mappedObjects.set(value, result);
+
+    copyRevealedProperties(
+      value,
+      clone,
+      events,
+      preserve,
+      ownedPorts,
+      mappedObjects,
+      result,
+      (key) => key !== "length",
+    );
+    result.complete = true;
+
+    if (!result.changed) {
+      result.value = value;
+      return result;
+    }
+
+    Object.freeze(clone);
+    return result;
   }
 
   const prototype = Object.getPrototypeOf(value) as unknown;
@@ -514,23 +546,78 @@ function mapRevealed(
     return { value, changed: false };
   }
 
-  const properties = value as Readonly<Record<PropertyKey, unknown>>;
-  const entries = Reflect.ownKeys(value).map((key) => {
-    const nested = properties[key];
-    const mapped = mapRevealed(nested, events, preserve, ownedPorts);
-    return { key, ...mapped };
-  });
+  const clone = Object.create(prototype) as object;
+  const result: MutableRevealResult = {
+    value: clone,
+    changed: false,
+    complete: false,
+  };
+  mappedObjects.set(value, result);
 
-  if (!entries.some((entry) => entry.changed)) {
-    return { value, changed: false };
+  copyRevealedProperties(
+    value,
+    clone,
+    events,
+    preserve,
+    ownedPorts,
+    mappedObjects,
+    result,
+  );
+  result.complete = true;
+
+  if (!result.changed) {
+    result.value = value;
+    return result;
   }
 
-  return {
-    value: Object.freeze(
-      Object.fromEntries(entries.map((entry) => [entry.key, entry.value])),
-    ),
-    changed: true,
-  };
+  Object.freeze(clone);
+  return result;
+}
+
+type MutableRevealResult = {
+  value: unknown;
+  changed: boolean;
+  complete: boolean;
+};
+
+function copyRevealedProperties(
+  source: object,
+  target: object,
+  events: Readonly<Record<string, EventToken>>,
+  preserve: (value: object) => boolean,
+  ownedPorts: ReadonlyMap<string, RuntimePort>,
+  mappedObjects: Map<object, MutableRevealResult>,
+  result: MutableRevealResult,
+  include: (key: PropertyKey) => boolean = () => true,
+): void {
+  const properties = source as Readonly<Record<PropertyKey, unknown>>;
+
+  for (const key of Reflect.ownKeys(source)) {
+    if (!include(key)) {
+      continue;
+    }
+
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+
+    if (descriptor === undefined) {
+      throw new Error("ledger module capability property disappeared");
+    }
+
+    if (!("value" in descriptor)) {
+      Object.defineProperty(target, key, descriptor);
+      continue;
+    }
+
+    const mapped = mapRevealed(
+      properties[key],
+      events,
+      preserve,
+      ownedPorts,
+      mappedObjects,
+    );
+    result.changed ||= mapped.changed;
+    Object.defineProperty(target, key, { ...descriptor, value: mapped.value });
+  }
 }
 
 // Imported event schemas are carried by their operator input contract. This
