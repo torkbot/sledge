@@ -308,6 +308,7 @@ type QueueHandlerInput = {
       timeoutMs: number,
       operation: (signal: AbortSignal) => Promise<TResult>,
     ): Promise<TResult>;
+    deadLetter(error: unknown): never;
   };
   readonly actions: {
     emit(eventName: string, payload: unknown): void;
@@ -759,11 +760,24 @@ export function createOperatorBindingCompiler(moduleId: string): {
               ? sourceSettlement.value
               : input.work.payload;
 
+          let operatorInput: Static<TSchema>;
+
           try {
-            const operatorInput = Value.Decode(
+            operatorInput = Value.Decode(
               binding.operator.input,
               rawOperatorInput,
             );
+          } catch (cause: unknown) {
+            input.control.deadLetter(
+              new UncaughtOperatorError(
+                binding.operator.name,
+                binding.bindingId,
+                cause,
+              ),
+            );
+          }
+
+          try {
             await binding.operator.run(operatorInput, context);
             input.lease.signal.throwIfAborted();
           } catch (cause: unknown) {

@@ -533,6 +533,7 @@ for (const adapter of adapters) {
     );
     const runtime = new VirtualRuntimeHarness(50_000);
     let downstreamCalls = 0;
+    let effectCalls = 0;
     const produceEmpty = new MapAsync("produce-empty", {
       input: Type.String(),
       output: Type.String(),
@@ -548,6 +549,12 @@ for (const adapter of adapters) {
         return input;
       },
     });
+    const consumeContent = new ForEach("consume-content", {
+      input: Type.String({ minLength: 1 }),
+      run: () => {
+        effectCalls += 1;
+      },
+    });
     const defineFlow = defineModule(
       "experimental.contract.operator-chain-schema",
       (module) => {
@@ -558,6 +565,7 @@ for (const adapter of adapters) {
           produced,
           requireContent,
         );
+        module.bind("consume-content", produced, consumeContent);
         const declaration = module.declare({ events: {} });
         const registered = module.link(declaration, null, {});
         return module.expose(registered, { requested, produced, validated });
@@ -580,6 +588,11 @@ for (const adapter of adapters) {
 
     const events = await readEvents(opened.ledger, 3);
     assert.equal(downstreamCalls, 0);
+    assert.equal(effectCalls, 0);
+    assert.equal(
+      (await opened.ledger.listWork({ states: ["dead"] })).length,
+      1,
+    );
     assert.deepEqual(
       events.find((entry) => entry.event === opened.capabilities.flow.produced)
         ?.payload,
