@@ -89,9 +89,9 @@ export type RevealedModuleCapabilities<TValue> =
         ? TValue
         : TValue extends object
           ? {
-              readonly [TKey in keyof TValue]: RevealedModuleCapabilities<
-                TValue[TKey]
-              >;
+              readonly [TKey in keyof TValue]: TKey extends string | number
+                ? RevealedModuleCapabilities<TValue[TKey]>
+                : TValue[TKey];
             }
           : TValue;
 
@@ -440,7 +440,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
       return { ...existing, events, queues } as TRegistration;
     },
     reveal: (value, events, preserve) =>
-      mapRevealed(value, events, preserve, ports).value,
+      mapRevealed(value, events, preserve, ports),
   };
 }
 
@@ -472,10 +472,9 @@ function mapRevealed(
   events: Readonly<Record<string, EventToken>>,
   preserve: (value: object) => boolean,
   ownedPorts: ReadonlyMap<string, RuntimePort>,
-  mappedObjects: Map<object, MutableRevealResult> = new Map(),
-): { readonly value: unknown; readonly changed: boolean } {
+): unknown {
   if (typeof value !== "object" || value === null) {
-    return { value, changed: false };
+    return value;
   }
 
   if (eventPortBrand in value) {
@@ -492,103 +491,35 @@ function mapRevealed(
       throw new Error(`ledger module lost operator event ${localName}`);
     }
 
-    return {
-      value: event,
-      changed: true,
-    };
+    return event;
   }
 
   if (preserve(value)) {
-    return { value, changed: false };
-  }
-
-  const existing = mappedObjects.get(value);
-
-  if (existing !== undefined) {
-    if (!existing.complete) {
-      existing.changed = true;
-    }
-
-    return existing;
+    return value;
   }
 
   if (Array.isArray(value)) {
-    const clone: unknown[] = new Array(value.length);
-    const result: MutableRevealResult = {
-      value: clone,
-      changed: false,
-      complete: false,
-    };
-    mappedObjects.set(value, result);
-
-    copyRevealedProperties(
-      value,
-      clone,
-      events,
-      preserve,
-      ownedPorts,
-      mappedObjects,
-      result,
-      (key) => key !== "length",
+    return Object.freeze(
+      value.map((entry) => mapRevealed(entry, events, preserve, ownedPorts)),
     );
-    result.complete = true;
-
-    if (!result.changed) {
-      result.value = value;
-      return result;
-    }
-
-    Object.freeze(clone);
-    return result;
   }
 
   const prototype = Object.getPrototypeOf(value) as object | null;
 
-  // Custom-prototype objects must retain their original receiver so methods
-  // backed by private fields keep their runtime brand. Module capabilities are
-  // sealed after reveal, so replacing their own port fields in place is safe.
-  const clone =
-    prototype === Object.prototype || prototype === null
-      ? (Object.create(prototype) as object)
-      : value;
-  const result: MutableRevealResult = {
-    value: clone,
-    changed: false,
-    complete: false,
-  };
-  mappedObjects.set(value, result);
-
-  copyRevealedProperties(
-    value,
-    clone,
-    events,
-    preserve,
-    ownedPorts,
-    mappedObjects,
-    result,
-  );
-
   if (prototype !== Object.prototype && prototype !== null) {
-    copyRevealedPrototypeAccessors(
-      value,
-      clone,
-      prototype,
-      events,
-      preserve,
-      ownedPorts,
-      mappedObjects,
-      result,
-    );
+    return value;
   }
-  result.complete = true;
 
-  if (!result.changed) {
-    result.value = value;
-    return result;
+  const clone = {
+    ...(value as Readonly<Record<PropertyKey, unknown>>),
+  };
+
+  for (const [key, entry] of Object.entries(value)) {
+    setOwn(clone, key, mapRevealed(entry, events, preserve, ownedPorts));
   }
 
   Object.freeze(clone);
-  return result;
+  return clone;
 }
 
 function setOwn<TValue>(
@@ -602,114 +533,6 @@ function setOwn<TValue>(
     value,
     writable: true,
   });
-}
-
-type MutableRevealResult = {
-  value: unknown;
-  changed: boolean;
-  complete: boolean;
-};
-
-function copyRevealedProperties(
-  source: object,
-  target: object,
-  events: Readonly<Record<string, EventToken>>,
-  preserve: (value: object) => boolean,
-  ownedPorts: ReadonlyMap<string, RuntimePort>,
-  mappedObjects: Map<object, MutableRevealResult>,
-  result: MutableRevealResult,
-  include: (key: PropertyKey) => boolean = () => true,
-): void {
-  const properties = source as Readonly<Record<PropertyKey, unknown>>;
-
-  for (const key of Reflect.ownKeys(source)) {
-    if (!include(key)) {
-      continue;
-    }
-
-    const descriptor = Object.getOwnPropertyDescriptor(source, key);
-
-    if (descriptor === undefined) {
-      throw new Error("ledger module capability property disappeared");
-    }
-
-    const propertyValue =
-      "value" in descriptor ? properties[key] : descriptor.get?.call(source);
-    const mapped = mapRevealed(
-      propertyValue,
-      events,
-      preserve,
-      ownedPorts,
-      mappedObjects,
-    );
-    result.changed ||= mapped.changed;
-
-    if (target === source && !mapped.changed) {
-      continue;
-    }
-
-    Object.defineProperty(target, key, {
-      configurable: descriptor.configurable,
-      enumerable: descriptor.enumerable,
-      value: mapped.value,
-      writable: "value" in descriptor && descriptor.writable,
-    });
-  }
-}
-
-function copyRevealedPrototypeAccessors(
-  source: object,
-  target: object,
-  initialPrototype: object,
-  events: Readonly<Record<string, EventToken>>,
-  preserve: (value: object) => boolean,
-  ownedPorts: ReadonlyMap<string, RuntimePort>,
-  mappedObjects: Map<object, MutableRevealResult>,
-  result: MutableRevealResult,
-): void {
-  const visitedKeys = new Set<PropertyKey>();
-  let prototype: object | null = initialPrototype;
-
-  while (prototype !== null && prototype !== Object.prototype) {
-    for (const key of Reflect.ownKeys(prototype)) {
-      if (
-        key === "constructor" ||
-        visitedKeys.has(key) ||
-        Object.hasOwn(source, key)
-      ) {
-        continue;
-      }
-
-      visitedKeys.add(key);
-      const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
-
-      if (descriptor?.get === undefined) {
-        continue;
-      }
-
-      const mapped = mapRevealed(
-        descriptor.get.call(source),
-        events,
-        preserve,
-        ownedPorts,
-        mappedObjects,
-      );
-
-      if (!mapped.changed) {
-        continue;
-      }
-
-      result.changed = true;
-      Object.defineProperty(target, key, {
-        configurable: true,
-        enumerable: descriptor.enumerable,
-        value: mapped.value,
-        writable: false,
-      });
-    }
-
-    prototype = Object.getPrototypeOf(prototype) as object | null;
-  }
 }
 
 // Imported event schemas are carried by their operator input contract. This

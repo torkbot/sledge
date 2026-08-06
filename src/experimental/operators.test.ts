@@ -497,23 +497,6 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     /event port does not belong to this ledger module/,
   );
 
-  const symbolCapability = Symbol("symbol capability");
-  const symbolModule = defineModule(
-    "experimental.contract.symbol-capability",
-    (module) => {
-      const input = module.event("input", Type.String());
-      const declaration = module.declare({ events: { input } });
-      const registered = module.link(declaration, null).register({});
-
-      return module.expose(registered, {
-        input,
-        [symbolCapability]: "preserved",
-      });
-    },
-  )();
-
-  assert.equal(symbolModule.capabilities[symbolCapability], "preserved");
-
   const arrayModule = defineModule(
     "experimental.contract.array-capability",
     (module) => {
@@ -547,24 +530,6 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
 
   assert(interfaceEvent);
 
-  let accessorPort!: EventPort<ReturnType<typeof Type.String>>;
-  const accessorModule = defineModule(
-    "experimental.contract.accessor-capability",
-    (module) => {
-      accessorPort = module.event("input", Type.String());
-      const declaration = module.declare({ events: { input: accessorPort } });
-      const registered = module.link(declaration, null).register({});
-
-      return module.expose(registered, {
-        get input() {
-          return accessorPort;
-        },
-      });
-    },
-  )();
-
-  assert.notEqual(accessorModule.capabilities.input, accessorPort);
-
   const inheritedNameModule = defineModule(
     "experimental.contract.inherited-binding-name",
     (module) => {
@@ -578,57 +543,6 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
   );
 
   assert.doesNotThrow(() => inheritedNameModule());
-
-  class ClassCapabilities {
-    readonly #label = "class capability";
-    readonly #input: EventPort<ReturnType<typeof Type.String>>;
-
-    constructor(input: EventPort<ReturnType<typeof Type.String>>) {
-      this.#input = input;
-    }
-
-    get input(): EventPort<ReturnType<typeof Type.String>> {
-      return this.#input;
-    }
-
-    readLabel(): string {
-      return this.#label;
-    }
-  }
-
-  let classPort!: EventPort<ReturnType<typeof Type.String>>;
-  const classModule = defineModule(
-    "experimental.contract.class-capability",
-    (module) => {
-      classPort = module.event("input", Type.String());
-      const declaration = module.declare({ events: { input: classPort } });
-      const registered = module.link(declaration, null).register({});
-
-      return module.expose(registered, new ClassCapabilities(classPort));
-    },
-  )();
-  const classEvent: EventToken = classModule.capabilities.input;
-
-  assert(classModule.capabilities instanceof ClassCapabilities);
-  assert.notEqual(classEvent, classPort);
-  assert.equal(classModule.capabilities.readLabel(), "class capability");
-  assert(Object.isFrozen(classModule.capabilities));
-
-  const cyclicModule = defineModule(
-    "experimental.contract.cyclic-capability",
-    (module) => {
-      const input = module.event("input", Type.String());
-      const declaration = module.declare({ events: { input } });
-      const registered = module.link(declaration, null).register({});
-      const capabilities: { input: typeof input; self?: unknown } = { input };
-      capabilities.self = capabilities;
-
-      return module.expose(registered, capabilities);
-    },
-  )();
-
-  assert.equal(cyclicModule.capabilities.self, cyclicModule.capabilities);
-  assert(Object.isFrozen(cyclicModule.capabilities));
   assert(Object.isFrozen(identity));
 });
 

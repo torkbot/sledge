@@ -392,6 +392,10 @@ graph.
 `@torkbot/sledge/experimental/operators` contributes two small dataflow
 primitives to the ordinary module interface. An operator is immutable reusable
 behavior; a binding installs that behavior as one independently durable node.
+Operator ports may be revealed through acyclic plain records and arrays. These
+capability values are module-authored data in the same trust domain as the
+ledger composition; class instances, prototype accessors, cyclic graphs, and
+adversarially forged ports are outside this experimental contract.
 
 ```ts
 import { defineModule } from "@torkbot/sledge";
