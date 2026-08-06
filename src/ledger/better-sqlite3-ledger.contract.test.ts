@@ -78,6 +78,7 @@ runLedgerContractSuite({
       runtime.scheduler,
     );
     let workers: LedgerWorkers = await ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: primaryScheduler,
       leaseMs: 1_000,
       defaultRetryDelayMs: 1_000,
@@ -118,6 +119,7 @@ runLedgerContractSuite({
           runtime.scheduler,
         );
         workers = await ledger.startWorkers({
+          configureQueue: () => ({ maxInFlight: 16 }),
           scheduler: primaryScheduler,
           leaseMs: 1_000,
           defaultRetryDelayMs: 1_000,
@@ -131,6 +133,7 @@ runLedgerContractSuite({
           runtime.scheduler,
         );
         workers = await ledger.startWorkers({
+          configureQueue: () => ({ maxInFlight: 16 }),
           scheduler: primaryScheduler,
           leaseMs: 1_000,
           defaultRetryDelayMs: 1_000,
@@ -140,6 +143,7 @@ runLedgerContractSuite({
       startCompetingWorkers: async ({ maxInFlight }) => {
         const competingLedger = await createRuntimeLedger();
         const competingWorkers = await competingLedger.startWorkers({
+          configureQueue: () => ({ maxInFlight: 16 }),
           scheduler: runtime.scheduler,
           leaseMs: 1_000,
           defaultRetryDelayMs: 1_000,

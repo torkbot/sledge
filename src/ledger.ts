@@ -39,6 +39,8 @@ export type {
   LedgerStreamEvent,
   LedgerTiming,
   LedgerWorkerOptions,
+  LedgerWorkerQueue,
+  LedgerWorkerQueueOptions,
   LedgerWorkers,
   ListWorkInput,
   MaterializationDatabaseFor,

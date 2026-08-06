@@ -3,6 +3,11 @@ import { Type, type Static, type TSchema } from "typebox";
 import type { RuntimeClock, RuntimeScheduler } from "../runtime/contracts.ts";
 import { createEventRef, type EventRef } from "./event-ref.ts";
 import {
+  createOperatorBindingCompiler,
+  type OperatorBindingDefinition,
+  type RevealedModuleCapabilities,
+} from "./operator-bindings.ts";
+import {
   ledgerIdentitySeparator,
   validateLedgerModuleId,
   validateLedgerPhysicalNamePart,
@@ -1302,10 +1307,32 @@ export interface Ledger<
 
 export type LedgerWorkerOptions = {
   readonly scheduler: RuntimeScheduler;
+  /**
+   * Resolves the concurrency owned by every installed queue. Sledge invokes
+   * this once per queue when the worker handle starts, using semantic module
+   * and local queue identities rather than storage names.
+   */
+  readonly configureQueue: (
+    queue: LedgerWorkerQueue,
+  ) => LedgerWorkerQueueOptions;
   readonly leaseMs?: number;
   readonly defaultRetryDelayMs?: number;
+  /**
+   * Optional process-wide safety ceiling. Queue limits remain the ordinary
+   * scheduling policy; this only bounds their combined concurrency.
+   */
   readonly maxInFlight?: number;
   readonly terminalWorkRetentionMs?: number;
+};
+
+export type LedgerWorkerQueue = {
+  readonly moduleId: string;
+  readonly name: string;
+  readonly kind: "queue" | "signal_queue";
+};
+
+export type LedgerWorkerQueueOptions = {
+  readonly maxInFlight: number;
 };
 
 export interface LedgerWorkers extends AsyncDisposable {
@@ -2179,8 +2206,8 @@ export type LedgerModuleContribution<
 };
 
 /**
- * Stable identity shared with reusable module primitives such as stdlib
- * result refs. The owner remains valid only while its module factory runs.
+ * Stable identity available to reusable module primitives. The owner remains
+ * valid only while its module factory runs.
  */
 export interface LedgerModuleOwner<TModuleId extends string> {
   readonly [ledgerModuleOwnerTypeBrand]: TModuleId;
@@ -2201,9 +2228,8 @@ type LedgerModuleContractDefinitions<
 };
 
 /** The scoped construction capability received by one module factory. */
-export interface LedgerModuleDefinition<
-  TModuleId extends string,
-> extends LedgerModuleOwner<TModuleId> {
+export interface LedgerModuleDefinition<TModuleId extends string>
+  extends LedgerModuleOwner<TModuleId>, OperatorBindingDefinition {
   declare<
     const TEventDefinitions extends Record<string, EventDefinition>,
     const TQueues extends Record<string, TSchema> = {},
@@ -2271,7 +2297,10 @@ export interface LedgerModuleDefinition<
   >(
     module: TModule,
     capabilities: TCapabilities,
-  ): LedgerModuleContribution<TCapabilities, TModule>;
+  ): LedgerModuleContribution<
+    RevealedModuleCapabilities<TCapabilities>,
+    TModule
+  >;
 }
 
 /**
@@ -2438,6 +2467,7 @@ export function defineModule<
     let revealed: object | undefined;
     const ownedDeclarations = new WeakSet<object>();
     const constructionScope = Object.freeze({});
+    const operatorBindings = createOperatorBindingCompiler(moduleId);
 
     const assertDefinitionOpen = (): void => {
       if (!definitionOpen) {
@@ -2470,6 +2500,7 @@ export function defineModule<
     > => {
       assertDefinitionOpen();
 
+      const augmented = operatorBindings.augmentContract(input);
       const declaration = declareLedgerModuleInternal<
         TModuleId,
         TEventDefinitions,
@@ -2478,8 +2509,11 @@ export function defineModule<
         TSignalQueues
       >({
         moduleId,
-        events: input.events,
-        queues: input.queues,
+        // Operator contracts are private implementation details. The public
+        // declaration retains the author's explicit type while the resolved
+        // ledger shape contains both sets of contracts.
+        events: augmented.events as TEventDefinitions,
+        queues: augmented.queues as TQueues & PrivateSchemaDefinitions<TQueues>,
         signals: input.signals,
         signalQueues: input.signalQueues,
       });
@@ -2513,8 +2547,18 @@ export function defineModule<
         );
       }
 
-      return attachLedgerModuleConstructionScope(
+      const linked = attachLedgerModuleConstructionScope(
         linkLedgerModuleInternal(declaration, materializations),
+        constructionScope,
+      );
+      const register = ((registration: unknown) =>
+        linked.register(
+          operatorBindings.augmentRegistration(registration) as never,
+        )) as typeof linked.register;
+      const integrated = Object.freeze({ ...linked, register });
+
+      return attachLedgerModuleConstructionScope(
+        integrated as typeof linked,
         constructionScope,
       );
     };
@@ -2547,11 +2591,16 @@ export function defineModule<
 
       // Public brands are type-only. Private registries below enforce that
       // both the owner and contribution were minted by this invocation.
+      const publicCapabilities = operatorBindings.reveal(
+        capabilities,
+        registeredModule.events,
+        isLedgerContractToken,
+      ) as RevealedModuleCapabilities<typeof capabilities>;
       const contribution = Object.freeze({
         module: registeredModule,
-        capabilities,
+        capabilities: publicCapabilities,
       }) as LedgerModuleContribution<
-        typeof capabilities,
+        RevealedModuleCapabilities<typeof capabilities>,
         typeof registeredModule
       >;
       revealed = contribution;
@@ -2564,6 +2613,7 @@ export function defineModule<
           get moduleId() {
             return readModuleId();
           },
+          ...operatorBindings.definition,
           declare,
           link,
           expose,

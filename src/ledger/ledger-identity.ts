@@ -1,6 +1,10 @@
 export const ledgerIdentitySeparator = "::";
 
 export function validateLedgerModuleId(moduleId: string): void {
+  if (moduleId.includes(":")) {
+    throw new Error("ledger module id must not contain reserved separator :");
+  }
+
   validateLedgerPhysicalNamePart("ledger module id", moduleId);
 }
 
