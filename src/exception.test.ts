@@ -40,3 +40,23 @@ test("non-error thrown values and cyclic causes remain finite", () => {
     ["Error", "CircularExceptionCause"],
   );
 });
+
+test("exception serialization survives throwing Error property getters", () => {
+  const hostile = new Error("hidden");
+  Object.defineProperties(hostile, {
+    name: { get: () => assert.fail("name getter must not escape") },
+    message: { get: () => assert.fail("message getter must not escape") },
+    stack: { get: () => assert.fail("stack getter must not escape") },
+    cause: { get: () => assert.fail("cause getter must not escape") },
+  });
+
+  assert.deepEqual(serializeException(hostile), {
+    chain: [
+      {
+        name: "Error",
+        message: "<unreadable error message>",
+        stack: null,
+      },
+    ],
+  });
+});

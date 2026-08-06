@@ -550,6 +550,30 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     timeoutMs: 1_000,
     map: (input) => input,
   });
+  const settlementConsumer = new MapAsync("settlement-consumer", {
+    input: SettlementSchema(Type.String()),
+    output: Type.String(),
+    timeoutMs: 1_000,
+    map: (input) =>
+      input.outcome === "succeeded"
+        ? input.value
+        : (input.error.chain.at(0)?.message ?? "failed"),
+  });
+
+  if (false) {
+    defineModule("experimental.contract.settlement-input", (module) => {
+      const source = module.event("input", Type.String());
+      const settled = module.bind("settled", source, identity);
+
+      // @ts-expect-error operator settlements are unwrapped before mapping
+      module.bind("invalid", settled, settlementConsumer);
+
+      const declaration = module.declare({ events: {} });
+      const registered = module.link(declaration, null, {});
+      return module.expose(registered, {});
+    });
+  }
+
   let foreignPort!: EventPort<ReturnType<typeof Type.String>>;
   const captureForeign = defineModule(
     "experimental.contract.foreign-operator-graph",

@@ -19,6 +19,9 @@ const eventPortBrand: unique symbol = Symbol("sledge.experimental.eventPort");
 const eventPortNameBrand: unique symbol = Symbol(
   "sledge.experimental.eventPortName",
 );
+const eventPortSettlementBrand: unique symbol = Symbol(
+  "sledge.experimental.eventPortSettlement",
+);
 const operatorIndexerPortBrand: unique symbol = Symbol(
   "sledge.experimental.operatorIndexerPort",
 );
@@ -122,9 +125,11 @@ export class ForEach<const TName extends string, TInputSchema extends TSchema> {
 export type EventPort<
   TSchemaValue extends TSchema,
   TName extends string = string,
+  TSettlementValueSchema extends TSchema | null = null,
 > = TSchemaValue & {
   readonly [eventPortBrand]: TSchemaValue;
   readonly [eventPortNameBrand]: TName;
+  readonly [eventPortSettlementBrand]: TSettlementValueSchema;
 };
 
 /** A terminal binding that cannot be used as another event source. */
@@ -133,7 +138,7 @@ export interface Sink {
 }
 
 export type RevealedModuleCapabilities<TValue> =
-  TValue extends EventPort<infer TSchemaValue, string>
+  TValue extends EventPort<infer TSchemaValue, string, TSchema | null>
     ? EventToken<string, string, TSchemaValue, null>
     : TValue extends readonly unknown[]
       ? {
@@ -159,9 +164,11 @@ export type SchemaOfEvent<TEvent extends EventToken> =
 type RuntimePort<
   TSchemaValue extends TSchema = TSchema,
   TName extends string = string,
+  TSettlementValueSchema extends TSchema | null = TSchema | null,
 > = TSchemaValue & {
   readonly [eventPortBrand]: TSchemaValue;
   readonly [eventPortNameBrand]: TName;
+  readonly [eventPortSettlementBrand]: TSettlementValueSchema;
   readonly definition: TSchema | EventToken;
   readonly localName: TName;
   readonly settlementValueSchema: TSchema | null;
@@ -208,7 +215,7 @@ export interface OperatorBindingDefinition {
   ): EventPort<SchemaOfEvent<TEvent>>;
 
   indexer<TSchemaValue extends TSchema, TName extends string>(
-    source: EventPort<TSchemaValue, TName>,
+    source: EventPort<TSchemaValue, TName, TSchema | null>,
   ): { readonly sourceEvent: TName; readonly input: TSchemaValue };
 
   bind<
@@ -217,9 +224,13 @@ export interface OperatorBindingDefinition {
     TOutputSchema extends TSchema,
   >(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema>,
+    source: EventPort<TInputSchema, string, null>,
     operator: MapAsync<string, TInputSchema, TOutputSchema>,
-  ): EventPort<OperatorSettlementSchema<TOutputSchema>, TBindingId>;
+  ): EventPort<
+    OperatorSettlementSchema<TOutputSchema>,
+    TBindingId,
+    TOutputSchema
+  >;
 
   bind<
     const TBindingId extends string,
@@ -227,19 +238,31 @@ export interface OperatorBindingDefinition {
     TOutputSchema extends TSchema,
   >(
     bindingId: TBindingId,
-    source: EventPort<OperatorSettlementSchema<TInputSchema>>,
+    source: EventPort<
+      OperatorSettlementSchema<TInputSchema>,
+      string,
+      TInputSchema
+    >,
     operator: MapAsync<string, TInputSchema, TOutputSchema>,
-  ): EventPort<OperatorSettlementSchema<TOutputSchema>, TBindingId>;
+  ): EventPort<
+    OperatorSettlementSchema<TOutputSchema>,
+    TBindingId,
+    TOutputSchema
+  >;
 
   bind<const TBindingId extends string, TInputSchema extends TSchema>(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema>,
+    source: EventPort<TInputSchema, string, null>,
     operator: ForEach<string, TInputSchema>,
   ): Sink;
 
   bind<const TBindingId extends string, TInputSchema extends TSchema>(
     bindingId: TBindingId,
-    source: EventPort<OperatorSettlementSchema<TInputSchema>>,
+    source: EventPort<
+      OperatorSettlementSchema<TInputSchema>,
+      string,
+      TInputSchema
+    >,
     operator: ForEach<string, TInputSchema>,
   ): Sink;
 
@@ -248,12 +271,13 @@ export interface OperatorBindingDefinition {
     TEvents extends Record<string, TSchema>,
     TSignals extends Record<string, TSchema>,
     TAncestorSchema extends TSchema,
+    TAncestorSettlementSchema extends TSchema | null,
   >(
     input: {
       readonly event: ProjectionIndexerEvent<string>;
       readonly db: ProjectionReadDatabase<TProjectionSchema, TEvents, TSignals>;
     },
-    ancestor: EventPort<TAncestorSchema>,
+    ancestor: EventPort<TAncestorSchema, string, TAncestorSettlementSchema>,
   ): Promise<OperatorOriginEvent<TAncestorSchema>>;
 }
 
@@ -332,13 +356,17 @@ export function createOperatorBindingCompiler(moduleId: string): {
       );
     }
   };
-  const createPort = <TSchemaValue extends TSchema, TName extends string>(
+  const createPort = <
+    TSchemaValue extends TSchema,
+    TName extends string,
+    TSettlementValueSchema extends TSchema | null,
+  >(
     localName: TName,
     schema: TSchemaValue,
-    definition: TSchema | EventToken = schema,
-    settlementValueSchema: TSchema | null = null,
-    source: RuntimePort | null = null,
-  ): RuntimePort<TSchemaValue, TName> => {
+    definition: TSchema | EventToken,
+    settlementValueSchema: TSettlementValueSchema,
+    source: RuntimePort | null,
+  ): RuntimePort<TSchemaValue, TName, TSettlementValueSchema> => {
     assertAuthoring();
 
     if (definition === schema && localName.startsWith(privateGraphIdPrefix)) {
@@ -355,6 +383,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
       Object.assign({}, schema, {
         [eventPortBrand]: schema,
         [eventPortNameBrand]: localName,
+        [eventPortSettlementBrand]: settlementValueSchema,
         definition,
         localName,
         settlementValueSchema,
@@ -365,7 +394,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
     return port;
   };
   const event: OperatorBindingDefinition["event"] = (name, schema) =>
-    createPort(name, schema);
+    createPort(name, schema, schema, null, null);
   const indexer: OperatorBindingDefinition["indexer"] = (source) => {
     const port = readPort(source);
 
@@ -393,17 +422,21 @@ export function createOperatorBindingCompiler(moduleId: string): {
       `${privateGraphIdPrefix}import_${imported.size}`,
       schema,
       external,
+      null,
+      null,
     );
     imported.set(external, port);
     return port;
   };
   function bind<TInputSchema extends TSchema, TOutputSchema extends TSchema>(
     bindingId: string,
-    source: EventPort<TInputSchema>,
+    source: EventPort<TInputSchema, string, TSchema | null>,
     operator:
       | MapAsync<string, TInputSchema, TOutputSchema>
       | ForEach<string, TInputSchema>,
-  ): EventPort<OperatorSettlementSchema<TOutputSchema>, string> | Sink {
+  ):
+    | EventPort<OperatorSettlementSchema<TOutputSchema>, string, TOutputSchema>
+    | Sink {
     assertAuthoring();
     const runtimeSource = readPort(source);
 
@@ -750,10 +783,16 @@ function createOperatorAttemptKey(
   return `${moduleId}:${bindingId}:${sourceEventId}`;
 }
 
-function readPort<TSchemaValue extends TSchema, TName extends string>(
-  port: EventPort<TSchemaValue, TName>,
-): RuntimePort<TSchemaValue, TName> {
-  const candidate = port as Partial<RuntimePort<TSchemaValue, TName>>;
+function readPort<
+  TSchemaValue extends TSchema,
+  TName extends string,
+  TSettlementValueSchema extends TSchema | null,
+>(
+  port: EventPort<TSchemaValue, TName, TSettlementValueSchema>,
+): RuntimePort<TSchemaValue, TName, TSettlementValueSchema> {
+  const candidate = port as Partial<
+    RuntimePort<TSchemaValue, TName, TSettlementValueSchema>
+  >;
 
   if (
     typeof candidate.localName !== "string" ||
@@ -762,7 +801,7 @@ function readPort<TSchemaValue extends TSchema, TName extends string>(
     throw new Error("event port does not belong to this ledger module");
   }
 
-  return candidate as RuntimePort<TSchemaValue, TName>;
+  return candidate as RuntimePort<TSchemaValue, TName, TSettlementValueSchema>;
 }
 
 function decodeSourceSettlement(
