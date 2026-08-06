@@ -45,6 +45,7 @@ async function runEpochPressureTest(): Promise<unknown> {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
       defaultRetryDelayMs: 10_000,
       maxInFlight: 4,
@@ -114,6 +115,7 @@ async function runEpochPressureTest(): Promise<unknown> {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
       defaultRetryDelayMs: 10_000,
       maxInFlight: 4,

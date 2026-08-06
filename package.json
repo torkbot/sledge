@@ -72,6 +72,14 @@
     "./experimental/event-invocation": {
       "types": "./dist/experimental/event-invocation.d.ts",
       "default": "./dist/experimental/event-invocation.js"
+    },
+    "./experimental/execution": {
+      "types": "./dist/experimental/execution.d.ts",
+      "default": "./dist/experimental/execution.js"
+    },
+    "./experimental/operators": {
+      "types": "./dist/experimental/operators.d.ts",
+      "default": "./dist/experimental/operators.js"
     }
   },
   "types": "./dist/sledge.d.ts",
@@ -85,6 +93,7 @@
     "test": "node --test src/*.test.ts src/**/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty",
     "lint": "prettier -c README.md package.json tsconfig.json tsconfig.build.json src/*.ts src/**/*.ts",
+    "prototype:execution": "node experiments/execution-graph-prototype/run.ts",
     "prototype:settlement": "node experiments/settlement-algebra-prototype/run.ts",
     "prepublishOnly": "node --run build"
   },

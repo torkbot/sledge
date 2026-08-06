@@ -43,6 +43,7 @@ import type {
   LedgerIndexerContext,
   ListWorkInput,
   LedgerWorkerOptions,
+  LedgerWorkerQueue,
   LedgerWorkers,
   QuerySchema,
   RegisterFunction,
@@ -823,6 +824,41 @@ function readQueueIdentity(
   };
 }
 
+function readWorkerQueueIdentity(
+  storedQueueName: string,
+  fallbackModuleId: string,
+  signal: boolean,
+): LedgerWorkerQueue {
+  const parts = storedQueueName.split(physicalContractNameSeparator);
+  const kind = signal ? "signal_queue" : "queue";
+
+  if (
+    parts.length === 4 &&
+    parts[0] === "sledge" &&
+    parts[1] !== undefined &&
+    parts[1].length > 0 &&
+    parts[2] === kind &&
+    parts[3] !== undefined &&
+    parts[3].length > 0
+  ) {
+    return {
+      moduleId: parts[1],
+      name: parts[3],
+      kind,
+    };
+  }
+
+  return {
+    moduleId: fallbackModuleId,
+    name: storedQueueName,
+    kind,
+  };
+}
+
+function createWorkerQueueKey(queueName: string, signal: boolean): string {
+  return `${signal ? "signal" : "queue"}\u0000${queueName}`;
+}
+
 function createContractEnvelope(
   event: {
     readonly causationEventId: number | null;
@@ -1339,6 +1375,12 @@ function openDatabaseLedgerEngine<
      */
     readonly maxInFlight: number;
     /**
+     * Queue-local capacity. The dispatcher only considers queues with a free
+     * slot, so a saturated queue cannot block claims from another queue.
+     */
+    readonly queues: readonly WorkerQueueRuntime[];
+    readonly inFlightByQueue: Map<string, number>;
+    /**
      * Currently executing handler promises claimed by this handle.
      */
     readonly inFlight: Set<Promise<void>>;
@@ -1396,6 +1438,13 @@ function openDatabaseLedgerEngine<
      */
     scheduledDispatchWake: { dueAtMs: number; cancel(): void } | null;
     scheduledStoreDiscovery: { cancel(): void } | null;
+  };
+
+  type WorkerQueueRuntime = {
+    readonly key: string;
+    readonly queueName: string;
+    readonly signal: boolean;
+    readonly maxInFlight: number;
   };
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
@@ -3502,9 +3551,45 @@ function openDatabaseLedgerEngine<
     };
   }
 
+  function readWorkerQueuesWithCapacity(
+    worker: WorkerRuntimeState,
+  ): readonly WorkerQueueRuntime[] {
+    return worker.queues.filter((queue) => {
+      const inFlight = worker.inFlightByQueue.get(queue.key) ?? 0;
+      return inFlight < queue.maxInFlight;
+    });
+  }
+
+  function createCandidateQueuePredicate(
+    queues: readonly WorkerQueueRuntime[],
+  ): {
+    readonly sql: string;
+    readonly params: readonly (number | string)[];
+  } {
+    if (queues.length === 0) {
+      return { sql: "0 = 1", params: [] };
+    }
+
+    const clauses: string[] = [];
+    const params: (number | string)[] = [];
+
+    for (const queue of queues) {
+      clauses.push("(candidate.signal = ? AND candidate.queue_name = ?)");
+      params.push(queue.signal ? 1 : 0, queue.queueName);
+    }
+
+    return {
+      sql: clauses.join(" OR "),
+      params,
+    };
+  }
+
   async function scheduleNextDispatchFromStore(
     worker: WorkerRuntimeState,
   ): Promise<void> {
+    const queuePredicate = createCandidateQueuePredicate(
+      readWorkerQueuesWithCapacity(worker),
+    );
     const row = await storage.read(async (database) => {
       return await database
         .prepare(
@@ -3513,6 +3598,7 @@ function openDatabaseLedgerEngine<
            WHERE candidate.dead = 0
              AND candidate.cancelled = 0
              AND candidate.lease_id IS NULL
+             AND (${queuePredicate.sql})
              AND (
                candidate.partition_key IS NULL
                OR NOT EXISTS (
@@ -3529,7 +3615,7 @@ function openDatabaseLedgerEngine<
            ORDER BY candidate.available_at_ms ASC
            LIMIT 1`,
         )
-        .get();
+        .get(...queuePredicate.params);
     });
 
     if (row !== undefined) {
@@ -3933,6 +4019,14 @@ function openDatabaseLedgerEngine<
   async function claimNextDueWork(
     worker: WorkerRuntimeState,
   ): Promise<PersistedWorkLease | null> {
+    const queuePredicate = createCandidateQueuePredicate(
+      readWorkerQueuesWithCapacity(worker),
+    );
+
+    if (queuePredicate.params.length === 0) {
+      return null;
+    }
+
     return await runInTransaction(async (database) => {
       const nowMs = clock.nowMs();
 
@@ -3944,6 +4038,7 @@ function openDatabaseLedgerEngine<
              AND candidate.cancelled = 0
              AND candidate.lease_id IS NULL
              AND candidate.available_at_ms <= ?
+             AND (${queuePredicate.sql})
              AND (
                candidate.partition_key IS NULL
                OR NOT EXISTS (
@@ -3960,7 +4055,7 @@ function openDatabaseLedgerEngine<
            ORDER BY candidate.work_id ASC
            LIMIT 1`,
         )
-        .get(nowMs);
+        .get(nowMs, ...queuePredicate.params);
 
       if (candidate === undefined) {
         return null;
@@ -4199,12 +4294,28 @@ function openDatabaseLedgerEngine<
           continue;
         }
 
+        const queueKey = createWorkerQueueKey(
+          claimed.queueName,
+          claimed.signal,
+        );
+        const queueInFlight = worker.inFlightByQueue.get(queueKey) ?? 0;
+        worker.inFlightByQueue.set(queueKey, queueInFlight + 1);
+
         const run = processClaimedWork(worker, claimed, handler)
           .catch((error: unknown) => {
             failWorker(worker, error);
           })
           .finally(() => {
             worker.inFlight.delete(run);
+            const remainingQueueInFlight =
+              (worker.inFlightByQueue.get(queueKey) ?? 1) - 1;
+
+            if (remainingQueueInFlight === 0) {
+              worker.inFlightByQueue.delete(queueKey);
+            } else {
+              worker.inFlightByQueue.set(queueKey, remainingQueueInFlight);
+            }
+
             worker.stateChanges.notify();
             requestDispatchRun(worker);
           });
@@ -5414,9 +5525,63 @@ function openDatabaseLedgerEngine<
 
       const leaseMs = options.leaseMs ?? 1_000;
       const defaultRetryDelayMs = options.defaultRetryDelayMs ?? 1_000;
-      const maxInFlight = options.maxInFlight ?? 16;
       const terminalWorkRetentionMs =
         options.terminalWorkRetentionMs ?? defaultTerminalWorkRetentionMs;
+      const queues: WorkerQueueRuntime[] = [];
+
+      for (const [signal, queueNames] of [
+        [false, Object.keys(model.queues)],
+        [true, Object.keys(model.signalQueues)],
+      ] as const) {
+        for (const queueName of queueNames) {
+          const identity = readWorkerQueueIdentity(
+            queueName,
+            rootModule.moduleId,
+            signal,
+          );
+          const configured = options.configureQueue(identity);
+
+          if (configured === null || typeof configured !== "object") {
+            throw new Error(
+              `configureQueue must return options for ${identity.moduleId}.${identity.name}`,
+            );
+          }
+
+          const queueMaxInFlight = configured.maxInFlight;
+
+          if (
+            !Number.isSafeInteger(queueMaxInFlight) ||
+            queueMaxInFlight <= 0
+          ) {
+            throw new Error(
+              `maxInFlight for ${identity.moduleId}.${identity.name} must be a positive safe integer, received ${queueMaxInFlight}`,
+            );
+          }
+
+          queues.push({
+            key: createWorkerQueueKey(queueName, signal),
+            queueName,
+            signal,
+            maxInFlight: queueMaxInFlight,
+          });
+        }
+      }
+
+      const combinedQueueMaxInFlight = queues.reduce(
+        (sum, queue) => sum + queue.maxInFlight,
+        0,
+      );
+
+      if (!Number.isSafeInteger(combinedQueueMaxInFlight)) {
+        throw new Error(
+          "combined queue maxInFlight exceeds safe integer range",
+        );
+      }
+
+      const maxInFlight =
+        options.maxInFlight === undefined
+          ? combinedQueueMaxInFlight
+          : Math.min(options.maxInFlight, combinedQueueMaxInFlight);
 
       if (!Number.isInteger(leaseMs) || leaseMs <= 0) {
         throw new Error(
@@ -5430,9 +5595,12 @@ function openDatabaseLedgerEngine<
         );
       }
 
-      if (!Number.isInteger(maxInFlight) || maxInFlight <= 0) {
+      if (
+        options.maxInFlight !== undefined &&
+        (!Number.isSafeInteger(options.maxInFlight) || options.maxInFlight <= 0)
+      ) {
         throw new Error(
-          `maxInFlight must be a positive integer, received ${maxInFlight}`,
+          `maxInFlight must be a positive integer, received ${options.maxInFlight}`,
         );
       }
 
@@ -5452,7 +5620,9 @@ function openDatabaseLedgerEngine<
         terminalWorkRetentionMs,
         storePollMs: defaultStorePollMs,
         maxInFlight,
+        queues,
         inFlight: new Set(),
+        inFlightByQueue: new Map(),
         leaseAbortControllers: new Map(),
         leaseExpiryTasks: new Map(),
         leaseHeartbeatTasks: new Map(),

@@ -79,6 +79,7 @@ for (const adapter of adapters) {
         { clock: runtime.clock, scheduler: runtime.scheduler },
       );
       await using workers = await opened.ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         defaultRetryDelayMs: 10,
         maxInFlight: 8,
@@ -159,6 +160,7 @@ for (const adapter of adapters) {
         { clock: runtime.clock, scheduler: runtime.scheduler },
       );
       await using workers = await opened.ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         defaultRetryDelayMs: 10,
         maxInFlight: 8,

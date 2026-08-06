@@ -110,6 +110,7 @@ export async function runFailureAudit(): Promise<unknown> {
 
   {
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
       defaultRetryDelayMs: 10,
       maxInFlight: 4,
@@ -122,6 +123,7 @@ export async function runFailureAudit(): Promise<unknown> {
 
   {
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
       defaultRetryDelayMs: 10,
       maxInFlight: 4,

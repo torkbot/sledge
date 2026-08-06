@@ -62,6 +62,7 @@ for (const adapter of adapters) {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
     const ref = opened.capabilities.invocation.result.ref("gated");
@@ -169,6 +170,7 @@ for (const adapter of adapters) {
         runtime,
       );
       await using workers = await opened.ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         defaultRetryDelayMs: 10,
       });
@@ -196,6 +198,7 @@ for (const adapter of adapters) {
         runtime,
       );
       await using workers = await opened.ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         defaultRetryDelayMs: 10,
       });
@@ -254,6 +257,7 @@ for (const adapter of adapters) {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
     const ref = opened.capabilities.invocation.result.ref("denied");

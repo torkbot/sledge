@@ -159,6 +159,7 @@ export async function runDurableDemo(): Promise<unknown> {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
       defaultRetryDelayMs: 10,
       maxInFlight: 8,
@@ -210,6 +211,7 @@ export async function runDurableDemo(): Promise<unknown> {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
       defaultRetryDelayMs: 10,
       maxInFlight: 8,

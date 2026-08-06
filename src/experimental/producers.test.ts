@@ -51,6 +51,7 @@ for (const adapter of adapters) {
       runtime,
     );
     await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
     const approvalRef = opened.capabilities.approval.result.ref("one");

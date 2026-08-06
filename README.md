@@ -209,7 +209,15 @@ await using opened = await application.open(
 );
 
 await using workers = await opened.ledger.startWorkers({
+  configureQueue: ({ moduleId, name }) => {
+    if (moduleId === "app.users" && name === "welcome-email.send") {
+      return { maxInFlight: 8 };
+    }
+
+    throw new Error(`unconfigured queue ${moduleId}.${name}`);
+  },
   scheduler: runtimeScheduler,
+  maxInFlight: 32,
 });
 
 await opened.ledger.emit(opened.capabilities.users.events["user.created"], {
@@ -585,8 +593,8 @@ from a fresh snapshot; caller cancellation always aborts the stream.
 
 ## Experimental Durable Algebra
 
-Small producers and operators build on `ResultPort` without introducing a
-workflow interpreter or a second generic settlement stream:
+Sledge currently exposes two independent pressure-test directions. Small
+producers and operators build on `ResultPort` without a workflow interpreter:
 
 - `defineInvocation(...)` turns an independently requested effect into a
   durable request/result protocol.
@@ -599,12 +607,97 @@ workflow interpreter or a second generic settlement stream:
 - `defineRace(...)` settles from the member whose terminal event was committed
   first.
 
+The execution-graph experiment instead composes one immutable program and
+interprets it through a private generic journal. It is intended to test whether
+data-dependent composition can remain as legible as ordinary TypeScript while
+using fewer application ledger modules.
+
 The operators are ordinary Sledge module factories. Install them next to their
 source modules; generated event aliases, projections, queues, deduplication,
 and restart recovery stay private. The stable `stdlib` path is the curated
 foundation; each `experimental/*` path is deliberately independent and may
 change incompatibly as real applications pressure-test its semantics and DX.
 There is no experimental barrel that silently grows into a second SDK.
+
+### Compose a durable execution graph
+
+`@torkbot/sledge/experimental/execution` currently has six graph forms:
+success, typed failure, cancellation, `map`, `flatMap`, and a durable activity
+leaf. An activity declares exactly one injected service. Its input, success,
+and typed-failure schemas validate every value that crosses the private generic
+journal.
+
+```ts
+import {
+  bindExecutionService,
+  defineActivity,
+  defineExecutionModule,
+  defineExecutionProgram,
+  defineExecutionService,
+} from "@torkbot/sledge/experimental/execution";
+
+const MemoryExtractor = defineExecutionService<
+  "app.memory-extractor",
+  MemoryExtractor
+>("app.memory-extractor");
+const PrefixCompactor = defineExecutionService<
+  "app.prefix-compactor",
+  PrefixCompactor
+>("app.prefix-compactor");
+
+const extractMemory = defineActivity("app.extract-memory", MemoryExtractor, {
+  inputSchema: EpochInputSchema,
+  resultSchema: ExtractedMemorySchema,
+  failureSchema: MemoryFailureSchema,
+  execute: ({ input, service, signal }) => service(input, { signal }),
+});
+const compactPrefix = defineActivity("app.compact-prefix", PrefixCompactor, {
+  inputSchema: CompactionInputSchema,
+  resultSchema: CompactedPrefixSchema,
+  failureSchema: CompactionFailureSchema,
+  execute: ({ input, service, signal }) => service(input, { signal }),
+});
+
+const compactEpoch = defineExecutionProgram("app.compact-epoch", {
+  inputSchema: EpochInputSchema,
+  resultSchema: EpochResultSchema,
+  failureSchema: EpochFailureSchema,
+  build: (input) =>
+    extractMemory(input).flatMap((memory) =>
+      compactPrefix({ ...input, memory }).map((compactedPrefix) => ({
+        memory,
+        compactedPrefix,
+      })),
+    ),
+});
+
+const { execution } = sledge.install(
+  defineExecutionModule("app.executions", {
+    programs: [compactEpoch],
+    services: [
+      bindExecutionService(MemoryExtractor, memoryExtractor),
+      bindExecutionService(PrefixCompactor, prefixCompactor),
+    ],
+  })(),
+);
+
+const ref = await execution.start(ledger, compactEpoch, epochInput, {
+  key: `epoch:${epochInput.epoch}`,
+});
+const settlement = await execution.read(ledger, compactEpoch, ref);
+```
+
+The module owns a small interpreter, one control queue, one activity queue, and
+the journal projection. A thrown activity attempt retains normal Sledge retry
+semantics. A returned `Settlement` becomes durable activity output, so a later
+`flatMap` receives the exact decoded value after restart. Service bindings are
+required by the program's graph type and remain ordinary user-supplied
+functions or objects.
+
+This is deliberately not a scheduler framework. Queue-local worker capacity
+keeps activity calls from consuming control capacity. Additional executor
+queues, fairness among execution refs, fan-out, and durable cancellation remain
+open design work that should be added only after real programs require them.
 
 ### Start independently requested work with `invocation`
 
@@ -1532,6 +1625,15 @@ Opening a ledger is passive. It initializes storage and can emit, query, tail,
 resume, and observe signals, but it does not claim or process queue work until
 `startWorkers(...)` is called.
 
+`startWorkers(...)` requires `configureQueue({ moduleId, name, kind })` to
+return a positive `maxInFlight` for every installed queue. The callback runs
+once during worker startup and receives semantic local identities rather than
+physical storage names. Each queue owns its configured capacity; a saturated
+queue is excluded from candidate selection so later work in another queue can
+still start. Optional top-level `maxInFlight` is only a combined safety ceiling.
+It can still create contention when set below the sum of queue capacities;
+Sledge does not yet promise fairness within that ceiling.
+
 The handle returned by `startWorkers(...)` exposes
 `waitForIdle({ signal })`. It resolves once no pending, delayed, leased, or
 executing work remains, including work blocked behind a partition head.
@@ -1882,6 +1984,11 @@ without being embedded in event consumption.
 - `@torkbot/sledge/runtime/virtual-runtime`
 - `@torkbot/sledge/stdlib`
 - `@torkbot/sledge/experimental/all`
+- `@torkbot/sledge/experimental/deadline`
+- `@torkbot/sledge/experimental/event-invocation`
+- `@torkbot/sledge/experimental/execution`
+- `@torkbot/sledge/experimental/external-value`
+- `@torkbot/sledge/experimental/invocation`
 - `@torkbot/sledge/experimental/race`
 - `@torkbot/sledge/experimental/then`
 

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Breaking: replace the default global worker concurrency policy with required
+  per-queue configuration. `configureQueue({ moduleId, name, kind })` assigns a
+  positive `maxInFlight` to every installed queue using semantic identities.
+  Saturated queues are excluded from claim selection, preventing their older
+  work from blocking another queue with free capacity. Top-level `maxInFlight`
+  remains optional as a combined process safety ceiling, not a fairness policy.
+- Add `@torkbot/sledge/experimental/execution`, a bounded durable execution
+  graph experiment with immutable `map`/`flatMap`, typed terminal settlement,
+  validated activity leaves, typed service bindings, and one private generic
+  journal. The interpreter uses separate control and activity queues, rebuilds
+  data-dependent continuations from registered program code after restart, and
+  journals an activity result before supplying it to the next graph node.
 - Add `ledger.querySnapshot(query, params)`, which returns a decoded projection
   result and resumable event cursor from one SQLite read snapshot. Both storage
   adapters pin the WAL snapshot before running the query, allowing public

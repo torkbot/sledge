@@ -1379,10 +1379,32 @@ export interface Ledger<
 
 export type LedgerWorkerOptions = {
   readonly scheduler: RuntimeScheduler;
+  /**
+   * Resolves the concurrency owned by every installed queue. Sledge invokes
+   * this once per queue when the worker handle starts, using semantic module
+   * and local queue identities rather than storage names.
+   */
+  readonly configureQueue: (
+    queue: LedgerWorkerQueue,
+  ) => LedgerWorkerQueueOptions;
   readonly leaseMs?: number;
   readonly defaultRetryDelayMs?: number;
+  /**
+   * Optional process-wide safety ceiling. Queue limits remain the ordinary
+   * scheduling policy; this only bounds their combined concurrency.
+   */
   readonly maxInFlight?: number;
   readonly terminalWorkRetentionMs?: number;
+};
+
+export type LedgerWorkerQueue = {
+  readonly moduleId: string;
+  readonly name: string;
+  readonly kind: "queue" | "signal_queue";
+};
+
+export type LedgerWorkerQueueOptions = {
+  readonly maxInFlight: number;
 };
 
 export interface LedgerWorkers extends AsyncDisposable {
