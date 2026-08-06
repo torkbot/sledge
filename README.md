@@ -389,16 +389,13 @@ graph.
 
 ## Experimental Operators
 
-`@torkbot/sledge/experimental/operators` explores a small dataflow interface
-for building deep ledger modules. An operator is immutable reusable behavior;
-a binding installs that behavior as one independently durable graph node.
+`@torkbot/sledge/experimental/operators` contributes two small dataflow
+primitives to the ordinary module interface. An operator is immutable reusable
+behavior; a binding installs that behavior as one independently durable node.
 
 ```ts
-import {
-  defineOperatorModule,
-  ForEach,
-  MapAsync,
-} from "@torkbot/sledge/experimental/operators";
+import { defineModule } from "@torkbot/sledge";
+import { ForEach, MapAsync } from "@torkbot/sledge/experimental/operators";
 
 const extractMemory = new MapAsync("extract-memory", {
   input: CompactionRequest,
@@ -413,21 +410,26 @@ const recordMetric = new ForEach("record-metric", {
     metrics.record(memory, { idempotencyKey: key, signal }),
 });
 
-const defineCompactionFlow = defineOperatorModule(
-  "app.compaction-flow",
-  (graph) => {
-    const requested = graph.event("requested", CompactionRequest);
-    const memory = graph.bind(
-      "extract-compaction-memory",
-      requested,
-      extractMemory,
-    );
+const defineCompactionFlow = defineModule("app.compaction-flow", (module) => {
+  const requested = module.event("requested", CompactionRequest);
+  const memory = module.bind(
+    "extract-compaction-memory",
+    requested,
+    extractMemory,
+  );
 
-    graph.bind("record-compaction-metric", memory, recordMetric);
+  module.bind("record-compaction-metric", memory, recordMetric);
 
-    return { requested, memory };
-  },
-);
+  const declaration = module.declare({
+    // Listing a port here makes it available to ordinary handlers,
+    // materializations, and queries in this module. Unlisted ports remain
+    // private but are still compiled into the ledger model.
+    events: { requested, "extract-compaction-memory": memory },
+  });
+  const registered = module.link(declaration, null).register({});
+
+  return module.expose(registered, { requested, memory });
+});
 ```
 
 `MapAsync` turns each source event into retryable private work and atomically
@@ -440,10 +442,12 @@ The operator name identifies reusable behavior in diagnostics. The binding id
 is the durable queue and output-event identity. Reusing one operator under two
 binding ids shares implementation but never execution state.
 
-Operator graphs compile into ordinary Sledge events, handlers, and queues.
-There is no workflow interpreter or generic protocol event. The experimental
-surface intentionally begins with only `MapAsync` and `ForEach`; additional
-operators must be justified by real application pressure.
+Bindings compile with the rest of their module into ordinary Sledge events,
+handlers, and queues. There is no second kind of module, workflow interpreter,
+or generic protocol event. This also lets one module combine dataflow bindings
+with its own handlers and materializations. The experimental surface
+intentionally begins with only `MapAsync` and `ForEach`; additional operators
+must be justified by real application pressure.
 
 ## Module and Application Phases
 

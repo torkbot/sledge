@@ -42,11 +42,14 @@
   is replaced by one operator graph interface rather than carried forward
   alongside a competing design.
 - Add `@torkbot/sledge/experimental/operators` with immutable `MapAsync` and
-  `ForEach` operators. `defineOperatorModule(...)` binds reusable behavior to
-  durable binding ids, compiles fan-out and chaining into ordinary ledger
-  events and private queues, supplies stable idempotency keys, and adds no
-  interpreter or generic protocol events. `MapAsync` emits one typed event on
-  success; terminal `ForEach` acknowledges without manufacturing an event.
+  `ForEach` operators. The canonical `defineModule(...)` port exposes
+  `event(...)`, `import(...)`, and `bind(...)`, so reusable behavior, ordinary
+  handlers, and materializations compile as one ledger module rather than a
+  parallel operator-module abstraction. Durable binding ids compile fan-out
+  and chaining into ordinary ledger events and private queues with stable
+  idempotency keys and no interpreter or generic protocol events. `MapAsync`
+  emits one typed event on success; terminal `ForEach` acknowledges without
+  manufacturing an event.
 - Breaking: make durable event `actions.enqueue(...)` asynchronous. Addressed
   work resolves to its persisted `WorkRef`, including an existing identity
   preserved by coalescing; anonymous work resolves to `null`. Export

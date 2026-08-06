@@ -8,16 +8,14 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 
 import { createBetterSqliteDriver } from "../better-sqlite3.ts";
-import type { LedgerWorkerQueue } from "../ledger/ledger.ts";
+import {
+  defineMaterialization,
+  type LedgerWorkerQueue,
+} from "../ledger/ledger.ts";
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { defineLedger, defineModule, type LedgerDriver } from "../sledge.ts";
 import { createTursoDriver } from "../turso.ts";
-import {
-  defineOperatorModule,
-  type EventPort,
-  ForEach,
-  MapAsync,
-} from "./operators.ts";
+import { type EventPort, ForEach, MapAsync } from "./operators.ts";
 
 const adapters: readonly {
   readonly name: string;
@@ -42,6 +40,7 @@ for (const adapter of adapters) {
     const runtime = new VirtualRuntimeHarness(10_000);
     const executions: string[] = [];
     const effectKeys: string[] = [];
+    const ordinaryHandlers: string[] = [];
     const Normalized = Type.Object({
       source: Type.String({ minLength: 1 }),
       value: Type.String({ minLength: 1 }),
@@ -82,31 +81,89 @@ for (const adapter of adapters) {
         executions.push(`observe:${input.value}`);
       },
     });
-    const defineFlow = defineOperatorModule(
+    const defineFlow = defineModule(
       "experimental.contract.operator-bindings",
-      (graph) => {
-        const requestedA = graph.event(
+      (module) => {
+        const requestedA = module.event(
           "requested_a",
           Type.String({ minLength: 1 }),
         );
-        const requestedB = graph.event(
+        const requestedB = module.event(
           "requested_b",
           Type.String({ minLength: 1 }),
         );
-        const normalizedA = graph.bind("normalize_a", requestedA, normalize);
-        const normalizedB = graph.bind("normalize_b", requestedB, normalize);
-        const loweredA = graph.bind("lowercase_a", requestedA, lowercase);
-        const summarizedA = graph.bind("summarize_a", normalizedA, summarize);
-        graph.bind("observe_b", normalizedB, observe);
+        const normalizedA = module.bind("normalize_a", requestedA, normalize);
+        const normalizedB = module.bind("normalize_b", requestedB, normalize);
+        const loweredA = module.bind("lowercase_a", requestedA, lowercase);
+        const summarizedA = module.bind("summarize_a", normalizedA, summarize);
+        module.bind("observe_b", normalizedB, observe);
+        const declaration = module.declare({
+          events: {
+            requested_a: requestedA,
+            normalize_a: normalizedA,
+          },
+        });
+        const materialization = defineMaterialization(declaration, {
+          namespace: "operator-bindings",
+        })
+          .version(1, "record normalized values", (schema) =>
+            schema.createTable("normalized", (table) =>
+              table
+                .columns({ value: table.text().notNull() })
+                .primaryKey(["value"]),
+            ),
+          )
+          .define({
+            indexers: {
+              recordNormalized: {
+                sourceEvent: "normalize_a",
+                input: Normalized,
+              },
+            },
+            queries: {
+              normalizedValues: {
+                params: Type.Object({}),
+                result: Type.Array(Type.String()),
+              },
+            },
+          });
+        const registered = module.link(declaration, materialization).register({
+          events: {
+            requested_a: ({ event }) => {
+              ordinaryHandlers.push(event.payload);
+            },
+            normalize_a: async ({ event, actions }) => {
+              await actions.index("recordNormalized", event.payload);
+            },
+          },
+          indexers: {
+            recordNormalized: async ({ input, db }) => {
+              await db
+                .insertInto("normalized")
+                .values({ value: input.value })
+                .execute();
+            },
+          },
+          queries: {
+            normalizedValues: async ({ db }) => {
+              const rows = await db
+                .selectFrom("normalized")
+                .select(["value"])
+                .execute();
+              return rows.map((row) => row.value);
+            },
+          },
+        });
 
-        return {
+        return module.expose(registered, {
           requestedA,
           requestedB,
           normalizedA,
           normalizedB,
           loweredA,
           summarizedA,
-        };
+          normalizedValues: registered.queries.normalizedValues,
+        });
       },
     );
     const application = defineLedger((sledge) => ({
@@ -154,6 +211,14 @@ for (const adapter of adapters) {
       "observe:BETA",
       "summarize:ALPHA",
     ]);
+    assert.deepEqual(ordinaryHandlers, [" Alpha "]);
+    assert.deepEqual(
+      await reopened.ledger.query(
+        reopened.capabilities.flow.normalizedValues,
+        {},
+      ),
+      ["ALPHA"],
+    );
     assert.equal(effectKeys.length, 2);
     assert.equal(effectKeys[0], effectKeys[1]);
     assert.match(
@@ -213,16 +278,18 @@ for (const adapter of adapters) {
     const application = defineLedger((sledge) => {
       const source = sledge.install(defineSource());
       const flow = sledge.install(
-        defineOperatorModule(
+        defineModule(
           "experimental.contract.imported-operator-graph",
-          (graph) => {
-            const doubled = graph.bind(
+          (module) => {
+            const doubled = module.bind(
               "double_requested",
-              graph.import(source.requested),
+              module.import(source.requested),
               double,
             );
+            const declaration = module.declare({ events: {} });
+            const registered = module.link(declaration, null).register({});
 
-            return { doubled };
+            return module.expose(registered, { doubled });
           },
         )(),
       );
@@ -258,11 +325,13 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
     map: (input) => input,
   });
   let foreignPort!: EventPort<ReturnType<typeof Type.String>>;
-  const captureForeign = defineOperatorModule(
+  const captureForeign = defineModule(
     "experimental.contract.foreign-operator-graph",
-    (graph) => {
-      foreignPort = graph.event("input", Type.String());
-      return { input: foreignPort };
+    (module) => {
+      foreignPort = module.event("input", Type.String());
+      const declaration = module.declare({ events: {} });
+      const registered = module.link(declaration, null).register({});
+      return module.expose(registered, { input: foreignPort });
     },
   );
 
@@ -270,24 +339,25 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
 
   assert.throws(
     () =>
-      defineOperatorModule(
-        "experimental.contract.invalid-operator-graph",
-        (graph) => {
-          graph.bind("duplicate", foreignPort, identity);
-          return {};
-        },
-      )(),
-    /event port does not belong to this operator graph/,
+      defineModule("experimental.contract.invalid-operator-graph", (module) => {
+        module.bind("duplicate", foreignPort, identity);
+        const declaration = module.declare({ events: {} });
+        const registered = module.link(declaration, null).register({});
+        return module.expose(registered, {});
+      })(),
+    /event port does not belong to this ledger module/,
   );
   assert.throws(
     () =>
-      defineOperatorModule(
+      defineModule(
         "experimental.contract.duplicate-operator-binding",
-        (graph) => {
-          const source = graph.event("input", Type.String());
-          graph.bind("duplicate", source, identity);
-          graph.bind("duplicate", source, identity);
-          return {};
+        (module) => {
+          const source = module.event("input", Type.String());
+          module.bind("duplicate", source, identity);
+          module.bind("duplicate", source, identity);
+          const declaration = module.declare({ events: {} });
+          const registered = module.link(declaration, null).register({});
+          return module.expose(registered, {});
         },
       )(),
     /duplicate operator binding id duplicate/,
