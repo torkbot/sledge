@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Breaking: make `MapAsync` produce one durable settlement for every input.
+  Returned values become successful settlements; thrown values, invalid mapped
+  outputs, and required per-operator timeouts become failed settlements using
+  Sledge's canonical portable exception format. Chained operators receive
+  successful values directly and propagate failures without invoking later
+  mappers. Add `module.indexer(port)` for automatic settlement indexing and
+  `module.origin(context, ancestor)` for typed traversal to an originating
+  event, removing application-owned settlement plumbing and causation queries.
 - Hide the implemented ledger module carried by `LedgerModuleContribution`.
   Contributions now expose only their bounded capabilities while Sledge keeps
   installation provenance and the implemented module in a library-owned

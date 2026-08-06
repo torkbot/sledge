@@ -404,6 +404,7 @@ import { ForEach, MapAsync } from "@torkbot/sledge/experimental/operators";
 const extractMemory = new MapAsync("extract-memory", {
   input: CompactionRequest,
   output: ExtractedMemory,
+  timeoutMs: 30_000,
   map: async (request, { key, signal }) =>
     memoryExtractor(request, { idempotencyKey: key, signal }),
 });
@@ -436,11 +437,39 @@ const defineCompactionFlow = defineModule("app.compaction-flow", (module) => {
 });
 ```
 
-`MapAsync` turns each source event into retryable private work and atomically
-emits its mapped output when that work succeeds. `ForEach` is a terminal sink:
-it retries an external effect but emits no output event. Both receive a stable
-idempotency key, attempt number, and active lease signal. Throwing retries;
-returning acknowledges the work. External effects remain at-least-once.
+`MapAsync` turns each source event into private work and emits one durable
+settlement. A returned value produces `{ outcome: "succeeded", value }`. A
+thrown value, output-schema violation, or operator timeout produces
+`{ outcome: "failed", error }`; mapper code does not need a `try`/`catch`.
+`timeoutMs` is required so every asynchronous mapping has an explicit bound.
+
+Bindings compose settlements automatically. A downstream `MapAsync` or
+`ForEach` receives the successful value rather than the wrapper. An upstream
+failure flows unchanged through downstream `MapAsync` bindings without calling
+their mapper, so one failure remains one portable graph outcome rather than a
+nested series of wrappers.
+
+`module.indexer(port)` binds a materialization indexer directly to an operator
+port. The port supplies both event identity and settlement schema, and Sledge
+dispatches the indexer before the port's ordinary event handler. Authors do not
+repeat `sourceEvent`, repeat `input`, or write a handler whose only purpose is
+calling `actions.index(...)`.
+
+Inside that indexer, `module.origin(context, requested)` follows the compiled
+operator graph and returns the typed ancestor event. Module authors do not
+reconstruct event refs, parse work identities, or write private causation
+queries.
+
+`ForEach` is a terminal sink: it retries an external effect but emits no output
+event. Both operators receive a stable idempotency key, attempt number, and
+active signal. Storage and worker interruptions may replay work, so external
+effects remain at-least-once. Per-operator retry policy is deliberately not
+part of this experimental interface.
+
+Sledge serializes every operator exception with the same flat cause-chain wire
+shape. `serializeException(...)` accepts any thrown JavaScript value and
+`rehydrateException(...)` returns ordinary `Error` instances linked by
+`cause`; rehydration does not depend on application-specific error classes.
 
 The operator name identifies reusable behavior in diagnostics. The binding id
 is the durable queue and output-event identity. Reusing one operator under two

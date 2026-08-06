@@ -13,6 +13,15 @@ export {
   WorkRefSchema,
 } from "./ledger/ledger.ts";
 
+export {
+  rehydrateException,
+  serializeException,
+  SerializedExceptionFrameSchema,
+  SerializedExceptionSchema,
+  type SerializedException,
+  type SerializedExceptionFrame,
+} from "./exception.ts";
+
 export type {
   AddressedEnqueueOptions,
   AnyMaterializationHistory,
