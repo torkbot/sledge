@@ -813,6 +813,7 @@ test("dispatch scheduling reads do not block event writes", async () => {
   });
 
   const workersPromise = ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
   await scheduleReadStarted.promise;
@@ -1118,6 +1119,7 @@ test("ledger construction and emit do not start queue workers", async () => {
   assert.equal(readCount(database, `SELECT COUNT(*) as total FROM work`), 1);
 
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -1203,6 +1205,7 @@ test("closing workers during a pending claim releases the claimed work", async (
 
   await ledger.emit("job.requested", { id: 1 });
   const workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -1292,6 +1295,7 @@ test("idle workers wake promptly for sibling-runtime commits", async () => {
 
   try {
     workers = await workerLedger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
 
@@ -1364,7 +1368,10 @@ test("event-only sibling commits do not wake queue workers", async () => {
     null;
 
   try {
-    workers = await workerLedger.startWorkers({ scheduler });
+    workers = await workerLedger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
+      scheduler,
+    });
     scheduledDelays.length = 0;
 
     await emitterLedger.emit("note.recorded", { id: 1 });
@@ -1442,6 +1449,7 @@ test("store discovery remains independent of a known durable deadline", async ()
       id: 1,
     });
     workers = await workerLedger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
     await runtime.flush();
@@ -1744,6 +1752,7 @@ test("worker failures preserve arbitrary rejection reasons", async () => {
 
   await ledger.emit("job.requested", { id: 1 });
   const workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
   await runtime.flush();
@@ -1831,6 +1840,7 @@ test("worker supervision reports work-processing failures", async () => {
   try {
     await ledger.emit("job.requested", { id: 1 });
     const workers = await ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
     const waiting = workers.waitForIdle({
@@ -1912,7 +1922,10 @@ test("worker supervision reports sibling wake scheduling failures", async () => 
   });
 
   try {
-    const workers = await workerLedger.startWorkers({ scheduler });
+    const workers = await workerLedger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
+      scheduler,
+    });
     const waitAbortController = new AbortController();
 
     failNextOneShot = true;
@@ -1978,11 +1991,13 @@ test("startWorkers rejects while workers are already running", async () => {
   });
 
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
   await assert.rejects(
     ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     }),
     /ledger workers are already running/,
@@ -2036,6 +2051,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
   await assert.rejects(
     async () =>
       await ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         leaseMs: 0,
       }),
@@ -2045,6 +2061,7 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
   await assert.rejects(
     async () =>
       await ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         defaultRetryDelayMs: -1,
       }),
@@ -2054,10 +2071,20 @@ test("startWorkers rejects invalid lease and retry timing options", async () => 
   await assert.rejects(
     async () =>
       await ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 16 }),
         scheduler: runtime.scheduler,
         maxInFlight: 0,
       }),
     /maxInFlight must be a positive integer/,
+  );
+
+  await assert.rejects(
+    async () =>
+      await ledger.startWorkers({
+        configureQueue: () => ({ maxInFlight: 0 }),
+        scheduler: runtime.scheduler,
+      }),
+    /maxInFlight for engine\.fixture\.job\.run must be a positive safe integer/,
   );
 });
 
@@ -2112,6 +2139,7 @@ test("waitForIdle waits for work and supports cancellation", async () => {
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -2224,6 +2252,7 @@ test("waitForIdle aborts while its durable-state read is still pending", async (
 
   try {
     const workers = await ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
     const waitController = new AbortController();
@@ -2319,6 +2348,7 @@ test("waitForIdle exits a pending durable-state read when workers close or fail"
 
       try {
         const workers = await ledger.startWorkers({
+          configureQueue: () => ({ maxInFlight: 16 }),
           scheduler: runtime.scheduler,
         });
         const waiting = workers.waitForIdle({
@@ -2418,6 +2448,7 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     maxInFlight: 2,
   });
@@ -2448,6 +2479,77 @@ test("ledger enforces maxInFlight dispatch concurrency", async () => {
   await waitFor(runtime, () => completed === 3);
 
   assert.equal(peak, 2);
+});
+
+test("a saturated queue does not block a later queue with free capacity", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const database = new Database(databaseUrl);
+  const releaseSlow = Promise.withResolvers<void>();
+  const slowStarted: number[] = [];
+  const fastStarted: number[] = [];
+  const configuredQueues: string[] = [];
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "fast.requested": Type.Object({ id: Type.Number() }),
+      "slow.requested": Type.Object({ id: Type.Number() }),
+    },
+    queues: {
+      "fast.run": Type.Object({ id: Type.Number() }),
+      "slow.run": Type.Object({ id: Type.Number() }),
+    },
+    register: {
+      events: {
+        "fast.requested": ({ event, actions }) => {
+          actions.enqueue("fast.run", event.payload);
+        },
+        "slow.requested": ({ event, actions }) => {
+          actions.enqueue("slow.run", event.payload);
+        },
+      },
+      queues: {
+        "fast.run": ({ work }) => {
+          fastStarted.push(work.payload.id);
+        },
+        "slow.run": async ({ work }) => {
+          slowStarted.push(work.payload.id);
+          await releaseSlow.promise;
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+  });
+  await using workers = await ledger.startWorkers({
+    configureQueue: (queue) => {
+      configuredQueues.push(`${queue.moduleId}:${queue.kind}:${queue.name}`);
+      return { maxInFlight: 1 };
+    },
+    scheduler: runtime.scheduler,
+    maxInFlight: 2,
+  });
+
+  await ledger.emit("slow.requested", { id: 1 });
+  await ledger.emit("slow.requested", { id: 2 });
+  await ledger.emit("fast.requested", { id: 3 });
+
+  await waitFor(runtime, () => slowStarted.length === 1);
+  await waitFor(runtime, () => fastStarted.length === 1);
+
+  assert.deepEqual(slowStarted, [1]);
+  assert.deepEqual(fastStarted, [3]);
+  assert.deepEqual(configuredQueues.sort(), [
+    "engine.fixture:queue:fast.run",
+    "engine.fixture:queue:slow.run",
+  ]);
+
+  releaseSlow.resolve();
+  await waitFor(runtime, () => slowStarted.length === 2);
 });
 
 test("deduped emit does not replay projections or materialization", async () => {
@@ -2515,6 +2617,7 @@ test("deduped emit does not replay projections or materialization", async () => 
       },
     });
     await using workers = await ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 16 }),
       scheduler: runtime.scheduler,
     });
 
@@ -2623,6 +2726,7 @@ test("event handlers can query to drive enqueue decisions", async () => {
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -2754,6 +2858,7 @@ test("signals materialize signal work and are pruned after ack", async () => {
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -2894,6 +2999,7 @@ test("queue emissions require an unexpired authenticated lease", async () => {
     timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     leaseMs: 1_000,
   });
@@ -2993,6 +3099,7 @@ test("queue handlers publish signals immediately before handler completion", asy
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -3114,6 +3221,7 @@ test("signal retry keeps signal event until signal work acks", async () => {
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -4048,6 +4156,7 @@ test("cancelWork durably cancels pending work by ref before execution", async ()
   assert.equal(cancelled.work.state, "cancelled");
 
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 
@@ -4129,6 +4238,7 @@ test("cancelWork aborts an in-flight lease by ref and makes the work terminal", 
     },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     leaseMs: 1_000,
   });
@@ -4219,6 +4329,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
   await ledger.cancelWork({ ref: cancelWork.ref });
 
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     terminalWorkRetentionMs: 10,
   });
@@ -4242,6 +4353,7 @@ test("terminalWorkRetentionMs prunes retained dead and cancelled work", async ()
   await runtime.advanceByMs(11);
   await workers.close();
   await using nextWorkers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     terminalWorkRetentionMs: 10,
   });
@@ -4284,6 +4396,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
 
   await ledger.emit("job.requested", { id: 1 });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     terminalWorkRetentionMs: 10,
   });
@@ -4295,6 +4408,7 @@ test("terminalWorkRetentionMs prunes no-handler dead work", async () => {
   await runtime.advanceByMs(11);
   await workers.close();
   await using nextWorkers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
     terminalWorkRetentionMs: 10,
   });
@@ -4735,6 +4849,7 @@ test("signal enqueue rejects coalescing options from untyped callers", async () 
     timing: { clock: runtime.clock, scheduler: runtime.scheduler },
   });
   await using workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 16 }),
     scheduler: runtime.scheduler,
   });
 

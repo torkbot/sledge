@@ -209,6 +209,7 @@ await using opened = await application.open(
 );
 
 await using workers = await opened.ledger.startWorkers({
+  configureQueue: () => ({ maxInFlight: 8 }),
   scheduler: runtimeScheduler,
 });
 
@@ -328,12 +329,6 @@ const users = sledge.install(defineUsersModule());
 const audit = sledge.install(defineAuditModule(users));
 ```
 
-Reusable primitives take the narrower `LedgerModuleOwner` capability. For
-example, replace `defineResult({ moduleId, resultSchema })` with
-`defineResult(module, { resultSchema })`. The primitive receives identity and
-private lifetime validation without gaining declaration, linking, or
-registration authority.
-
 ### Replace prepared-model resolution with assembly queries
 
 `defineLedgerModel(...)`, `prepare(...)`, and `extend(...)` are removed. Install
@@ -371,16 +366,14 @@ opening the final runtime, and an abandoned query failure rejects the open.
 | `prepare(...)` / `extend(...)`                   | `sledge.query(...)` / `sledge.install(...)`           |
 | `defineSledge(...)`                              | `defineLedger(...)`                                   |
 | `{ module, capabilities }`                       | `defineModule(...)` plus `module.expose(...)`         |
-| `defineResult({ moduleId, resultSchema })`       | `defineResult(module, { resultSchema })`              |
 | `createBetterSqliteSledge({ application, ... })` | `application.open(createBetterSqliteDriver({ ... }))` |
 | `createTursoSledge({ application, ... })`        | `application.open(createTursoDriver({ ... }))`        |
 | A required production `timing` input             | Node timing by default; an optional test override     |
 | Registered module handles used as public API     | `OpenedLedger.capabilities`                           |
 
 The root `defineLedger` export is now the application entry point. Low-level
-ledger declarations remain under `@torkbot/sledge/ledger`, the two driver
-factories keep their adapter subpaths, and curated primitives live under
-`@torkbot/sledge/stdlib`.
+ledger declarations remain under `@torkbot/sledge/ledger`, and the two driver
+factories keep their adapter subpaths.
 
 ### Preserve the durable graph
 
@@ -394,280 +387,63 @@ must install the complete initial graph from code or external bootstrap input.
 Later opens may query an installed registry prefix to reconstruct that exact
 graph.
 
-## Stable Standard Library: Typed Results
+## Experimental Operators
 
-Sledge separates primitives by compatibility commitment:
-
-- `@torkbot/sledge/stdlib` is the stable standard-library surface. Its
-  contracts follow the package's normal compatibility policy.
-- `@torkbot/sledge/experimental/*` contains correctness-tested primitives
-  whose API and durable model may still change while real applications test
-  their ergonomics. Experimental data may require a migration or intentional
-  reset when an operator changes.
-
-Experimental means compatibility is unsettled, not that restart, concurrency,
-or validation invariants are relaxed. Each operator has its own import path;
-there is deliberately no `@torkbot/sledge/experimental` barrel whose surface
-would grow without bound.
-
-The first standard-library contract is an addressable durable result. It gives
-independently defined modules a common way to name and observe eventual results
-without making `WorkRef` a domain identity or appending a second generic
-settlement event.
-
-Declare the result inside the producer's module factory before its events, so
-the owner-bound ref schema can be used directly in durable payloads:
+`@torkbot/sledge/experimental/operators` explores a small dataflow interface
+for building deep ledger modules. An operator is immutable reusable behavior;
+a binding installs that behavior as one independently durable graph node.
 
 ```ts
-import { Type } from "typebox";
+import {
+  defineOperatorModule,
+  ForEach,
+  MapAsync,
+} from "@torkbot/sledge/experimental/operators";
 
-import { defineLedger, defineModule } from "@torkbot/sledge";
-import { createBetterSqliteDriver } from "@torkbot/sledge/better-sqlite3";
-import { defineResult } from "@torkbot/sledge/stdlib";
-
-const CompactionResultSchema = Type.Object({
-  keptRevision: Type.String(),
-  removedRevisions: Type.Integer({ minimum: 0 }),
+const extractMemory = new MapAsync("extract-memory", {
+  input: CompactionRequest,
+  output: ExtractedMemory,
+  map: async (request, { key, signal }) =>
+    memoryExtractor(request, { idempotencyKey: key, signal }),
 });
 
-const defineCompactionsModule = defineModule("app.compactions", (module) => {
-  const result = defineResult(module, {
-    resultSchema: CompactionResultSchema,
-  });
-  const declaration = module.declare({
-    events: {
-      completed: Type.Object({
-        ref: result.refSchema,
-        output: CompactionResultSchema,
-      }),
-    },
-  });
-  const registered = module.link(declaration, null).register({});
-
-  return module.expose(registered, {
-    result: result.fromEvent(registered.events.completed, (payload) => ({
-      ref: payload.ref,
-      outcome: "succeeded",
-      value: payload.output,
-    })),
-  });
+const recordMetric = new ForEach("record-metric", {
+  input: ExtractedMemory,
+  run: async (memory, { key, signal }) =>
+    metrics.record(memory, { idempotencyKey: key, signal }),
 });
 
-const application = defineLedger((sledge) => ({
-  compactions: sledge.install(defineCompactionsModule()),
-}));
+const defineCompactionFlow = defineOperatorModule(
+  "app.compaction-flow",
+  (graph) => {
+    const requested = graph.event("requested", CompactionRequest);
+    const memory = graph.bind(
+      "extract-compaction-memory",
+      requested,
+      extractMemory,
+    );
 
-declare const databaseUrl: string;
+    graph.bind("record-compaction-metric", memory, recordMetric);
 
-await using opened = await application.open(
-  createBetterSqliteDriver({ databaseUrl }),
-);
-const ref = opened.capabilities.compactions.result.ref("document-42");
-```
-
-`ResultRef<TResult, TModuleId>` carries both the result type and its producing
-module as phantom types. A ref from another module is rejected by TypeScript
-even when both modules return the same payload shape. `refSchema` also validates
-the producer prefix when refs cross event, outcome, or projection boundaries.
-Store refs exactly as returned and do not construct or parse their string
-representation.
-
-One ledger module owns at most one result protocol. This keeps the module id as
-the complete durable and typed protocol identity, without adding a second name
-that most producers would repeat mechanically. When a domain has two
-independently composable terminal protocols, define two small modules. The
-incomplete result declaration may bind exactly one terminal event and must do
-so while its module factory is open.
-
-`fromEvent(...)` accepts only a plain event token owned by the same module and
-consumes the declaration's one binding capability. It returns a new immutable
-`ResultPort` rather than activating or mutating a capability in place. Its
-runtime provenance check also requires that token to come from the exact open
-module-factory invocation, not merely another module with the same durable id.
-Its `source` pairs that exact terminal event with a normalized
-`succeeded | failed | cancelled` observation. A join or race module can
-contribute a handler to the original typed event, update its own projection,
-and wake dependents in the same append transaction. The typed terminal event
-therefore remains the only durable fact.
-
-`ResultSource.observe(...)` is a composition-time adapter for payloads already
-decoded by the paired Sledge event token. It is not an input-validation API;
-untrusted I/O must still enter through declared ledger schemas.
-
-## Experimental Result Algebra
-
-Three small operators build on `ResultPort` without introducing a workflow
-interpreter or a second generic settlement stream:
-
-- `defineThen(...)` derives one durable result from another result.
-- `defineAll(...)` settles after every named member settles.
-- `defineRace(...)` settles from the member whose terminal event was committed
-  first.
-
-The operators are ordinary Sledge module factories. Install them next to their
-source modules; generated event aliases, projections, queues, deduplication,
-and restart recovery stay private. The stable `stdlib` path is the curated
-foundation; each `experimental/*` path is deliberately independent and may
-change incompatibly as real applications pressure-test its semantics and DX.
-There is no experimental barrel that silently grows into a second SDK.
-
-### Sequence work with `then`
-
-The source result is the durable request for the derived operation. A derived
-operation therefore contributes only its own terminal fact instead of first
-copying the source into a generic request event.
-
-```ts
-import { Type } from "typebox";
-
-import { defineLedger } from "@torkbot/sledge";
-import { defineAll } from "@torkbot/sledge/experimental/all";
-import { defineThen } from "@torkbot/sledge/experimental/then";
-
-const CompactedPrefixSchema = Type.Object({
-  memoryRef: Type.String(),
-  compactedPrefixRef: Type.String(),
-});
-
-const application = defineLedger((sledge) => {
-  const dreaming = sledge.install(defineDreamingModule());
-  const compactions = sledge.install(
-    defineThen("app.memory-aware-compactions", dreaming.result, {
-      resultSchema: CompactedPrefixSchema,
-      execute: async ({ value, ref, attempt, signal, withTimeout }) => {
-        try {
-          const compacted = await withTimeout(30_000, async (operationSignal) =>
-            compactPrefixWithoutMemoryFacts(value, {
-              idempotencyKey: ref,
-              signal: operationSignal,
-            }),
-          );
-
-          return { outcome: "succeeded", value: compacted };
-        } catch (error: unknown) {
-          signal.throwIfAborted();
-
-          if (attempt < 3) {
-            throw error;
-          }
-
-          return { outcome: "failed" };
-        }
-      },
-    })(),
-  );
-  const publishReady = sledge.install(
-    defineAll("app.epoch-inputs", [dreaming.result, compactions.result])(),
-  );
-
-  return { compactions, dreaming, publishReady };
-});
-```
-
-Returning a `succeeded`, `failed`, or `cancelled` resolution settles the
-derived result. Throwing leaves it pending and requests the queue's ordinary
-durable retry. The callback receives the current attempt, the active lease
-signal, and Sledge's deterministic `withTimeout(...)` primitive, so retry and
-deadline policy remains explicit application code rather than a fixed operator
-option bag. A failed or cancelled source propagates directly and never invokes
-the callback.
-
-`execute` is at-least-once. It can run again after an exception, lease loss, or
-a crash after an external effect but before the terminal event commits. Use the
-deterministic derived `ref` as the idempotency key for external effects and pass
-the provided signals through every cancellable operation. An abort requests
-cooperative cancellation; it cannot undo an effect that already happened.
-
-`compactions.refFor(dreamRef)` deterministically names the result derived from
-one source ref. Its `queries.state` capability reports `pending`, `succeeded`,
-`failed`, or `cancelled` without exposing the private queue identity.
-
-### Join named results with `all`
-
-One installed operator handles any number of groups. Its source list declares
-which result protocols a group may reference; each group then supplies a plain
-record of meaningful member names:
-
-```ts
-const dreamRef = opened.capabilities.dreaming.result.ref("epoch-42");
-const compactionRef = opened.capabilities.compactions.refFor(dreamRef);
-const groupRef = opened.capabilities.publishReady.result.ref("epoch-42");
-
-await opened.ledger.emit(
-  opened.capabilities.publishReady.events.opened,
-  {
-    ref: groupRef,
-    members: {
-      memory: dreamRef,
-      context: compactionRef,
-    },
+    return { requested, memory };
   },
-  { dedupeKey: "epoch-42:publish-ready" },
 );
 ```
 
-The record accepts multiple refs from the same admitted producer, rejects refs
-from other producers at compile time, and rejects duplicate refs at runtime.
-An `all` result contains every member's ref and normalized outcome. Its overall
-outcome is `failed` if any member failed, otherwise `cancelled` if any member
-was cancelled, otherwise `succeeded`.
+`MapAsync` turns each source event into retryable private work and atomically
+emits its mapped output when that work succeeds. `ForEach` is a terminal sink:
+it retries an external effect but emits no output event. Both receive a stable
+idempotency key, attempt number, and active lease signal. Throwing retries;
+returning acknowledges the work. External effects remain at-least-once.
 
-To nest compositions, install a later `all` or `race` operator whose admitted
-sources include the earlier operator's result port. The earlier port does not
-exist until its module has been installed, so ordinary assembly order makes the
-operator dependency graph acyclic by construction; an operator cannot admit
-its own result.
+The operator name identifies reusable behavior in diagnostics. The binding id
+is the durable queue and output-event identity. Reusing one operator under two
+binding ids shares implementation but never execution state.
 
-### Choose the first durable result with `race`
-
-`defineRace(...)` has the same source and opening shape:
-
-```ts
-import { defineRace } from "@torkbot/sledge/experimental/race";
-
-const application = defineLedger((sledge) => {
-  const backgroundCompactions = sledge.install(
-    defineBackgroundCompactionsModule(),
-  );
-  const synchronousCompactions = sledge.install(
-    defineSynchronousCompactionsModule(),
-  );
-  const compactionRace = sledge.install(
-    defineRace("app.compaction-race", [
-      backgroundCompactions.result,
-      synchronousCompactions.result,
-    ])(),
-  );
-
-  return { compactionRace };
-});
-
-await opened.ledger.emit(opened.capabilities.compactionRace.events.opened, {
-  ref: opened.capabilities.compactionRace.result.ref("epoch-42"),
-  members: {
-    background: backgroundRef,
-    synchronous: synchronousRef,
-  },
-});
-```
-
-The lowest terminal event id wins, including when the race opens after several
-members already settled. A later loser cannot change the result. `race` does
-not cancel losers; cancellation is a separate domain decision with potentially
-observable consequences.
-
-To support groups that open after a member has already settled, each installed
-`all` or `race` module maintains one compact observation row for every terminal
-result produced by its admitted source protocols. Keep source lists narrow and
-reuse one operator module across many groups. This projection cost is part of
-the experimental pressure test; restricting groups to open-before-settlement
-would save rows but could leave late discovery permanently pending.
-
-`all`, `race`, and `then` require an active Sledge worker runtime to reconcile
-and execute their private durable work. Their state queries are snapshots, not
-race-free wait handles. Sledge does not yet expose the atomic query-plus-cursor
-snapshot needed for a correct blocking `wait`, so the experimental SDK does not
-paper over that gap with process-local notifications or unbounded polling.
+Operator graphs compile into ordinary Sledge events, handlers, and queues.
+There is no workflow interpreter or generic protocol event. The experimental
+surface intentionally begins with only `MapAsync` and `ForEach`; additional
+operators must be justified by real application pressure.
 
 ## Module and Application Phases
 
@@ -1052,7 +828,7 @@ compile time.
 Declaration, linking, registration, and exposure form a capability-narrowing
 flow. Materializations remain ordinary values passed into `module.link(...)`,
 and every phase returns a new value rather than mutating the previous one.
-Reusable userspace or stdlib primitives can accept the narrower
+Reusable userspace primitives can accept the narrower
 `LedgerModuleOwner` interface when they need identity but should not receive
 declaration, linking, or reveal authority.
 
@@ -1251,6 +1027,12 @@ releasing Sledge's writer.
 Opening a ledger is passive. It initializes storage and can emit, query, tail,
 resume, and observe signals, but it does not claim or process queue work until
 `startWorkers(...)` is called.
+
+Worker capacity is configured per queue through
+`configureQueue({ moduleId, name, kind })`. A saturated queue is excluded from
+claim selection, so slow terminal effects cannot block unrelated queues with
+free capacity. Optional top-level `maxInFlight` remains a combined process
+safety ceiling.
 
 The handle returned by `startWorkers(...)` exposes
 `waitForIdle({ signal })`. It resolves once no pending, delayed, leased, or
@@ -1600,10 +1382,7 @@ without being embedded in event consumption.
 - `@torkbot/sledge/runtime/contracts`
 - `@torkbot/sledge/runtime/node-runtime`
 - `@torkbot/sledge/runtime/virtual-runtime`
-- `@torkbot/sledge/stdlib`
-- `@torkbot/sledge/experimental/all`
-- `@torkbot/sledge/experimental/race`
-- `@torkbot/sledge/experimental/then`
+- `@torkbot/sledge/experimental/operators`
 
 ## Development
 
