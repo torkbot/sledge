@@ -224,7 +224,15 @@ test("module ids are validated when their factory is defined", () => {
         const registered = registerEmptyModule(module);
         return module.expose(registered, {});
       }),
-    /ledger module id must not contain reserved separator ::/,
+    /ledger module id must not contain reserved separator :/,
+  );
+  assert.throws(
+    () =>
+      defineModule("contract:invalid", (module) => {
+        const registered = registerEmptyModule(module);
+        return module.expose(registered, {});
+      }),
+    /ledger module id must not contain reserved separator :/,
   );
 });
 

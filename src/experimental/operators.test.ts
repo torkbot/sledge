@@ -221,17 +221,10 @@ for (const adapter of adapters) {
     );
     assert.equal(effectKeys.length, 2);
     assert.equal(effectKeys[0], effectKeys[1]);
-    const AttemptKey = Type.Tuple([
-      Type.String(),
-      Type.String(),
-      Type.Integer(),
-    ]);
-    const parsedAttemptKey: unknown = JSON.parse(effectKeys[0] ?? "");
-    Value.Assert(AttemptKey, parsedAttemptKey);
-    assert.deepEqual(Value.Decode(AttemptKey, parsedAttemptKey).slice(0, 2), [
-      "experimental.contract.operator-bindings",
-      "observe_b",
-    ]);
+    assert.match(
+      effectKeys[0] ?? "",
+      /^experimental\.contract\.operator-bindings:observe_b:\d+$/,
+    );
 
     const events = await readEvents(reopened.ledger, 6);
     assert.deepEqual(
@@ -289,9 +282,9 @@ for (const adapter of adapters) {
     const application = defineLedger((sledge) => {
       const source = sledge.install(defineSource());
       const firstFlow = sledge.install(
-        defineModule("a:b", (module) => {
+        defineModule("a", (module) => {
           const doubled = module.bind(
-            "c",
+            "b:c",
             module.import(source.requested),
             double,
           );
@@ -302,9 +295,9 @@ for (const adapter of adapters) {
         })(),
       );
       const secondFlow = sledge.install(
-        defineModule("a", (module) => {
+        defineModule("d", (module) => {
           const doubled = module.bind(
-            "b:c",
+            "e",
             module.import(source.requested),
             double,
           );
@@ -342,6 +335,8 @@ for (const adapter of adapters) {
       [42, 42],
     );
     assert.equal(new Set(keys).size, 2);
+    assert(keys.some((key) => /^a:b:c:\d+$/.test(key)));
+    assert(keys.some((key) => /^d:e:\d+$/.test(key)));
   });
 
   test(`${adapter.name} invalid mapped output retries without failing the worker`, async () => {
@@ -477,6 +472,18 @@ test("operator graph rejects ambiguous ownership before opening storage", () => 
         return module.expose(registered, {});
       })(),
     /ledger event mapped conflicts with an operator port/,
+  );
+  assert.throws(
+    () =>
+      defineModule("experimental.contract.foreign-port-reveal", (module) => {
+        const localPort = module.event("input", Type.String());
+        const declaration = module.declare({
+          events: { input: localPort },
+        });
+        const registered = module.link(declaration, null).register({});
+        return module.expose(registered, { input: foreignPort });
+      })(),
+    /event port does not belong to this ledger module/,
   );
   assert(Object.isFrozen(identity));
 });

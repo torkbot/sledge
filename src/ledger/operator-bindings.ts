@@ -430,7 +430,9 @@ export function createOperatorBindingCompiler(moduleId: string): {
       return { ...existing, events, queues } as TRegistration;
     },
     reveal: (value, events, preserve) =>
-      ports.size === 0 ? value : mapRevealed(value, events, preserve).value,
+      ports.size === 0
+        ? value
+        : mapRevealed(value, events, preserve, ports).value,
   };
 }
 
@@ -439,7 +441,7 @@ function createOperatorAttemptKey(
   bindingId: string,
   sourceEventId: number,
 ): string {
-  return JSON.stringify([moduleId, bindingId, sourceEventId]);
+  return `${moduleId}:${bindingId}:${sourceEventId}`;
 }
 
 function readPort<TSchemaValue extends TSchema>(
@@ -461,13 +463,20 @@ function mapRevealed(
   value: unknown,
   events: Readonly<Record<string, EventToken>>,
   preserve: (value: object) => boolean,
+  ownedPorts: ReadonlyMap<string, RuntimePort>,
 ): { readonly value: unknown; readonly changed: boolean } {
   if (typeof value !== "object" || value === null) {
     return { value, changed: false };
   }
 
   if (eventPortBrand in value) {
-    const localName = readPort(value as EventPort<TSchema>).localName;
+    const port = readPort(value as EventPort<TSchema>);
+    const localName = port.localName;
+
+    if (ownedPorts.get(localName) !== port) {
+      throw new Error("event port does not belong to this ledger module");
+    }
+
     const event = events[localName];
 
     if (event === undefined) {
@@ -485,7 +494,9 @@ function mapRevealed(
   }
 
   if (Array.isArray(value)) {
-    const nested = value.map((entry) => mapRevealed(entry, events, preserve));
+    const nested = value.map((entry) =>
+      mapRevealed(entry, events, preserve, ownedPorts),
+    );
 
     if (!nested.some((entry) => entry.changed)) {
       return { value, changed: false };
@@ -504,7 +515,7 @@ function mapRevealed(
   }
 
   const entries = Object.entries(value).map(([key, nested]) => {
-    const mapped = mapRevealed(nested, events, preserve);
+    const mapped = mapRevealed(nested, events, preserve, ownedPorts);
     return { key, ...mapped };
   });
 
