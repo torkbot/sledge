@@ -48,13 +48,11 @@ export function serializeException(thrown: unknown): SerializedException {
 
     chain.push(exceptionFrame(current));
 
-    const cause = exceptionCause(current);
-
-    if (cause === noExceptionCause) {
+    if (!(current instanceof Error) || current.cause === undefined) {
       break;
     }
 
-    current = cause;
+    current = current.cause;
   }
 
   const serialized = { chain };
@@ -86,11 +84,11 @@ export function rehydrateException(serialized: SerializedException): Error {
 }
 
 function exceptionFrame(thrown: unknown): SerializedExceptionFrame {
-  if (isError(thrown)) {
+  if (thrown instanceof Error) {
     return {
-      name: readErrorString(thrown, "name", "Error"),
-      message: readErrorString(thrown, "message", "<unreadable error message>"),
-      stack: readErrorStack(thrown),
+      name: thrown.name,
+      message: thrown.message,
+      stack: thrown.stack ?? null,
     };
   }
 
@@ -99,50 +97,6 @@ function exceptionFrame(thrown: unknown): SerializedExceptionFrame {
     message: safeString(thrown),
     stack: null,
   };
-}
-
-const noExceptionCause = Symbol("no exception cause");
-
-function exceptionCause(error: unknown): unknown | typeof noExceptionCause {
-  if (!isError(error)) {
-    return noExceptionCause;
-  }
-
-  try {
-    const cause = error.cause;
-    return cause === undefined ? noExceptionCause : cause;
-  } catch {
-    return noExceptionCause;
-  }
-}
-
-function isError(value: unknown): value is Error {
-  try {
-    return value instanceof Error;
-  } catch {
-    return false;
-  }
-}
-
-function readErrorString(
-  error: Error,
-  property: "name" | "message",
-  fallback: string,
-): string {
-  try {
-    const value = error[property];
-    return typeof value === "string" ? value : safeString(value);
-  } catch {
-    return fallback;
-  }
-}
-
-function readErrorStack(error: Error): string | null {
-  try {
-    return typeof error.stack === "string" ? error.stack : null;
-  } catch {
-    return null;
-  }
 }
 
 function safeString(value: unknown): string {
