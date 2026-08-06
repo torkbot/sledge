@@ -71,6 +71,8 @@ export function rehydrateException(serialized: SerializedException): Error {
 
     if (frame.stack !== null) {
       error.stack = frame.stack;
+    } else {
+      delete error.stack;
     }
 
     cause = error;

@@ -40,3 +40,11 @@ test("non-error thrown values and cyclic causes remain finite", () => {
     ["Error", "CircularExceptionCause"],
   );
 });
+
+test("rehydration preserves absent stacks", () => {
+  const serialized = serializeException("plain failure");
+  const rehydrated = rehydrateException(serialized);
+
+  assert.equal(rehydrated.stack, undefined);
+  assert.deepEqual(serializeException(rehydrated), serialized);
+});
