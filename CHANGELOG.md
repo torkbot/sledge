@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Allow `module.declare(...)` to import caller-owned query tokens. Projectionless
+  modules can now query explicit installed capabilities from event, durable
+  queue, and signal-queue handlers without inventing an empty materialization.
 - Express ledger query parameters and results directly from their token schemas.
   Generic module factories can now call `ledger.query(...)` without private
   type adapters while concrete tokens continue to reject invalid parameters.

@@ -519,12 +519,16 @@ installed graph.
 boundary contracts with TypeBox:
 
 - `events`: facts appended to the event stream
+- `queries`: query tokens imported from installed modules for use by this
+  module's handlers
 - `queues`: durable work payloads
 - `signals`: process-local, short-lived records emitted by queue handlers
 - `signalQueues`: retryable work materialized from signals
 
-`events` is required. Omit `queues`, `signals`, or `signalQueues` when the
-module does not define contracts in that category. Plain event definitions
+`events` is required. Omit `queries`, `queues`, `signals`, or `signalQueues`
+when the module does not define contracts in that category. Imported queries
+do not give the module ownership of another projection; they name an explicit
+read capability that its private durable work may invoke. Plain event definitions
 create contracts owned by that module and produce opaque event tokens such as
 `declaration.events["user.created"]`. Runtime APIs accept these tokens
 instead of string names.
@@ -532,6 +536,37 @@ instead of string names.
 Module construction has no standalone equivalent. `module.declare(...)` and
 `module.link(...)` are scoped to the current factory invocation so identity and
 construction ownership cannot drift across primitives and contracts.
+
+```ts
+const declaration = module.declare({
+  events: {
+    requested: Type.Object({ laneId: Type.String() }),
+  },
+  queries: {
+    conversationPrefix: conversations.queries.prefixByLane,
+  },
+  queues: {
+    select: Type.Object({ laneId: Type.String() }),
+  },
+});
+
+const registered = module.link(declaration, null, {
+  events: {
+    requested: ({ event, actions }) => {
+      actions.enqueue("select", event.payload);
+    },
+  },
+  queues: {
+    select: async ({ work, actions }) => {
+      const prefix = await actions.query("conversationPrefix", {
+        laneId: work.payload.laneId,
+      });
+
+      // Continue with an ordinary caller-owned event.
+    },
+  },
+});
+```
 
 An event may declare a durable result alongside its payload:
 

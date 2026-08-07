@@ -140,6 +140,66 @@ if (false) {
 }
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
+  test(`${driver} projectionless modules import queries for private durable work`, async () => {
+    await using fixture = await createFixture(driver, "imported-query");
+    const observations: (readonly string[] | null)[] = [];
+    const errors: unknown[] = [];
+    const application = defineLedger((sledge) => {
+      const registry = sledge.install(defineRegistryModule());
+      const consumer = sledge.install(
+        defineModule("contract.query-consumer", (module) => {
+          const declaration = module.declare({
+            events: { requested: Type.Null() },
+            queries: {
+              configuredModuleIds: registry.queries.configuredModuleIds,
+            },
+            queues: { read: Type.Null() },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              requested: ({ actions }) => {
+                actions.enqueue("read", null);
+              },
+            },
+            queues: {
+              read: async ({ actions }) => {
+                try {
+                  observations.push(
+                    await actions.query("configuredModuleIds", {}),
+                  );
+                } catch (error: unknown) {
+                  errors.push(error);
+                }
+              },
+            },
+          });
+
+          return module.expose(registered, { events: registered.events });
+        })(),
+      );
+
+      return { consumer, registry };
+    });
+    await using opened = await fixture.open(application);
+
+    await opened.ledger.emit(opened.capabilities.registry.events.configured, {
+      moduleIds: ["alpha", "beta"],
+    });
+    await opened.ledger.emit(
+      opened.capabilities.consumer.events.requested,
+      null,
+    );
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+    await runtime.flush();
+    await workers.waitForIdle({ signal: AbortSignal.timeout(2_000) });
+
+    assert.deepEqual(errors, []);
+    assert.deepEqual(observations, [["alpha", "beta"]]);
+  });
+
   test(`${driver} opens a fresh Sledge application with its installed modules`, async () => {
     await using fixture = await createFixture(driver, "fresh");
     const application = defineLedger((sledge) => {

@@ -592,6 +592,17 @@ type QueryTokenResultSchema<TToken> =
     ? TResultSchema
     : never;
 
+type QuerySchemasForTokens<TQueries extends Record<string, AnyQueryToken>> = {
+  readonly [TName in keyof TQueries]: TQueries[TName] extends QueryToken<
+    string,
+    string,
+    infer TParams,
+    infer TResult
+  >
+    ? { readonly params: TParams; readonly result: TResult }
+    : never;
+};
+
 export type EventPayload<TEvent extends AnyEventToken> = Static<
   EventTokenSchema<TEvent>
 >;
@@ -2142,6 +2153,7 @@ export function defineMaterialization<
   const TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   },
+  const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
 >(
   shape: DeclaredLedgerModule<
     TEvents,
@@ -2149,7 +2161,8 @@ export function defineMaterialization<
     TSignals,
     TSignalQueues,
     TModuleId,
-    TEventTokens
+    TEventTokens,
+    TDeclaredQueryTokens
   >,
   input: MaterializationDefinitionInput<TNamespace>,
 ): MaterializationDefinitionBuilder<
@@ -2191,9 +2204,11 @@ export type DeclaredLedgerModule<
   TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   } = EventTokensForSchemas<TModuleId, TEvents>,
+  TQueryTokens extends Record<string, AnyQueryToken> = {},
 > = {
   readonly moduleId: TModuleId;
   readonly events: TEventTokens;
+  readonly queries: TQueryTokens;
   readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
 };
@@ -2222,9 +2237,11 @@ type LedgerModuleContractDefinitions<
   TQueues extends Record<string, TSchema>,
   TSignals extends Record<string, TSchema>,
   TSignalQueues extends Record<string, TSchema>,
+  TQueries extends Record<string, AnyQueryToken>,
 > = {
   readonly events: TEventDefinitions;
   readonly queues?: TQueues & PrivateSchemaDefinitions<TQueues>;
+  readonly queries?: TQueries;
   readonly signals?: TSignals & PrivateSchemaDefinitions<TSignals>;
   readonly signalQueues?: TSignalQueues &
     PrivateSchemaDefinitions<TSignalQueues>;
@@ -2235,6 +2252,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
   extends LedgerModuleOwner<TModuleId>, OperatorBindingDefinition {
   declare<
     const TEventDefinitions extends Record<string, EventDefinition>,
+    const TQueries extends Record<string, AnyQueryToken>,
     const TQueues extends Record<string, TSchema> = {},
     const TSignals extends Record<string, TSchema> = {},
     const TSignalQueues extends Record<string, TSchema> = {},
@@ -2243,7 +2261,8 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       TEventDefinitions,
       TQueues,
       TSignals,
-      TSignalQueues
+      TSignalQueues,
+      TQueries
     >,
   ): DeclaredLedgerModule<
     EventSchemasFor<TEventDefinitions>,
@@ -2251,7 +2270,8 @@ export interface LedgerModuleDefinition<TModuleId extends string>
     TSignals,
     TSignalQueues,
     TModuleId,
-    EventTokensFor<TModuleId, TEventDefinitions>
+    EventTokensFor<TModuleId, TEventDefinitions>,
+    TQueries
   >;
 
   /**
@@ -2266,6 +2286,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
     const TEventTokens extends {
       readonly [TEventName in keyof TEvents]: AnyEventToken;
     },
+    const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
     const TMaterializations extends Materializations<
       AnyMaterializationHistory<TEvents>,
       ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
@@ -2278,7 +2299,8 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       TSignals,
       TSignalQueues,
       TModuleId,
-      TEventTokens
+      TEventTokens,
+      TDeclaredQueryTokens
     >,
     materializations: TMaterializations,
     registration: Parameters<
@@ -2289,6 +2311,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
         TSignalQueues,
         TModuleId,
         TEventTokens,
+        TDeclaredQueryTokens,
         TMaterializations
       >["register"]
     >[0],
@@ -2300,6 +2323,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       TSignalQueues,
       TModuleId,
       TEventTokens,
+      TDeclaredQueryTokens,
       TMaterializations
     >["register"]
   >;
@@ -2394,6 +2418,7 @@ export type LinkedLedgerModule<
 export function declareLedgerModuleInternal<
   const TModuleId extends string,
   const TEventDefinitions extends Record<string, EventDefinition>,
+  const TQueries extends Record<string, AnyQueryToken>,
   const TQueues extends Record<string, TSchema> = {},
   const TSignals extends Record<string, TSchema> = {},
   const TSignalQueues extends Record<string, TSchema> = {},
@@ -2402,7 +2427,8 @@ export function declareLedgerModuleInternal<
     TEventDefinitions,
     TQueues,
     TSignals,
-    TSignalQueues
+    TSignalQueues,
+    TQueries
   > & {
     readonly moduleId: TModuleId;
   },
@@ -2412,7 +2438,8 @@ export function declareLedgerModuleInternal<
   TSignals,
   TSignalQueues,
   TModuleId,
-  EventTokensFor<TModuleId, TEventDefinitions>
+  EventTokensFor<TModuleId, TEventDefinitions>,
+  TQueries
 > {
   validateLedgerModuleId(input.moduleId);
   const queueDefinitions = (input.queues ?? {}) as TQueues;
@@ -2445,6 +2472,7 @@ export function declareLedgerModuleInternal<
   return {
     moduleId: input.moduleId,
     events,
+    queries: input.queries ?? ({} as TQueries),
     signals,
     shape,
   };
@@ -2490,6 +2518,7 @@ export function defineModule<
     };
     const declare = <
       const TEventDefinitions extends Record<string, EventDefinition>,
+      const TQueries extends Record<string, AnyQueryToken>,
       const TQueues extends Record<string, TSchema> = {},
       const TSignals extends Record<string, TSchema> = {},
       const TSignalQueues extends Record<string, TSchema> = {},
@@ -2498,7 +2527,8 @@ export function defineModule<
         TEventDefinitions,
         TQueues,
         TSignals,
-        TSignalQueues
+        TSignalQueues,
+        TQueries
       >,
     ): DeclaredLedgerModule<
       EventSchemasFor<TEventDefinitions>,
@@ -2506,7 +2536,8 @@ export function defineModule<
       TSignals,
       TSignalQueues,
       TModuleId,
-      EventTokensFor<TModuleId, TEventDefinitions>
+      EventTokensFor<TModuleId, TEventDefinitions>,
+      TQueries
     > => {
       assertDefinitionOpen();
 
@@ -2514,6 +2545,7 @@ export function defineModule<
       const declaration = declareLedgerModuleInternal<
         TModuleId,
         TEventDefinitions,
+        TQueries,
         TQueues,
         TSignals,
         TSignalQueues
@@ -2526,6 +2558,7 @@ export function defineModule<
         queues: augmented.queues as TQueues & PrivateSchemaDefinitions<TQueues>,
         signals: input.signals,
         signalQueues: input.signalQueues,
+        queries: input.queries,
       });
 
       for (const [localName, definition] of Object.entries(input.events)) {
@@ -2666,6 +2699,7 @@ type LinkedLedgerModuleFor<
   TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   },
+  TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
   TMaterializations extends Materializations<
     AnyMaterializationHistory<TEvents>,
     ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
@@ -2684,7 +2718,8 @@ type LinkedLedgerModuleFor<
         TQueues,
         THistory["current"],
         ProjectionIndexerSchemas<TIndexerDefinitions>,
-        ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>>,
+        ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>> &
+          QuerySchemasForTokens<TDeclaredQueryTokens>,
         TSignals,
         TSignalQueues,
         TIndexerDefinitions,
@@ -2692,14 +2727,14 @@ type LinkedLedgerModuleFor<
         THistory,
         TModuleId,
         TEventTokens,
-        QueryTokensFor<TModuleId, TQueryDefinitions>
+        TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>
       >
     : LinkedLedgerModule<
         TEvents,
         TQueues,
         ProjectionSchema<{}, {}, Extract<keyof TEvents, string>>,
         {},
-        {},
+        QuerySchemasForTokens<TDeclaredQueryTokens>,
         TSignals,
         TSignalQueues,
         {},
@@ -2707,7 +2742,7 @@ type LinkedLedgerModuleFor<
         null,
         TModuleId,
         TEventTokens,
-        {}
+        TDeclaredQueryTokens
       >;
 
 /**
@@ -2726,6 +2761,7 @@ export function linkLedgerModuleInternal<
   const TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   },
+  const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
   const TMaterializations extends Materializations<
     AnyMaterializationHistory<TEvents>,
     ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
@@ -2738,7 +2774,8 @@ export function linkLedgerModuleInternal<
     TSignals,
     TSignalQueues,
     TModuleId,
-    TEventTokens
+    TEventTokens,
+    TDeclaredQueryTokens
   >,
   materializations: TMaterializations,
 ): LinkedLedgerModuleFor<
@@ -2748,6 +2785,7 @@ export function linkLedgerModuleInternal<
   TSignalQueues,
   TModuleId,
   TEventTokens,
+  TDeclaredQueryTokens,
   TMaterializations
 > {
   // The runtime branch and the public conditional type describe the same two
@@ -2755,6 +2793,7 @@ export function linkLedgerModuleInternal<
   // its conditional return branch, so each trusted construction is asserted
   // back to that exact public result type.
   if (materializations === null) {
+    const queryDefinitions = normalizeQueryDefinitions(shape.queries);
     const queues = createSchemaTokens(
       shape.moduleId,
       "queue",
@@ -2769,23 +2808,31 @@ export function linkLedgerModuleInternal<
       moduleId: shape.moduleId,
       contracts: {
         events: shape.events,
-        queries: {},
+        queries: shape.queries,
         queues,
         signals: shape.signals,
         signalQueues,
       },
       shape: shape.shape,
-      access: createEmptyProjectionAccess<Extract<keyof TEvents, string>>(),
+      access: createProjectionAccess({
+        projections: defineProjectionSchemaForEvents<
+          Extract<keyof TEvents, string>
+        >()({}),
+        indexers: {},
+        queries: queryDefinitions,
+        ownedQueries: {},
+      }),
       materializationHistory: null,
     });
 
-    return linked as LinkedLedgerModuleFor<
+    return linked as unknown as LinkedLedgerModuleFor<
       TEvents,
       TQueues,
       TSignals,
       TSignalQueues,
       TModuleId,
       TEventTokens,
+      TDeclaredQueryTokens,
       TMaterializations
     >;
   }
@@ -2800,6 +2847,7 @@ export function linkLedgerModuleInternal<
     TSignalQueues,
     TModuleId,
     TEventTokens,
+    TDeclaredQueryTokens,
     TMaterializations
   >;
 }
@@ -2818,6 +2866,7 @@ function linkMaterializedLedgerModule<
   const TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventToken;
   },
+  const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
 >(
   shape: DeclaredLedgerModule<
     TEvents,
@@ -2825,7 +2874,8 @@ function linkMaterializedLedgerModule<
     TSignals,
     TSignalQueues,
     TModuleId,
-    TEventTokens
+    TEventTokens,
+    TDeclaredQueryTokens
   >,
   materializations: Materializations<
     THistory,
@@ -2843,25 +2893,30 @@ function linkMaterializedLedgerModule<
   TQueues,
   THistory["current"],
   ProjectionIndexerSchemas<TIndexerDefinitions>,
-  ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>>,
+  ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>> &
+    QuerySchemasForTokens<TDeclaredQueryTokens>,
   TSignals,
   TSignalQueues,
   TIndexerDefinitions,
-  OwnedQueryDefinitions<TQueryDefinitions>,
+  OwnedQueryDefinitions<TDeclaredQueryTokens & TQueryDefinitions>,
   THistory,
   TModuleId,
   TEventTokens,
-  QueryTokensFor<TModuleId, TQueryDefinitions>
+  TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>
 > {
   validateMaterializationEvents(shape.shape, materializations);
-  const queryDefinitions = normalizeQueryDefinitions(materializations.queries);
-  const ownedQueryDefinitions = readOwnedQueryDefinitions(
-    materializations.queries,
-  );
+  validateQueryDefinitionNames(shape.queries, materializations.queries);
+  const allQueryDefinitions = {
+    ...shape.queries,
+    ...materializations.queries,
+  };
+  const queryDefinitions = normalizeQueryDefinitions(allQueryDefinitions);
+  const ownedQueryDefinitions = readOwnedQueryDefinitions(allQueryDefinitions);
   const queryTokens = createQueryTokens(
     shape.moduleId,
-    materializations.queries,
-  );
+    allQueryDefinitions,
+  ) as unknown as TDeclaredQueryTokens &
+    QueryTokensFor<TModuleId, TQueryDefinitions>;
   const queues = createSchemaTokens(
     shape.moduleId,
     "queue",
@@ -2891,7 +2946,35 @@ function linkMaterializedLedgerModule<
     shape: shape.shape,
     access,
     materializationHistory: materializations.history,
-  });
+  }) as unknown as LinkedLedgerModule<
+    TEvents,
+    TQueues,
+    THistory["current"],
+    ProjectionIndexerSchemas<TIndexerDefinitions>,
+    ProjectionQuerySchemas<NormalizedQueryDefinitions<TQueryDefinitions>> &
+      QuerySchemasForTokens<TDeclaredQueryTokens>,
+    TSignals,
+    TSignalQueues,
+    TIndexerDefinitions,
+    OwnedQueryDefinitions<TDeclaredQueryTokens & TQueryDefinitions>,
+    THistory,
+    TModuleId,
+    TEventTokens,
+    TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>
+  >;
+}
+
+function validateQueryDefinitionNames(
+  imported: Readonly<Record<string, AnyQueryToken>>,
+  owned: LedgerQueryDefinitions,
+): void {
+  for (const localName of Object.keys(imported)) {
+    if (Object.hasOwn(owned, localName)) {
+      throw new Error(
+        `ledger query ${localName} cannot be both imported and owned`,
+      );
+    }
+  }
 }
 
 export type AnyRegisteredLedgerModule = {
@@ -4486,19 +4569,6 @@ function validateMaterializationColumnEventRef(
   if (!eventNames.has(column.eventName)) {
     throw new Error(`${context} references unknown event ${column.eventName}`);
   }
-}
-
-function createEmptyProjectionAccess<
-  TEventName extends string,
->(): ProjectionAccess<ProjectionSchema<{}, {}, TEventName>, {}, {}, {}, {}> {
-  return {
-    projections: defineProjectionSchemaForEvents<TEventName>()({}),
-    indexers: {},
-    queries: {},
-    indexerDefinitions: {},
-    queryDefinitions: {},
-    ownedQueryDefinitions: {},
-  };
 }
 
 type RuntimeEventHandlerInput = {
