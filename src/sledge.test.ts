@@ -4,10 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Type } from "typebox";
+import {
+  Type,
+  type Static,
+  type TObject,
+  type TString,
+  type TSchema,
+} from "typebox";
 
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
-import { defineMaterialization } from "./ledger/ledger.ts";
+import { defineMaterialization, type QueryToken } from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
 import { createBetterSqliteDriver } from "./better-sqlite3.ts";
 import { createTursoDriver } from "./turso.ts";
@@ -15,6 +21,7 @@ import { VirtualRuntimeHarness } from "./runtime/virtual-runtime.ts";
 import {
   defineLedger,
   defineModule,
+  type ApplicationLedger,
   type OpenedLedger,
   type LedgerApplication,
   type LedgerApplicationCapabilities,
@@ -27,6 +34,33 @@ const timing = {
 };
 
 if (false) {
+  const verifyConcreteQuery = (
+    ledger: ApplicationLedger,
+    query: QueryToken<"typecheck", "lookup", TObject<{ id: TString }>, TString>,
+  ) => {
+    const result: Promise<string> = ledger.query(query, { id: "record-1" });
+    void result;
+
+    // @ts-expect-error the token requires its declared id parameter
+    ledger.query(query, {});
+
+    // @ts-expect-error the token's id parameter is a string
+    ledger.query(query, { id: 1 });
+  };
+  const queryGenerically = <
+    const TModuleId extends string,
+    const TName extends string,
+    const TParamsSchema extends TSchema,
+    const TResultSchema extends TSchema,
+  >(
+    ledger: ApplicationLedger,
+    query: QueryToken<TModuleId, TName, TParamsSchema, TResultSchema>,
+    params: Static<TParamsSchema>,
+  ): Promise<Static<TResultSchema>> => ledger.query(query, params);
+
+  void verifyConcreteQuery;
+  void queryGenerically;
+
   void (async () => {
     const application = defineLedger((sledge) => ({
       source: sledge.install(defineSourceModule()),

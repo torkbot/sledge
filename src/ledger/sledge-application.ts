@@ -1,11 +1,9 @@
-import type { TSchema } from "typebox";
+import type { Static, TSchema } from "typebox";
 
 import type {
   AnyRegisteredLedgerModule,
   LedgerModuleContribution,
   LedgerTiming,
-  QueryParameters,
-  QueryResult,
   QueryToken,
 } from "./ledger.ts";
 import type { AnyComposedLedgerModel } from "./ledger-composition.ts";
@@ -180,11 +178,14 @@ async function resolveLedgerApplication<
     return contribution.capabilities;
   };
   const query = <
-    const TQuery extends QueryToken<string, string, TSchema, TSchema>,
+    const TModuleId extends string,
+    const TName extends string,
+    const TParamsSchema extends TSchema,
+    const TResultSchema extends TSchema,
   >(
-    queryToken: TQuery,
-    params: QueryParameters<NoInfer<TQuery>>,
-  ): Promise<QueryResult<TQuery>> =>
+    queryToken: QueryToken<TModuleId, TName, TParamsSchema, TResultSchema>,
+    params: Static<TParamsSchema>,
+  ): Promise<Static<TResultSchema>> =>
     runQuery(async () => {
       const [first, ...rest] = modules;
 

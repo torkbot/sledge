@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Express ledger query parameters and results directly from their token schemas.
+  Generic module factories can now call `ledger.query(...)` without private
+  type adapters while concrete tokens continue to reject invalid parameters.
 - Breaking: make `MapAsync` produce one durable settlement for every input.
   Returned values become successful settlements; thrown values, invalid mapped
   outputs, and required per-operator timeouts become failed settlements using

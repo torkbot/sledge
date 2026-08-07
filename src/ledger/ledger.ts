@@ -1273,10 +1273,16 @@ export interface Ledger<
     options?: EmitOptions,
   ): Promise<LedgerEventCommit<TEvent>>;
 
-  query<const TQuery extends TQueries>(
-    query: TQuery,
-    params: QueryParameters<NoInfer<TQuery>>,
-  ): Promise<QueryResult<TQuery>>;
+  query<
+    const TModuleId extends string,
+    const TName extends string,
+    const TParamsSchema extends TSchema,
+    const TResultSchema extends TSchema,
+  >(
+    query: TQueries &
+      QueryToken<TModuleId, TName, TParamsSchema, TResultSchema>,
+    params: Static<TParamsSchema>,
+  ): Promise<Static<TResultSchema>>;
 
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
