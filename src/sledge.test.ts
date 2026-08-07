@@ -425,6 +425,35 @@ test("a Sledge application rejects duplicate module ids", async () => {
   );
 });
 
+test("a Sledge module rejects same-identity imported query tokens", async () => {
+  await using fixture = await createFixture(
+    "better-sqlite3",
+    "same-identity-query",
+  );
+  const application = defineLedger((sledge) => {
+    const registry = sledge.install(defineRegistryModule());
+    const duplicate = defineModule("contract.model-registry", (module) => {
+      const declaration = module.declare({
+        events: {},
+        queries: {
+          configuredModuleIds: registry.queries.configuredModuleIds,
+        },
+      });
+      const registered = module.link(declaration, null, {});
+
+      return module.expose(registered, {});
+    });
+
+    sledge.install(duplicate());
+    return { registry };
+  });
+
+  await assert.rejects(
+    fixture.open(application),
+    /cannot import its own query configuredModuleIds/,
+  );
+});
+
 test("a Sledge application rejects hand-assembled module contributions", async () => {
   await using fixture = await createFixture(
     "better-sqlite3",

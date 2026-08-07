@@ -2445,7 +2445,10 @@ export function declareLedgerModuleInternal<
   const queueDefinitions = (input.queues ?? {}) as TQueues;
   const signalDefinitions = (input.signals ?? {}) as TSignals;
   const signalQueueDefinitions = (input.signalQueues ?? {}) as TSignalQueues;
-  const queries = snapshotImportedQueries(input.queries ?? ({} as TQueries));
+  const queries = snapshotImportedQueries(
+    input.moduleId,
+    input.queries ?? ({} as TQueries),
+  );
   validatePrivateSchemaDefinitions("queue", queueDefinitions);
   validatePrivateSchemaDefinitions("signal", signalDefinitions);
   validatePrivateSchemaDefinitions("signal queue", signalQueueDefinitions);
@@ -2480,12 +2483,20 @@ export function declareLedgerModuleInternal<
 }
 
 function snapshotImportedQueries<
+  TModuleId extends string,
   TQueries extends Record<string, AnyQueryToken>,
->(queries: TQueries): TQueries {
+>(moduleId: TModuleId, queries: TQueries): TQueries {
   const snapshot: Record<string, AnyQueryToken> = {};
 
   for (const [localName, query] of Object.entries(queries)) {
-    readLedgerContractToken(query, "query");
+    const metadata = readLedgerContractToken(query, "query");
+
+    if (metadata.moduleId === moduleId) {
+      throw new Error(
+        `ledger module ${moduleId} cannot import its own query ${metadata.localName}`,
+      );
+    }
+
     defineRecordEntry(snapshot, localName, query);
   }
 
