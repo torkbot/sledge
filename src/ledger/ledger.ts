@@ -582,25 +582,17 @@ type EventTokenOutcomeSchema<TToken> =
     ? TOutcomeSchema
     : never;
 
-type QueryTokenParamsSchema<TToken> =
-  TToken extends QueryToken<string, string, infer TParamsSchema, TSchema>
-    ? TParamsSchema
-    : never;
+type QueryTokenParamsSchema<TToken extends AnyQueryToken> =
+  TToken[typeof queryTokenTypeBrand]["params"];
 
-type QueryTokenResultSchema<TToken> =
-  TToken extends QueryToken<string, string, TSchema, infer TResultSchema>
-    ? TResultSchema
-    : never;
+type QueryTokenResultSchema<TToken extends AnyQueryToken> =
+  TToken[typeof queryTokenTypeBrand]["result"];
 
 type QuerySchemasForTokens<TQueries extends Record<string, AnyQueryToken>> = {
-  readonly [TName in keyof TQueries]: TQueries[TName] extends QueryToken<
-    string,
-    string,
-    infer TParams,
-    infer TResult
-  >
-    ? { readonly params: TParams; readonly result: TResult }
-    : never;
+  readonly [TName in keyof TQueries]: {
+    readonly params: QueryTokenParamsSchema<TQueries[TName]>;
+    readonly result: QueryTokenResultSchema<TQueries[TName]>;
+  };
 };
 
 export type EventPayload<TEvent extends AnyEventToken> = Static<
