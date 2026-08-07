@@ -1,4 +1,4 @@
-import type { TSchema } from "typebox";
+import type { Static, TSchema } from "typebox";
 
 import {
   attachLedgerApplicationConfigure,
@@ -9,8 +9,6 @@ import type {
   Ledger,
   LedgerModuleContribution,
   LedgerTiming,
-  QueryParameters,
-  QueryResult,
   QueryToken,
   SignalToken,
 } from "./ledger/ledger.ts";
@@ -43,10 +41,15 @@ export interface LedgerAssembly {
     contribution: LedgerModuleContribution<TCapabilities>,
   ): TCapabilities;
 
-  query<const TQuery extends QueryToken<string, string, TSchema, TSchema>>(
-    query: TQuery,
-    params: QueryParameters<NoInfer<TQuery>>,
-  ): Promise<QueryResult<TQuery>>;
+  query<
+    const TModuleId extends string,
+    const TName extends string,
+    const TParamsSchema extends TSchema,
+    const TResultSchema extends TSchema,
+  >(
+    query: QueryToken<TModuleId, TName, TParamsSchema, TResultSchema>,
+    params: Static<TParamsSchema>,
+  ): Promise<Static<TResultSchema>>;
 }
 
 export interface LedgerDriver {
