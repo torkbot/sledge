@@ -389,7 +389,7 @@ graph.
 
 ## Experimental Operators
 
-`@torkbot/sledge/experimental/operators` contributes two small dataflow
+`@torkbot/sledge/experimental/operators` contributes three small dataflow
 primitives to the ordinary module interface. An operator is immutable reusable
 behavior; a binding installs that behavior as one independently durable node.
 Operator ports may be revealed through acyclic plain records and arrays. These
@@ -399,7 +399,11 @@ adversarially forged ports are outside this experimental contract.
 
 ```ts
 import { defineModule } from "@torkbot/sledge";
-import { ForEach, MapAsync } from "@torkbot/sledge/experimental/operators";
+import {
+  CoalescingOperation,
+  ForEach,
+  MapAsync,
+} from "@torkbot/sledge/experimental/operators";
 
 const extractMemory = new MapAsync("extract-memory", {
   input: CompactionRequest,
@@ -443,6 +447,60 @@ thrown value, output-schema violation, or operator timeout produces
 `{ outcome: "failed", error }`; mapper code does not need a `try`/`catch`.
 `timeoutMs` is required so every asynchronous mapping has an explicit bound.
 
+`CoalescingOperation` handles stateful demand such as refreshing an index or
+compacting a conversation lane. The source event must be a canonical demand
+signal: events coalesced into the same live generation or pending successor
+must have the same decoded payload. The operation may query installed ledger
+projections for current authoritative state instead of carrying a stale
+snapshot in the trigger.
+
+```ts
+const compactLane = new CoalescingOperation("compact-lane", {
+  input: Type.Object({ laneId: Type.String({ minLength: 1 }) }),
+  output: CompactedEpoch,
+  timeoutMs: 30_000,
+  queries: { conversationPrefix },
+  keyBy: (request) => request.laneId,
+  run: async (request, { key, attempt, signal, ledger }) => {
+    const prefix = await ledger.query(conversationPrefix, {
+      laneId: request.laneId,
+    });
+
+    return await compact(prefix, { idempotencyKey: key, attempt, signal });
+  },
+});
+
+const requested = module.event("compaction-requested", CompactionRequest);
+const epochProduced = module.import(conversationEvents.epochProduced);
+const settled = module.bind("compact-lane", requested, compactLane, {
+  continueWith: epochProduced,
+});
+```
+
+One generation per key holds a valid lease at a time, including across workers
+and processes. Demand arriving after a generation is claimed collapses into at
+most one pending successor. Different keys remain concurrent subject to the
+queue's worker-level concurrency configuration. Every admitted generation is
+at least once, so external effects must use the stable `key` for idempotency or
+fencing.
+Successful output is emitted directly to the typed continuation event in the
+same transaction that completes the generation. The returned settlement port
+also records failures without requiring the continuation protocol to model a
+failure outcome.
+
+Same-key events with different payloads fail the enclosing event transaction
+while a generation or its pending successor remains live; Sledge cannot choose
+whether first, latest, or merged data is correct. After all work for that key
+completes, a later event starts a new stream and may carry a different payload.
+Emit a smaller semantic demand event and query current state when the operation
+runs.
+
+Cancellation and lease loss revoke ownership; they cannot forcibly stop
+JavaScript already executing in an attempt. A signal-ignoring attempt may
+therefore overlap a later valid attempt, as with any at-least-once durable work.
+Operations must propagate `signal`, and external writes that cannot be made
+idempotent must reject stale attempt keys with application-level fencing.
+
 Bindings compose settlements automatically. A downstream `MapAsync` or
 `ForEach` receives the successful value rather than the wrapper. An upstream
 failure flows unchanged through downstream `MapAsync` bindings without calling
@@ -478,9 +536,9 @@ binding ids shares implementation but never execution state.
 Bindings compile with the rest of their module into ordinary Sledge events,
 handlers, and queues. There is no second kind of module, workflow interpreter,
 or generic protocol event. This also lets one module combine dataflow bindings
-with its own handlers and materializations. The experimental surface
-intentionally begins with only `MapAsync` and `ForEach`; additional operators
-must be justified by real application pressure.
+with its own handlers and materializations. The experimental surface remains
+deliberately small: `MapAsync`, `ForEach`, and `CoalescingOperation` each exist
+because a distinct application pressure justified their durable semantics.
 
 ## Module and Application Phases
 

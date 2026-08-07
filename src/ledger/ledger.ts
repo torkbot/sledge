@@ -7,6 +7,7 @@ import {
   type OperatorBindingDefinition,
   type RevealedModuleCapabilities,
 } from "./operator-bindings.ts";
+import type { OperatorCoalescingEnqueueOptions } from "./operator-runtime.ts";
 import {
   ledgerIdentitySeparator,
   validateLedgerModuleId,
@@ -4604,7 +4605,7 @@ type RuntimeEventHandlerInput = {
     enqueue(
       queueName: string,
       payload: unknown,
-      options?: EnqueueOptions,
+      options?: EnqueueOptions | OperatorCoalescingEnqueueOptions,
     ): Promise<WorkRef | null>;
     query(queryName: string, params: unknown): Promise<unknown>;
   };
