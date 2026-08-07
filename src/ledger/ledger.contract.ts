@@ -575,10 +575,13 @@ export function createLedgerContractHarnessLedger(
 
       if (property === "query") {
         return (queryName: keyof LedgerContractQueries, params: unknown) => {
-          return runtime.query(
-            ledgerContractDefinition.queries[queryName],
-            params,
-          );
+          const query = ledgerContractDefinition.queries[queryName];
+
+          if (query === undefined) {
+            throw new Error(`unknown ledger query ${String(queryName)}`);
+          }
+
+          return runtime.query(query, params);
         };
       }
 

@@ -140,6 +140,69 @@ if (false) {
 }
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
+  test(`${driver} projectionless modules import queries for private durable work`, async () => {
+    await using fixture = await createFixture(driver, "imported-query");
+    const observations: (readonly string[] | null)[] = [];
+    const errors: unknown[] = [];
+    const application = defineLedger((sledge) => {
+      const registry = sledge.install(defineRegistryModule());
+      const consumer = sledge.install(
+        defineModule("contract.query-consumer", (module) => {
+          const importedQueries = {
+            configuredModuleIds: registry.queries.configuredModuleIds,
+          };
+          const declaration = module.declare({
+            events: { requested: Type.Null() },
+            queries: importedQueries,
+            queues: { read: Type.Null() },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              requested: ({ actions }) => {
+                actions.enqueue("read", null);
+              },
+            },
+            queues: {
+              read: async ({ actions }) => {
+                try {
+                  observations.push(
+                    await actions.query("configuredModuleIds", {}),
+                  );
+                } catch (error: unknown) {
+                  errors.push(error);
+                }
+              },
+            },
+          });
+
+          Reflect.deleteProperty(importedQueries, "configuredModuleIds");
+
+          return module.expose(registered, { events: registered.events });
+        })(),
+      );
+
+      return { consumer, registry };
+    });
+    await using opened = await fixture.open(application);
+
+    await opened.ledger.emit(opened.capabilities.registry.events.configured, {
+      moduleIds: ["alpha", "beta"],
+    });
+    await opened.ledger.emit(
+      opened.capabilities.consumer.events.requested,
+      null,
+    );
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+    await runtime.flush();
+    await workers.waitForIdle({ signal: AbortSignal.timeout(2_000) });
+
+    assert.deepEqual(errors, []);
+    assert.deepEqual(observations, [["alpha", "beta"]]);
+  });
+
   test(`${driver} opens a fresh Sledge application with its installed modules`, async () => {
     await using fixture = await createFixture(driver, "fresh");
     const application = defineLedger((sledge) => {
@@ -359,6 +422,35 @@ test("a Sledge application rejects duplicate module ids", async () => {
   await assert.rejects(
     fixture.open(application),
     /duplicate ledger module id contract.application-source/,
+  );
+});
+
+test("a Sledge module rejects same-identity imported query tokens", async () => {
+  await using fixture = await createFixture(
+    "better-sqlite3",
+    "same-identity-query",
+  );
+  const application = defineLedger((sledge) => {
+    const registry = sledge.install(defineRegistryModule());
+    const duplicate = defineModule("contract.model-registry", (module) => {
+      const declaration = module.declare({
+        events: {},
+        queries: {
+          configuredModuleIds: registry.queries.configuredModuleIds,
+        },
+      });
+      const registered = module.link(declaration, null, {});
+
+      return module.expose(registered, {});
+    });
+
+    sledge.install(duplicate());
+    return { registry };
+  });
+
+  await assert.rejects(
+    fixture.open(application),
+    /cannot import its own query configuredModuleIds/,
   );
 });
 
