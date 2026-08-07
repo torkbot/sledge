@@ -34,6 +34,33 @@ const timing = {
 };
 
 if (false) {
+  const defineGenericQueryConsumer = <TModuleId extends string>(
+    query: QueryToken<
+      TModuleId,
+      "prefix",
+      TObject<{ laneId: TString }>,
+      TString
+    >,
+  ) =>
+    defineModule("typecheck.query-consumer", (module) => {
+      const declaration = module.declare({
+        events: {},
+        queries: { prefix: query },
+        queues: { read: Type.Null() },
+      });
+      const registered = module.link(declaration, null, {
+        queues: {
+          read: async ({ actions }) => {
+            const prefix: string = await actions.query("prefix", {
+              laneId: "lane-1",
+            });
+            void prefix;
+          },
+        },
+      });
+
+      return module.expose(registered, {});
+    });
   const verifyConcreteQuery = (
     ledger: ApplicationLedger,
     query: QueryToken<"typecheck", "lookup", TObject<{ id: TString }>, TString>,
@@ -60,6 +87,7 @@ if (false) {
 
   void verifyConcreteQuery;
   void queryGenerically;
+  void defineGenericQueryConsumer;
 
   void (async () => {
     const application = defineLedger((sledge) => ({
