@@ -2445,6 +2445,7 @@ export function declareLedgerModuleInternal<
   const queueDefinitions = (input.queues ?? {}) as TQueues;
   const signalDefinitions = (input.signals ?? {}) as TSignals;
   const signalQueueDefinitions = (input.signalQueues ?? {}) as TSignalQueues;
+  const queries = snapshotImportedQueries(input.queries ?? ({} as TQueries));
   validatePrivateSchemaDefinitions("queue", queueDefinitions);
   validatePrivateSchemaDefinitions("signal", signalDefinitions);
   validatePrivateSchemaDefinitions("signal queue", signalQueueDefinitions);
@@ -2472,10 +2473,23 @@ export function declareLedgerModuleInternal<
   return {
     moduleId: input.moduleId,
     events,
-    queries: input.queries ?? ({} as TQueries),
+    queries,
     signals,
     shape,
   };
+}
+
+function snapshotImportedQueries<
+  TQueries extends Record<string, AnyQueryToken>,
+>(queries: TQueries): TQueries {
+  const snapshot: Record<string, AnyQueryToken> = {};
+
+  for (const [localName, query] of Object.entries(queries)) {
+    readLedgerContractToken(query, "query");
+    defineRecordEntry(snapshot, localName, query);
+  }
+
+  return Object.freeze(snapshot) as TQueries;
 }
 
 /**

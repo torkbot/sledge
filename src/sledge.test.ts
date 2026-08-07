@@ -148,11 +148,12 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
       const registry = sledge.install(defineRegistryModule());
       const consumer = sledge.install(
         defineModule("contract.query-consumer", (module) => {
+          const importedQueries = {
+            configuredModuleIds: registry.queries.configuredModuleIds,
+          };
           const declaration = module.declare({
             events: { requested: Type.Null() },
-            queries: {
-              configuredModuleIds: registry.queries.configuredModuleIds,
-            },
+            queries: importedQueries,
             queues: { read: Type.Null() },
           });
           const registered = module.link(declaration, null, {
@@ -173,6 +174,8 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
               },
             },
           });
+
+          Reflect.deleteProperty(importedQueries, "configuredModuleIds");
 
           return module.expose(registered, { events: registered.events });
         })(),
