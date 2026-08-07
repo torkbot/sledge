@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add experimental `CoalescingOperation` bindings for canonical keyed demand.
+  Each key runs one at-least-once generation at a time, coalesces activity
+  during execution into at most one successor, reads authoritative ledger
+  projections through its operation context, and commits successful output to
+  a required typed continuation event. Payload disagreements within one live
+  coalescing stream fail instead of silently choosing first, latest, or merge
+  semantics. Lease loss and cancellation retain the usual cooperative,
+  at-least-once execution boundary.
 - Allow `module.declare(...)` to import caller-owned query tokens. Projectionless
   modules can now query explicit installed capabilities from event, durable
   queue, and signal-queue handlers without inventing an empty materialization.

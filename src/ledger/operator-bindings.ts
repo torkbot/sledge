@@ -12,8 +12,15 @@ import type {
   EventToken,
   ProjectionIndexerEvent,
   ProjectionReadDatabase,
+  QueryParameters,
+  QueryResult,
+  QueryToken,
 } from "./ledger.ts";
 import type { AnyProjectionSchema } from "./projection-access.ts";
+import {
+  requireMatchingOperatorCoalescingPayload,
+  type OperatorCoalescingEnqueueOptions,
+} from "./operator-runtime.ts";
 
 const eventPortBrand: unique symbol = Symbol("sledge.experimental.eventPort");
 const eventPortNameBrand: unique symbol = Symbol(
@@ -27,6 +34,7 @@ const operatorIndexerPortBrand: unique symbol = Symbol(
 );
 const sinkBrand: unique symbol = Symbol("sledge.experimental.sink");
 const privateGraphIdPrefix = "__sledge_";
+const OperatorCoalescingKeySchema = Type.String({ minLength: 1 });
 
 export type AsyncOperatorContext = {
   /** Stable across retries and suitable for external idempotency. */
@@ -34,6 +42,18 @@ export type AsyncOperatorContext = {
   readonly attempt: number;
   readonly signal: AbortSignal;
 };
+
+type OperationQueries = Readonly<Record<string, QueryToken>>;
+
+export type OperationContext<TQueries extends OperationQueries> =
+  AsyncOperatorContext & {
+    readonly ledger: {
+      query<TQuery extends TQueries[keyof TQueries]>(
+        query: TQuery,
+        params: QueryParameters<TQuery>,
+      ): Promise<QueryResult<TQuery>>;
+    };
+  };
 
 export type OperatorSettlement<TValue> =
   | { readonly outcome: "succeeded"; readonly value: TValue }
@@ -95,6 +115,67 @@ export class MapAsync<
     assertTimeoutMs(definition.timeoutMs);
     this.timeoutMs = definition.timeoutMs;
     this.map = definition.map;
+    Object.freeze(this);
+  }
+}
+
+/**
+ * A durable asynchronous transformation whose triggers coalesce by key.
+ *
+ * One generation per key may hold a valid lease at a time. Triggers received
+ * while that generation remains live collapse into at most one pending
+ * successor and must carry the same decoded payload. Each admitted generation
+ * retains at-least-once execution semantics, so lease loss or cancellation can
+ * overlap an attempt that ignores its signal. Producers should emit a
+ * canonical demand event, query authoritative state, and fence external
+ * effects with the stable attempt key.
+ */
+export class CoalescingOperation<
+  const TName extends string,
+  TInputSchema extends TSchema,
+  TOutputSchema extends TSchema,
+  TQueries extends OperationQueries,
+> {
+  readonly name: TName;
+  readonly input: TInputSchema;
+  readonly output: TOutputSchema;
+  readonly timeoutMs: number;
+  readonly queries: TQueries;
+  readonly keyBy: (input: Static<TInputSchema>) => string;
+  readonly run: (
+    input: Static<TInputSchema>,
+    context: OperationContext<TQueries>,
+  ) => Static<TOutputSchema> | Promise<Static<TOutputSchema>>;
+
+  constructor(
+    name: TName,
+    definition: {
+      readonly input: TInputSchema;
+      readonly output: TOutputSchema;
+      readonly timeoutMs: number;
+      readonly queries: TQueries;
+      readonly keyBy: CoalescingOperation<
+        TName,
+        TInputSchema,
+        TOutputSchema,
+        TQueries
+      >["keyBy"];
+      readonly run: CoalescingOperation<
+        TName,
+        TInputSchema,
+        TOutputSchema,
+        TQueries
+      >["run"];
+    },
+  ) {
+    this.name = name;
+    this.input = definition.input;
+    this.output = definition.output;
+    this.queries = Object.freeze({ ...definition.queries });
+    assertTimeoutMs(definition.timeoutMs);
+    this.timeoutMs = definition.timeoutMs;
+    this.keyBy = definition.keyBy;
+    this.run = definition.run;
     Object.freeze(this);
   }
 }
@@ -191,7 +272,10 @@ type RuntimeBinding =
       readonly bindingId: string;
       readonly source: RuntimePort;
       readonly output: RuntimePort;
-      readonly operator: MapAsync<string, TSchema, TSchema>;
+      readonly continuation: RuntimePort | null;
+      readonly operator:
+        | MapAsync<string, TSchema, TSchema>
+        | CoalescingOperation<string, TSchema, TSchema, OperationQueries>;
     }
   | {
       readonly bindingId: string;
@@ -226,6 +310,28 @@ export interface OperatorBindingDefinition {
     bindingId: TBindingId,
     source: EventPort<TInputSchema, string, null>,
     operator: MapAsync<string, TInputSchema, TOutputSchema>,
+  ): EventPort<
+    OperatorSettlementSchema<TOutputSchema>,
+    TBindingId,
+    TOutputSchema
+  >;
+
+  bind<
+    const TBindingId extends string,
+    TInputSchema extends TSchema,
+    TOutputSchema extends TSchema,
+  >(
+    bindingId: TBindingId,
+    source: EventPort<TInputSchema, string, null>,
+    operator: CoalescingOperation<
+      string,
+      TInputSchema,
+      TOutputSchema,
+      OperationQueries
+    >,
+    options: {
+      readonly continueWith: EventPort<TOutputSchema, string, null>;
+    },
   ): EventPort<
     OperatorSettlementSchema<TOutputSchema>,
     TBindingId,
@@ -291,7 +397,14 @@ type EventHandlerInput = {
     enqueue(
       queueName: string,
       payload: unknown,
-      options: { readonly workKey: string },
+      options:
+        | OperatorCoalescingEnqueueOptions
+        | {
+            readonly coalescingKey?: never;
+            readonly partitionKey?: never;
+            readonly [requireMatchingOperatorCoalescingPayload]?: never;
+            readonly workKey: string;
+          },
     ): Promise<unknown>;
   };
 };
@@ -303,6 +416,7 @@ type QueueHandlerInput = {
     readonly sourceEventId: number;
   };
   readonly lease: { readonly signal: AbortSignal };
+  readonly ledger: OperationContext<OperationQueries>["ledger"];
   readonly control: {
     withTimeout<TResult>(
       timeoutMs: number,
@@ -330,6 +444,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
   readonly definition: OperatorBindingDefinition;
   augmentContract(input: {
     readonly events: Readonly<Record<string, TSchema | EventToken>>;
+    readonly queries?: Readonly<Record<string, QueryToken>>;
     readonly queues?: Readonly<Record<string, TSchema>>;
   }): {
     readonly events: Record<string, TSchema | EventToken>;
@@ -434,7 +549,16 @@ export function createOperatorBindingCompiler(moduleId: string): {
     source: EventPort<TInputSchema, string, TSchema | null>,
     operator:
       | MapAsync<string, TInputSchema, TOutputSchema>
+      | CoalescingOperation<
+          string,
+          TInputSchema,
+          TOutputSchema,
+          OperationQueries
+        >
       | ForEach<string, TInputSchema>,
+    options?: {
+      readonly continueWith: EventPort<TOutputSchema, string, null>;
+    },
   ):
     | EventPort<OperatorSettlementSchema<TOutputSchema>, string, TOutputSchema>
     | Sink {
@@ -455,7 +579,31 @@ export function createOperatorBindingCompiler(moduleId: string): {
       );
     }
 
-    if (operator instanceof MapAsync) {
+    if (
+      operator instanceof MapAsync ||
+      operator instanceof CoalescingOperation
+    ) {
+      const runtimeContinuation =
+        options === undefined ? null : readPort(options.continueWith);
+
+      if (
+        operator instanceof CoalescingOperation &&
+        runtimeContinuation === null
+      ) {
+        throw new Error("coalescing operations require a continuation event");
+      }
+
+      if (operator instanceof MapAsync && runtimeContinuation !== null) {
+        throw new Error("MapAsync does not accept a continuation event");
+      }
+
+      if (
+        runtimeContinuation !== null &&
+        ports.get(runtimeContinuation.localName) !== runtimeContinuation
+      ) {
+        throw new Error("continuation event does not belong to this module");
+      }
+
       const outputSchema = SettlementSchema(operator.output);
       const output = createPort(
         bindingId,
@@ -468,7 +616,10 @@ export function createOperatorBindingCompiler(moduleId: string): {
         bindingId,
         source: runtimeSource,
         output,
-        operator: operator as MapAsync<string, TSchema, TSchema>,
+        continuation: runtimeContinuation,
+        operator: operator as
+          | MapAsync<string, TSchema, TSchema>
+          | CoalescingOperation<string, TSchema, TSchema, OperationQueries>,
       });
       return output;
     }
@@ -592,6 +743,18 @@ export function createOperatorBindingCompiler(moduleId: string): {
             ? binding.operator.input
             : binding.source,
         );
+
+        if (binding.operator instanceof CoalescingOperation) {
+          const declaredQueries = new Set(Object.values(input.queries ?? {}));
+
+          for (const query of Object.values(binding.operator.queries)) {
+            if (!declaredQueries.has(query)) {
+              throw new Error(
+                `coalescing operation ${binding.operator.name} requires an undeclared query`,
+              );
+            }
+          }
+        }
       }
 
       return { events, queues };
@@ -661,16 +824,34 @@ export function createOperatorBindingCompiler(moduleId: string): {
           });
           await Promise.all(
             downstream.map(async (binding) => {
+              const coalescing = readOperatorCoalescingWork(
+                binding,
+                input.event.payload,
+              );
+              const coalescingIdentity =
+                coalescing === null
+                  ? null
+                  : createOperatorCoalescingKey(
+                      moduleId,
+                      binding.bindingId,
+                      coalescing.key,
+                    );
               await input.actions.enqueue(
                 binding.bindingId,
-                input.event.payload,
-                {
-                  workKey: createOperatorAttemptKey(
-                    moduleId,
-                    binding.bindingId,
-                    input.event.eventId,
-                  ),
-                },
+                coalescing?.work ?? input.event.payload,
+                coalescingIdentity === null
+                  ? {
+                      workKey: createOperatorAttemptKey(
+                        moduleId,
+                        binding.bindingId,
+                        input.event.eventId,
+                      ),
+                    }
+                  : {
+                      coalescingKey: coalescingIdentity,
+                      partitionKey: coalescingIdentity,
+                      [requireMatchingOperatorCoalescingPayload]: true,
+                    },
               );
             }),
           );
@@ -698,9 +879,11 @@ export function createOperatorBindingCompiler(moduleId: string): {
             }
 
             const rawOperatorInput =
-              sourceSettlement?.outcome === "succeeded"
-                ? sourceSettlement.value
-                : input.work.payload;
+              binding.operator instanceof CoalescingOperation
+                ? input.work.payload
+                : sourceSettlement?.outcome === "succeeded"
+                  ? sourceSettlement.value
+                  : input.work.payload;
 
             try {
               const operatorInput = Value.Decode(
@@ -709,12 +892,22 @@ export function createOperatorBindingCompiler(moduleId: string): {
               );
               const output = await input.control.withTimeout(
                 binding.operator.timeoutMs,
-                async (signal) =>
-                  await binding.operator.map(operatorInput, {
+                async (signal) => {
+                  const context: AsyncOperatorContext = {
                     key,
                     attempt: input.work.attempt,
                     signal,
-                  }),
+                  };
+
+                  if (binding.operator instanceof CoalescingOperation) {
+                    return await binding.operator.run(operatorInput, {
+                      ...context,
+                      ledger: input.ledger,
+                    });
+                  }
+
+                  return await binding.operator.map(operatorInput, context);
+                },
               );
               input.lease.signal.throwIfAborted();
               Value.Assert(binding.operator.output, output);
@@ -737,6 +930,16 @@ export function createOperatorBindingCompiler(moduleId: string): {
             }
 
             input.actions.emit(binding.output.localName, settlement);
+
+            if (
+              settlement.outcome === "succeeded" &&
+              binding.continuation !== null
+            ) {
+              input.actions.emit(
+                binding.continuation.localName,
+                settlement.value,
+              );
+            }
             return;
           }
 
@@ -795,6 +998,36 @@ export function createOperatorBindingCompiler(moduleId: string): {
     reveal: (value, events, preserve) =>
       mapRevealed(value, events, preserve, ports).value,
   };
+}
+
+function readOperatorCoalescingWork(
+  binding: RuntimeBinding,
+  payload: unknown,
+): { readonly key: string; readonly work: unknown } | null {
+  if (!(binding.operator instanceof CoalescingOperation)) {
+    return null;
+  }
+
+  const input = Value.Decode(binding.operator.input, payload);
+  const rawKey = binding.operator.keyBy(input);
+
+  if (!Value.Check(OperatorCoalescingKeySchema, rawKey)) {
+    throw new Error(
+      `operator ${binding.operator.name} must produce a non-empty string coalescing key`,
+    );
+  }
+
+  const key = Value.Decode(OperatorCoalescingKeySchema, rawKey);
+
+  return { key, work: input };
+}
+
+function createOperatorCoalescingKey(
+  moduleId: string,
+  bindingId: string,
+  key: string,
+): string {
+  return `${moduleId}:${bindingId}:coalesce:${key}`;
 }
 
 function createOperatorAttemptKey(

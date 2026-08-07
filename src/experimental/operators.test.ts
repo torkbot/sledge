@@ -17,6 +17,7 @@ import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { defineLedger, defineModule, type LedgerDriver } from "../sledge.ts";
 import { createTursoDriver } from "../turso.ts";
 import {
+  CoalescingOperation,
   type EventPort,
   ForEach,
   MapAsync,
@@ -38,6 +39,552 @@ const adapters: readonly {
 ];
 
 for (const adapter of adapters) {
+  test(`${adapter.name} coalescing operators run one generation per key at a time`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-coalescing-operator-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(10_000);
+    const firstStarted = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const executions: string[] = [];
+    const continuations: string[] = [];
+    const activeByKey = new Map<string, number>();
+    let maximumActiveForA = 0;
+    let aGenerations = 0;
+    const Input = Type.Object({ key: Type.String({ minLength: 1 }) });
+    const Output = Type.String({ minLength: 1 });
+    const coalesce = new CoalescingOperation("coalesce", {
+      input: Input,
+      output: Output,
+      timeoutMs: 1_000,
+      queries: {},
+      keyBy: (input) => input.key,
+      run: async (input) => {
+        const active = (activeByKey.get(input.key) ?? 0) + 1;
+        activeByKey.set(input.key, active);
+        maximumActiveForA = Math.max(
+          maximumActiveForA,
+          input.key === "a" ? active : 0,
+        );
+        executions.push(input.key);
+
+        if (input.key === "a") {
+          aGenerations += 1;
+        }
+
+        try {
+          if (input.key === "a" && aGenerations === 1) {
+            firstStarted.resolve();
+            await releaseFirst.promise;
+          }
+
+          return input.key;
+        } finally {
+          activeByKey.set(input.key, active - 1);
+        }
+      },
+    });
+    const defineFlow = defineModule(
+      `experimental.contract.coalescing-${adapter.name}`,
+      (module) => {
+        const requested = module.event("requested", Input);
+        const completed = module.event("completed", Output);
+        const settled = module.bind("coalesced", requested, coalesce, {
+          continueWith: completed,
+        });
+
+        if (false) {
+          // A coalescing operation always completes through an explicit typed
+          // continuation; its settlement is the failure-observation seam.
+          // @ts-expect-error missing required continuation event
+          module.bind("missing-continuation", requested, coalesce);
+        }
+
+        const declaration = module.declare({
+          events: { requested, completed, coalesced: settled },
+        });
+        const registered = module.link(declaration, null, {
+          events: {
+            completed: ({ event }) => {
+              continuations.push(event.payload);
+            },
+          },
+        });
+
+        return module.expose(registered, { requested, completed, settled });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "operator.sqlite")),
+      runtime,
+    );
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 4 }),
+      scheduler: runtime.scheduler,
+    });
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "a",
+    });
+    await runtime.flush();
+    await firstStarted.promise;
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "a",
+    });
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "a",
+    });
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "b",
+    });
+    await runtime.flush();
+    releaseFirst.resolve();
+    await driveUntilIdle(runtime, workers);
+
+    assert.equal(maximumActiveForA, 1);
+    assert.deepEqual(executions.sort(), ["a", "a", "b"]);
+    assert.deepEqual(continuations.sort(), ["a", "a", "b"]);
+  });
+
+  test(`${adapter.name} coalescing operators reject ambiguous same-key payloads`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-coalescing-payload-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(20_000);
+    const activeStarted = Promise.withResolvers<void>();
+    const releaseActive = Promise.withResolvers<void>();
+    const Input = Type.Object({
+      key: Type.String({ minLength: 1 }),
+      revision: Type.Integer({ minimum: 1 }),
+    });
+    const Output = Type.Integer({ minimum: 1 });
+    const refresh = new CoalescingOperation("refresh", {
+      input: Input,
+      output: Output,
+      timeoutMs: 1_000,
+      queries: {},
+      keyBy: (input) => input.key,
+      run: async (input) => {
+        if (input.key === "active") {
+          activeStarted.resolve();
+          await releaseActive.promise;
+        }
+
+        return input.revision;
+      },
+    });
+    const defineFlow = defineModule(
+      `experimental.contract.coalescing-payload-${adapter.name}`,
+      (module) => {
+        const requested = module.event("requested", Input);
+        const completed = module.event("completed", Output);
+        const settled = module.bind("refreshed", requested, refresh, {
+          continueWith: completed,
+        });
+        const declaration = module.declare({
+          events: { requested, completed },
+        });
+        const registered = module.link(declaration, null, {});
+
+        return module.expose(registered, { requested, settled });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "operator.sqlite")),
+      runtime,
+    );
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "document-1",
+      revision: 1,
+    });
+
+    await assert.rejects(
+      opened.ledger.emit(opened.capabilities.flow.requested, {
+        key: "document-1",
+        revision: 2,
+      }),
+      /payload does not match the pending item/,
+    );
+
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 2 }),
+      scheduler: runtime.scheduler,
+    });
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "active",
+      revision: 1,
+    });
+    await driveUntil(runtime, activeStarted.promise);
+
+    await assert.rejects(
+      opened.ledger.emit(opened.capabilities.flow.requested, {
+        key: "active",
+        revision: 2,
+      }),
+      /payload does not match the live generation/,
+    );
+
+    releaseActive.resolve();
+    await driveUntilIdle(runtime, workers);
+  });
+
+  test(`${adapter.name} coalescing operators reject invalid runtime keys`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-coalescing-key-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(25_000);
+    const Demand = Type.Object({ key: Type.String() });
+    const invalid = new CoalescingOperation("invalid-key", {
+      input: Demand,
+      output: Type.String(),
+      timeoutMs: 1_000,
+      queries: {},
+      // @ts-expect-error exercise an untyped caller crossing the runtime boundary
+      keyBy: () => 42,
+      run: (demand) => demand.key,
+    });
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(
+        defineModule(
+          `experimental.contract.coalescing-key-${adapter.name}`,
+          (module) => {
+            const requested = module.event("requested", Demand);
+            const completed = module.event("completed", Type.String());
+            module.bind("invalid", requested, invalid, {
+              continueWith: completed,
+            });
+            const declaration = module.declare({ events: {} });
+            const registered = module.link(declaration, null, {});
+
+            return module.expose(registered, { requested });
+          },
+        )(),
+      ),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "operator.sqlite")),
+      runtime,
+    );
+
+    await assert.rejects(
+      opened.ledger.emit(opened.capabilities.flow.requested, { key: "a" }),
+      /must produce a non-empty string coalescing key/,
+    );
+  });
+
+  test(`${adapter.name} coalescing operations query authority and continue atomically`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-coalescing-continuation-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(30_000);
+    const firstStarted = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const authorityObserved: boolean[] = [];
+    const settlements: unknown[] = [];
+    let orderedRuns = 0;
+    const Demand = Type.Object({ key: Type.String({ minLength: 1 }) });
+    const Completed = Type.String({ minLength: 1 });
+    const application = defineLedger((sledge) => {
+      const destination = sledge.install(
+        defineModule(
+          `experimental.contract.coalescing-destination-${adapter.name}`,
+          (module) => {
+            const completed = module.event("completed", Completed);
+            const declaration = module.declare({ events: { completed } });
+            const materialization = defineMaterialization(declaration, {
+              namespace: "coalescing-destination",
+            })
+              .version(1, "record completed operations", (schema) =>
+                schema.createTable("completed", (table) =>
+                  table
+                    .columns({ key: table.text().notNull() })
+                    .primaryKey(["key"]),
+                ),
+              )
+              .define({
+                indexers: { recordCompleted: module.indexer(completed) },
+                queries: {
+                  isCompleted: {
+                    params: Demand,
+                    result: Type.Boolean(),
+                  },
+                },
+              });
+            const registered = module.link(declaration, materialization, {
+              indexers: {
+                recordCompleted: async ({ input, db }) => {
+                  await db
+                    .insertInto("completed")
+                    .values({ key: input })
+                    .onConflict(["key"])
+                    .doNothing()
+                    .execute();
+                },
+              },
+              queries: {
+                isCompleted: async ({ params, db }) => {
+                  const row = await db
+                    .selectFrom("completed")
+                    .select(["key"])
+                    .where("key", "=", params.key)
+                    .executeTakeFirst();
+
+                  return row !== null;
+                },
+              },
+            });
+
+            return module.expose(registered, {
+              completed,
+              isCompleted: registered.queries.isCompleted,
+            });
+          },
+        )(),
+      );
+      const operation = new CoalescingOperation("run", {
+        input: Demand,
+        output: Completed,
+        timeoutMs: 1_000,
+        queries: { isCompleted: destination.isCompleted },
+        keyBy: (demand) => demand.key,
+        run: async (demand, context) => {
+          const completed = await context.ledger.query(
+            destination.isCompleted,
+            demand,
+          );
+          authorityObserved.push(completed);
+
+          if (demand.key === "failed") {
+            throw new Error("operation failed");
+          }
+
+          if (demand.key === "ordered") {
+            orderedRuns += 1;
+
+            if (orderedRuns === 1) {
+              firstStarted.resolve();
+              await releaseFirst.promise;
+            }
+          }
+
+          return demand.key;
+        },
+      });
+      assert.throws(
+        () =>
+          defineModule(
+            `experimental.contract.coalescing-undeclared-query-${adapter.name}`,
+            (module) => {
+              const requested = module.event("requested", Demand);
+              const continueWith = module.import(destination.completed);
+              module.bind("run", requested, operation, { continueWith });
+              const declaration = module.declare({ events: {} });
+              const registered = module.link(declaration, null, {});
+
+              return module.expose(registered, {});
+            },
+          )(),
+        /coalescing operation run requires an undeclared query/,
+      );
+      const flow = sledge.install(
+        defineModule(
+          `experimental.contract.coalescing-flow-${adapter.name}`,
+          (module) => {
+            const requested = module.event("requested", Demand);
+            const continueWith = module.import(destination.completed);
+            const settled = module.bind("run", requested, operation, {
+              continueWith,
+            });
+            const declaration = module.declare({
+              events: { requested, run: settled },
+              queries: { isCompleted: destination.isCompleted },
+            });
+            const registered = module.link(declaration, null, {
+              events: {
+                run: ({ event }) => {
+                  settlements.push(event.payload);
+                },
+              },
+            });
+
+            return module.expose(registered, { requested });
+          },
+        )(),
+      );
+
+      return { destination, flow };
+    });
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "operator.sqlite")),
+      runtime,
+    );
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 4 }),
+      scheduler: runtime.scheduler,
+    });
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "ordered",
+    });
+    await driveUntil(runtime, firstStarted.promise);
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "ordered",
+    });
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "ordered",
+    });
+    releaseFirst.resolve();
+    await driveUntilIdle(runtime, workers);
+
+    assert.equal(orderedRuns, 2);
+    assert.deepEqual(authorityObserved, [false, true]);
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "failed",
+    });
+    await driveUntilIdle(runtime, workers);
+
+    assert.deepEqual(
+      settlements.map(
+        (settlement) =>
+          Value.Decode(SettlementSchema(Completed), settlement).outcome,
+      ),
+      ["succeeded", "succeeded", "failed"],
+    );
+    assert.equal(
+      await opened.ledger.query(opened.capabilities.destination.isCompleted, {
+        key: "failed",
+      }),
+      false,
+    );
+  });
+
+  test(`${adapter.name} coalescing operations preserve identity and propagate cancellation`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-coalescing-recovery-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(40_000);
+    const firstStarted = Promise.withResolvers<void>();
+    const attempts: { readonly attempt: number; readonly key: string }[] = [];
+    const aborted: string[] = [];
+    const continuations: string[] = [];
+    const settlements: unknown[] = [];
+    let recoveryRuns = 0;
+    const Demand = Type.Object({ key: Type.String({ minLength: 1 }) });
+    const Completed = Type.String({ minLength: 1 });
+    const operation = new CoalescingOperation("recover", {
+      input: Demand,
+      output: Completed,
+      timeoutMs: 5,
+      queries: {},
+      keyBy: (demand) => demand.key,
+      run: async (demand, context) => {
+        attempts.push({ key: context.key, attempt: context.attempt });
+
+        if (demand.key === "recover") {
+          recoveryRuns += 1;
+
+          if (recoveryRuns === 1) {
+            firstStarted.resolve();
+            await waitForAbort(context.signal);
+            aborted.push(demand.key);
+            context.signal.throwIfAborted();
+          }
+        }
+
+        if (demand.key === "timeout") {
+          await waitForAbort(context.signal);
+          aborted.push(demand.key);
+          context.signal.throwIfAborted();
+        }
+
+        return demand.key;
+      },
+    });
+    const defineFlow = defineModule(
+      `experimental.contract.coalescing-recovery-${adapter.name}`,
+      (module) => {
+        const requested = module.event("requested", Demand);
+        const completed = module.event("completed", Completed);
+        const settled = module.bind("recover", requested, operation, {
+          continueWith: completed,
+        });
+        const declaration = module.declare({
+          events: { requested, completed, recover: settled },
+        });
+        const registered = module.link(declaration, null, {
+          events: {
+            completed: ({ event }) => {
+              continuations.push(event.payload);
+            },
+            recover: ({ event }) => {
+              settlements.push(event.payload);
+            },
+          },
+        });
+
+        return module.expose(registered, { requested });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "operator.sqlite")),
+      runtime,
+    );
+    const firstWorkers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+      defaultRetryDelayMs: 1,
+    });
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "recover",
+    });
+    await driveUntil(runtime, firstStarted.promise);
+    await firstWorkers.close();
+
+    await using recoveredWorkers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+      defaultRetryDelayMs: 1,
+    });
+    await driveUntilIdle(runtime, recoveredWorkers);
+
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0]?.key, attempts[1]?.key);
+    assert.deepEqual(
+      attempts.map((attempt) => attempt.attempt),
+      [1, 2],
+    );
+    assert.deepEqual(aborted, ["recover"]);
+    assert.deepEqual(continuations, ["recover"]);
+
+    await opened.ledger.emit(opened.capabilities.flow.requested, {
+      key: "timeout",
+    });
+    await driveUntilIdle(runtime, recoveredWorkers);
+
+    assert.deepEqual(aborted, ["recover", "timeout"]);
+    assert.deepEqual(continuations, ["recover"]);
+    assert.deepEqual(
+      settlements.map(
+        (settlement) =>
+          Value.Decode(SettlementSchema(Completed), settlement).outcome,
+      ),
+      ["succeeded", "failed"],
+    );
+  });
+
   test(`${adapter.name} operator bindings compose, fan out, reuse behavior, and survive restart`, async () => {
     await using directory = await mkdtempDisposable(
       join(tmpdir(), `sledge-operators-${adapter.name}-`),
@@ -809,6 +1356,37 @@ async function driveUntilIdle(
   }
 
   await idle;
+}
+
+async function driveUntil(
+  runtime: VirtualRuntimeHarness,
+  condition: Promise<void>,
+): Promise<void> {
+  let settled = false;
+  condition.then(() => {
+    settled = true;
+  });
+
+  for (let attempt = 0; attempt < 200 && !settled; attempt += 1) {
+    await runtime.advanceByMs(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  if (!settled) {
+    throw new Error("operator condition did not settle");
+  }
+
+  await condition;
+}
+
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 async function readEvents(

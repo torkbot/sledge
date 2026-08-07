@@ -21,6 +21,10 @@ import {
   type LedgerStorageStatement,
 } from "./internal-storage.ts";
 import type { ProjectionStatementCompiler } from "./projection-sql-compiler.ts";
+import {
+  requireMatchingOperatorCoalescingPayload,
+  type OperatorCoalescingEnqueueOptions,
+} from "./operator-runtime.ts";
 import type {
   AnyComposedLedgerModel,
   ComposedLedgerEventTokens,
@@ -1122,6 +1126,11 @@ const CoalescedWorkRowSchema = Type.Object({
   work_ref: Type.String(),
 });
 
+const CanonicalCoalescingRowSchema = Type.Object({
+  partition_key: Type.Union([Type.Null(), Type.String()]),
+  payload_json: Type.String(),
+});
+
 const DeferredSuccessorRowSchema = Type.Object({
   available_at_ms: Type.Number(),
   work_id: Type.Number(),
@@ -1678,6 +1687,15 @@ function openDatabaseLedgerEngine<
     } catch {
       throw new Error("coalescingKey must be non-empty");
     }
+  }
+
+  function isOperatorCoalescingEnqueueOptions(
+    options: EnqueueOptions | OperatorCoalescingEnqueueOptions | undefined,
+  ): options is OperatorCoalescingEnqueueOptions {
+    return (
+      options !== undefined &&
+      requireMatchingOperatorCoalescingPayload in options
+    );
   }
 
   function validatePartitionKey(partitionKey: string): void {
@@ -2545,6 +2563,7 @@ function openDatabaseLedgerEngine<
   type PendingDurableWork = {
     readonly availableAtMs: number;
     readonly coalescingKey: string | null;
+    readonly requireMatchingCoalescingPayload: boolean;
     readonly partitionKey: string | null;
     readonly payload: unknown;
     readonly queueName: string;
@@ -2565,6 +2584,48 @@ function openDatabaseLedgerEngine<
     let availableAtMs = work.availableAtMs;
 
     if (work.coalescingKey !== null) {
+      if (work.requireMatchingCoalescingPayload) {
+        const liveRows = await database
+          .prepare(
+            `SELECT partition_key, payload_json
+             FROM work
+             WHERE queue_name = ?
+               AND coalescing_key = ?
+               AND dead = 0
+               AND cancelled = 0
+               AND (attempt > 0 OR lease_id IS NOT NULL)`,
+          )
+          .all(work.queueName, work.coalescingKey);
+        const queueSchema = model.queues[work.queueName as keyof TQueues];
+
+        if (queueSchema === undefined) {
+          throw new Error(`unknown queue: ${work.queueName}`);
+        }
+
+        for (const liveRow of liveRows) {
+          const decodedLive = decodeRow(liveRow, CanonicalCoalescingRowSchema);
+          const livePayload = decodeValue(
+            queueSchema,
+            parseJson(
+              decodedLive.payload_json,
+              `coalesced work ${work.queueName}/${work.coalescingKey}`,
+            ),
+          );
+
+          if (!Value.Equal(livePayload, work.payload)) {
+            throw new Error(
+              `coalesced work ${work.queueName}/${work.coalescingKey} payload does not match the live generation`,
+            );
+          }
+
+          if (decodedLive.partition_key !== work.partitionKey) {
+            throw new Error(
+              `coalesced work ${work.queueName}/${work.coalescingKey} partition does not match the live generation`,
+            );
+          }
+        }
+      }
+
       const existing = await database
         .prepare(
           `SELECT
@@ -2969,14 +3030,15 @@ function openDatabaseLedgerEngine<
       function enqueue<const TQueueName extends keyof TQueues>(
         queueName: TQueueName,
         payload: Static<TQueues[TQueueName]>,
-        options: EnqueueOptions,
+        options: EnqueueOptions | OperatorCoalescingEnqueueOptions,
       ): Promise<WorkRef | null>;
       function enqueue<const TQueueName extends keyof TQueues>(
         queueName: TQueueName,
         payload: Static<TQueues[TQueueName]>,
-        options?: EnqueueOptions,
+        options?: EnqueueOptions | OperatorCoalescingEnqueueOptions,
       ): Promise<WorkRef | null> {
         assertActionScopeOpen();
+        const operatorCoalescing = isOperatorCoalescingEnqueueOptions(options);
         const queueSchema = model.queues[queueName];
 
         if (queueSchema === undefined) {
@@ -3008,9 +3070,15 @@ function openDatabaseLedgerEngine<
           queueName: String(queueName),
           workKey: options?.workKey ?? null,
           coalescingKey: options?.coalescingKey ?? null,
+          // Operator-authored canonical demand must agree with every live
+          // generation. Ordinary queue coalescing deliberately retains its
+          // broader active-plus-successor payload semantics.
+          requireMatchingCoalescingPayload: operatorCoalescing,
           partitionKey: options?.partitionKey ?? null,
           payload: decodedQueuePayload,
-          availableAtMs: options?.availableAtMs ?? eventInput.nowMs,
+          availableAtMs: operatorCoalescing
+            ? eventInput.nowMs
+            : (options?.availableAtMs ?? eventInput.nowMs),
         };
         const operation = enqueueTail.then(async () => {
           const materialized = await materializeDurableWork(
