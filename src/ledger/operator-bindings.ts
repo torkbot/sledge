@@ -1,9 +1,30 @@
-import { type Static, type TSchema } from "typebox";
+import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 
-import type { EventToken } from "./ledger.ts";
+import {
+  serializeException,
+  SerializedExceptionSchema,
+  type SerializedException,
+} from "../exception.ts";
+import { createEventRef, type EventRef } from "./event-ref.ts";
+import type {
+  EventCausationWork,
+  EventToken,
+  ProjectionIndexerEvent,
+  ProjectionReadDatabase,
+} from "./ledger.ts";
+import type { AnyProjectionSchema } from "./projection-access.ts";
 
 const eventPortBrand: unique symbol = Symbol("sledge.experimental.eventPort");
+const eventPortNameBrand: unique symbol = Symbol(
+  "sledge.experimental.eventPortName",
+);
+const eventPortSettlementBrand: unique symbol = Symbol(
+  "sledge.experimental.eventPortSettlement",
+);
+const operatorIndexerPortBrand: unique symbol = Symbol(
+  "sledge.experimental.operatorIndexerPort",
+);
 const sinkBrand: unique symbol = Symbol("sledge.experimental.sink");
 const privateGraphIdPrefix = "__sledge_";
 
@@ -14,6 +35,36 @@ export type AsyncOperatorContext = {
   readonly signal: AbortSignal;
 };
 
+export type OperatorSettlement<TValue> =
+  | { readonly outcome: "succeeded"; readonly value: TValue }
+  | { readonly outcome: "failed"; readonly error: SerializedException };
+
+export type OperatorSettlementSchema<TValueSchema extends TSchema> = ReturnType<
+  typeof SettlementSchema<TValueSchema>
+>;
+
+export function SettlementSchema<TValueSchema extends TSchema>(
+  value: TValueSchema,
+) {
+  return Type.Union([
+    Type.Object({
+      outcome: Type.Literal("succeeded"),
+      value,
+    }),
+    Type.Object({
+      outcome: Type.Literal("failed"),
+      error: SerializedExceptionSchema,
+    }),
+  ]);
+}
+
+export class UncaughtOperatorError extends Error {
+  constructor(operatorName: string, bindingId: string, cause: unknown) {
+    super(`operator ${operatorName} failed at binding ${bindingId}`, { cause });
+    this.name = "UncaughtOperatorError";
+  }
+}
+
 /** An immutable, reusable asynchronous transformation. */
 export class MapAsync<
   const TName extends string,
@@ -23,6 +74,7 @@ export class MapAsync<
   readonly name: TName;
   readonly input: TInputSchema;
   readonly output: TOutputSchema;
+  readonly timeoutMs: number;
   readonly map: (
     input: Static<TInputSchema>,
     context: AsyncOperatorContext,
@@ -33,12 +85,15 @@ export class MapAsync<
     definition: {
       readonly input: TInputSchema;
       readonly output: TOutputSchema;
+      readonly timeoutMs: number;
       readonly map: MapAsync<TName, TInputSchema, TOutputSchema>["map"];
     },
   ) {
     this.name = name;
     this.input = definition.input;
     this.output = definition.output;
+    assertTimeoutMs(definition.timeoutMs);
+    this.timeoutMs = definition.timeoutMs;
     this.map = definition.map;
     Object.freeze(this);
   }
@@ -67,8 +122,14 @@ export class ForEach<const TName extends string, TInputSchema extends TSchema> {
   }
 }
 
-export type EventPort<TSchemaValue extends TSchema> = TSchemaValue & {
+export type EventPort<
+  TSchemaValue extends TSchema,
+  TName extends string = string,
+  TSettlementValueSchema extends TSchema | null = null,
+> = TSchemaValue & {
   readonly [eventPortBrand]: TSchemaValue;
+  readonly [eventPortNameBrand]: TName;
+  readonly [eventPortSettlementBrand]: TSettlementValueSchema;
 };
 
 /** A terminal binding that cannot be used as another event source. */
@@ -77,7 +138,7 @@ export interface Sink {
 }
 
 export type RevealedModuleCapabilities<TValue> =
-  TValue extends EventPort<infer TSchemaValue>
+  TValue extends EventPort<infer TSchemaValue, string, TSchema | null>
     ? EventToken<string, string, TSchemaValue, null>
     : TValue extends readonly unknown[]
       ? {
@@ -100,10 +161,29 @@ export type SchemaOfEvent<TEvent extends EventToken> =
     ? TSchemaValue
     : never;
 
-type RuntimePort<TSchemaValue extends TSchema = TSchema> = TSchemaValue & {
+type RuntimePort<
+  TSchemaValue extends TSchema = TSchema,
+  TName extends string = string,
+  TSettlementValueSchema extends TSchema | null = TSchema | null,
+> = TSchemaValue & {
   readonly [eventPortBrand]: TSchemaValue;
+  readonly [eventPortNameBrand]: TName;
+  readonly [eventPortSettlementBrand]: TSettlementValueSchema;
   readonly definition: TSchema | EventToken;
-  readonly localName: string;
+  readonly localName: TName;
+  readonly settlementValueSchema: TSchema | null;
+  readonly source: RuntimePort | null;
+};
+
+export type OperatorOriginEvent<TSchemaValue extends TSchema> = {
+  readonly eventId: number;
+  readonly ref: EventRef<string>;
+  readonly tsMs: number;
+  readonly eventName: string;
+  readonly payload: Static<TSchemaValue>;
+  readonly causationEventId: number | null;
+  readonly causationWork: EventCausationWork | null;
+  readonly dedupeKey: string | null;
 };
 
 type RuntimeBinding =
@@ -120,15 +200,23 @@ type RuntimeBinding =
       readonly operator: ForEach<string, TSchema>;
     };
 
+type RuntimeOperatorIndexerDefinition = {
+  readonly [operatorIndexerPortBrand]: RuntimePort;
+};
+
 export interface OperatorBindingDefinition {
   event<const TName extends string, const TEventSchema extends TSchema>(
     name: TName,
     schema: TEventSchema,
-  ): EventPort<TEventSchema>;
+  ): EventPort<TEventSchema, TName>;
 
   import<const TEvent extends EventToken>(
     event: TEvent,
   ): EventPort<SchemaOfEvent<TEvent>>;
+
+  indexer<TSchemaValue extends TSchema, TName extends string>(
+    source: EventPort<TSchemaValue, TName, TSchema | null>,
+  ): { readonly sourceEvent: TName; readonly input: TSchemaValue };
 
   bind<
     const TBindingId extends string,
@@ -136,15 +224,61 @@ export interface OperatorBindingDefinition {
     TOutputSchema extends TSchema,
   >(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema>,
+    source: EventPort<TInputSchema, string, null>,
     operator: MapAsync<string, TInputSchema, TOutputSchema>,
-  ): EventPort<TOutputSchema>;
+  ): EventPort<
+    OperatorSettlementSchema<TOutputSchema>,
+    TBindingId,
+    TOutputSchema
+  >;
+
+  bind<
+    const TBindingId extends string,
+    TInputSchema extends TSchema,
+    TOutputSchema extends TSchema,
+  >(
+    bindingId: TBindingId,
+    source: EventPort<
+      OperatorSettlementSchema<TInputSchema>,
+      string,
+      TInputSchema
+    >,
+    operator: MapAsync<string, TInputSchema, TOutputSchema>,
+  ): EventPort<
+    OperatorSettlementSchema<TOutputSchema>,
+    TBindingId,
+    TOutputSchema
+  >;
 
   bind<const TBindingId extends string, TInputSchema extends TSchema>(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema>,
+    source: EventPort<TInputSchema, string, null>,
     operator: ForEach<string, TInputSchema>,
   ): Sink;
+
+  bind<const TBindingId extends string, TInputSchema extends TSchema>(
+    bindingId: TBindingId,
+    source: EventPort<
+      OperatorSettlementSchema<TInputSchema>,
+      string,
+      TInputSchema
+    >,
+    operator: ForEach<string, TInputSchema>,
+  ): Sink;
+
+  origin<
+    TProjectionSchema extends AnyProjectionSchema,
+    TEvents extends Record<string, TSchema>,
+    TSignals extends Record<string, TSchema>,
+    TAncestorSchema extends TSchema,
+    TAncestorSettlementSchema extends TSchema | null,
+  >(
+    input: {
+      readonly event: ProjectionIndexerEvent<string>;
+      readonly db: ProjectionReadDatabase<TProjectionSchema, TEvents, TSignals>;
+    },
+    ancestor: EventPort<TAncestorSchema, string, TAncestorSettlementSchema>,
+  ): Promise<OperatorOriginEvent<TAncestorSchema>>;
 }
 
 type EventHandlerInput = {
@@ -153,6 +287,7 @@ type EventHandlerInput = {
     readonly payload: unknown;
   };
   readonly actions: {
+    index(indexName: string, input: unknown): Promise<void>;
     enqueue(
       queueName: string,
       payload: unknown,
@@ -168,6 +303,13 @@ type QueueHandlerInput = {
     readonly sourceEventId: number;
   };
   readonly lease: { readonly signal: AbortSignal };
+  readonly control: {
+    withTimeout<TResult>(
+      timeoutMs: number,
+      operation: (signal: AbortSignal) => Promise<TResult>,
+    ): Promise<TResult>;
+    deadLetter(error: unknown): never;
+  };
   readonly actions: {
     emit(eventName: string, payload: unknown): void;
   };
@@ -195,6 +337,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
   };
   augmentRegistration<TRegistration>(
     registration: TRegistration,
+    indexers?: Readonly<Record<string, unknown>>,
   ): TRegistration;
   reveal(
     value: unknown,
@@ -214,11 +357,17 @@ export function createOperatorBindingCompiler(moduleId: string): {
       );
     }
   };
-  const createPort = <TSchemaValue extends TSchema>(
-    localName: string,
+  const createPort = <
+    TSchemaValue extends TSchema,
+    TName extends string,
+    TSettlementValueSchema extends TSchema | null,
+  >(
+    localName: TName,
     schema: TSchemaValue,
-    definition: TSchema | EventToken = schema,
-  ): RuntimePort<TSchemaValue> => {
+    definition: TSchema | EventToken,
+    settlementValueSchema: TSettlementValueSchema,
+    source: RuntimePort | null,
+  ): RuntimePort<TSchemaValue, TName, TSettlementValueSchema> => {
     assertAuthoring();
 
     if (definition === schema && localName.startsWith(privateGraphIdPrefix)) {
@@ -234,15 +383,33 @@ export function createOperatorBindingCompiler(moduleId: string): {
     const port = Object.freeze(
       Object.assign({}, schema, {
         [eventPortBrand]: schema,
+        [eventPortNameBrand]: localName,
+        [eventPortSettlementBrand]: settlementValueSchema,
         definition,
         localName,
+        settlementValueSchema,
+        source,
       }),
     );
     ports.set(localName, port);
     return port;
   };
   const event: OperatorBindingDefinition["event"] = (name, schema) =>
-    createPort(name, schema);
+    createPort(name, schema, schema, null, null);
+  const indexer: OperatorBindingDefinition["indexer"] = (source) => {
+    const port = readPort(source);
+
+    if (ports.get(port.localName) !== port) {
+      throw new Error("event port does not belong to this ledger module");
+    }
+
+    const definition = Object.freeze({
+      [operatorIndexerPortBrand]: port,
+      sourceEvent: port.localName,
+      input: source,
+    });
+    return definition;
+  };
   const importEvent: OperatorBindingDefinition["import"] = (external) => {
     assertAuthoring();
     const existing = imported.get(external);
@@ -256,17 +423,21 @@ export function createOperatorBindingCompiler(moduleId: string): {
       `${privateGraphIdPrefix}import_${imported.size}`,
       schema,
       external,
+      null,
+      null,
     );
     imported.set(external, port);
     return port;
   };
   function bind<TInputSchema extends TSchema, TOutputSchema extends TSchema>(
     bindingId: string,
-    source: EventPort<TInputSchema>,
+    source: EventPort<TInputSchema, string, TSchema | null>,
     operator:
       | MapAsync<string, TInputSchema, TOutputSchema>
       | ForEach<string, TInputSchema>,
-  ): EventPort<TOutputSchema> | Sink {
+  ):
+    | EventPort<OperatorSettlementSchema<TOutputSchema>, string, TOutputSchema>
+    | Sink {
     assertAuthoring();
     const runtimeSource = readPort(source);
 
@@ -285,7 +456,14 @@ export function createOperatorBindingCompiler(moduleId: string): {
     }
 
     if (operator instanceof MapAsync) {
-      const output = createPort(bindingId, operator.output);
+      const outputSchema = SettlementSchema(operator.output);
+      const output = createPort(
+        bindingId,
+        outputSchema,
+        outputSchema,
+        operator.output,
+        runtimeSource,
+      );
       bindings.push({
         bindingId,
         source: runtimeSource,
@@ -311,12 +489,57 @@ export function createOperatorBindingCompiler(moduleId: string): {
     });
     return Object.freeze({ [sinkBrand]: true as const });
   }
+  const origin: OperatorBindingDefinition["origin"] = async (
+    input,
+    ancestor,
+  ) => {
+    const current = ports.get(input.event.eventName);
+    const target = readPort(ancestor);
+
+    if (current === undefined || ports.get(target.localName) !== target) {
+      throw new Error("operator origin is outside this ledger module");
+    }
+
+    let source = current.source;
+    let causationEventId = input.event.causationEventId;
+    // The compiler has already proved every path member belongs to the
+    // declaration. ProjectionReadDatabase cannot express that runtime-derived
+    // event-name union, so this internal reader restores the proven shape.
+    const readEvent = input.db.readEvent as unknown as (
+      ref: EventRef<string>,
+    ) => Promise<OperatorOriginEvent<TSchema> | null>;
+
+    while (source !== null && causationEventId !== null) {
+      const event = await readEvent(
+        createEventRef(source.localName, causationEventId),
+      );
+
+      if (event === null) {
+        throw new Error(
+          `operator event ${current.localName} lost ancestor ${source.localName}`,
+        );
+      }
+
+      if (source === target) {
+        return event as OperatorOriginEvent<typeof ancestor>;
+      }
+
+      source = source.source;
+      causationEventId = event.causationEventId;
+    }
+
+    throw new Error(
+      `operator event ${current.localName} does not descend from ${target.localName}`,
+    );
+  };
 
   return {
     definition: Object.freeze({
       event,
       import: importEvent,
       bind: bind as OperatorBindingDefinition["bind"],
+      indexer,
+      origin,
     }),
     augmentContract: (input) => {
       assertAuthoring();
@@ -362,12 +585,21 @@ export function createOperatorBindingCompiler(moduleId: string): {
           throw new Error(`duplicate ledger queue ${binding.bindingId}`);
         }
 
-        setOwn(queues, binding.bindingId, binding.operator.input);
+        setOwn(
+          queues,
+          binding.bindingId,
+          binding.source.settlementValueSchema === null
+            ? binding.operator.input
+            : binding.source,
+        );
       }
 
       return { events, queues };
     },
-    augmentRegistration: <TRegistration>(registration: TRegistration) => {
+    augmentRegistration: <TRegistration>(
+      registration: TRegistration,
+      indexerDefinitions = {},
+    ) => {
       const existing = registration as RuntimeRegistration;
       const downstreamBySource = Map.groupBy(
         bindings,
@@ -375,13 +607,58 @@ export function createOperatorBindingCompiler(moduleId: string): {
       );
       const events = { ...existing.events };
       const queues = { ...existing.queues };
+      const operatorIndexersBySource = new Map<string, string[]>();
 
-      for (const [sourceName, downstream] of downstreamBySource) {
+      for (const [indexerName, definition] of Object.entries(
+        indexerDefinitions,
+      )) {
+        if (typeof definition !== "object" || definition === null) {
+          continue;
+        }
+
+        const port = (definition as Partial<RuntimeOperatorIndexerDefinition>)[
+          operatorIndexerPortBrand
+        ];
+
+        if (port === undefined || ports.get(port.localName) !== port) {
+          continue;
+        }
+
+        const names = operatorIndexersBySource.get(port.localName) ?? [];
+        names.push(indexerName);
+        operatorIndexersBySource.set(port.localName, names);
+      }
+
+      for (const sourceName of new Set([
+        ...downstreamBySource.keys(),
+        ...operatorIndexersBySource.keys(),
+      ])) {
+        const downstream = downstreamBySource.get(sourceName) ?? [];
+        const indexerNames = operatorIndexersBySource.get(sourceName) ?? [];
         const existingHandler = Object.hasOwn(events, sourceName)
           ? events[sourceName]
           : undefined;
         setOwn(events, sourceName, async (input: EventHandlerInput) => {
-          await existingHandler?.(input);
+          await Promise.all(
+            indexerNames.map(async (indexerName) => {
+              await input.actions.index(indexerName, input.event.payload);
+            }),
+          );
+          await existingHandler?.({
+            ...input,
+            actions: {
+              ...input.actions,
+              index: async (indexerName, indexInput) => {
+                if (indexerNames.includes(indexerName)) {
+                  throw new Error(
+                    `operator indexer ${indexerName} is dispatched automatically`,
+                  );
+                }
+
+                await input.actions.index(indexerName, indexInput);
+              },
+            },
+          });
           await Promise.all(
             downstream.map(async (binding) => {
               await input.actions.enqueue(
@@ -402,36 +679,112 @@ export function createOperatorBindingCompiler(moduleId: string): {
 
       for (const binding of bindings) {
         setOwn(queues, binding.bindingId, async (input: QueueHandlerInput) => {
+          const key = createOperatorAttemptKey(
+            moduleId,
+            binding.bindingId,
+            input.work.sourceEventId,
+          );
+
+          if (binding.output !== null) {
+            let settlement: OperatorSettlement<unknown>;
+            const sourceSettlement = decodeSourceSettlement(
+              binding.source,
+              input.work.payload,
+            );
+
+            if (sourceSettlement?.outcome === "failed") {
+              input.actions.emit(binding.output.localName, sourceSettlement);
+              return;
+            }
+
+            const rawOperatorInput =
+              sourceSettlement?.outcome === "succeeded"
+                ? sourceSettlement.value
+                : input.work.payload;
+
+            try {
+              const operatorInput = Value.Decode(
+                binding.operator.input,
+                rawOperatorInput,
+              );
+              const output = await input.control.withTimeout(
+                binding.operator.timeoutMs,
+                async (signal) =>
+                  await binding.operator.map(operatorInput, {
+                    key,
+                    attempt: input.work.attempt,
+                    signal,
+                  }),
+              );
+              input.lease.signal.throwIfAborted();
+              Value.Assert(binding.operator.output, output);
+              settlement = {
+                outcome: "succeeded",
+                value: Value.Decode(binding.operator.output, output),
+              };
+            } catch (cause: unknown) {
+              input.lease.signal.throwIfAborted();
+              settlement = {
+                outcome: "failed",
+                error: serializeException(
+                  new UncaughtOperatorError(
+                    binding.operator.name,
+                    binding.bindingId,
+                    cause,
+                  ),
+                ),
+              };
+            }
+
+            input.actions.emit(binding.output.localName, settlement);
+            return;
+          }
+
           const context: AsyncOperatorContext = {
-            key: createOperatorAttemptKey(
-              moduleId,
-              binding.bindingId,
-              input.work.sourceEventId,
-            ),
+            key,
             attempt: input.work.attempt,
             signal: input.lease.signal,
           };
 
+          const sourceSettlement = decodeSourceSettlement(
+            binding.source,
+            input.work.payload,
+          );
+
+          if (sourceSettlement?.outcome === "failed") {
+            return;
+          }
+
+          const rawOperatorInput =
+            sourceSettlement?.outcome === "succeeded"
+              ? sourceSettlement.value
+              : input.work.payload;
+
+          let operatorInput: Static<TSchema>;
+
           try {
-            if (binding.output !== null) {
-              const output = await binding.operator.map(
-                input.work.payload,
-                context,
-              );
-              input.lease.signal.throwIfAborted();
-              Value.Assert(binding.operator.output, output);
-              input.actions.emit(
-                binding.output.localName,
-                Value.Decode(binding.operator.output, output),
-              );
-            } else {
-              await binding.operator.run(input.work.payload, context);
-              input.lease.signal.throwIfAborted();
-            }
+            operatorInput = Value.Decode(
+              binding.operator.input,
+              rawOperatorInput,
+            );
           } catch (cause: unknown) {
-            throw new Error(
-              `operator ${binding.operator.name} failed at binding ${binding.bindingId}`,
-              { cause },
+            input.control.deadLetter(
+              new UncaughtOperatorError(
+                binding.operator.name,
+                binding.bindingId,
+                cause,
+              ),
+            );
+          }
+
+          try {
+            await binding.operator.run(operatorInput, context);
+            input.lease.signal.throwIfAborted();
+          } catch (cause: unknown) {
+            throw new UncaughtOperatorError(
+              binding.operator.name,
+              binding.bindingId,
+              cause,
             );
           }
         });
@@ -452,10 +805,16 @@ function createOperatorAttemptKey(
   return `${moduleId}:${bindingId}:${sourceEventId}`;
 }
 
-function readPort<TSchemaValue extends TSchema>(
-  port: EventPort<TSchemaValue>,
-): RuntimePort<TSchemaValue> {
-  const candidate = port as Partial<RuntimePort>;
+function readPort<
+  TSchemaValue extends TSchema,
+  TName extends string,
+  TSettlementValueSchema extends TSchema | null,
+>(
+  port: EventPort<TSchemaValue, TName, TSettlementValueSchema>,
+): RuntimePort<TSchemaValue, TName, TSettlementValueSchema> {
+  const candidate = port as Partial<
+    RuntimePort<TSchemaValue, TName, TSettlementValueSchema>
+  >;
 
   if (
     typeof candidate.localName !== "string" ||
@@ -464,7 +823,18 @@ function readPort<TSchemaValue extends TSchema>(
     throw new Error("event port does not belong to this ledger module");
   }
 
-  return candidate as RuntimePort<TSchemaValue>;
+  return candidate as RuntimePort<TSchemaValue, TName, TSettlementValueSchema>;
+}
+
+function decodeSourceSettlement(
+  source: RuntimePort,
+  payload: unknown,
+): OperatorSettlement<unknown> | null {
+  if (source.settlementValueSchema === null) {
+    return null;
+  }
+
+  return Value.Decode(source, payload) as OperatorSettlement<unknown>;
 }
 
 function mapRevealed(
@@ -561,3 +931,15 @@ function setOwn<TValue>(
 // Imported event schemas are carried by their operator input contract. This
 // sentinel is never passed to the ledger declaration or used for decoding.
 const operatorInputPlaceholder = {} as TSchema;
+
+function assertTimeoutMs(timeoutMs: number): void {
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > 2_147_483_647
+  ) {
+    throw new RangeError(
+      "operator timeoutMs must be a positive integer no greater than 2,147,483,647",
+    );
+  }
+}

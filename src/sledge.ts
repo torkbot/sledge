@@ -20,6 +20,14 @@ import {
 } from "./runtime/node-runtime.ts";
 
 export { defineModule } from "./ledger/ledger.ts";
+export {
+  rehydrateException,
+  serializeException,
+  SerializedExceptionFrameSchema,
+  SerializedExceptionSchema,
+  type SerializedException,
+  type SerializedExceptionFrame,
+} from "./exception.ts";
 export type {
   LedgerModuleContribution,
   LedgerModuleDefinition,

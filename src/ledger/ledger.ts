@@ -2561,7 +2561,10 @@ export function defineModule<
       // and the typed low-level linker has constructed the exact result.
       return attachLedgerModuleConstructionScope(
         linked.register(
-          operatorBindings.augmentRegistration(registration) as never,
+          operatorBindings.augmentRegistration(
+            registration,
+            materializations?.indexers,
+          ) as never,
         ),
         constructionScope,
       );

@@ -16,7 +16,12 @@ import {
 import { VirtualRuntimeHarness } from "../runtime/virtual-runtime.ts";
 import { defineLedger, defineModule, type LedgerDriver } from "../sledge.ts";
 import { createTursoDriver } from "../turso.ts";
-import { type EventPort, ForEach, MapAsync } from "./operators.ts";
+import {
+  type EventPort,
+  ForEach,
+  MapAsync,
+  SettlementSchema,
+} from "./operators.ts";
 
 const adapters: readonly {
   readonly name: string;
@@ -42,13 +47,18 @@ for (const adapter of adapters) {
     const executions: string[] = [];
     const effectKeys: string[] = [];
     const ordinaryHandlers: string[] = [];
+    const summaryOrigins: string[] = [];
+    const summaryDispatch: string[] = [];
     const Normalized = Type.Object({
       source: Type.String({ minLength: 1 }),
       value: Type.String({ minLength: 1 }),
     });
+    const NormalizedSettlement = SettlementSchema(Normalized);
+    const Summary = Type.Object({ summary: Type.String({ minLength: 1 }) });
     const normalize = new MapAsync("normalize", {
       input: Type.String({ minLength: 1 }),
       output: Normalized,
+      timeoutMs: 1_000,
       map: (input) => {
         executions.push(`normalize:${input}`);
         return { source: input, value: input.trim().toUpperCase() };
@@ -57,6 +67,7 @@ for (const adapter of adapters) {
     const lowercase = new MapAsync("lowercase", {
       input: Type.String({ minLength: 1 }),
       output: Type.String({ minLength: 1 }),
+      timeoutMs: 1_000,
       map: (input) => {
         executions.push(`lowercase:${input}`);
         return input.toLowerCase();
@@ -64,7 +75,8 @@ for (const adapter of adapters) {
     });
     const summarize = new MapAsync("summarize", {
       input: Normalized,
-      output: Type.Object({ summary: Type.String({ minLength: 1 }) }),
+      output: Summary,
+      timeoutMs: 1_000,
       map: (input) => {
         executions.push(`summarize:${input.value}`);
         return { summary: `${input.source} -> ${input.value}` };
@@ -102,6 +114,7 @@ for (const adapter of adapters) {
           events: {
             requested_a: requestedA,
             normalize_a: normalizedA,
+            summarize_a: summarizedA,
           },
         });
         const materialization = defineMaterialization(declaration, {
@@ -116,10 +129,8 @@ for (const adapter of adapters) {
           )
           .define({
             indexers: {
-              recordNormalized: {
-                sourceEvent: "normalize_a",
-                input: Normalized,
-              },
+              recordNormalized: module.indexer(normalizedA),
+              recordSummaryOrigin: module.indexer(summarizedA),
             },
             queries: {
               normalizedValues: {
@@ -133,16 +144,25 @@ for (const adapter of adapters) {
             requested_a: ({ event }) => {
               ordinaryHandlers.push(event.payload);
             },
-            normalize_a: async ({ event, actions }) => {
-              await actions.index("recordNormalized", event.payload);
+            summarize_a: () => {
+              summaryDispatch.push("handler");
             },
           },
           indexers: {
             recordNormalized: async ({ input, db }) => {
+              if (input.outcome === "failed") {
+                return;
+              }
+
               await db
                 .insertInto("normalized")
-                .values({ value: input.value })
+                .values({ value: input.value.value })
                 .execute();
+            },
+            recordSummaryOrigin: async (context) => {
+              const origin = await module.origin(context, requestedA);
+              summaryOrigins.push(origin.payload);
+              summaryDispatch.push("indexer");
             },
           },
           queries: {
@@ -213,6 +233,8 @@ for (const adapter of adapters) {
       "summarize:ALPHA",
     ]);
     assert.deepEqual(ordinaryHandlers, [" Alpha "]);
+    assert.deepEqual(summaryOrigins, [" Alpha "]);
+    assert.deepEqual(summaryDispatch, ["indexer", "handler"]);
     assert.deepEqual(
       await reopened.ledger.query(
         reopened.capabilities.flow.normalizedValues,
@@ -235,7 +257,13 @@ for (const adapter of adapters) {
             entry.event === reopened.capabilities.flow.normalizedA ||
             entry.event === reopened.capabilities.flow.normalizedB,
         )
-        .map((entry) => Value.Decode(Normalized, entry.payload).value)
+        .map((entry) => {
+          const settlement = Value.Decode(NormalizedSettlement, entry.payload);
+          assert.equal(settlement.outcome, "succeeded");
+          return settlement.outcome === "succeeded"
+            ? settlement.value.value
+            : "";
+        })
         .sort(),
       ["ALPHA", "BETA"],
     );
@@ -243,13 +271,16 @@ for (const adapter of adapters) {
       events.find(
         (entry) => entry.event === reopened.capabilities.flow.loweredA,
       )?.payload,
-      " alpha ",
+      { outcome: "succeeded", value: " alpha " },
     );
     assert.deepEqual(
       events.find(
         (entry) => entry.event === reopened.capabilities.flow.summarizedA,
       )?.payload,
-      { summary: " Alpha  -> ALPHA" },
+      {
+        outcome: "succeeded",
+        value: { summary: " Alpha  -> ALPHA" },
+      },
     );
   });
 
@@ -262,6 +293,7 @@ for (const adapter of adapters) {
     const double = new MapAsync("double", {
       input: Type.Integer(),
       output: Type.Integer(),
+      timeoutMs: 1_000,
       map: (input, context) => {
         keys.push(context.key);
         return input * 2;
@@ -333,22 +365,27 @@ for (const adapter of adapters) {
             entry.event === opened.capabilities.secondFlow.doubled,
         )
         .map((entry) => entry.payload),
-      [42, 42],
+      [
+        { outcome: "succeeded", value: 42 },
+        { outcome: "succeeded", value: 42 },
+      ],
     );
     assert.equal(new Set(keys).size, 2);
     assert(keys.some((key) => /^a:b:c:\d+$/.test(key)));
     assert(keys.some((key) => /^d:e:\d+$/.test(key)));
   });
 
-  test(`${adapter.name} invalid mapped output retries without failing the worker`, async () => {
+  test(`${adapter.name} invalid mapped output becomes a durable failure`, async () => {
     await using directory = await mkdtempDisposable(
       join(tmpdir(), `sledge-invalid-operator-output-${adapter.name}-`),
     );
     const runtime = new VirtualRuntimeHarness(30_000);
     const attempts: number[] = [];
+    let downstreamCalls = 0;
     const mapExternalValue = new MapAsync("map-external-value", {
       input: Type.String(),
       output: Type.String(),
+      timeoutMs: 1_000,
       map: (_input, context) => {
         attempts.push(context.attempt);
 
@@ -356,6 +393,15 @@ for (const adapter of adapters) {
         // with its declared TypeBox output contract.
         const externalValue: unknown = context.attempt === 1 ? 42 : "valid";
         return externalValue as string;
+      },
+    });
+    const downstream = new MapAsync("downstream", {
+      input: Type.String(),
+      output: Type.String(),
+      timeoutMs: 1_000,
+      map: (input) => {
+        downstreamCalls += 1;
+        return input.toUpperCase();
       },
     });
     const defineFlow = defineModule(
@@ -367,6 +413,7 @@ for (const adapter of adapters) {
           requested,
           mapExternalValue,
         );
+        const propagated = module.bind("downstream", mapped, downstream);
         const declaration = module.declare({ events: {} });
 
         if (false) {
@@ -378,7 +425,7 @@ for (const adapter of adapters) {
 
         const registered = module.link(declaration, null, {});
 
-        return module.expose(registered, { requested, mapped });
+        return module.expose(registered, { requested, mapped, propagated });
       },
     );
     const application = defineLedger((sledge) => ({
@@ -403,22 +450,212 @@ for (const adapter of adapters) {
     assert.deepEqual(attempts, [1]);
     await driveUntilIdle(runtime, workers);
 
-    assert.deepEqual(attempts, [1, 2]);
-    const events = await readEvents(opened.ledger, 2);
+    assert.deepEqual(attempts, [1]);
+    assert.equal(downstreamCalls, 0);
+    const events = await readEvents(opened.ledger, 3);
+    const settlement = events.find(
+      (entry) => entry.event === opened.capabilities.flow.mapped,
+    )?.payload;
     assert.equal(
-      events.find((entry) => entry.event === opened.capabilities.flow.mapped)
+      Value.Decode(SettlementSchema(Type.String()), settlement).outcome,
+      "failed",
+    );
+    assert.deepEqual(
+      events.find(
+        (entry) => entry.event === opened.capabilities.flow.propagated,
+      )?.payload,
+      settlement,
+    );
+  });
+
+  test(`${adapter.name} operator timeout becomes a canonical durable failure`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-operator-timeout-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(40_000);
+    const neverFinishes = new MapAsync("never-finishes", {
+      input: Type.String(),
+      output: Type.String(),
+      timeoutMs: 5,
+      map: async (_input, context) =>
+        await new Promise<string>((_resolve, reject) => {
+          context.signal.addEventListener(
+            "abort",
+            () => reject(context.signal.reason),
+            { once: true },
+          );
+        }),
+    });
+    const defineFlow = defineModule(
+      "experimental.contract.operator-timeout",
+      (module) => {
+        const requested = module.event("requested", Type.String());
+        const settled = module.bind("never-finishes", requested, neverFinishes);
+        const declaration = module.declare({ events: {} });
+        const registered = module.link(declaration, null, {});
+        return module.expose(registered, { requested, settled });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "timeout.sqlite")),
+      runtime,
+    );
+    await opened.ledger.emit(opened.capabilities.flow.requested, "input");
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+
+    await driveUntilIdle(runtime, workers);
+
+    const events = await readEvents(opened.ledger, 2);
+    const settlement = Value.Decode(
+      SettlementSchema(Type.String()),
+      events.find((entry) => entry.event === opened.capabilities.flow.settled)
         ?.payload,
-      "valid",
+    );
+    assert.equal(settlement.outcome, "failed");
+
+    if (settlement.outcome === "failed") {
+      assert.deepEqual(
+        settlement.error.chain.map(({ name }) => name),
+        ["UncaughtOperatorError", "WorkOperationTimeoutError"],
+      );
+    }
+  });
+
+  test(`${adapter.name} chained values satisfy the downstream runtime schema`, async () => {
+    await using directory = await mkdtempDisposable(
+      join(tmpdir(), `sledge-operator-chain-schema-${adapter.name}-`),
+    );
+    const runtime = new VirtualRuntimeHarness(50_000);
+    let downstreamCalls = 0;
+    let effectCalls = 0;
+    const produceEmpty = new MapAsync("produce-empty", {
+      input: Type.String(),
+      output: Type.String(),
+      timeoutMs: 1_000,
+      map: () => "",
+    });
+    const requireContent = new MapAsync("require-content", {
+      input: Type.String({ minLength: 1 }),
+      output: Type.String(),
+      timeoutMs: 1_000,
+      map: (input) => {
+        downstreamCalls += 1;
+        return input;
+      },
+    });
+    const consumeContent = new ForEach("consume-content", {
+      input: Type.String({ minLength: 1 }),
+      run: () => {
+        effectCalls += 1;
+      },
+    });
+    const defineFlow = defineModule(
+      "experimental.contract.operator-chain-schema",
+      (module) => {
+        const requested = module.event("requested", Type.String());
+        const produced = module.bind("produce-empty", requested, produceEmpty);
+        const validated = module.bind(
+          "require-content",
+          produced,
+          requireContent,
+        );
+        module.bind("consume-content", produced, consumeContent);
+        const declaration = module.declare({ events: {} });
+        const registered = module.link(declaration, null, {});
+        return module.expose(registered, { requested, produced, validated });
+      },
+    );
+    const application = defineLedger((sledge) => ({
+      flow: sledge.install(defineFlow()),
+    }));
+    await using opened = await application.open(
+      adapter.createDriver(join(directory.path, "chain-schema.sqlite")),
+      runtime,
+    );
+    await opened.ledger.emit(opened.capabilities.flow.requested, "input");
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+
+    await driveUntilIdle(runtime, workers);
+
+    const events = await readEvents(opened.ledger, 3);
+    assert.equal(downstreamCalls, 0);
+    assert.equal(effectCalls, 0);
+    assert.equal(
+      (await opened.ledger.listWork({ states: ["dead"] })).length,
+      1,
+    );
+    assert.deepEqual(
+      events.find((entry) => entry.event === opened.capabilities.flow.produced)
+        ?.payload,
+      { outcome: "succeeded", value: "" },
+    );
+    assert.equal(
+      Value.Decode(
+        SettlementSchema(Type.String()),
+        events.find(
+          (entry) => entry.event === opened.capabilities.flow.validated,
+        )?.payload,
+      ).outcome,
+      "failed",
     );
   });
 }
+
+test("MapAsync requires a bounded positive integer timeout", () => {
+  for (const timeoutMs of [0, -1, 1.5, 2_147_483_648]) {
+    assert.throws(
+      () =>
+        new MapAsync("invalid-timeout", {
+          input: Type.String(),
+          output: Type.String(),
+          timeoutMs,
+          map: (input) => input,
+        }),
+      /operator timeoutMs must be a positive integer no greater than 2,147,483,647/,
+    );
+  }
+});
 
 test("operator graph rejects ambiguous ownership before opening storage", () => {
   const identity = new MapAsync("identity", {
     input: Type.String(),
     output: Type.String(),
+    timeoutMs: 1_000,
     map: (input) => input,
   });
+  const settlementConsumer = new MapAsync("settlement-consumer", {
+    input: SettlementSchema(Type.String()),
+    output: Type.String(),
+    timeoutMs: 1_000,
+    map: (input) =>
+      input.outcome === "succeeded"
+        ? input.value
+        : (input.error.chain.at(0)?.message ?? "failed"),
+  });
+
+  if (false) {
+    defineModule("experimental.contract.settlement-input", (module) => {
+      const source = module.event("input", Type.String());
+      const settled = module.bind("settled", source, identity);
+
+      // @ts-expect-error operator settlements are unwrapped before mapping
+      module.bind("invalid", settled, settlementConsumer);
+
+      const declaration = module.declare({ events: {} });
+      const registered = module.link(declaration, null, {});
+      return module.expose(registered, {});
+    });
+  }
+
   let foreignPort!: EventPort<ReturnType<typeof Type.String>>;
   const captureForeign = defineModule(
     "experimental.contract.foreign-operator-graph",
