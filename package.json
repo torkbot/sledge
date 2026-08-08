@@ -29,6 +29,10 @@
       "types": "./dist/turso.d.ts",
       "default": "./dist/turso.js"
     },
+    "./durable-object": {
+      "types": "./dist/durable-object.d.ts",
+      "default": "./dist/durable-object.js"
+    },
     "./runtime/contracts": {
       "types": "./dist/runtime/contracts.d.ts",
       "default": "./dist/runtime/contracts.js"

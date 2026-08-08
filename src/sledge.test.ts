@@ -168,6 +168,73 @@ if (false) {
 }
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
+  test(`${driver} invocation workers exit at present quiescence and report delayed work`, async () => {
+    await using fixture = await createFixture(driver, "quiescence");
+    const handled: string[] = [];
+    const application = defineLedger((sledge) => {
+      const work = sledge.install(
+        defineModule("contract.quiescence", (module) => {
+          const payload = Type.Object({
+            availableAtMs: Type.Integer(),
+            id: Type.String(),
+          });
+          const declaration = module.declare({
+            events: { requested: payload },
+            queues: { execute: payload },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              requested: ({ event, actions }) => {
+                actions.enqueue("execute", event.payload, {
+                  availableAtMs: event.payload.availableAtMs,
+                });
+              },
+            },
+            queues: {
+              execute: ({ work }) => {
+                handled.push(work.payload.id);
+              },
+            },
+          });
+
+          return module.expose(registered, { events: registered.events });
+        })(),
+      );
+
+      return { work };
+    });
+    await using opened = await fixture.open(application);
+    const delayedAtMs = runtime.nowMs() + 60_000;
+
+    await opened.ledger.emit(opened.capabilities.work.events.requested, {
+      availableAtMs: runtime.nowMs(),
+      id: "ready",
+    });
+    await opened.ledger.emit(opened.capabilities.work.events.requested, {
+      availableAtMs: delayedAtMs,
+      id: "later",
+    });
+
+    const quiescence = opened.ledger.runWorkersUntilQuiescent({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+      signal: AbortSignal.timeout(2_000),
+    });
+
+    for (let index = 0; index < 20; index += 1) {
+      await runtime.flush();
+    }
+
+    assert.deepEqual(await quiescence, { nextEligibleAtMs: delayedAtMs });
+    assert.deepEqual(handled, ["ready"]);
+
+    const workItems = await opened.ledger.listWork();
+    assert.equal(
+      workItems.filter((item) => item.state === "delayed").length,
+      1,
+    );
+  });
+
   test(`${driver} projectionless modules import queries for private durable work`, async () => {
     await using fixture = await createFixture(driver, "imported-query");
     const observations: (readonly string[] | null)[] = [];

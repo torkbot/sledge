@@ -47,6 +47,7 @@ import type {
   LedgerIndexerContext,
   ListWorkInput,
   LedgerWorkerOptions,
+  LedgerQuiescence,
   LedgerWorkerQueue,
   LedgerWorkers,
   QuerySchema,
@@ -151,6 +152,10 @@ export interface DatabaseLedger<
   expireHistory(input: ExpireHistoryInput): Promise<void>;
 
   startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
+
+  runWorkersUntilQuiescent(
+    options: LedgerWorkerOptions & { readonly signal: AbortSignal },
+  ): Promise<LedgerQuiescence>;
 
   close(): Promise<void>;
 }
@@ -1010,6 +1015,12 @@ async function runWorkOperationWithTimeout<TResult>(input: {
         return result.value;
       }
 
+      // Cancellation requests stop new ownership from being released, but
+      // cannot forcibly stop JavaScript already executing in the operation.
+      // Retain the handler's lease until that operation settles so a
+      // same-partition successor cannot overlap work that merely ignored or
+      // was still unwinding from its abort signal.
+      await Promise.allSettled([operation]);
       operationAbortController.signal.throwIfAborted();
       throw new Error("work operation stopped without an abort reason");
     } finally {
@@ -1750,6 +1761,7 @@ function openDatabaseLedgerEngine<
         .prepare(
           `DELETE FROM work
            WHERE terminal_at_ms IS NOT NULL
+             AND lease_id IS NULL
              AND terminal_at_ms <= ?`,
         )
         .run(clock.nowMs() - retentionMs);
@@ -3629,7 +3641,7 @@ function openDatabaseLedgerEngine<
                  SELECT 1
                  FROM work AS predecessor
                  WHERE predecessor.dead = 0
-                   AND predecessor.cancelled = 0
+                   AND (predecessor.cancelled = 0 OR predecessor.lease_id IS NOT NULL)
                    AND predecessor.signal = candidate.signal
                    AND predecessor.queue_name = candidate.queue_name
                    AND predecessor.partition_key = candidate.partition_key
@@ -3713,6 +3725,101 @@ function openDatabaseLedgerEngine<
     });
 
     return row !== undefined;
+  }
+
+  async function readNextEligibleWorkAt(
+    queues: readonly WorkerQueueRuntime[],
+  ): Promise<number | null> {
+    const queuePredicate = createCandidateQueuePredicate(queues, "work");
+    const row = await storage.read(async (database) => {
+      return await database
+        .prepare(
+          `SELECT MIN(
+             CASE
+               WHEN work.lease_id IS NOT NULL
+                 THEN MAX(work.available_at_ms, work.lease_expires_at_ms)
+               ELSE work.available_at_ms
+             END
+           ) AS available_at_ms
+           FROM work
+           WHERE work.dead = 0
+             AND work.cancelled = 0
+             AND (${queuePredicate.sql})
+             AND (
+               work.partition_key IS NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM work AS predecessor
+                 WHERE predecessor.dead = 0
+                   AND (predecessor.cancelled = 0 OR predecessor.lease_id IS NOT NULL)
+                   AND predecessor.signal = work.signal
+                   AND predecessor.queue_name = work.queue_name
+                   AND predecessor.partition_key = work.partition_key
+                   AND predecessor.work_id < work.work_id
+               )
+             )`,
+        )
+        .get(...queuePredicate.params);
+    });
+
+    if (row === undefined || row.available_at_ms === null) {
+      return null;
+    }
+
+    return decodeRow(row, AvailableAtRowSchema).available_at_ms;
+  }
+
+  async function waitForWorkerQuiescence(
+    worker: WorkerRuntimeState,
+    signal: AbortSignal,
+  ): Promise<LedgerQuiescence> {
+    const waitSignal = AbortSignal.any([
+      signal,
+      worker.lifecycleAbortController.signal,
+    ]);
+
+    while (true) {
+      assertWorkerWaitActive(worker, signal);
+
+      const observedState = worker.stateChanges.snapshot();
+      const nextEligibleResult = await raceWithSignal(
+        readNextEligibleWorkAt(worker.queues),
+        waitSignal,
+      );
+
+      if (nextEligibleResult.status === "aborted") {
+        assertWorkerWaitActive(worker, signal);
+        throw waitSignal.reason;
+      }
+
+      assertWorkerWaitActive(worker, signal);
+
+      const runtimeIsActive =
+        worker.dispatchLoopActive ||
+        worker.dispatchLoopQueued ||
+        worker.inFlight.size > 0;
+      const stateIsStable = worker.stateChanges.snapshot() === observedState;
+      const nextEligibleAtMs = nextEligibleResult.value;
+
+      if (
+        !runtimeIsActive &&
+        stateIsStable &&
+        (nextEligibleAtMs === null || nextEligibleAtMs > clock.nowMs())
+      ) {
+        return { nextEligibleAtMs };
+      }
+
+      if (
+        !runtimeIsActive &&
+        stateIsStable &&
+        nextEligibleAtMs !== null &&
+        nextEligibleAtMs <= clock.nowMs()
+      ) {
+        requestDispatchRun(worker);
+      }
+
+      await worker.stateChanges.waitForChange(observedState, waitSignal);
+    }
   }
 
   async function waitForWorkerIdle(
@@ -4069,7 +4176,7 @@ function openDatabaseLedgerEngine<
                  SELECT 1
                  FROM work AS predecessor
                  WHERE predecessor.dead = 0
-                   AND predecessor.cancelled = 0
+                   AND (predecessor.cancelled = 0 OR predecessor.lease_id IS NOT NULL)
                    AND predecessor.signal = candidate.signal
                    AND predecessor.queue_name = candidate.queue_name
                    AND predecessor.partition_key = candidate.partition_key
@@ -4389,6 +4496,8 @@ function openDatabaseLedgerEngine<
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
                lease_protocol_version = 0,
+               coalescing_key = CASE WHEN cancelled != 0 THEN NULL ELSE coalescing_key END,
+               partition_key = CASE WHEN cancelled != 0 THEN NULL ELSE partition_key END,
                available_at_ms = ?
              WHERE work_id = ?
                AND lease_id = ?
@@ -4772,6 +4881,22 @@ function openDatabaseLedgerEngine<
           );
 
         if (active === undefined) {
+          await database
+            .prepare(
+              `UPDATE work
+               SET
+                 lease_id = NULL,
+                 lease_acquired_at_ms = NULL,
+                 lease_expires_at_ms = NULL,
+                 lease_protocol_version = 0,
+                 coalescing_key = NULL,
+                 partition_key = NULL
+               WHERE work_id = ?
+                 AND lease_id = ?
+                 AND cancelled != 0`,
+            )
+            .run(claimed.workId, claimed.leaseId);
+
           return {
             durableEvents: 0,
             latestDurableEventId: committedEventId,
@@ -5176,6 +5301,8 @@ function openDatabaseLedgerEngine<
 
         cancelledLeaseId = existing.lease?.leaseId ?? null;
 
+        const retainActiveReservation = existing.lease !== null;
+
         await database
           .prepare(
             `UPDATE work
@@ -5184,12 +5311,12 @@ function openDatabaseLedgerEngine<
                cancel_requested_at_ms = ?,
                cancel_reason = ?,
                terminal_at_ms = ?,
-               lease_id = NULL,
-               lease_acquired_at_ms = NULL,
-               lease_expires_at_ms = NULL,
-               lease_protocol_version = 0,
-               coalescing_key = NULL,
-               partition_key = NULL,
+               lease_id = CASE WHEN ? THEN lease_id ELSE NULL END,
+               lease_acquired_at_ms = CASE WHEN ? THEN lease_acquired_at_ms ELSE NULL END,
+               lease_expires_at_ms = CASE WHEN ? THEN lease_expires_at_ms ELSE NULL END,
+               lease_protocol_version = CASE WHEN ? THEN lease_protocol_version ELSE 0 END,
+               coalescing_key = CASE WHEN ? THEN coalescing_key ELSE NULL END,
+               partition_key = CASE WHEN ? THEN partition_key ELSE NULL END,
                last_error = ?
              WHERE work_ref = ?
                AND dead = 0
@@ -5199,6 +5326,12 @@ function openDatabaseLedgerEngine<
             nowMs,
             input.reason ?? null,
             nowMs,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
             input.reason ?? "work cancelled",
             ref,
           );
@@ -5692,6 +5825,21 @@ function openDatabaseLedgerEngine<
         close: closeHandle,
         [Symbol.asyncDispose]: closeHandle,
       };
+    },
+    runWorkersUntilQuiescent: async ({ signal, ...options }) => {
+      const workers = await ledger.startWorkers(options);
+      const worker = activeWorker;
+
+      if (worker === null) {
+        await workers.close();
+        throw new Error("ledger worker runtime was not installed");
+      }
+
+      try {
+        return await waitForWorkerQuiescence(worker, signal);
+      } finally {
+        await workers.close();
+      }
     },
     close,
     [Symbol.asyncDispose]: close,

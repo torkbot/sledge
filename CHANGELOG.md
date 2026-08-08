@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add a Durable Object driver for host-owned SQLite and
+  `runWorkersUntilQuiescent(...)` for invocation-shaped runtimes. Eligible work
+  drains under ordinary queue limits, delayed work remains durable, and the
+  result reports its earliest known future eligibility before workers close.
+- Retain queue ownership while timed-out or explicitly cancelled operations
+  unwind. Cancellation still aborts the operation signal immediately, but a
+  same-partition successor cannot start merely because the cancelled JavaScript
+  promise has not settled yet.
 - Add experimental `CoalescingOperation` bindings for canonical keyed demand.
   Each key runs one at-least-once generation at a time, coalesces activity
   during execution into at most one successor, reads authoritative ledger

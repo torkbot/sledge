@@ -93,6 +93,7 @@ const ControlledSignalWorkSchema = Type.Object({
 });
 
 const TimedWorkSchema = Type.Object({
+  partitionKey: Type.String(),
   workKey: Type.String(),
   timeoutMs: Type.Number(),
 });
@@ -1138,11 +1139,13 @@ export function createLedgerContractModel(input: {
       },
       "timed-work.requested": ({ event, actions }) => {
         actions.enqueue("timed-work.run", event.payload, {
+          partitionKey: event.payload.partitionKey,
           workKey: event.payload.workKey,
         });
       },
       "timed-signal-work.requested": ({ event, actions }) => {
         actions.enqueue("timed-signal-work.publish", event.payload, {
+          partitionKey: event.payload.partitionKey,
           workKey: event.payload.workKey,
         });
       },
@@ -1330,6 +1333,7 @@ export function createLedgerContractModel(input: {
       },
       "timed-work.signalled": ({ event, actions }) => {
         actions.enqueueSignal("timed-signal-work.run", event.payload, {
+          partitionKey: event.payload.partitionKey,
           workKey: event.payload.workKey,
         });
       },
@@ -1500,14 +1504,17 @@ export function runLedgerContractSuite(input: {
       kind: "durable" | "signal",
       workKey: string,
       timeoutMs: number,
+      partitionKey = workKey,
     ): Promise<void> => {
       if (kind === "durable") {
         await harness.ledger.emit("timed-work.requested", {
+          partitionKey,
           workKey,
           timeoutMs,
         });
       } else {
         await harness.ledger.emit("timed-signal-work.requested", {
+          partitionKey,
           workKey,
           timeoutMs,
         });
@@ -1614,10 +1621,23 @@ export function runLedgerContractSuite(input: {
         async () => {
           await withHarness(input.create, async (harness) => {
             const workKey = `timed-${kind}-deadline`;
+            const partitionKey = `${workKey}-partition`;
             const gate = harness.prepareTimedWork(workKey);
+            const successor = harness.prepareTimedWork(`${workKey}-successor`);
 
-            await emitTimedWork(harness, kind, workKey, 100);
+            await emitTimedWork(harness, kind, workKey, 100, partitionKey);
             const entered = await gate.entered;
+            await emitTimedWork(
+              harness,
+              kind,
+              `${workKey}-successor`,
+              100,
+              partitionKey,
+            );
+            let successorDidStart = false;
+            void successor.entered.then(() => {
+              successorDidStart = true;
+            });
             let didSettle = false;
             void gate.settled.then(() => {
               didSettle = true;
@@ -1628,6 +1648,11 @@ export function runLedgerContractSuite(input: {
             assert.equal(didSettle, false);
 
             await harness.advanceByMs(1);
+            assert.equal(entered.operationSignal.aborted, true);
+            assert.equal(didSettle, false);
+            assert.equal(successorDidStart, false);
+
+            gate.resolve("operation unwound after timeout");
             const settled = await gate.settled;
 
             assert.equal(settled.status, "rejected");
@@ -1643,6 +1668,10 @@ export function runLedgerContractSuite(input: {
             assert.equal(entered.operationSignal.reason, settled.error);
             assert.equal(entered.leaseSignal.aborted, false);
 
+            await successor.entered;
+            successor.resolve("successor completed");
+            assert.equal((await successor.settled).status, "completed");
+
             await harness.waitForIdle();
 
             if (kind === "durable") {
@@ -1651,7 +1680,7 @@ export function runLedgerContractSuite(input: {
               assert.deepEqual(
                 Value.Decode(TimedWorkHandledSchema, latestEvent.payload),
                 {
-                  workKey,
+                  workKey: `${workKey}-successor`,
                 },
               );
             }
@@ -1666,10 +1695,23 @@ export function runLedgerContractSuite(input: {
             const workKey = `timed-${kind}-cancelled`;
             const queueName =
               kind === "durable" ? "timed-work.run" : "timed-signal-work.run";
+            const partitionKey = `${workKey}-partition`;
             const gate = harness.prepareTimedWork(workKey);
+            const successor = harness.prepareTimedWork(`${workKey}-successor`);
 
-            await emitTimedWork(harness, kind, workKey, 500);
+            await emitTimedWork(harness, kind, workKey, 500, partitionKey);
             const entered = await gate.entered;
+            await emitTimedWork(
+              harness,
+              kind,
+              `${workKey}-successor`,
+              500,
+              partitionKey,
+            );
+            let successorDidStart = false;
+            void successor.entered.then(() => {
+              successorDidStart = true;
+            });
             const [work] = await harness.ledger.listWork({
               queueName,
               states: ["leased"],
@@ -1684,6 +1726,16 @@ export function runLedgerContractSuite(input: {
               reason: "contract cancellation",
             });
             assert.equal(cancelled.status, "cancelled");
+
+            let didSettle = false;
+            void gate.settled.then(() => {
+              didSettle = true;
+            });
+            await harness.flush();
+            assert.equal(didSettle, false);
+            assert.equal(successorDidStart, false);
+
+            gate.resolve("operation unwound after cancellation");
 
             const settled = await gate.settled;
             assert.equal(settled.status, "rejected");
@@ -1704,6 +1756,10 @@ export function runLedgerContractSuite(input: {
               settled.error instanceof WorkOperationTimeoutError,
               false,
             );
+
+            await successor.entered;
+            successor.resolve("successor completed");
+            assert.equal((await successor.settled).status, "completed");
 
             await harness.advanceByMs(500);
             assert.equal(

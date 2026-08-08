@@ -227,6 +227,24 @@ const user = await opened.ledger.query(
 console.log(user);
 ```
 
+Invocation-shaped hosts can process everything eligible now and then release
+their runtime instead of keeping background workers resident:
+
+```ts
+const quiescence = await opened.ledger.runWorkersUntilQuiescent({
+  configureQueue: () => ({ maxInFlight: 8 }),
+  scheduler: runtimeScheduler,
+  signal,
+});
+
+// A durable alarm or scheduler can arrange the next activation.
+console.log(quiescence.nextEligibleAtMs);
+```
+
+Present quiescence means that no known queue work is eligible or executing at
+the current runtime-clock instant. Delayed work remains durable and contributes
+the returned `nextEligibleAtMs`.
+
 ## Migrating to 0.26
 
 Version 0.26 finishes the application assembly design introduced in 0.25. The
@@ -1128,6 +1146,25 @@ them as SQLite URI filenames consistently. Pass a normal filesystem path for
 local SQLite. The `better-sqlite3` adapter verifies that the opened database
 actually enters WAL journal mode and rejects databases that cannot.
 
+Durable Object runtimes already own their SQLite connection. Use the dedicated
+adapter without exposing a filesystem path:
+
+```ts
+import { createDurableObjectDriver } from "@torkbot/sledge/durable-object";
+
+await using opened = await application.open(
+  createDurableObjectDriver({
+    databaseIdentity: state.id.toString(),
+    storage: state.storage,
+  }),
+  timing,
+);
+```
+
+The Durable Object remains the exclusive database and transaction owner.
+Sledge closes only its logical adapter state; it never closes the host-owned
+SQLite database.
+
 ## Runtime API
 
 The opened ledger exposes:
@@ -1142,6 +1179,7 @@ The opened ledger exposes:
 - `expireHistory({ through })`
 - `onSignal(signalToken, observer)`
 - `startWorkers(options)`
+- `runWorkersUntilQuiescent(options)`
 - `close()`
 
 `close()` stops new ledger operations, drains Sledge-owned writes and readers,
