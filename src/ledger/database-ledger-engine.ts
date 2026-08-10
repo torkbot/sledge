@@ -43,6 +43,7 @@ import type {
   ExpireHistoryInput,
   Ledger,
   LedgerCursor,
+  LedgerQuerySnapshot,
   LedgerTiming,
   LedgerIndexerContext,
   ListWorkInput,
@@ -91,6 +92,27 @@ import type {
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
 
+type DatabaseLedgerQueryRequest<TQueries extends Record<string, AnyQueryDef>> =
+  {
+    readonly [TQueryName in keyof TQueries]: {
+      readonly queryName: TQueryName;
+      readonly params: Static<TQueries[TQueryName]["params"]>;
+    };
+  }[keyof TQueries];
+
+type DatabaseLedgerQuerySnapshotResults<
+  TQueries extends Record<string, AnyQueryDef>,
+  TRequests extends readonly DatabaseLedgerQueryRequest<TQueries>[],
+> = {
+  readonly [TIndex in keyof TRequests]: TRequests[TIndex] extends {
+    readonly queryName: infer TQueryName;
+  }
+    ? TQueryName extends keyof TQueries
+      ? Static<TQueries[TQueryName]["result"]>
+      : never
+    : never;
+};
+
 type DatabaseLedgerStreamEvent<
   TEvents extends Record<string, TSchema>,
   TEventName extends keyof TEvents = keyof TEvents,
@@ -128,6 +150,14 @@ export interface DatabaseLedger<
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>>;
 
+  querySnapshot<
+    const TRequests extends readonly DatabaseLedgerQueryRequest<TQueries>[],
+  >(
+    ...requests: TRequests
+  ): Promise<
+    LedgerQuerySnapshot<DatabaseLedgerQuerySnapshotResults<TQueries, TRequests>>
+  >;
+
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
   queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
@@ -138,6 +168,10 @@ export interface DatabaseLedger<
     signalName: TSignalName,
     observer: SignalObserverFunction<TSignals, TSignalName>,
   ): SignalSubscription;
+
+  readEvents(input: {
+    readonly cursor: LedgerCursor;
+  }): Promise<readonly DatabaseLedgerStreamEvent<TEvents>[]>;
 
   tailEvents(input: {
     readonly last: number;
@@ -596,6 +630,30 @@ function createLedgerContractFacade<
         };
       }
 
+      if (property === "querySnapshot") {
+        return async (
+          ...requests: readonly {
+            readonly query: object;
+            readonly params: unknown;
+          }[]
+        ) => {
+          const physicalRequests = requests.map((request) => {
+            return {
+              queryName: findPhysicalContractName(
+                contracts.queries,
+                request.query,
+                "query",
+              ) as keyof TQueries,
+              params: request.params as Static<
+                TQueries[keyof TQueries]["params"]
+              >,
+            };
+          });
+
+          return await target.querySnapshot(...physicalRequests);
+        };
+      }
+
       if (property === "onSignal") {
         return (
           token: object,
@@ -613,6 +671,22 @@ function createLedgerContractFacade<
               await observer(createContractEnvelope(signal, token));
             },
           );
+        };
+      }
+
+      if (property === "readEvents") {
+        return async (input: { readonly cursor: LedgerCursor }) => {
+          const source = await target.readEvents(input);
+          const mapped = [];
+
+          for await (const item of mapContractEventStream(
+            source,
+            contracts.events,
+          )) {
+            mapped.push(item);
+          }
+
+          return mapped;
         };
       }
 
@@ -879,7 +953,9 @@ function createContractEnvelope(
 }
 
 async function* mapContractEventStream<TEvents extends Record<string, TSchema>>(
-  source: AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>,
+  source:
+    | AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>
+    | Iterable<DatabaseLedgerStreamEvent<TEvents>>,
   contracts: Readonly<Record<string, object>>,
 ): AsyncIterable<{
   readonly event: object;
@@ -1446,6 +1522,7 @@ function openDatabaseLedgerEngine<
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
   const defaultStorePollMs = 1_000;
+  const eventReadBatchSize = 256;
 
   let committedEventId = 0;
   let committedExpiredThroughEventId = 0;
@@ -2533,6 +2610,45 @@ function openDatabaseLedgerEngine<
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
     return await storage.read(async (database) => {
       return await runQueryImplementation(database, queryName, params);
+    });
+  }
+
+  async function runLedgerQuerySnapshot<
+    const TRequests extends readonly DatabaseLedgerQueryRequest<TQueries>[],
+  >(
+    requests: TRequests,
+  ): Promise<
+    LedgerQuerySnapshot<DatabaseLedgerQuerySnapshotResults<TQueries, TRequests>>
+  > {
+    // Projection state and the stream boundary must come from one SQLite
+    // transaction. Otherwise an event committed between two independent reads
+    // could be present in neither the snapshot nor the resumed stream.
+    return await runInTransaction(async (database) => {
+      const results: unknown[] = [];
+
+      for (const request of requests) {
+        results.push(
+          await runQueryImplementation(
+            database,
+            request.queryName,
+            request.params,
+          ),
+        );
+      }
+
+      const state = await readStoredStreamState(database);
+
+      return {
+        // Each entry was decoded by its query's result schema in the same
+        // order as the immutable request tuple. TypeScript cannot recover the
+        // variadic tuple after the runtime loop, so the assertion remains
+        // local to this interface implementation.
+        result: results as DatabaseLedgerQuerySnapshotResults<
+          TQueries,
+          TRequests
+        >,
+        cursor: encodeCursor(state.latestEventId),
+      };
     });
   }
 
@@ -4101,8 +4217,6 @@ function openDatabaseLedgerEngine<
     }
 
     let currentAfterEventId = input.afterEventId;
-    const readLimit = 256;
-
     streamLoop: while (!closed) {
       if (input.signal.aborted) {
         return;
@@ -4113,7 +4227,7 @@ function openDatabaseLedgerEngine<
 
       try {
         const readResult = await raceWithSignal(
-          readEventsAfter(currentAfterEventId, readLimit),
+          readEventsAfter(currentAfterEventId, eventReadBatchSize),
           input.signal,
         );
 
@@ -5277,6 +5391,10 @@ function openDatabaseLedgerEngine<
       await startup;
       return await runLedgerQuery(queryName, params);
     },
+    querySnapshot: async (...requests) => {
+      await startup;
+      return await runLedgerQuerySnapshot(requests);
+    },
     cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
       await startup;
       const ref = decodeWorkRef(input.ref);
@@ -5512,6 +5630,20 @@ function openDatabaseLedgerEngine<
           }
         },
       };
+    },
+    readEvents: async ({ cursor }) => {
+      const afterEventId = decodeCursor(cursor);
+
+      await startup;
+
+      const events = await readEventsAfter(afterEventId, eventReadBatchSize);
+
+      return events.map((event) => {
+        return {
+          event,
+          cursor: encodeCursor(event.eventId),
+        };
+      });
     },
     tailEvents: ({ last, signal }) => {
       if (!Number.isInteger(last) || last < 0) {

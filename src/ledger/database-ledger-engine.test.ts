@@ -4060,6 +4060,108 @@ test("resumeEvents continues from opaque cursor", async () => {
   });
 });
 
+test("querySnapshot cannot omit an event committed during its projection read", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+  const queryEntered = Promise.withResolvers<void>();
+  const releaseQuery = Promise.withResolvers<void>();
+  const EventIdRowSchema = Type.Object({ event_id: Type.Integer() });
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "message.received": Type.Object({ id: Type.Number() }),
+    },
+    queues: {},
+    indexers: {},
+    queries: {
+      eventIds: {
+        params: Type.Object({}),
+        result: Type.Array(Type.Integer()),
+      },
+    },
+    register: {},
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({
+      indexers: {},
+      queries: {
+        eventIds: async (database) => {
+          const rows = await database
+            .prepare(
+              `SELECT event_id
+               FROM events
+               WHERE signal = 0
+               ORDER BY event_id ASC`,
+            )
+            .all();
+
+          queryEntered.resolve();
+          await releaseQuery.promise;
+
+          return rows.map((row) => {
+            return Value.Decode(EventIdRowSchema, row).event_id;
+          });
+        },
+      },
+    }),
+    timing: {
+      clock: runtime.clock,
+      scheduler: runtime.scheduler,
+    },
+  });
+
+  try {
+    const first = await ledger.emit("message.received", { id: 1 });
+    const snapshotPromise = ledger.querySnapshot({
+      queryName: "eventIds",
+      params: {},
+    });
+
+    await queryEntered.promise;
+
+    // The pause is test-only: it exposes the transaction boundary and proves
+    // that a local append cannot interleave between the projection value and
+    // its cursor. Production query implementations remain bounded and
+    // storage-local.
+    const secondPromise = ledger.emit("message.received", { id: 2 });
+    assert.equal(await settlesWithin(secondPromise, 10), false);
+
+    releaseQuery.resolve();
+
+    const snapshot = await snapshotPromise;
+    assert.deepEqual(snapshot.result, [[first.eventId]]);
+
+    const second = await secondPromise;
+    const resumeController = new AbortController();
+    const resumed = ledger
+      .resumeEvents({
+        cursor: snapshot.cursor,
+        signal: resumeController.signal,
+      })
+      [Symbol.asyncIterator]();
+
+    try {
+      const item = await nextWithTimeout(resumed);
+      assert.equal(item.done, false);
+
+      if (item.done) {
+        assert.fail("expected the append committed after the snapshot");
+      }
+
+      assert.equal(item.value.event.eventId, second.eventId);
+    } finally {
+      resumeController.abort();
+      await resumed.return?.();
+    }
+  } finally {
+    releaseQuery.resolve();
+    await ledger.close();
+    await rm(databaseUrl, { force: true });
+  }
+});
+
 test("tail iterator return stops stream without external abort", async () => {
   const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
   const databaseUrl = createTempDatabasePath();

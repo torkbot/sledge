@@ -613,6 +613,24 @@ export type QueryResult<TQuery extends AnyQueryToken> = Static<
   QueryTokenResultSchema<TQuery>
 >;
 
+export type LedgerQueryRequest<TQuery extends AnyQueryToken> =
+  TQuery extends AnyQueryToken
+    ? {
+        readonly query: TQuery;
+        readonly params: QueryParameters<TQuery>;
+      }
+    : never;
+
+export type LedgerQuerySnapshotResults<
+  TRequests extends readonly LedgerQueryRequest<AnyQueryToken>[],
+> = {
+  readonly [TIndex in keyof TRequests]: TRequests[TIndex] extends LedgerQueryRequest<
+    infer TQuery
+  >
+    ? QueryResult<TQuery>
+    : never;
+};
+
 type SignalTokenSchema<TToken> =
   TToken extends SignalToken<string, string, infer TSchemaToInfer>
     ? TSchemaToInfer
@@ -1270,6 +1288,16 @@ export type LedgerStreamEvent<TEvents extends AnyEventToken> = {
   readonly cursor: LedgerCursor;
 };
 
+/**
+ * A projection result and the exact durable-event boundary at which it was
+ * read. Resuming the ledger event stream from `cursor` yields every durable
+ * event committed after the projection snapshot.
+ */
+export type LedgerQuerySnapshot<TResult> = {
+  readonly result: TResult;
+  readonly cursor: LedgerCursor;
+};
+
 export interface Ledger<
   TEvents extends AnyEventToken,
   TQueries extends AnyQueryToken,
@@ -1292,6 +1320,12 @@ export interface Ledger<
     params: Static<TParamsSchema>,
   ): Promise<Static<TResultSchema>>;
 
+  querySnapshot<
+    const TRequests extends readonly LedgerQueryRequest<TQueries>[],
+  >(
+    ...requests: TRequests
+  ): Promise<LedgerQuerySnapshot<LedgerQuerySnapshotResults<TRequests>>>;
+
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
   queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
@@ -1302,6 +1336,15 @@ export interface Ledger<
     signal: TSignal,
     observer: (signal: LedgerEventEnvelope<TSignal>) => void | Promise<void>,
   ): SignalSubscription;
+
+  /**
+   * Reads one bounded batch of durable events committed after `cursor` and
+   * returns immediately. Callers may continue from the final returned cursor;
+   * an empty result means the reader is caught up at that instant.
+   */
+  readEvents(input: {
+    readonly cursor: LedgerCursor;
+  }): Promise<readonly LedgerStreamEvent<TEvents>[]>;
 
   tailEvents(input: {
     readonly last: number;

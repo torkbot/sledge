@@ -1171,6 +1171,8 @@ The opened ledger exposes:
 
 - `emit(eventToken, payload, options?)`
 - `query(queryToken, params)`
+- `querySnapshot(...requests)`
+- `readEvents({ cursor })`
 - `cancelWork({ ref, reason? })`
 - `queryWork({ workId })`
 - `listWork({ queueName?, sourceEventId?, states?, limit? })`
@@ -1501,6 +1503,42 @@ queue name and `workKey`.
 Cancellation is terminal. Cancelled work will not dispatch again, including
 after process restart.
 
+## Cursor-bound projection snapshots
+
+Use `querySnapshot(...)` when a consumer must initialize a projection and then
+follow every durable event committed after that exact state:
+
+```ts
+const snapshot = await ledger.querySnapshot(
+  {
+    query: currentAgentState,
+    params: { agentId },
+  },
+  {
+    query: recentAgentHistory,
+    params: { agentId, maximum: 100 },
+  },
+);
+
+const [current, history] = snapshot.result;
+render(current, history);
+
+for await (const item of ledger.resumeEvents({
+  cursor: snapshot.cursor,
+  signal: abortController.signal,
+})) {
+  applyEvent(item.event);
+}
+```
+
+The projection queries and event high-water mark are read in one SQLite
+transaction. An event is therefore reflected either in `snapshot.result` or in
+the resumed stream; it cannot fall between independent reads. Results preserve
+request order and retain each query token's result type. Snapshot queries have
+the same storage-local, bounded performance requirements as ordinary projection
+queries and temporarily serialize ledger writes while the snapshot transaction
+is open.
+
 ## Event Streams
 
 Use durable event streams for external materialization:
@@ -1523,6 +1561,32 @@ for await (const item of ledger.resumeEvents({
 ```
 
 Cursor values are opaque. Persist and reuse them as-is.
+
+Hosts that cannot safely keep a request open can consume the same feed in
+finite batches:
+
+```ts
+let cursor = snapshot.cursor;
+
+while (!signal.aborted) {
+  const events = await ledger.readEvents({ cursor });
+
+  for (const item of events) {
+    await applyEvent(item.event);
+    cursor = item.cursor;
+    await saveCursor(cursor);
+  }
+
+  if (events.length === 0) {
+    await waitForNextPoll(signal);
+  }
+}
+```
+
+`readEvents(...)` returns immediately with one implementation-bounded batch.
+An empty result means the reader was caught up at that instant; a later read
+from the same cursor discovers subsequent commits. This is the finite transport
+shape of `resumeEvents(...)`, not a second event source.
 
 `expireHistory({ through: cursor })` durably advances the earliest stream
 position Sledge will serve. The cursor itself remains resumable; an earlier

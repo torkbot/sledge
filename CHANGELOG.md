@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add `querySnapshot(...requests)` to atomically return an ordered tuple of
+  validated projection results and the opaque durable-event cursor through
+  which they were read. Resuming from that cursor cannot omit an event
+  committed concurrently with the snapshot.
+- Add `readEvents({ cursor })` for one immediate, bounded read of durable events
+  after a cursor. Invocation-shaped hosts can advance the same durable feed
+  without keeping a request open.
 - Add a Durable Object driver for host-owned SQLite and
   `runWorkersUntilQuiescent(...)` for invocation-shaped runtimes. Eligible work
   drains under ordinary queue limits, delayed work remains durable, and the

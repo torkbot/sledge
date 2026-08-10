@@ -540,10 +540,22 @@ export function createLedgerContractHarnessLedger(
       readonly states?: readonly string[];
     }): Promise<readonly unknown[]>;
     query(query: object, params: unknown): Promise<unknown>;
+    querySnapshot(
+      ...requests: readonly {
+        readonly query: object;
+        readonly params: unknown;
+      }[]
+    ): Promise<{
+      readonly cursor: LedgerCursor;
+      readonly result: readonly unknown[];
+    }>;
     onSignal(
       signal: object,
       observer: (signal: LedgerContractTokenEnvelope) => void | Promise<void>,
     ): unknown;
+    readEvents(input: {
+      readonly cursor: LedgerCursor;
+    }): Promise<readonly LedgerContractTokenStreamEvent[]>;
     tailEvents(input: {
       readonly last: number;
       readonly signal: AbortSignal;
@@ -586,6 +598,29 @@ export function createLedgerContractHarnessLedger(
         };
       }
 
+      if (property === "querySnapshot") {
+        return (
+          ...requests: readonly {
+            readonly queryName: keyof LedgerContractQueries;
+            readonly params: unknown;
+          }[]
+        ) => {
+          return runtime.querySnapshot(
+            ...requests.map((request) => {
+              const query = ledgerContractDefinition.queries[request.queryName];
+
+              if (query === undefined) {
+                throw new Error(
+                  `unknown ledger query ${String(request.queryName)}`,
+                );
+              }
+
+              return { query, params: request.params };
+            }),
+          );
+        };
+      }
+
       if (property === "listWork") {
         return runtime.listWork.bind(runtime);
       }
@@ -601,6 +636,19 @@ export function createLedgerContractHarnessLedger(
               await observer(createLedgerContractEnvelope(signal, signalName));
             },
           );
+        };
+      }
+
+      if (property === "readEvents") {
+        return async (input: { readonly cursor: LedgerCursor }) => {
+          const events = await runtime.readEvents(input);
+          const mapped = [];
+
+          for await (const event of mapLedgerContractEventStream(events)) {
+            mapped.push(event);
+          }
+
+          return mapped;
         };
       }
 
@@ -655,7 +703,9 @@ function createLedgerContractEnvelope(
 }
 
 async function* mapLedgerContractEventStream(
-  source: AsyncIterable<LedgerContractTokenStreamEvent>,
+  source:
+    | AsyncIterable<LedgerContractTokenStreamEvent>
+    | Iterable<LedgerContractTokenStreamEvent>,
 ): AsyncIterable<{
   readonly cursor: LedgerContractTokenStreamEvent["cursor"];
   readonly event: object;
@@ -1566,6 +1616,82 @@ export function runLedgerContractSuite(input: {
         await iterator.return?.();
       }
     };
+
+    await t.test(
+      "querySnapshot provides an exact event-stream resume boundary",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const initial = await harness.ledger.querySnapshot({
+            queryName: "decisionAttempts",
+            params: { sourceEventId: 71 },
+          });
+
+          assert.deepEqual(initial.result, [0]);
+
+          const first = await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 71,
+            attempt: 1,
+          });
+
+          const initialResumeController = new AbortController();
+          const initialResume = harness.ledger
+            .resumeEvents({
+              cursor: initial.cursor,
+              signal: initialResumeController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const resumed = await initialResume.next();
+            assert.equal(resumed.done, false);
+
+            if (resumed.done) {
+              assert.fail("expected the event committed after the snapshot");
+            }
+
+            assert.equal(resumed.value.event.eventId, first.eventId);
+          } finally {
+            initialResumeController.abort();
+            await initialResume.return?.();
+          }
+
+          const afterFirst = await harness.ledger.querySnapshot({
+            queryName: "decisionAttempts",
+            params: { sourceEventId: 71 },
+          });
+
+          assert.deepEqual(afterFirst.result, [1]);
+
+          const second = await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 71,
+            attempt: 2,
+          });
+          const afterFirstResumeController = new AbortController();
+          const afterFirstResume = harness.ledger
+            .resumeEvents({
+              cursor: afterFirst.cursor,
+              signal: afterFirstResumeController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const resumed = await afterFirstResume.next();
+            assert.equal(resumed.done, false);
+
+            if (resumed.done) {
+              assert.fail("expected the event committed after the snapshot");
+            }
+
+            assert.equal(resumed.value.event.eventId, second.eventId);
+          } finally {
+            afterFirstResumeController.abort();
+            await afterFirstResume.return?.();
+          }
+        });
+      },
+    );
 
     await t.test(
       "withTimeout returns values and preserves operation failures",
@@ -4129,6 +4255,57 @@ export function runLedgerContractSuite(input: {
             assert.equal(error.expiredThrough, second.cursor);
             return true;
           });
+        });
+      },
+    );
+
+    await t.test(
+      "readEvents returns available history without waiting for future events",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const initial = await harness.ledger.querySnapshot({
+            queryName: "decisionAttempts",
+            params: { sourceEventId: 711 },
+          });
+
+          await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 711,
+            attempt: 1,
+          });
+          await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 711,
+            attempt: 2,
+          });
+
+          const available = await harness.ledger.readEvents({
+            cursor: initial.cursor,
+          });
+
+          assert.equal(available.length, 2);
+          assert.deepEqual(
+            available.map((item) => item.event.payload),
+            [
+              {
+                type: "decision.attempted",
+                sourceEventId: 711,
+                attempt: 1,
+              },
+              {
+                type: "decision.attempted",
+                sourceEventId: 711,
+                attempt: 2,
+              },
+            ],
+          );
+
+          const latest = available.at(-1);
+          assert.ok(latest !== undefined);
+          assert.deepEqual(
+            await harness.ledger.readEvents({ cursor: latest.cursor }),
+            [],
+          );
         });
       },
     );
