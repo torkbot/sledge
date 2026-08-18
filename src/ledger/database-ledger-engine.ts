@@ -3859,7 +3859,7 @@ function openDatabaseLedgerEngine<
            ) AS available_at_ms
            FROM work
            WHERE work.dead = 0
-             AND work.cancelled = 0
+             AND (work.cancelled = 0 OR work.lease_id IS NOT NULL)
              AND (${queuePredicate.sql})
              AND (
                work.partition_key IS NULL

@@ -10,6 +10,7 @@ import type {
 import type {
   EventCausationWork,
   LedgerCursor,
+  LedgerQuiescence,
   MaterializationImplementationRegistrationFor,
   QueueHandlerControl,
   WorkRef,
@@ -998,6 +999,7 @@ export type LedgerContractHarness = {
   restart(): Promise<void>;
   restartWorkers(input: { readonly maxInFlight: number }): Promise<void>;
   startCompetingWorkers(input: { readonly maxInFlight: number }): Promise<void>;
+  runWorkersUntilQuiescentFromPeer(): Promise<LedgerQuiescence>;
   emitCoalescedFromPeer(input: {
     readonly availableAtMs: number;
     readonly coalescingKey: string;
@@ -2893,6 +2895,66 @@ export function runLedgerContractSuite(input: {
           });
 
           assert.equal(recoveredCancellation.status, "cancelled");
+        });
+      },
+    );
+
+    await t.test(
+      "invocation quiescence reports a cancelled partition head's lease expiry",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const head = harness.prepareControlledWork(
+            "cancelled-partition-head",
+          );
+          const successor = harness.prepareControlledWork(
+            "cancelled-partition-successor",
+          );
+
+          const committed = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              partitionKey: "cancelled-partition",
+              workKey: "cancelled-partition-head",
+            },
+          );
+          const outcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            committed.outcome,
+          );
+
+          await harness.flush();
+          await head.entered;
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            partitionKey: "cancelled-partition",
+            workKey: "cancelled-partition-successor",
+          });
+
+          const [leased] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+          assert.ok(leased?.lease !== null && leased !== undefined);
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "owner lost",
+          });
+          assert.equal(cancellation.status, "cancelled");
+
+          const quiescence = await harness.runWorkersUntilQuiescentFromPeer();
+
+          head.release();
+          await head.settled;
+          await successor.entered;
+          successor.release();
+          await successor.settled;
+          await harness.waitForIdle();
+
+          assert.deepEqual(quiescence, {
+            nextEligibleAtMs: leased.lease.expiresAtMs,
+          });
         });
       },
     );

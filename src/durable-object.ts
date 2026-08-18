@@ -38,9 +38,7 @@ interface DurableObjectSqlStorage {
 export interface SledgeDurableObjectStorage {
   readonly sql: DurableObjectSqlStorage;
 
-  transaction<T>(
-    closure: (transaction: SledgeDurableObjectStorage) => Promise<T>,
-  ): Promise<T>;
+  transaction<T>(closure: () => Promise<T>): Promise<T>;
 }
 
 type CreateDurableObjectDriverInput = {
@@ -96,8 +94,8 @@ function createDurableObjectStorageRuntime(
     write: async (run) => {
       assertOpen();
 
-      return await input.storage.transaction(async (transaction) => {
-        return await run(wrapSqlStorage(transaction.sql, true));
+      return await input.storage.transaction(async () => {
+        return await run(wrapSqlStorage(input.storage.sql, true));
       });
     },
     close: async () => {

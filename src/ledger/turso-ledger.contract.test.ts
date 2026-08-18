@@ -88,6 +88,7 @@ runLedgerContractSuite({
       ledger: typeof ledger;
       workers: LedgerWorkers;
     }[] = [];
+    const quiescenceLedgers: (typeof ledger)[] = [];
 
     const stopCompetingWorkers = async (): Promise<void> => {
       const runtimes = competingRuntimes.splice(0);
@@ -114,6 +115,9 @@ runLedgerContractSuite({
         await stopCompetingWorkers();
         await workers.close();
         await ledger.close();
+        await Promise.all(
+          quiescenceLedgers.splice(0).map((peer) => peer.close()),
+        );
         ledger = await createRuntimeLedger();
         primaryScheduler = new LedgerContractPausableScheduler(
           runtime.scheduler,
@@ -155,6 +159,19 @@ runLedgerContractSuite({
           workers: competingWorkers,
         });
       },
+      runWorkersUntilQuiescentFromPeer: async () => {
+        const peer = await createRuntimeLedger();
+        quiescenceLedgers.push(peer);
+
+        return await peer.runWorkersUntilQuiescent({
+          configureQueue: () => ({ maxInFlight: 16 }),
+          scheduler: runtime.scheduler,
+          leaseMs: 1_000,
+          defaultRetryDelayMs: 1_000,
+          maxInFlight: 16,
+          signal: AbortSignal.timeout(2_000),
+        });
+      },
       emitCoalescedFromPeer: async (input) => {
         const peerLedger = await createRuntimeLedger();
 
@@ -175,6 +192,9 @@ runLedgerContractSuite({
         await stopCompetingWorkers();
         await workers.close();
         await ledger.close();
+        await Promise.all(
+          quiescenceLedgers.splice(0).map((peer) => peer.close()),
+        );
         await rm(databaseUrl, { force: true });
         await rm(`${databaseUrl}-wal`, { force: true });
       },
