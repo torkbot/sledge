@@ -26,6 +26,7 @@ test("package exports expose only supported public modules", async () => {
   assert.deepEqual(Object.keys(packageJson.exports).sort(), [
     ".",
     "./better-sqlite3",
+    "./durable-object",
     "./experimental/operators",
     "./ledger",
     "./runtime/contracts",
@@ -36,6 +37,10 @@ test("package exports expose only supported public modules", async () => {
   assert.deepEqual(packageJson.exports["./ledger"], {
     types: "./dist/ledger.d.ts",
     default: "./dist/ledger.js",
+  });
+  assert.deepEqual(packageJson.exports["./durable-object"], {
+    types: "./dist/durable-object.d.ts",
+    default: "./dist/durable-object.js",
   });
   assert.equal(Object.hasOwn(packageJson.exports, "./experimental"), false);
 

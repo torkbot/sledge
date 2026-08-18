@@ -613,6 +613,24 @@ export type QueryResult<TQuery extends AnyQueryToken> = Static<
   QueryTokenResultSchema<TQuery>
 >;
 
+export type LedgerQueryRequest<TQuery extends AnyQueryToken> =
+  TQuery extends AnyQueryToken
+    ? {
+        readonly query: TQuery;
+        readonly params: QueryParameters<TQuery>;
+      }
+    : never;
+
+export type LedgerQuerySnapshotResults<
+  TRequests extends readonly LedgerQueryRequest<AnyQueryToken>[],
+> = {
+  readonly [TIndex in keyof TRequests]: TRequests[TIndex] extends LedgerQueryRequest<
+    infer TQuery
+  >
+    ? QueryResult<TQuery>
+    : never;
+};
+
 type SignalTokenSchema<TToken> =
   TToken extends SignalToken<string, string, infer TSchemaToInfer>
     ? TSchemaToInfer
@@ -800,11 +818,15 @@ interface WorkHandlerControl {
    *
    * `timeoutMs` must be a positive integer no greater than 2,147,483,647.
    *
-   * Aborting cannot forcibly stop JavaScript. An operation that ignores its
-   * signal may continue after this promise rejects. This method is a timing
-   * primitive, not an execution sandbox: the operation retains access to
-   * anything its closure captures. Pass only the capabilities it should retain,
-   * and use application-level idempotency for external side effects.
+   * Aborting cannot forcibly stop JavaScript. The timeout determines when
+   * cancellation is requested, not a hard bound on when this promise rejects:
+   * `withTimeout` retains the active work lease until the operation promise
+   * settles. An operation that ignores its signal can therefore delay handler
+   * settlement indefinitely. This prevents a same-partition successor from
+   * overlapping an operation that is still unwinding, but it is not an
+   * execution sandbox. Pass only the capabilities the operation should retain,
+   * cooperate with its signal, and use application-level idempotency for
+   * external side effects.
    */
   withTimeout<TResult>(
     timeoutMs: number,
@@ -1266,6 +1288,16 @@ export type LedgerStreamEvent<TEvents extends AnyEventToken> = {
   readonly cursor: LedgerCursor;
 };
 
+/**
+ * A projection result and the exact durable-event boundary at which it was
+ * read. Resuming the ledger event stream from `cursor` yields every durable
+ * event committed after the projection snapshot.
+ */
+export type LedgerQuerySnapshot<TResult> = {
+  readonly result: TResult;
+  readonly cursor: LedgerCursor;
+};
+
 export interface Ledger<
   TEvents extends AnyEventToken,
   TQueries extends AnyQueryToken,
@@ -1288,6 +1320,12 @@ export interface Ledger<
     params: Static<TParamsSchema>,
   ): Promise<Static<TResultSchema>>;
 
+  querySnapshot<
+    const TRequests extends readonly LedgerQueryRequest<TQueries>[],
+  >(
+    ...requests: TRequests
+  ): Promise<LedgerQuerySnapshot<LedgerQuerySnapshotResults<TRequests>>>;
+
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
   queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
@@ -1298,6 +1336,15 @@ export interface Ledger<
     signal: TSignal,
     observer: (signal: LedgerEventEnvelope<TSignal>) => void | Promise<void>,
   ): SignalSubscription;
+
+  /**
+   * Reads one bounded batch of durable events committed after `cursor` and
+   * returns immediately. Callers may continue from the final returned cursor;
+   * an empty result means the reader is caught up at that instant.
+   */
+  readEvents(input: {
+    readonly cursor: LedgerCursor;
+  }): Promise<readonly LedgerStreamEvent<TEvents>[]>;
 
   tailEvents(input: {
     readonly last: number;
@@ -1312,6 +1359,15 @@ export interface Ledger<
   expireHistory(input: ExpireHistoryInput): Promise<void>;
 
   startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
+
+  /**
+   * Runs eligible work and closes the worker runtime once no work can run at
+   * the current runtime-clock instant. Delayed work remains durable and is
+   * reported so an invocation-shaped host can arrange the next activation.
+   */
+  runWorkersUntilQuiescent(
+    options: LedgerWorkerOptions & { readonly signal: AbortSignal },
+  ): Promise<LedgerQuiescence>;
 
   close(): Promise<void>;
 }
@@ -1344,6 +1400,11 @@ export type LedgerWorkerQueue = {
 
 export type LedgerWorkerQueueOptions = {
   readonly maxInFlight: number;
+};
+
+export type LedgerQuiescence = {
+  /** Earliest known instant at which durable work may become eligible. */
+  readonly nextEligibleAtMs: number | null;
 };
 
 export interface LedgerWorkers extends AsyncDisposable {

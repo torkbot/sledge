@@ -43,10 +43,12 @@ import type {
   ExpireHistoryInput,
   Ledger,
   LedgerCursor,
+  LedgerQuerySnapshot,
   LedgerTiming,
   LedgerIndexerContext,
   ListWorkInput,
   LedgerWorkerOptions,
+  LedgerQuiescence,
   LedgerWorkerQueue,
   LedgerWorkers,
   QuerySchema,
@@ -90,6 +92,27 @@ import type {
 type AnyIndexerDef = TSchema;
 type AnyQueryDef = QuerySchema<TSchema, TSchema>;
 
+type DatabaseLedgerQueryRequest<TQueries extends Record<string, AnyQueryDef>> =
+  {
+    readonly [TQueryName in keyof TQueries]: {
+      readonly queryName: TQueryName;
+      readonly params: Static<TQueries[TQueryName]["params"]>;
+    };
+  }[keyof TQueries];
+
+type DatabaseLedgerQuerySnapshotResults<
+  TQueries extends Record<string, AnyQueryDef>,
+  TRequests extends readonly DatabaseLedgerQueryRequest<TQueries>[],
+> = {
+  readonly [TIndex in keyof TRequests]: TRequests[TIndex] extends {
+    readonly queryName: infer TQueryName;
+  }
+    ? TQueryName extends keyof TQueries
+      ? Static<TQueries[TQueryName]["result"]>
+      : never
+    : never;
+};
+
 type DatabaseLedgerStreamEvent<
   TEvents extends Record<string, TSchema>,
   TEventName extends keyof TEvents = keyof TEvents,
@@ -127,6 +150,14 @@ export interface DatabaseLedger<
     params: Static<TQueries[TQueryName]["params"]>,
   ): Promise<Static<TQueries[TQueryName]["result"]>>;
 
+  querySnapshot<
+    const TRequests extends readonly DatabaseLedgerQueryRequest<TQueries>[],
+  >(
+    ...requests: TRequests
+  ): Promise<
+    LedgerQuerySnapshot<DatabaseLedgerQuerySnapshotResults<TQueries, TRequests>>
+  >;
+
   cancelWork(input: CancelWorkInput): Promise<CancelWorkResult>;
 
   queryWork(input: QueryWorkInput): Promise<WorkSnapshot | null>;
@@ -137,6 +168,10 @@ export interface DatabaseLedger<
     signalName: TSignalName,
     observer: SignalObserverFunction<TSignals, TSignalName>,
   ): SignalSubscription;
+
+  readEvents(input: {
+    readonly cursor: LedgerCursor;
+  }): Promise<readonly DatabaseLedgerStreamEvent<TEvents>[]>;
 
   tailEvents(input: {
     readonly last: number;
@@ -151,6 +186,10 @@ export interface DatabaseLedger<
   expireHistory(input: ExpireHistoryInput): Promise<void>;
 
   startWorkers(options: LedgerWorkerOptions): Promise<LedgerWorkers>;
+
+  runWorkersUntilQuiescent(
+    options: LedgerWorkerOptions & { readonly signal: AbortSignal },
+  ): Promise<LedgerQuiescence>;
 
   close(): Promise<void>;
 }
@@ -591,6 +630,30 @@ function createLedgerContractFacade<
         };
       }
 
+      if (property === "querySnapshot") {
+        return async (
+          ...requests: readonly {
+            readonly query: object;
+            readonly params: unknown;
+          }[]
+        ) => {
+          const physicalRequests = requests.map((request) => {
+            return {
+              queryName: findPhysicalContractName(
+                contracts.queries,
+                request.query,
+                "query",
+              ) as keyof TQueries,
+              params: request.params as Static<
+                TQueries[keyof TQueries]["params"]
+              >,
+            };
+          });
+
+          return await target.querySnapshot(...physicalRequests);
+        };
+      }
+
       if (property === "onSignal") {
         return (
           token: object,
@@ -608,6 +671,22 @@ function createLedgerContractFacade<
               await observer(createContractEnvelope(signal, token));
             },
           );
+        };
+      }
+
+      if (property === "readEvents") {
+        return async (input: { readonly cursor: LedgerCursor }) => {
+          const source = await target.readEvents(input);
+          const mapped = [];
+
+          for await (const item of mapContractEventStream(
+            source,
+            contracts.events,
+          )) {
+            mapped.push(item);
+          }
+
+          return mapped;
         };
       }
 
@@ -874,7 +953,9 @@ function createContractEnvelope(
 }
 
 async function* mapContractEventStream<TEvents extends Record<string, TSchema>>(
-  source: AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>,
+  source:
+    | AsyncIterable<DatabaseLedgerStreamEvent<TEvents>>
+    | Iterable<DatabaseLedgerStreamEvent<TEvents>>,
   contracts: Readonly<Record<string, object>>,
 ): AsyncIterable<{
   readonly event: object;
@@ -1010,6 +1091,12 @@ async function runWorkOperationWithTimeout<TResult>(input: {
         return result.value;
       }
 
+      // Cancellation requests stop new ownership from being released, but
+      // cannot forcibly stop JavaScript already executing in the operation.
+      // Retain the handler's lease until that operation settles so a
+      // same-partition successor cannot overlap work that merely ignored or
+      // was still unwinding from its abort signal.
+      await Promise.allSettled([operation]);
       operationAbortController.signal.throwIfAborted();
       throw new Error("work operation stopped without an abort reason");
     } finally {
@@ -1134,6 +1221,11 @@ const CanonicalCoalescingRowSchema = Type.Object({
 const DeferredSuccessorRowSchema = Type.Object({
   available_at_ms: Type.Number(),
   work_id: Type.Number(),
+});
+
+const LeaseRenewalRowSchema = Type.Object({
+  cancelled: Type.Number(),
+  cancel_reason: Type.Union([Type.Null(), Type.String()]),
 });
 
 const CoalescingKeySchema = Type.String({ minLength: 1 });
@@ -1435,6 +1527,7 @@ function openDatabaseLedgerEngine<
 
   const defaultTerminalWorkRetentionMs = 7 * 24 * 60 * 60 * 1_000;
   const defaultStorePollMs = 1_000;
+  const eventReadBatchSize = 256;
 
   let committedEventId = 0;
   let committedExpiredThroughEventId = 0;
@@ -1750,6 +1843,7 @@ function openDatabaseLedgerEngine<
         .prepare(
           `DELETE FROM work
            WHERE terminal_at_ms IS NOT NULL
+             AND lease_id IS NULL
              AND terminal_at_ms <= ?`,
         )
         .run(clock.nowMs() - retentionMs);
@@ -2521,6 +2615,45 @@ function openDatabaseLedgerEngine<
   ): Promise<Static<TQueries[TQueryName]["result"]>> {
     return await storage.read(async (database) => {
       return await runQueryImplementation(database, queryName, params);
+    });
+  }
+
+  async function runLedgerQuerySnapshot<
+    const TRequests extends readonly DatabaseLedgerQueryRequest<TQueries>[],
+  >(
+    requests: TRequests,
+  ): Promise<
+    LedgerQuerySnapshot<DatabaseLedgerQuerySnapshotResults<TQueries, TRequests>>
+  > {
+    // Projection state and the stream boundary must come from one SQLite
+    // transaction. Otherwise an event committed between two independent reads
+    // could be present in neither the snapshot nor the resumed stream.
+    return await runInTransaction(async (database) => {
+      const results: unknown[] = [];
+
+      for (const request of requests) {
+        results.push(
+          await runQueryImplementation(
+            database,
+            request.queryName,
+            request.params,
+          ),
+        );
+      }
+
+      const state = await readStoredStreamState(database);
+
+      return {
+        // Each entry was decoded by its query's result schema in the same
+        // order as the immutable request tuple. TypeScript cannot recover the
+        // variadic tuple after the runtime loop, so the assertion remains
+        // local to this interface implementation.
+        result: results as DatabaseLedgerQuerySnapshotResults<
+          TQueries,
+          TRequests
+        >,
+        cursor: encodeCursor(state.latestEventId),
+      };
     });
   }
 
@@ -3482,22 +3615,31 @@ function openDatabaseLedgerEngine<
 
   async function releaseExpiredLeases(): Promise<void> {
     await runInTransaction(async (database) => {
-      await database
-        .prepare(
-          `UPDATE work
-           SET
-             lease_id = NULL,
-             lease_acquired_at_ms = NULL,
-             lease_expires_at_ms = NULL,
-             lease_protocol_version = 0,
-             available_at_ms = ?
-           WHERE dead = 0
-             AND lease_id IS NOT NULL
-             AND lease_expires_at_ms IS NOT NULL
-             AND lease_expires_at_ms <= ?`,
-        )
-        .run(clock.nowMs(), clock.nowMs());
+      await releaseExpiredLeasesInDatabase(database, clock.nowMs());
     });
+  }
+
+  async function releaseExpiredLeasesInDatabase(
+    database: StorageDatabase,
+    nowMs: number,
+  ): Promise<void> {
+    await database
+      .prepare(
+        `UPDATE work
+         SET
+           lease_id = NULL,
+           lease_acquired_at_ms = NULL,
+           lease_expires_at_ms = NULL,
+           lease_protocol_version = 0,
+           coalescing_key = CASE WHEN cancelled != 0 THEN NULL ELSE coalescing_key END,
+           partition_key = CASE WHEN cancelled != 0 THEN NULL ELSE partition_key END,
+           available_at_ms = ?
+         WHERE dead = 0
+           AND lease_id IS NOT NULL
+           AND lease_expires_at_ms IS NOT NULL
+           AND lease_expires_at_ms <= ?`,
+      )
+      .run(nowMs, nowMs);
   }
 
   function scheduleDispatchAt(
@@ -3629,7 +3771,7 @@ function openDatabaseLedgerEngine<
                  SELECT 1
                  FROM work AS predecessor
                  WHERE predecessor.dead = 0
-                   AND predecessor.cancelled = 0
+                   AND (predecessor.cancelled = 0 OR predecessor.lease_id IS NOT NULL)
                    AND predecessor.signal = candidate.signal
                    AND predecessor.queue_name = candidate.queue_name
                    AND predecessor.partition_key = candidate.partition_key
@@ -3713,6 +3855,117 @@ function openDatabaseLedgerEngine<
     });
 
     return row !== undefined;
+  }
+
+  async function readNextEligibleWorkAt(
+    queues: readonly WorkerQueueRuntime[],
+  ): Promise<number | null> {
+    const queuePredicate = createCandidateQueuePredicate(queues, "work");
+    const row = await storage.read(async (database) => {
+      return await database
+        .prepare(
+          `SELECT MIN(
+             CASE
+               WHEN work.lease_id IS NOT NULL
+                 THEN MAX(work.available_at_ms, work.lease_expires_at_ms)
+               ELSE work.available_at_ms
+             END
+           ) AS available_at_ms
+           FROM work
+           WHERE work.dead = 0
+             AND (
+               work.cancelled = 0
+               OR (
+                 work.lease_id IS NOT NULL
+                 AND work.partition_key IS NOT NULL
+                 AND EXISTS (
+                   SELECT 1
+                   FROM work AS successor
+                   WHERE successor.dead = 0
+                     AND successor.cancelled = 0
+                     AND successor.signal = work.signal
+                     AND successor.queue_name = work.queue_name
+                     AND successor.partition_key = work.partition_key
+                     AND successor.work_id > work.work_id
+                 )
+               )
+             )
+             AND (${queuePredicate.sql})
+             AND (
+               work.partition_key IS NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM work AS predecessor
+                 WHERE predecessor.dead = 0
+                   AND (predecessor.cancelled = 0 OR predecessor.lease_id IS NOT NULL)
+                   AND predecessor.signal = work.signal
+                   AND predecessor.queue_name = work.queue_name
+                   AND predecessor.partition_key = work.partition_key
+                   AND predecessor.work_id < work.work_id
+               )
+             )`,
+        )
+        .get(...queuePredicate.params);
+    });
+
+    if (row === undefined || row.available_at_ms === null) {
+      return null;
+    }
+
+    return decodeRow(row, AvailableAtRowSchema).available_at_ms;
+  }
+
+  async function waitForWorkerQuiescence(
+    worker: WorkerRuntimeState,
+    signal: AbortSignal,
+  ): Promise<LedgerQuiescence> {
+    const waitSignal = AbortSignal.any([
+      signal,
+      worker.lifecycleAbortController.signal,
+    ]);
+
+    while (true) {
+      assertWorkerWaitActive(worker, signal);
+
+      const observedState = worker.stateChanges.snapshot();
+      const nextEligibleResult = await raceWithSignal(
+        readNextEligibleWorkAt(worker.queues),
+        waitSignal,
+      );
+
+      if (nextEligibleResult.status === "aborted") {
+        assertWorkerWaitActive(worker, signal);
+        throw waitSignal.reason;
+      }
+
+      assertWorkerWaitActive(worker, signal);
+
+      const runtimeIsActive =
+        worker.dispatchLoopActive ||
+        worker.dispatchLoopQueued ||
+        worker.inFlight.size > 0;
+      const stateIsStable = worker.stateChanges.snapshot() === observedState;
+      const nextEligibleAtMs = nextEligibleResult.value;
+
+      if (
+        !runtimeIsActive &&
+        stateIsStable &&
+        (nextEligibleAtMs === null || nextEligibleAtMs > clock.nowMs())
+      ) {
+        return { nextEligibleAtMs };
+      }
+
+      if (
+        !runtimeIsActive &&
+        stateIsStable &&
+        nextEligibleAtMs !== null &&
+        nextEligibleAtMs <= clock.nowMs()
+      ) {
+        requestDispatchRun(worker);
+      }
+
+      await worker.stateChanges.waitForChange(observedState, waitSignal);
+    }
   }
 
   async function waitForWorkerIdle(
@@ -3994,8 +4247,6 @@ function openDatabaseLedgerEngine<
     }
 
     let currentAfterEventId = input.afterEventId;
-    const readLimit = 256;
-
     streamLoop: while (!closed) {
       if (input.signal.aborted) {
         return;
@@ -4006,7 +4257,7 @@ function openDatabaseLedgerEngine<
 
       try {
         const readResult = await raceWithSignal(
-          readEventsAfter(currentAfterEventId, readLimit),
+          readEventsAfter(currentAfterEventId, eventReadBatchSize),
           input.signal,
         );
 
@@ -4053,6 +4304,7 @@ function openDatabaseLedgerEngine<
 
     return await runInTransaction(async (database) => {
       const nowMs = clock.nowMs();
+      await releaseExpiredLeasesInDatabase(database, nowMs);
 
       const candidate = await database
         .prepare(
@@ -4069,7 +4321,7 @@ function openDatabaseLedgerEngine<
                  SELECT 1
                  FROM work AS predecessor
                  WHERE predecessor.dead = 0
-                   AND predecessor.cancelled = 0
+                   AND (predecessor.cancelled = 0 OR predecessor.lease_id IS NOT NULL)
                    AND predecessor.signal = candidate.signal
                    AND predecessor.queue_name = candidate.queue_name
                    AND predecessor.partition_key = candidate.partition_key
@@ -4389,6 +4641,8 @@ function openDatabaseLedgerEngine<
                lease_acquired_at_ms = NULL,
                lease_expires_at_ms = NULL,
                lease_protocol_version = 0,
+               coalescing_key = CASE WHEN cancelled != 0 THEN NULL ELSE coalescing_key END,
+               partition_key = CASE WHEN cancelled != 0 THEN NULL ELSE partition_key END,
                available_at_ms = ?
              WHERE work_id = ?
                AND lease_id = ?
@@ -4430,7 +4684,7 @@ function openDatabaseLedgerEngine<
       const renewedLeaseExpiresAtMs = nowMs + worker.leaseMs;
 
       const renewal = await runInTransaction(async (database) => {
-        return await database
+        const renewed = await database
           .prepare(
             `UPDATE work
              SET
@@ -4438,7 +4692,6 @@ function openDatabaseLedgerEngine<
              WHERE work_id = ?
                AND lease_id = ?
                AND dead = 0
-               AND cancelled = 0
                AND lease_expires_at_ms > ?
                AND lease_protocol_version = ?`,
           )
@@ -4449,14 +4702,37 @@ function openDatabaseLedgerEngine<
             nowMs,
             queueProvenanceLeaseProtocolVersion,
           );
+
+        if (renewed.changes <= 0) {
+          return null;
+        }
+
+        const row = await database
+          .prepare(
+            `SELECT cancelled, cancel_reason
+             FROM work
+             WHERE work_id = ?
+               AND lease_id = ?`,
+          )
+          .get(claimed.workId, claimed.leaseId);
+
+        if (row === undefined) {
+          throw new Error("renewed lease disappeared before state read");
+        }
+
+        return decodeRow(row, LeaseRenewalRowSchema);
       });
 
-      if (renewal.changes <= 0) {
+      if (renewal === null) {
         throw new Error("lease renewal lost ownership");
       }
 
       currentLeaseExpiresAtMs = renewedLeaseExpiresAtMs;
       scheduleLeaseExpiry();
+
+      if (renewal.cancelled !== 0) {
+        abortLease(renewal.cancel_reason ?? "work cancelled");
+      }
     };
 
     const startLeaseHeartbeat = (): void => {
@@ -4468,11 +4744,6 @@ function openDatabaseLedgerEngine<
       const heartbeatTask = worker.scheduler.scheduleRepeating(
         heartbeatEveryMs,
         () => {
-          if (leaseAbortController.signal.aborted) {
-            clearLeaseHeartbeat();
-            return;
-          }
-
           void renewLease().catch(() => {
             clearLeaseHeartbeat();
             abortLease("lease renewal failed");
@@ -4772,6 +5043,22 @@ function openDatabaseLedgerEngine<
           );
 
         if (active === undefined) {
+          await database
+            .prepare(
+              `UPDATE work
+               SET
+                 lease_id = NULL,
+                 lease_acquired_at_ms = NULL,
+                 lease_expires_at_ms = NULL,
+                 lease_protocol_version = 0,
+                 coalescing_key = NULL,
+                 partition_key = NULL
+               WHERE work_id = ?
+                 AND lease_id = ?
+                 AND cancelled != 0`,
+            )
+            .run(claimed.workId, claimed.leaseId);
+
           return {
             durableEvents: 0,
             latestDurableEventId: committedEventId,
@@ -5152,6 +5439,10 @@ function openDatabaseLedgerEngine<
       await startup;
       return await runLedgerQuery(queryName, params);
     },
+    querySnapshot: async (...requests) => {
+      await startup;
+      return await runLedgerQuerySnapshot(requests);
+    },
     cancelWork: async (input: CancelWorkInput): Promise<CancelWorkResult> => {
       await startup;
       const ref = decodeWorkRef(input.ref);
@@ -5176,6 +5467,8 @@ function openDatabaseLedgerEngine<
 
         cancelledLeaseId = existing.lease?.leaseId ?? null;
 
+        const retainActiveReservation = existing.lease !== null;
+
         await database
           .prepare(
             `UPDATE work
@@ -5184,12 +5477,12 @@ function openDatabaseLedgerEngine<
                cancel_requested_at_ms = ?,
                cancel_reason = ?,
                terminal_at_ms = ?,
-               lease_id = NULL,
-               lease_acquired_at_ms = NULL,
-               lease_expires_at_ms = NULL,
-               lease_protocol_version = 0,
-               coalescing_key = NULL,
-               partition_key = NULL,
+               lease_id = CASE WHEN ? THEN lease_id ELSE NULL END,
+               lease_acquired_at_ms = CASE WHEN ? THEN lease_acquired_at_ms ELSE NULL END,
+               lease_expires_at_ms = CASE WHEN ? THEN lease_expires_at_ms ELSE NULL END,
+               lease_protocol_version = CASE WHEN ? THEN lease_protocol_version ELSE 0 END,
+               coalescing_key = CASE WHEN ? THEN coalescing_key ELSE NULL END,
+               partition_key = CASE WHEN ? THEN partition_key ELSE NULL END,
                last_error = ?
              WHERE work_ref = ?
                AND dead = 0
@@ -5199,6 +5492,12 @@ function openDatabaseLedgerEngine<
             nowMs,
             input.reason ?? null,
             nowMs,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
+            retainActiveReservation ? 1 : 0,
             input.reason ?? "work cancelled",
             ref,
           );
@@ -5379,6 +5678,20 @@ function openDatabaseLedgerEngine<
           }
         },
       };
+    },
+    readEvents: async ({ cursor }) => {
+      const afterEventId = decodeCursor(cursor);
+
+      await startup;
+
+      const events = await readEventsAfter(afterEventId, eventReadBatchSize);
+
+      return events.map((event) => {
+        return {
+          event,
+          cursor: encodeCursor(event.eventId),
+        };
+      });
     },
     tailEvents: ({ last, signal }) => {
       if (!Number.isInteger(last) || last < 0) {
@@ -5692,6 +6005,21 @@ function openDatabaseLedgerEngine<
         close: closeHandle,
         [Symbol.asyncDispose]: closeHandle,
       };
+    },
+    runWorkersUntilQuiescent: async ({ signal, ...options }) => {
+      const workers = await ledger.startWorkers(options);
+      const worker = activeWorker;
+
+      if (worker === null) {
+        await workers.close();
+        throw new Error("ledger worker runtime was not installed");
+      }
+
+      try {
+        return await waitForWorkerQuiescence(worker, signal);
+      } finally {
+        await workers.close();
+      }
     },
     close,
     [Symbol.asyncDispose]: close,

@@ -27,9 +27,14 @@ export {
   type SerializedExceptionFrame,
 } from "./exception.ts";
 export type {
+  LedgerCursor,
   LedgerModuleContribution,
   LedgerModuleDefinition,
   LedgerModuleOwner,
+  LedgerQuiescence,
+  LedgerQueryRequest,
+  LedgerQuerySnapshot,
+  LedgerQuerySnapshotResults,
 } from "./ledger/ledger.ts";
 
 const ledgerApplicationTypeBrand: unique symbol = Symbol(

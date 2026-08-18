@@ -15,6 +15,7 @@ import {
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
 import { defineMaterialization, type QueryToken } from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
+import type { LedgerQuiescence as LedgerModuleQuiescence } from "./ledger.ts";
 import { createBetterSqliteDriver } from "./better-sqlite3.ts";
 import { createTursoDriver } from "./turso.ts";
 import { VirtualRuntimeHarness } from "./runtime/virtual-runtime.ts";
@@ -25,6 +26,7 @@ import {
   type OpenedLedger,
   type LedgerApplication,
   type LedgerApplicationCapabilities,
+  type LedgerQuiescence as RootLedgerQuiescence,
 } from "./sledge.ts";
 
 const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
@@ -34,6 +36,15 @@ const timing = {
 };
 
 if (false) {
+  const verifyQuiescenceExports = (
+    rootQuiescence: RootLedgerQuiescence,
+    moduleQuiescence: LedgerModuleQuiescence,
+  ) => {
+    const rootFromModule: RootLedgerQuiescence = moduleQuiescence;
+    const moduleFromRoot: LedgerModuleQuiescence = rootQuiescence;
+    void rootFromModule;
+    void moduleFromRoot;
+  };
   const defineGenericQueryConsumer = <TModuleId extends string>(
     query: QueryToken<
       TModuleId,
@@ -86,6 +97,7 @@ if (false) {
   ): Promise<Static<TResultSchema>> => ledger.query(query, params);
 
   void verifyConcreteQuery;
+  void verifyQuiescenceExports;
   void queryGenerically;
   void defineGenericQueryConsumer;
 
@@ -168,6 +180,73 @@ if (false) {
 }
 
 for (const driver of ["better-sqlite3", "turso"] as const) {
+  test(`${driver} invocation workers exit at present quiescence and report delayed work`, async () => {
+    await using fixture = await createFixture(driver, "quiescence");
+    const handled: string[] = [];
+    const application = defineLedger((sledge) => {
+      const work = sledge.install(
+        defineModule("contract.quiescence", (module) => {
+          const payload = Type.Object({
+            availableAtMs: Type.Integer(),
+            id: Type.String(),
+          });
+          const declaration = module.declare({
+            events: { requested: payload },
+            queues: { execute: payload },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              requested: ({ event, actions }) => {
+                actions.enqueue("execute", event.payload, {
+                  availableAtMs: event.payload.availableAtMs,
+                });
+              },
+            },
+            queues: {
+              execute: ({ work }) => {
+                handled.push(work.payload.id);
+              },
+            },
+          });
+
+          return module.expose(registered, { events: registered.events });
+        })(),
+      );
+
+      return { work };
+    });
+    await using opened = await fixture.open(application);
+    const delayedAtMs = runtime.nowMs() + 60_000;
+
+    await opened.ledger.emit(opened.capabilities.work.events.requested, {
+      availableAtMs: runtime.nowMs(),
+      id: "ready",
+    });
+    await opened.ledger.emit(opened.capabilities.work.events.requested, {
+      availableAtMs: delayedAtMs,
+      id: "later",
+    });
+
+    const quiescence = opened.ledger.runWorkersUntilQuiescent({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+      signal: AbortSignal.timeout(2_000),
+    });
+
+    for (let index = 0; index < 20; index += 1) {
+      await runtime.flush();
+    }
+
+    assert.deepEqual(await quiescence, { nextEligibleAtMs: delayedAtMs });
+    assert.deepEqual(handled, ["ready"]);
+
+    const workItems = await opened.ledger.listWork();
+    assert.equal(
+      workItems.filter((item) => item.state === "delayed").length,
+      1,
+    );
+  });
+
   test(`${driver} projectionless modules import queries for private durable work`, async () => {
     await using fixture = await createFixture(driver, "imported-query");
     const observations: (readonly string[] | null)[] = [];

@@ -10,6 +10,7 @@ import type {
 import type {
   EventCausationWork,
   LedgerCursor,
+  LedgerQuiescence,
   MaterializationImplementationRegistrationFor,
   QueueHandlerControl,
   WorkRef,
@@ -93,6 +94,7 @@ const ControlledSignalWorkSchema = Type.Object({
 });
 
 const TimedWorkSchema = Type.Object({
+  partitionKey: Type.String(),
   workKey: Type.String(),
   timeoutMs: Type.Number(),
 });
@@ -539,10 +541,22 @@ export function createLedgerContractHarnessLedger(
       readonly states?: readonly string[];
     }): Promise<readonly unknown[]>;
     query(query: object, params: unknown): Promise<unknown>;
+    querySnapshot(
+      ...requests: readonly {
+        readonly query: object;
+        readonly params: unknown;
+      }[]
+    ): Promise<{
+      readonly cursor: LedgerCursor;
+      readonly result: readonly unknown[];
+    }>;
     onSignal(
       signal: object,
       observer: (signal: LedgerContractTokenEnvelope) => void | Promise<void>,
     ): unknown;
+    readEvents(input: {
+      readonly cursor: LedgerCursor;
+    }): Promise<readonly LedgerContractTokenStreamEvent[]>;
     tailEvents(input: {
       readonly last: number;
       readonly signal: AbortSignal;
@@ -585,6 +599,29 @@ export function createLedgerContractHarnessLedger(
         };
       }
 
+      if (property === "querySnapshot") {
+        return (
+          ...requests: readonly {
+            readonly queryName: keyof LedgerContractQueries;
+            readonly params: unknown;
+          }[]
+        ) => {
+          return runtime.querySnapshot(
+            ...requests.map((request) => {
+              const query = ledgerContractDefinition.queries[request.queryName];
+
+              if (query === undefined) {
+                throw new Error(
+                  `unknown ledger query ${String(request.queryName)}`,
+                );
+              }
+
+              return { query, params: request.params };
+            }),
+          );
+        };
+      }
+
       if (property === "listWork") {
         return runtime.listWork.bind(runtime);
       }
@@ -600,6 +637,19 @@ export function createLedgerContractHarnessLedger(
               await observer(createLedgerContractEnvelope(signal, signalName));
             },
           );
+        };
+      }
+
+      if (property === "readEvents") {
+        return async (input: { readonly cursor: LedgerCursor }) => {
+          const events = await runtime.readEvents(input);
+          const mapped = [];
+
+          for await (const event of mapLedgerContractEventStream(events)) {
+            mapped.push(event);
+          }
+
+          return mapped;
         };
       }
 
@@ -654,7 +704,9 @@ function createLedgerContractEnvelope(
 }
 
 async function* mapLedgerContractEventStream(
-  source: AsyncIterable<LedgerContractTokenStreamEvent>,
+  source:
+    | AsyncIterable<LedgerContractTokenStreamEvent>
+    | Iterable<LedgerContractTokenStreamEvent>,
 ): AsyncIterable<{
   readonly cursor: LedgerContractTokenStreamEvent["cursor"];
   readonly event: object;
@@ -947,6 +999,7 @@ export type LedgerContractHarness = {
   restart(): Promise<void>;
   restartWorkers(input: { readonly maxInFlight: number }): Promise<void>;
   startCompetingWorkers(input: { readonly maxInFlight: number }): Promise<void>;
+  runWorkersUntilQuiescentFromPeer(): Promise<LedgerQuiescence>;
   emitCoalescedFromPeer(input: {
     readonly availableAtMs: number;
     readonly coalescingKey: string;
@@ -1138,11 +1191,13 @@ export function createLedgerContractModel(input: {
       },
       "timed-work.requested": ({ event, actions }) => {
         actions.enqueue("timed-work.run", event.payload, {
+          partitionKey: event.payload.partitionKey,
           workKey: event.payload.workKey,
         });
       },
       "timed-signal-work.requested": ({ event, actions }) => {
         actions.enqueue("timed-signal-work.publish", event.payload, {
+          partitionKey: event.payload.partitionKey,
           workKey: event.payload.workKey,
         });
       },
@@ -1330,6 +1385,7 @@ export function createLedgerContractModel(input: {
       },
       "timed-work.signalled": ({ event, actions }) => {
         actions.enqueueSignal("timed-signal-work.run", event.payload, {
+          partitionKey: event.payload.partitionKey,
           workKey: event.payload.workKey,
         });
       },
@@ -1397,6 +1453,23 @@ async function waitFor(
   }
 
   assert.fail(`condition not met after ${timeoutMs}ms`);
+}
+
+async function waitForObservedState(
+  harness: LedgerContractHarness,
+  predicate: () => Promise<boolean>,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await harness.flush();
+
+    if (await predicate()) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  assert.fail("observed state did not become visible");
 }
 
 export function runLedgerContractSuite(input: {
@@ -1500,14 +1573,17 @@ export function runLedgerContractSuite(input: {
       kind: "durable" | "signal",
       workKey: string,
       timeoutMs: number,
+      partitionKey = workKey,
     ): Promise<void> => {
       if (kind === "durable") {
         await harness.ledger.emit("timed-work.requested", {
+          partitionKey,
           workKey,
           timeoutMs,
         });
       } else {
         await harness.ledger.emit("timed-signal-work.requested", {
+          partitionKey,
           workKey,
           timeoutMs,
         });
@@ -1559,6 +1635,82 @@ export function runLedgerContractSuite(input: {
         await iterator.return?.();
       }
     };
+
+    await t.test(
+      "querySnapshot provides an exact event-stream resume boundary",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const initial = await harness.ledger.querySnapshot({
+            queryName: "decisionAttempts",
+            params: { sourceEventId: 71 },
+          });
+
+          assert.deepEqual(initial.result, [0]);
+
+          const first = await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 71,
+            attempt: 1,
+          });
+
+          const initialResumeController = new AbortController();
+          const initialResume = harness.ledger
+            .resumeEvents({
+              cursor: initial.cursor,
+              signal: initialResumeController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const resumed = await initialResume.next();
+            assert.equal(resumed.done, false);
+
+            if (resumed.done) {
+              assert.fail("expected the event committed after the snapshot");
+            }
+
+            assert.equal(resumed.value.event.eventId, first.eventId);
+          } finally {
+            initialResumeController.abort();
+            await initialResume.return?.();
+          }
+
+          const afterFirst = await harness.ledger.querySnapshot({
+            queryName: "decisionAttempts",
+            params: { sourceEventId: 71 },
+          });
+
+          assert.deepEqual(afterFirst.result, [1]);
+
+          const second = await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 71,
+            attempt: 2,
+          });
+          const afterFirstResumeController = new AbortController();
+          const afterFirstResume = harness.ledger
+            .resumeEvents({
+              cursor: afterFirst.cursor,
+              signal: afterFirstResumeController.signal,
+            })
+            [Symbol.asyncIterator]();
+
+          try {
+            const resumed = await afterFirstResume.next();
+            assert.equal(resumed.done, false);
+
+            if (resumed.done) {
+              assert.fail("expected the event committed after the snapshot");
+            }
+
+            assert.equal(resumed.value.event.eventId, second.eventId);
+          } finally {
+            afterFirstResumeController.abort();
+            await afterFirstResume.return?.();
+          }
+        });
+      },
+    );
 
     await t.test(
       "withTimeout returns values and preserves operation failures",
@@ -1614,10 +1766,23 @@ export function runLedgerContractSuite(input: {
         async () => {
           await withHarness(input.create, async (harness) => {
             const workKey = `timed-${kind}-deadline`;
+            const partitionKey = `${workKey}-partition`;
             const gate = harness.prepareTimedWork(workKey);
+            const successor = harness.prepareTimedWork(`${workKey}-successor`);
 
-            await emitTimedWork(harness, kind, workKey, 100);
+            await emitTimedWork(harness, kind, workKey, 100, partitionKey);
             const entered = await gate.entered;
+            await emitTimedWork(
+              harness,
+              kind,
+              `${workKey}-successor`,
+              100,
+              partitionKey,
+            );
+            let successorDidStart = false;
+            void successor.entered.then(() => {
+              successorDidStart = true;
+            });
             let didSettle = false;
             void gate.settled.then(() => {
               didSettle = true;
@@ -1628,6 +1793,11 @@ export function runLedgerContractSuite(input: {
             assert.equal(didSettle, false);
 
             await harness.advanceByMs(1);
+            assert.equal(entered.operationSignal.aborted, true);
+            assert.equal(didSettle, false);
+            assert.equal(successorDidStart, false);
+
+            gate.resolve("operation unwound after timeout");
             const settled = await gate.settled;
 
             assert.equal(settled.status, "rejected");
@@ -1643,6 +1813,10 @@ export function runLedgerContractSuite(input: {
             assert.equal(entered.operationSignal.reason, settled.error);
             assert.equal(entered.leaseSignal.aborted, false);
 
+            await successor.entered;
+            successor.resolve("successor completed");
+            assert.equal((await successor.settled).status, "completed");
+
             await harness.waitForIdle();
 
             if (kind === "durable") {
@@ -1651,7 +1825,7 @@ export function runLedgerContractSuite(input: {
               assert.deepEqual(
                 Value.Decode(TimedWorkHandledSchema, latestEvent.payload),
                 {
-                  workKey,
+                  workKey: `${workKey}-successor`,
                 },
               );
             }
@@ -1666,10 +1840,23 @@ export function runLedgerContractSuite(input: {
             const workKey = `timed-${kind}-cancelled`;
             const queueName =
               kind === "durable" ? "timed-work.run" : "timed-signal-work.run";
+            const partitionKey = `${workKey}-partition`;
             const gate = harness.prepareTimedWork(workKey);
+            const successor = harness.prepareTimedWork(`${workKey}-successor`);
 
-            await emitTimedWork(harness, kind, workKey, 500);
+            await emitTimedWork(harness, kind, workKey, 500, partitionKey);
             const entered = await gate.entered;
+            await emitTimedWork(
+              harness,
+              kind,
+              `${workKey}-successor`,
+              500,
+              partitionKey,
+            );
+            let successorDidStart = false;
+            void successor.entered.then(() => {
+              successorDidStart = true;
+            });
             const [work] = await harness.ledger.listWork({
               queueName,
               states: ["leased"],
@@ -1678,12 +1865,61 @@ export function runLedgerContractSuite(input: {
             if (work?.ref === null || work === undefined) {
               throw new Error(`expected leased ${kind} timed work`);
             }
+            const originalLeaseExpiresAtMs = work.lease?.expiresAtMs;
+
+            if (originalLeaseExpiresAtMs === undefined) {
+              throw new Error(`expected ${kind} timed work lease metadata`);
+            }
 
             const cancelled = await harness.ledger.cancelWork({
               ref: work.ref,
               reason: "contract cancellation",
             });
             assert.equal(cancelled.status, "cancelled");
+
+            let didSettle = false;
+            void gate.settled.then(() => {
+              didSettle = true;
+            });
+            await harness.flush();
+            assert.equal(didSettle, false);
+            assert.equal(successorDidStart, false);
+
+            await harness.advanceByMs(
+              Math.floor((originalLeaseExpiresAtMs - harness.nowMs()) / 2),
+            );
+            await waitForObservedState(harness, async () => {
+              const [reserved] = await harness.ledger.listWork({
+                queueName,
+                states: ["cancelled"],
+              });
+
+              return (
+                reserved?.lease !== null &&
+                reserved?.lease !== undefined &&
+                reserved.lease.expiresAtMs > originalLeaseExpiresAtMs
+              );
+            });
+            await harness.advanceByMs(
+              originalLeaseExpiresAtMs - harness.nowMs() + 1,
+            );
+            await harness.flush();
+            assert.equal(didSettle, false);
+            assert.equal(successorDidStart, false);
+
+            const [reserved] = await harness.ledger.listWork({
+              queueName,
+              states: ["cancelled"],
+            });
+            assert.ok(
+              reserved?.lease !== null && reserved?.lease !== undefined,
+            );
+            assert.equal(
+              reserved.lease.expiresAtMs > originalLeaseExpiresAtMs,
+              true,
+            );
+
+            gate.resolve("operation unwound after cancellation");
 
             const settled = await gate.settled;
             assert.equal(settled.status, "rejected");
@@ -1704,6 +1940,10 @@ export function runLedgerContractSuite(input: {
               settled.error instanceof WorkOperationTimeoutError,
               false,
             );
+
+            await successor.entered;
+            successor.resolve("successor completed");
+            assert.equal((await successor.settled).status, "completed");
 
             await harness.advanceByMs(500);
             assert.equal(
@@ -2716,6 +2956,111 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
+      "invocation quiescence reports a cancelled partition head's lease expiry",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const head = harness.prepareControlledWork(
+            "cancelled-partition-head",
+          );
+          const successor = harness.prepareControlledWork(
+            "cancelled-partition-successor",
+          );
+
+          const committed = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              partitionKey: "cancelled-partition",
+              workKey: "cancelled-partition-head",
+            },
+          );
+          const outcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            committed.outcome,
+          );
+
+          await harness.flush();
+          await head.entered;
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            partitionKey: "cancelled-partition",
+            workKey: "cancelled-partition-successor",
+          });
+
+          const [leased] = await harness.ledger.listWork({
+            queueName: "controlled-work.run",
+            states: ["leased"],
+          });
+          assert.ok(leased?.lease !== null && leased !== undefined);
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "owner lost",
+          });
+          assert.equal(cancellation.status, "cancelled");
+
+          const quiescence = await harness.runWorkersUntilQuiescentFromPeer();
+
+          head.release();
+          await head.settled;
+          await successor.entered;
+          successor.release();
+          await successor.settled;
+          await harness.waitForIdle();
+
+          assert.deepEqual(quiescence, {
+            nextEligibleAtMs: leased.lease.expiresAtMs,
+          });
+        });
+      },
+    );
+
+    await t.test(
+      "invocation quiescence ignores cancelled leases that reserve no successor",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          for (const [suffix, partitionKey] of [
+            ["unpartitioned", null],
+            ["empty-partition", "cancelled-empty-partition"],
+          ] as const) {
+            const workKey = `cancelled-${suffix}`;
+            const gate = harness.prepareControlledWork(workKey);
+            const committed = await harness.ledger.emit(
+              "controlled-work.requested",
+              {
+                availableAtMs: null,
+                partitionKey,
+                workKey,
+              },
+            );
+            const outcome = Value.Decode(
+              EnqueuedWorkOutcomeSchema,
+              committed.outcome,
+            );
+
+            await harness.flush();
+            await gate.entered;
+
+            const cancellation = await harness.ledger.cancelWork({
+              ref: outcome.workRef,
+              reason: "no reserved successor",
+            });
+            assert.equal(cancellation.status, "cancelled");
+
+            assert.deepEqual(await harness.runWorkersUntilQuiescentFromPeer(), {
+              nextEligibleAtMs: null,
+            });
+
+            gate.release();
+            await gate.settled;
+          }
+
+          await harness.waitForIdle();
+        });
+      },
+    );
+
+    await t.test(
       "acknowledgement wins against a later cancellation",
       async () => {
         await withHarness(input.create, async (harness) => {
@@ -3447,6 +3792,68 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
+      "resident peers release expired cancelled reservations",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          await harness.restartWorkers({ maxInFlight: 1 });
+
+          const head = harness.prepareControlledWork("resident-cancelled-head");
+          const successor = harness.prepareControlledWork(
+            "resident-cancelled-successor",
+          );
+          const committed = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              workKey: "resident-cancelled-head",
+              partitionKey: "resident-cancelled-partition",
+            },
+          );
+          const outcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            committed.outcome,
+          );
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            workKey: "resident-cancelled-successor",
+            partitionKey: "resident-cancelled-partition",
+          });
+
+          await harness.flush();
+          await head.entered;
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "owner crashed after cancellation",
+          });
+          assert.equal(cancellation.status, "cancelled");
+
+          harness.pausePrimaryScheduler();
+          await harness.advanceByMs(999);
+          await harness.startCompetingWorkers({ maxInFlight: 1 });
+          await harness.advanceByMs(1_001);
+          await waitForObservedState(harness, async () => {
+            return harness
+              .getStartedControlledWorkKeys()
+              .includes("resident-cancelled-successor");
+          });
+
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "resident-cancelled-head",
+            "resident-cancelled-successor",
+          ]);
+
+          head.release();
+          await head.settled;
+          await harness.stopPrimaryWorkers();
+          successor.release();
+          await successor.settled;
+          await harness.stopCompetingWorkers();
+        });
+      },
+    );
+
+    await t.test(
       "an empty partition key rolls back event materialization",
       async () => {
         await withHarness(input.create, async (harness) => {
@@ -4073,6 +4480,57 @@ export function runLedgerContractSuite(input: {
             assert.equal(error.expiredThrough, second.cursor);
             return true;
           });
+        });
+      },
+    );
+
+    await t.test(
+      "readEvents returns available history without waiting for future events",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          const initial = await harness.ledger.querySnapshot({
+            queryName: "decisionAttempts",
+            params: { sourceEventId: 711 },
+          });
+
+          await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 711,
+            attempt: 1,
+          });
+          await harness.ledger.emit("decision.recorded", {
+            type: "decision.attempted",
+            sourceEventId: 711,
+            attempt: 2,
+          });
+
+          const available = await harness.ledger.readEvents({
+            cursor: initial.cursor,
+          });
+
+          assert.equal(available.length, 2);
+          assert.deepEqual(
+            available.map((item) => item.event.payload),
+            [
+              {
+                type: "decision.attempted",
+                sourceEventId: 711,
+                attempt: 1,
+              },
+              {
+                type: "decision.attempted",
+                sourceEventId: 711,
+                attempt: 2,
+              },
+            ],
+          );
+
+          const latest = available.at(-1);
+          assert.ok(latest !== undefined);
+          assert.deepEqual(
+            await harness.ledger.readEvents({ cursor: latest.cursor }),
+            [],
+          );
         });
       },
     );
