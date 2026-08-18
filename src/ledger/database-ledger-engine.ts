@@ -1223,6 +1223,11 @@ const DeferredSuccessorRowSchema = Type.Object({
   work_id: Type.Number(),
 });
 
+const LeaseRenewalRowSchema = Type.Object({
+  cancelled: Type.Number(),
+  cancel_reason: Type.Union([Type.Null(), Type.String()]),
+});
+
 const CoalescingKeySchema = Type.String({ minLength: 1 });
 const PartitionKeySchema = Type.String({ minLength: 1 });
 const WorkSnapshotRowSchema = Type.Object({
@@ -4653,7 +4658,7 @@ function openDatabaseLedgerEngine<
       const renewedLeaseExpiresAtMs = nowMs + worker.leaseMs;
 
       const renewal = await runInTransaction(async (database) => {
-        return await database
+        const renewed = await database
           .prepare(
             `UPDATE work
              SET
@@ -4661,7 +4666,6 @@ function openDatabaseLedgerEngine<
              WHERE work_id = ?
                AND lease_id = ?
                AND dead = 0
-               AND cancelled = 0
                AND lease_expires_at_ms > ?
                AND lease_protocol_version = ?`,
           )
@@ -4672,14 +4676,37 @@ function openDatabaseLedgerEngine<
             nowMs,
             queueProvenanceLeaseProtocolVersion,
           );
+
+        if (renewed.changes <= 0) {
+          return null;
+        }
+
+        const row = await database
+          .prepare(
+            `SELECT cancelled, cancel_reason
+             FROM work
+             WHERE work_id = ?
+               AND lease_id = ?`,
+          )
+          .get(claimed.workId, claimed.leaseId);
+
+        if (row === undefined) {
+          throw new Error("renewed lease disappeared before state read");
+        }
+
+        return decodeRow(row, LeaseRenewalRowSchema);
       });
 
-      if (renewal.changes <= 0) {
+      if (renewal === null) {
         throw new Error("lease renewal lost ownership");
       }
 
       currentLeaseExpiresAtMs = renewedLeaseExpiresAtMs;
       scheduleLeaseExpiry();
+
+      if (renewal.cancelled !== 0) {
+        abortLease(renewal.cancel_reason ?? "work cancelled");
+      }
     };
 
     const startLeaseHeartbeat = (): void => {
@@ -4691,11 +4718,6 @@ function openDatabaseLedgerEngine<
       const heartbeatTask = worker.scheduler.scheduleRepeating(
         heartbeatEveryMs,
         () => {
-          if (leaseAbortController.signal.aborted) {
-            clearLeaseHeartbeat();
-            return;
-          }
-
           void renewLease().catch(() => {
             clearLeaseHeartbeat();
             abortLease("lease renewal failed");

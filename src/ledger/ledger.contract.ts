@@ -1455,6 +1455,23 @@ async function waitFor(
   assert.fail(`condition not met after ${timeoutMs}ms`);
 }
 
+async function waitForObservedState(
+  harness: LedgerContractHarness,
+  predicate: () => Promise<boolean>,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await harness.flush();
+
+    if (await predicate()) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  assert.fail("observed state did not become visible");
+}
+
 export function runLedgerContractSuite(input: {
   readonly suiteName: string;
   readonly create: LedgerContractHarnessFactory;
@@ -1848,6 +1865,11 @@ export function runLedgerContractSuite(input: {
             if (work?.ref === null || work === undefined) {
               throw new Error(`expected leased ${kind} timed work`);
             }
+            const originalLeaseExpiresAtMs = work.lease?.expiresAtMs;
+
+            if (originalLeaseExpiresAtMs === undefined) {
+              throw new Error(`expected ${kind} timed work lease metadata`);
+            }
 
             const cancelled = await harness.ledger.cancelWork({
               ref: work.ref,
@@ -1862,6 +1884,40 @@ export function runLedgerContractSuite(input: {
             await harness.flush();
             assert.equal(didSettle, false);
             assert.equal(successorDidStart, false);
+
+            await harness.advanceByMs(
+              Math.floor((originalLeaseExpiresAtMs - harness.nowMs()) / 2),
+            );
+            await waitForObservedState(harness, async () => {
+              const [reserved] = await harness.ledger.listWork({
+                queueName,
+                states: ["cancelled"],
+              });
+
+              return (
+                reserved?.lease !== null &&
+                reserved?.lease !== undefined &&
+                reserved.lease.expiresAtMs > originalLeaseExpiresAtMs
+              );
+            });
+            await harness.advanceByMs(
+              originalLeaseExpiresAtMs - harness.nowMs() + 1,
+            );
+            await harness.flush();
+            assert.equal(didSettle, false);
+            assert.equal(successorDidStart, false);
+
+            const [reserved] = await harness.ledger.listWork({
+              queueName,
+              states: ["cancelled"],
+            });
+            assert.ok(
+              reserved?.lease !== null && reserved?.lease !== undefined,
+            );
+            assert.equal(
+              reserved.lease.expiresAtMs > originalLeaseExpiresAtMs,
+              true,
+            );
 
             gate.resolve("operation unwound after cancellation");
 

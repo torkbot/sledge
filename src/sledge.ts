@@ -31,6 +31,7 @@ export type {
   LedgerModuleContribution,
   LedgerModuleDefinition,
   LedgerModuleOwner,
+  LedgerQuiescence,
   LedgerQueryRequest,
   LedgerQuerySnapshot,
   LedgerQuerySnapshotResults,

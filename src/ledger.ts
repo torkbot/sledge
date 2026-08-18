@@ -45,6 +45,7 @@ export type {
   LedgerEventCommit,
   LedgerEventEnvelope,
   LedgerIndexerContext,
+  LedgerQuiescence,
   LedgerQuerySnapshot,
   LedgerQueryRequest,
   LedgerQuerySnapshotResults,

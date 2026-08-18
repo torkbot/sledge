@@ -15,6 +15,7 @@ import {
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
 import { defineMaterialization, type QueryToken } from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
+import type { LedgerQuiescence as LedgerModuleQuiescence } from "./ledger.ts";
 import { createBetterSqliteDriver } from "./better-sqlite3.ts";
 import { createTursoDriver } from "./turso.ts";
 import { VirtualRuntimeHarness } from "./runtime/virtual-runtime.ts";
@@ -25,6 +26,7 @@ import {
   type OpenedLedger,
   type LedgerApplication,
   type LedgerApplicationCapabilities,
+  type LedgerQuiescence as RootLedgerQuiescence,
 } from "./sledge.ts";
 
 const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
@@ -34,6 +36,15 @@ const timing = {
 };
 
 if (false) {
+  const verifyQuiescenceExports = (
+    rootQuiescence: RootLedgerQuiescence,
+    moduleQuiescence: LedgerModuleQuiescence,
+  ) => {
+    const rootFromModule: RootLedgerQuiescence = moduleQuiescence;
+    const moduleFromRoot: LedgerModuleQuiescence = rootQuiescence;
+    void rootFromModule;
+    void moduleFromRoot;
+  };
   const defineGenericQueryConsumer = <TModuleId extends string>(
     query: QueryToken<
       TModuleId,
@@ -86,6 +97,7 @@ if (false) {
   ): Promise<Static<TResultSchema>> => ledger.query(query, params);
 
   void verifyConcreteQuery;
+  void verifyQuiescenceExports;
   void queryGenerically;
   void defineGenericQueryConsumer;
 
