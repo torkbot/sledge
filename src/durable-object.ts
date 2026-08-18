@@ -84,22 +84,41 @@ function createDurableObjectStorageRuntime(
   input: CreateDurableObjectDriverInput,
 ): StorageRuntime {
   let closed = false;
+  let writeTail = Promise.resolve();
+  const activeReads = new Set<Promise<void>>();
 
   return {
     [storageRuntimeIdentityBrand]: input.databaseIdentity,
     read: async (run) => {
       assertOpen();
-      return await run(wrapSqlStorage(input.storage.sql));
+      const settled = Promise.withResolvers<void>();
+      activeReads.add(settled.promise);
+
+      try {
+        return await run(wrapSqlStorage(input.storage.sql));
+      } finally {
+        activeReads.delete(settled.promise);
+        settled.resolve();
+      }
     },
     write: async (run) => {
       assertOpen();
 
-      return await input.storage.transaction(async () => {
-        return await run(wrapSqlStorage(input.storage.sql, true));
+      const operation = writeTail.then(async () => {
+        return await input.storage.transaction(async () => {
+          return await run(wrapSqlStorage(input.storage.sql, true));
+        });
       });
+      writeTail = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+
+      return await operation;
     },
     close: async () => {
       closed = true;
+      await Promise.all([writeTail, ...activeReads]);
     },
   };
 
