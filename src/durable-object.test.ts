@@ -111,6 +111,68 @@ test("the Durable Object driver closes after accepted writes settle", async () =
   }
 });
 
+test("the Durable Object driver serializes reads behind active host transactions", async () => {
+  const database = new Database(":memory:");
+  const transactionEntered = Promise.withResolvers<void>();
+  const releaseTransaction = Promise.withResolvers<void>();
+  let pauseTransactions = false;
+  const storage = {
+    sql: createSqlStorage(database),
+    transaction: async <T>(
+      closure: (transaction: DurableObjectTransaction) => Promise<T>,
+    ): Promise<T> => {
+      if (pauseTransactions) {
+        transactionEntered.resolve();
+        await releaseTransaction.promise;
+      }
+
+      return await closure({ rollback: () => undefined });
+    },
+  } satisfies SledgeDurableObjectStorage;
+  const application = createDurableObjectApplication();
+  const opened = await application.open(
+    createDurableObjectDriver({
+      databaseIdentity: "durable-object:isolation",
+      storage,
+    }),
+  );
+  let emit: Promise<unknown> | null = null;
+  let read: Promise<unknown> | null = null;
+
+  try {
+    pauseTransactions = true;
+    emit = opened.ledger.emit(
+      opened.capabilities.messages.events.received,
+      "in flight",
+    );
+    await transactionEntered.promise;
+
+    let readDidSettle = false;
+    read = opened.ledger.listWork().then((work) => {
+      readDidSettle = true;
+      return work;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    try {
+      assert.equal(readDidSettle, false);
+    } finally {
+      releaseTransaction.resolve();
+    }
+
+    await emit;
+    await read;
+  } finally {
+    releaseTransaction.resolve();
+    await Promise.allSettled([
+      ...(emit === null ? [] : [emit]),
+      ...(read === null ? [] : [read]),
+    ]);
+    await opened.close();
+    database.close();
+  }
+});
+
 function createDurableObjectApplication() {
   return defineLedger((sledge) => {
     const messages = sledge.install(

@@ -84,43 +84,38 @@ function createDurableObjectStorageRuntime(
   input: CreateDurableObjectDriverInput,
 ): StorageRuntime {
   let closed = false;
-  let writeTail = Promise.resolve();
-  const activeReads = new Set<Promise<void>>();
+  let operationTail = Promise.resolve();
 
   return {
     [storageRuntimeIdentityBrand]: input.databaseIdentity,
     read: async (run) => {
       assertOpen();
-      const settled = Promise.withResolvers<void>();
-      activeReads.add(settled.promise);
-
-      try {
-        return await run(wrapSqlStorage(input.storage.sql));
-      } finally {
-        activeReads.delete(settled.promise);
-        settled.resolve();
-      }
+      return await enqueueOperation(
+        async () => await run(wrapSqlStorage(input.storage.sql)),
+      );
     },
     write: async (run) => {
       assertOpen();
-
-      const operation = writeTail.then(async () => {
+      return await enqueueOperation(async () => {
         return await input.storage.transaction(async () => {
           return await run(wrapSqlStorage(input.storage.sql, true));
         });
       });
-      writeTail = operation.then(
-        () => undefined,
-        () => undefined,
-      );
-
-      return await operation;
     },
     close: async () => {
       closed = true;
-      await Promise.all([writeTail, ...activeReads]);
+      await operationTail;
     },
   };
+
+  function enqueueOperation<T>(run: () => Promise<T>): Promise<T> {
+    const operation = operationTail.then(run);
+    operationTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
 
   function assertOpen(): void {
     if (closed) {
