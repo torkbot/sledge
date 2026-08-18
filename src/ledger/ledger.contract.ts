@@ -3016,6 +3016,51 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
+      "invocation quiescence ignores cancelled leases that reserve no successor",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          for (const [suffix, partitionKey] of [
+            ["unpartitioned", null],
+            ["empty-partition", "cancelled-empty-partition"],
+          ] as const) {
+            const workKey = `cancelled-${suffix}`;
+            const gate = harness.prepareControlledWork(workKey);
+            const committed = await harness.ledger.emit(
+              "controlled-work.requested",
+              {
+                availableAtMs: null,
+                partitionKey,
+                workKey,
+              },
+            );
+            const outcome = Value.Decode(
+              EnqueuedWorkOutcomeSchema,
+              committed.outcome,
+            );
+
+            await harness.flush();
+            await gate.entered;
+
+            const cancellation = await harness.ledger.cancelWork({
+              ref: outcome.workRef,
+              reason: "no reserved successor",
+            });
+            assert.equal(cancellation.status, "cancelled");
+
+            assert.deepEqual(await harness.runWorkersUntilQuiescentFromPeer(), {
+              nextEligibleAtMs: null,
+            });
+
+            gate.release();
+            await gate.settled;
+          }
+
+          await harness.waitForIdle();
+        });
+      },
+    );
+
+    await t.test(
       "acknowledgement wins against a later cancellation",
       async () => {
         await withHarness(input.create, async (harness) => {
