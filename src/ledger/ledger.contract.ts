@@ -3792,6 +3792,68 @@ export function runLedgerContractSuite(input: {
     );
 
     await t.test(
+      "resident peers release expired cancelled reservations",
+      async () => {
+        await withHarness(input.create, async (harness) => {
+          await harness.restartWorkers({ maxInFlight: 1 });
+
+          const head = harness.prepareControlledWork("resident-cancelled-head");
+          const successor = harness.prepareControlledWork(
+            "resident-cancelled-successor",
+          );
+          const committed = await harness.ledger.emit(
+            "controlled-work.requested",
+            {
+              availableAtMs: null,
+              workKey: "resident-cancelled-head",
+              partitionKey: "resident-cancelled-partition",
+            },
+          );
+          const outcome = Value.Decode(
+            EnqueuedWorkOutcomeSchema,
+            committed.outcome,
+          );
+          await harness.ledger.emit("controlled-work.requested", {
+            availableAtMs: null,
+            workKey: "resident-cancelled-successor",
+            partitionKey: "resident-cancelled-partition",
+          });
+
+          await harness.flush();
+          await head.entered;
+
+          const cancellation = await harness.ledger.cancelWork({
+            ref: outcome.workRef,
+            reason: "owner crashed after cancellation",
+          });
+          assert.equal(cancellation.status, "cancelled");
+
+          harness.pausePrimaryScheduler();
+          await harness.advanceByMs(999);
+          await harness.startCompetingWorkers({ maxInFlight: 1 });
+          await harness.advanceByMs(1_001);
+          await waitForObservedState(harness, async () => {
+            return harness
+              .getStartedControlledWorkKeys()
+              .includes("resident-cancelled-successor");
+          });
+
+          assert.deepEqual(harness.getStartedControlledWorkKeys(), [
+            "resident-cancelled-head",
+            "resident-cancelled-successor",
+          ]);
+
+          head.release();
+          await head.settled;
+          await harness.stopPrimaryWorkers();
+          successor.release();
+          await successor.settled;
+          await harness.stopCompetingWorkers();
+        });
+      },
+    );
+
+    await t.test(
       "an empty partition key rolls back event materialization",
       async () => {
         await withHarness(input.create, async (harness) => {

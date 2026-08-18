@@ -3615,22 +3615,31 @@ function openDatabaseLedgerEngine<
 
   async function releaseExpiredLeases(): Promise<void> {
     await runInTransaction(async (database) => {
-      await database
-        .prepare(
-          `UPDATE work
-           SET
-             lease_id = NULL,
-             lease_acquired_at_ms = NULL,
-             lease_expires_at_ms = NULL,
-             lease_protocol_version = 0,
-             available_at_ms = ?
-           WHERE dead = 0
-             AND lease_id IS NOT NULL
-             AND lease_expires_at_ms IS NOT NULL
-             AND lease_expires_at_ms <= ?`,
-        )
-        .run(clock.nowMs(), clock.nowMs());
+      await releaseExpiredLeasesInDatabase(database, clock.nowMs());
     });
+  }
+
+  async function releaseExpiredLeasesInDatabase(
+    database: StorageDatabase,
+    nowMs: number,
+  ): Promise<void> {
+    await database
+      .prepare(
+        `UPDATE work
+         SET
+           lease_id = NULL,
+           lease_acquired_at_ms = NULL,
+           lease_expires_at_ms = NULL,
+           lease_protocol_version = 0,
+           coalescing_key = CASE WHEN cancelled != 0 THEN NULL ELSE coalescing_key END,
+           partition_key = CASE WHEN cancelled != 0 THEN NULL ELSE partition_key END,
+           available_at_ms = ?
+         WHERE dead = 0
+           AND lease_id IS NOT NULL
+           AND lease_expires_at_ms IS NOT NULL
+           AND lease_expires_at_ms <= ?`,
+      )
+      .run(nowMs, nowMs);
   }
 
   function scheduleDispatchAt(
@@ -4295,6 +4304,7 @@ function openDatabaseLedgerEngine<
 
     return await runInTransaction(async (database) => {
       const nowMs = clock.nowMs();
+      await releaseExpiredLeasesInDatabase(database, nowMs);
 
       const candidate = await database
         .prepare(
