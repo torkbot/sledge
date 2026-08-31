@@ -380,7 +380,21 @@ type EventOutcomeSchemasFor<
   >;
 };
 
-type EventTokensFor<
+type RequiredOwnedResultEventNamesForDefinitions<
+  TDefinitions extends Record<string, EventDefinition>,
+> = {
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends OutcomeEventDefinition
+    ? TName
+    : never;
+}[keyof TDefinitions];
+
+type OwnedResultEventToken<TEvent extends AnyEventToken> = TEvent & {
+  readonly [eventTokenTypeBrand]: TEvent[typeof eventTokenTypeBrand] & {
+    readonly requiredOwnedResult: true;
+  };
+};
+
+type EventTokensForDefinitions<
   TModuleId extends string,
   TDefinitions extends Record<string, EventDefinition>,
 > = {
@@ -401,12 +415,35 @@ type EventTokensFor<
         >;
 };
 
+type EventTokensFor<
+  TModuleId extends string,
+  TDefinitions extends Record<string, EventDefinition>,
+> = EventTokensCarryingRequiredOwnedResultNames<
+  EventSchemasFor<TDefinitions>,
+  EventTokensForDefinitions<TModuleId, TDefinitions>,
+  RequiredOwnedResultEventNamesForDefinitions<TDefinitions>
+>;
+
+type EventTokensCarryingRequiredOwnedResultNames<
+  TEvents extends Record<string, TSchema>,
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
+  },
+  TRequiredOwnedResultEventNames extends keyof TEvents,
+> = TEventTokens & {
+  readonly [TEventName in keyof TEvents]: TEventName extends TRequiredOwnedResultEventNames
+    ? TEventTokens[TEventName] extends AnyEventToken
+      ? OwnedResultEventToken<TEventTokens[TEventName]>
+      : never
+    : TEventTokens[TEventName];
+};
+
 type EmittableEventNames<
   TEventTokens extends Readonly<Record<string, AnyEventContractToken>>,
 > = {
-  readonly [TEventName in keyof TEventTokens]: TEventTokens[TEventName] extends AnyEventToken
-    ? TEventName
-    : never;
+  readonly [TEventName in keyof TEventTokens]: TEventTokens[TEventName] extends AnyEventObservation
+    ? never
+    : TEventName;
 }[keyof TEventTokens];
 
 type EventTokensForSchemas<
@@ -613,20 +650,11 @@ export type EventEnvelope<
   readonly dedupeKey: string | null;
 };
 
-type EventTokenSchema<TToken> =
-  TToken extends EventToken<
-    string,
-    string,
-    infer TSchemaToInfer,
-    TSchema | null
-  >
-    ? TSchemaToInfer
-    : never;
+type EventTokenSchema<TToken extends AnyEventToken> =
+  TToken[typeof eventTokenTypeBrand]["schema"];
 
-type EventTokenOutcomeSchema<TToken> =
-  TToken extends EventToken<string, string, TSchema, infer TOutcomeSchema>
-    ? TOutcomeSchema
-    : never;
+type EventTokenOutcomeSchema<TToken extends AnyEventToken> =
+  TToken[typeof eventTokenTypeBrand]["outcome"];
 
 type QueryTokenParamsSchema<TToken extends AnyQueryToken> =
   TToken[typeof queryTokenTypeBrand]["params"];
@@ -988,48 +1016,6 @@ export interface EventEnqueueAction<TQueues extends Record<string, TSchema>> {
   ): Promise<WorkRef | null>;
 }
 
-type EventHandlerResult<
-  TModuleId extends string,
-  TEventToken extends AnyEventContractToken,
-> =
-  TEventToken extends EventToken<
-    infer TOwnerModuleId,
-    string,
-    TSchema,
-    infer TOutcomeSchema
-  >
-    ? TOutcomeSchema extends TSchema
-      ? TModuleId extends TOwnerModuleId
-        ? TOwnerModuleId extends TModuleId
-          ? Static<TOutcomeSchema>
-          : void
-        : void
-      : void
-    : void;
-
-type RequiredOwnedResultEventNames<
-  TModuleId extends string,
-  TEvents extends Record<string, TSchema>,
-  TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
-  },
-> = {
-  readonly [TEventName in keyof TEvents]: TEventTokens[TEventName] extends EventToken<
-    infer TOwnerModuleId,
-    string,
-    TSchema,
-    infer TOutcomeSchema
-  >
-    ? TOutcomeSchema extends TSchema
-      ? TModuleId extends TOwnerModuleId
-        ? TOwnerModuleId extends TModuleId
-          ? TEventName
-          : never
-        : never
-      : never
-    : never;
-}[keyof TEvents];
-
 type EventHandlerRegistrations<
   TModuleId extends string,
   TEvents extends Record<string, TSchema>,
@@ -1040,29 +1026,29 @@ type EventHandlerRegistrations<
   TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
+  TRequiredOwnedResultEventNames extends keyof TEvents,
 > = {
-  readonly [TEventName in keyof TEvents]?: EventHandlerFunction<
+  readonly [TEventName in Exclude<
+    keyof TEvents,
+    TRequiredOwnedResultEventNames
+  >]?: EventHandlerFunction<
     TEvents,
     TEventName,
     TIndexers,
     TQueues,
     TQueries,
     TIndexerDefinitions,
-    EventHandlerResult<TModuleId, TEventTokens[TEventName]>
+    void
   >;
 } & {
-  readonly [TEventName in RequiredOwnedResultEventNames<
-    TModuleId,
-    TEvents,
-    TEventTokens
-  >]-?: EventHandlerFunction<
+  readonly [TEventName in TRequiredOwnedResultEventNames]-?: EventHandlerFunction<
     TEvents,
     TEventName,
     TIndexers,
     TQueues,
     TQueries,
     TIndexerDefinitions,
-    EventHandlerResult<TModuleId, TEventTokens[TEventName]>
+    EventOutcome<TEventTokens[TEventName] & EventToken<TModuleId>>
   >;
 };
 
@@ -1076,9 +1062,8 @@ type EventRegistrationProperty<
   TEventTokens extends {
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
-> = [RequiredOwnedResultEventNames<TModuleId, TEvents, TEventTokens>] extends [
-  never,
-]
+  TRequiredOwnedResultEventNames extends keyof TEvents,
+> = [TRequiredOwnedResultEventNames] extends [never]
   ? {
       readonly events?: EventHandlerRegistrations<
         TModuleId,
@@ -1087,7 +1072,8 @@ type EventRegistrationProperty<
         TIndexers,
         TQueries,
         TIndexerDefinitions,
-        TEventTokens
+        TEventTokens,
+        TRequiredOwnedResultEventNames
       >;
     }
   : {
@@ -1098,7 +1084,8 @@ type EventRegistrationProperty<
         TIndexers,
         TQueries,
         TIndexerDefinitions,
-        TEventTokens
+        TEventTokens,
+        TRequiredOwnedResultEventNames
       >;
     };
 
@@ -1142,7 +1129,7 @@ export type QueueHandlerFunction<
   readonly lease: WorkLease<TQueues, TQueueName>;
   readonly actions: QueueActions<TEvents, TQueries, TSignals, TEventTokens>;
   readonly ledger: QueueLedger<
-    Extract<TEventTokens[keyof TEventTokens], AnyEventToken>,
+    Exclude<TEventTokens[keyof TEvents], AnyEventObservation>,
     TQueryTokens[keyof TQueryTokens]
   >;
   readonly control: QueueHandlerControl;
@@ -1180,6 +1167,7 @@ export type RegisterFunction<
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
   } = QueryTokensFor<string, TQueries>,
   TModuleId extends string = string,
+  TRequiredOwnedResultEventNames extends keyof TEvents = never,
 > = EventRegistrationProperty<
   TModuleId,
   TEvents,
@@ -1187,7 +1175,8 @@ export type RegisterFunction<
   TIndexers,
   TQueries,
   TIndexerDefinitions,
-  TEventTokens
+  TEventTokens,
+  TRequiredOwnedResultEventNames
 > & {
   readonly signals?: {
     readonly [TSignalName in keyof TSignals]?: SignalHandlerFunction<
@@ -2258,6 +2247,7 @@ export function defineMaterialization<
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
+  const TRequiredOwnedResultEventNames extends keyof TEvents,
 >(
   shape: DeclaredLedgerModule<
     TEvents,
@@ -2266,7 +2256,8 @@ export function defineMaterialization<
     TSignalQueues,
     TModuleId,
     TEventTokens,
-    TDeclaredQueryTokens
+    TDeclaredQueryTokens,
+    TRequiredOwnedResultEventNames
   >,
   input: MaterializationDefinitionInput<TNamespace>,
 ): MaterializationDefinitionBuilder<
@@ -2309,9 +2300,14 @@ export type DeclaredLedgerModule<
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   } = EventTokensForSchemas<TModuleId, TEvents>,
   TQueryTokens extends Record<string, AnyQueryToken> = {},
+  TRequiredOwnedResultEventNames extends keyof TEvents = never,
 > = {
   readonly moduleId: TModuleId;
-  readonly events: TEventTokens;
+  readonly events: EventTokensCarryingRequiredOwnedResultNames<
+    TEvents,
+    TEventTokens,
+    TRequiredOwnedResultEventNames
+  >;
   readonly queries: TQueryTokens;
   readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
   readonly shape: LedgerShape<TEvents, TQueues, TSignals, TSignalQueues>;
@@ -2380,8 +2376,9 @@ export interface LedgerModuleDefinition<TModuleId extends string>
     TSignals,
     TSignalQueues,
     TModuleId,
-    EventTokensFor<TModuleId, TEventDefinitions>,
-    TQueries
+    EventTokensForDefinitions<TModuleId, TEventDefinitions>,
+    TQueries,
+    RequiredOwnedResultEventNamesForDefinitions<TEventDefinitions>
   >;
 
   /**
@@ -2402,6 +2399,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
       LedgerQueryDefinitions
     > | null,
+    const TRequiredOwnedResultEventNames extends keyof TEvents = never,
   >(
     declaration: DeclaredLedgerModule<
       TEvents,
@@ -2410,7 +2408,8 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       TSignalQueues,
       TModuleId,
       TEventTokens,
-      TDeclaredQueryTokens
+      TDeclaredQueryTokens,
+      TRequiredOwnedResultEventNames
     >,
     materializations: TMaterializations,
     registration: Parameters<
@@ -2422,6 +2421,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
         TModuleId,
         TEventTokens,
         TDeclaredQueryTokens,
+        TRequiredOwnedResultEventNames,
         TMaterializations
       >["register"]
     >[0],
@@ -2434,6 +2434,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
       TModuleId,
       TEventTokens,
       TDeclaredQueryTokens,
+      TRequiredOwnedResultEventNames,
       TMaterializations
     >["register"]
   >;
@@ -2473,6 +2474,7 @@ export type LinkedLedgerModule<
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
   } = QueryTokensFor<TModuleId, TQueries>,
+  TRequiredOwnedResultEventNames extends keyof TEvents = never,
 > = {
   readonly moduleId: TModuleId;
   readonly events: TEventTokens;
@@ -2499,7 +2501,8 @@ export type LinkedLedgerModule<
       TIndexerDefinitions,
       TEventTokens,
       TQueryTokens,
-      TModuleId
+      TModuleId,
+      TRequiredOwnedResultEventNames
     > &
       ProjectionImplementationRegistration<
         TProjectionSchema,
@@ -2548,8 +2551,9 @@ export function declareLedgerModuleInternal<
   TSignals,
   TSignalQueues,
   TModuleId,
-  EventTokensFor<TModuleId, TEventDefinitions>,
-  TQueries
+  EventTokensForDefinitions<TModuleId, TEventDefinitions>,
+  TQueries,
+  RequiredOwnedResultEventNamesForDefinitions<TEventDefinitions>
 > {
   validateLedgerModuleId(input.moduleId);
   const queueDefinitions = (input.queues ?? {}) as TQueues;
@@ -2693,8 +2697,9 @@ export function defineModule<
       TSignals,
       TSignalQueues,
       TModuleId,
-      EventTokensFor<TModuleId, TEventDefinitions>,
-      TQueries
+      EventTokensForDefinitions<TModuleId, TEventDefinitions>,
+      TQueries,
+      RequiredOwnedResultEventNamesForDefinitions<TEventDefinitions>
     > => {
       assertDefinitionOpen();
 
@@ -2861,6 +2866,7 @@ type LinkedLedgerModuleFor<
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
+  TRequiredOwnedResultEventNames extends keyof TEvents,
   TMaterializations extends Materializations<
     AnyMaterializationHistory<TEvents>,
     ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
@@ -2888,7 +2894,8 @@ type LinkedLedgerModuleFor<
         THistory,
         TModuleId,
         TEventTokens,
-        TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>
+        TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>,
+        TRequiredOwnedResultEventNames
       >
     : LinkedLedgerModule<
         TEvents,
@@ -2903,7 +2910,8 @@ type LinkedLedgerModuleFor<
         null,
         TModuleId,
         TEventTokens,
-        TDeclaredQueryTokens
+        TDeclaredQueryTokens,
+        TRequiredOwnedResultEventNames
       >;
 
 /**
@@ -2923,6 +2931,7 @@ export function linkLedgerModuleInternal<
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
+  const TRequiredOwnedResultEventNames extends keyof TEvents,
   const TMaterializations extends Materializations<
     AnyMaterializationHistory<TEvents>,
     ProjectionIndexerDefinitions<Extract<keyof TEvents, string>>,
@@ -2936,7 +2945,8 @@ export function linkLedgerModuleInternal<
     TSignalQueues,
     TModuleId,
     TEventTokens,
-    TDeclaredQueryTokens
+    TDeclaredQueryTokens,
+    TRequiredOwnedResultEventNames
   >,
   materializations: TMaterializations,
 ): LinkedLedgerModuleFor<
@@ -2947,6 +2957,7 @@ export function linkLedgerModuleInternal<
   TModuleId,
   TEventTokens,
   TDeclaredQueryTokens,
+  TRequiredOwnedResultEventNames,
   TMaterializations
 > {
   // The runtime branch and the public conditional type describe the same two
@@ -2994,6 +3005,7 @@ export function linkLedgerModuleInternal<
       TModuleId,
       TEventTokens,
       TDeclaredQueryTokens,
+      TRequiredOwnedResultEventNames,
       TMaterializations
     >;
   }
@@ -3009,6 +3021,7 @@ export function linkLedgerModuleInternal<
     TModuleId,
     TEventTokens,
     TDeclaredQueryTokens,
+    TRequiredOwnedResultEventNames,
     TMaterializations
   >;
 }
@@ -3028,6 +3041,7 @@ function linkMaterializedLedgerModule<
     readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
+  const TRequiredOwnedResultEventNames extends keyof TEvents,
 >(
   shape: DeclaredLedgerModule<
     TEvents,
@@ -3036,7 +3050,8 @@ function linkMaterializedLedgerModule<
     TSignalQueues,
     TModuleId,
     TEventTokens,
-    TDeclaredQueryTokens
+    TDeclaredQueryTokens,
+    TRequiredOwnedResultEventNames
   >,
   materializations: Materializations<
     THistory,
@@ -3063,7 +3078,8 @@ function linkMaterializedLedgerModule<
   THistory,
   TModuleId,
   TEventTokens,
-  TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>
+  TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>,
+  TRequiredOwnedResultEventNames
 > {
   validateMaterializationEvents(shape.shape, materializations);
   validateQueryDefinitionNames(shape.queries, materializations.queries);
@@ -3121,7 +3137,8 @@ function linkMaterializedLedgerModule<
     THistory,
     TModuleId,
     TEventTokens,
-    TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>
+    TDeclaredQueryTokens & QueryTokensFor<TModuleId, TQueryDefinitions>,
+    TRequiredOwnedResultEventNames
   >;
 }
 
@@ -4861,10 +4878,15 @@ function createPhysicalRegisteredModule<
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
   },
+  TRequiredOwnedResultEventNames extends keyof TEvents,
 >(input: {
   readonly moduleId: TModuleId;
   readonly contracts: {
-    readonly events: TEventTokens;
+    readonly events: EventTokensCarryingRequiredOwnedResultNames<
+      TEvents,
+      TEventTokens,
+      TRequiredOwnedResultEventNames
+    >;
     readonly queries: TQueryTokens;
     readonly queues: TokensForSchemas<TModuleId, TQueues, "queue">;
     readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
@@ -4896,7 +4918,8 @@ function createPhysicalRegisteredModule<
     TIndexerDefinitions,
     TEventTokens,
     TQueryTokens,
-    TModuleId
+    TModuleId,
+    TRequiredOwnedResultEventNames
   >;
 }): {
   readonly model: LedgerModel<
@@ -4917,7 +4940,8 @@ function createPhysicalRegisteredModule<
     TIndexerDefinitions,
     TEventTokens,
     TQueryTokens,
-    TModuleId
+    TModuleId,
+    TRequiredOwnedResultEventNames
   >;
 } {
   const runtimeRegister = input.register as RuntimeRegister;
@@ -5216,7 +5240,8 @@ function createPhysicalRegisteredModule<
       TIndexerDefinitions,
       TEventTokens,
       TQueryTokens,
-      TModuleId
+      TModuleId,
+      TRequiredOwnedResultEventNames
     >,
   };
 }
@@ -6059,10 +6084,15 @@ function createLinkedLedgerModule<
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
   },
+  TRequiredOwnedResultEventNames extends keyof TEvents,
 >(input: {
   readonly moduleId: TModuleId;
   readonly contracts: {
-    readonly events: TEventTokens;
+    readonly events: EventTokensCarryingRequiredOwnedResultNames<
+      TEvents,
+      TEventTokens,
+      TRequiredOwnedResultEventNames
+    >;
     readonly queries: TQueryTokens;
     readonly queues: TokensForSchemas<TModuleId, TQueues, "queue">;
     readonly signals: TokensForSchemas<TModuleId, TSignals, "signal">;
@@ -6095,7 +6125,8 @@ function createLinkedLedgerModule<
   TMaterializationHistory,
   TModuleId,
   TEventTokens,
-  TQueryTokens
+  TQueryTokens,
+  TRequiredOwnedResultEventNames
 > {
   const localModel: LedgerModel<
     TEvents,
@@ -6138,7 +6169,8 @@ function createLinkedLedgerModule<
     TMaterializationHistory,
     TModuleId,
     TEventTokens,
-    TQueryTokens
+    TQueryTokens,
+    TRequiredOwnedResultEventNames
   >;
 
   linked = {

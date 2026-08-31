@@ -13,7 +13,12 @@ import {
 } from "typebox";
 
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
-import { defineMaterialization, type QueryToken } from "./ledger/ledger.ts";
+import {
+  defineMaterialization,
+  type EventObservation,
+  type EventToken,
+  type QueryToken,
+} from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
 import type { LedgerQuiescence as LedgerModuleQuiescence } from "./ledger.ts";
 import { createBetterSqliteDriver } from "./better-sqlite3.ts";
@@ -36,6 +41,74 @@ const timing = {
 };
 
 if (false) {
+  const GenericEventPayloadSchema = Type.Object({ id: Type.String() });
+  const defineGenericEventConsumer = <
+    TModuleId extends string,
+    TSourceModuleId extends string,
+  >(input: {
+    readonly moduleId: TModuleId;
+    readonly granted: EventToken<
+      TSourceModuleId,
+      "granted",
+      typeof GenericEventPayloadSchema,
+      null
+    >;
+    readonly observed: EventObservation<
+      EventToken<
+        TSourceModuleId,
+        "observed",
+        typeof GenericEventPayloadSchema,
+        null
+      >
+    >;
+  }) =>
+    defineModule(input.moduleId, (module) => {
+      const declaration = module.declare({
+        events: {
+          granted: input.granted,
+          observed: input.observed,
+          owned: GenericEventPayloadSchema,
+          ownedResult: {
+            payload: GenericEventPayloadSchema,
+            outcome: Type.String(),
+          },
+        },
+        queues: { publish: GenericEventPayloadSchema },
+      });
+      if (false) {
+        // @ts-expect-error generic result events still require their owner
+        module.link(declaration, null, {});
+        module.link(declaration, null, {
+          events: {
+            // @ts-expect-error generic result events retain their outcome type
+            ownedResult: () => 1,
+          },
+        });
+      }
+      const registered = module.link(declaration, null, {
+        events: {
+          ownedResult: () => "recorded",
+        },
+        queues: {
+          publish: async ({ work, actions, ledger }) => {
+            actions.emit("owned", work.payload);
+            actions.emit("granted", work.payload);
+            await ledger.emit(declaration.events.owned, work.payload);
+            await ledger.emit(declaration.events.granted, work.payload);
+
+            // @ts-expect-error observations remain read-only in generic modules
+            actions.emit("observed", work.payload);
+            await ledger.emit(
+              // @ts-expect-error observation tokens remain read-only in generic modules
+              declaration.events.observed,
+              work.payload,
+            );
+          },
+        },
+      });
+
+      return module.expose(registered, {});
+    });
   const verifyQuiescenceExports = (
     rootQuiescence: RootLedgerQuiescence,
     moduleQuiescence: LedgerModuleQuiescence,
@@ -99,6 +172,7 @@ if (false) {
   void verifyConcreteQuery;
   void verifyQuiescenceExports;
   void queryGenerically;
+  void defineGenericEventConsumer;
   void defineGenericQueryConsumer;
 
   void (async () => {
