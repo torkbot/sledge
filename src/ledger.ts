@@ -34,6 +34,7 @@ export type {
   EventEnvelope,
   EventEnqueueAction,
   EventHandlerFunction,
+  EventObservation,
   EventOutcome,
   EventPayload,
   EventRef,

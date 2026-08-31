@@ -831,7 +831,7 @@ for (const adapter of adapters) {
     );
   });
 
-  test(`${adapter.name} operator graphs consume events revealed by ordinary modules`, async () => {
+  test(`${adapter.name} operator graphs consume owner-granted event observations`, async () => {
     await using directory = await mkdtempDisposable(
       join(tmpdir(), `sledge-imported-operators-${adapter.name}-`),
     );
@@ -846,6 +846,17 @@ for (const adapter of adapters) {
         return input * 2;
       },
     });
+    const forbiddenContinuation = new CoalescingOperation(
+      "forbidden-continuation",
+      {
+        input: Type.Integer(),
+        output: Type.Integer(),
+        timeoutMs: 1_000,
+        queries: {},
+        keyBy: String,
+        run: (input) => input,
+      },
+    );
     const defineSource = defineModule(
       "experimental.contract.operator-source",
       (module) => {
@@ -856,6 +867,7 @@ for (const adapter of adapters) {
 
         return module.expose(registered, {
           requested: registered.events.requested,
+          requestedObservation: module.observation(registered.events.requested),
         });
       },
     );
@@ -863,11 +875,28 @@ for (const adapter of adapters) {
       const source = sledge.install(defineSource());
       const firstFlow = sledge.install(
         defineModule("a", (module) => {
-          const doubled = module.bind(
-            "b:c",
-            module.import(source.requested),
-            double,
+          const observed = module.import(source.requestedObservation);
+
+          if (false) {
+            module.bind("forbidden", observed, forbiddenContinuation, {
+              // @ts-expect-error an observation is not continuation authority
+              continueWith: observed,
+            });
+          }
+
+          assert.throws(
+            () =>
+              module.bind("forbidden", observed, forbiddenContinuation, {
+                continueWith: observed as unknown as EventPort<
+                  ReturnType<typeof Type.Integer>,
+                  string,
+                  null,
+                  true
+                >,
+              }),
+            /event observation cannot be used as a continuation/,
           );
+          const doubled = module.bind("b:c", observed, double);
           const declaration = module.declare({ events: {} });
           const registered = module.link(declaration, null, {});
 
@@ -878,7 +907,7 @@ for (const adapter of adapters) {
         defineModule("d", (module) => {
           const doubled = module.bind(
             "e",
-            module.import(source.requested),
+            module.import(source.requestedObservation),
             double,
           );
           const declaration = module.declare({ events: {} });

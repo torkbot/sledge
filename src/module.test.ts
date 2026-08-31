@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { Type } from "typebox";
+
 import {
   declareLedgerModuleInternal as declareLedgerModule,
   linkLedgerModuleInternal as linkLedgerModule,
   type AnyRegisteredLedgerModule,
+  type EventToken,
   type LedgerModuleDefinition,
 } from "./ledger/ledger.ts";
 import { defineModule } from "./sledge.ts";
@@ -78,6 +81,49 @@ test("module owners are revoked after revealing one contribution", () => {
   assert.throws(
     () => retained.link(retainedDeclaration as never, null, {}),
     /ledger module definition has already closed/,
+  );
+});
+
+test("only the scoped event owner can grant observation", () => {
+  const defineOwner = defineModule("contract.observation-owner", (module) => {
+    const declaration = module.declare({ events: { changed: Type.String() } });
+    const registered = module.link(declaration, null, {});
+    const changed = registered.events.changed;
+
+    return module.expose(registered, {
+      changed,
+      observation: module.observation(changed),
+    });
+  });
+  const owner = defineOwner();
+
+  if (false) {
+    // @ts-expect-error an observation is not event emission authority
+    const emissionAuthority: EventToken = owner.capabilities.observation;
+    void emissionAuthority;
+
+    defineModule("contract.observation-consumer", (module) => {
+      // @ts-expect-error only the event's typed owner can grant observation
+      module.observation(owner.capabilities.changed);
+      const declaration = module.declare({ events: {} });
+      const registered = module.link(declaration, null, {});
+      return module.expose(registered, {});
+    });
+  }
+
+  const defineSameNamedImpostor = defineModule(
+    "contract.observation-owner",
+    (module) => {
+      module.observation(owner.capabilities.changed);
+      const declaration = module.declare({ events: {} });
+      const registered = module.link(declaration, null, {});
+      return module.expose(registered, {});
+    },
+  );
+
+  assert.throws(
+    () => defineSameNamedImpostor(),
+    /cannot grant observation of event contract\.observation-owner\.changed/,
   );
 });
 

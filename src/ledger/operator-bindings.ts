@@ -9,6 +9,7 @@ import {
 import { createEventRef, type EventRef } from "./event-ref.ts";
 import type {
   EventCausationWork,
+  EventObservation,
   EventToken,
   ProjectionIndexerEvent,
   ProjectionReadDatabase,
@@ -28,6 +29,9 @@ const eventPortNameBrand: unique symbol = Symbol(
 );
 const eventPortSettlementBrand: unique symbol = Symbol(
   "sledge.experimental.eventPortSettlement",
+);
+const eventPortContinuationBrand: unique symbol = Symbol(
+  "sledge.experimental.eventPortContinuation",
 );
 const operatorIndexerPortBrand: unique symbol = Symbol(
   "sledge.experimental.operatorIndexerPort",
@@ -207,10 +211,12 @@ export type EventPort<
   TSchemaValue extends TSchema,
   TName extends string = string,
   TSettlementValueSchema extends TSchema | null = null,
+  TCanContinue extends boolean = true,
 > = TSchemaValue & {
   readonly [eventPortBrand]: TSchemaValue;
   readonly [eventPortNameBrand]: TName;
   readonly [eventPortSettlementBrand]: TSettlementValueSchema;
+  readonly [eventPortContinuationBrand]: TCanContinue;
 };
 
 /** A terminal binding that cannot be used as another event source. */
@@ -219,8 +225,15 @@ export interface Sink {
 }
 
 export type RevealedModuleCapabilities<TValue> =
-  TValue extends EventPort<infer TSchemaValue, string, TSchema | null>
-    ? EventToken<string, string, TSchemaValue, null>
+  TValue extends EventPort<
+    infer TSchemaValue,
+    string,
+    TSchema | null,
+    infer TCanContinue
+  >
+    ? TCanContinue extends true
+      ? EventToken<string, string, TSchemaValue, null>
+      : EventObservation<EventToken<string, string, TSchemaValue, null>>
     : TValue extends readonly unknown[]
       ? {
           readonly [TKey in keyof TValue]: RevealedModuleCapabilities<
@@ -237,21 +250,33 @@ export type RevealedModuleCapabilities<TValue> =
             }
           : TValue;
 
-export type SchemaOfEvent<TEvent extends EventToken> =
-  TEvent extends EventToken<string, string, infer TSchemaValue, TSchema | null>
-    ? TSchemaValue
-    : never;
+type EventContract = EventToken | EventObservation;
+
+export type SchemaOfEvent<TEvent extends EventContract> =
+  TEvent extends EventObservation<infer TObservedEvent>
+    ? SchemaOfEvent<TObservedEvent>
+    : TEvent extends EventToken<
+          string,
+          string,
+          infer TSchemaValue,
+          TSchema | null
+        >
+      ? TSchemaValue
+      : never;
 
 type RuntimePort<
   TSchemaValue extends TSchema = TSchema,
   TName extends string = string,
   TSettlementValueSchema extends TSchema | null = TSchema | null,
+  TCanContinue extends boolean = boolean,
 > = TSchemaValue & {
   readonly [eventPortBrand]: TSchemaValue;
   readonly [eventPortNameBrand]: TName;
   readonly [eventPortSettlementBrand]: TSettlementValueSchema;
-  readonly definition: TSchema | EventToken;
+  readonly [eventPortContinuationBrand]: TCanContinue;
+  readonly definition: TSchema | EventContract;
   readonly localName: TName;
+  readonly canContinue: TCanContinue;
   readonly settlementValueSchema: TSchema | null;
   readonly source: RuntimePort | null;
 };
@@ -296,10 +321,14 @@ export interface OperatorBindingDefinition {
 
   import<const TEvent extends EventToken>(
     event: TEvent,
-  ): EventPort<SchemaOfEvent<TEvent>>;
+  ): EventPort<SchemaOfEvent<TEvent>, string, null, true>;
+
+  import<const TObservation extends EventObservation>(
+    event: TObservation,
+  ): EventPort<SchemaOfEvent<TObservation>, string, null, false>;
 
   indexer<TSchemaValue extends TSchema, TName extends string>(
-    source: EventPort<TSchemaValue, TName, TSchema | null>,
+    source: EventPort<TSchemaValue, TName, TSchema | null, boolean>,
   ): { readonly sourceEvent: TName; readonly input: TSchemaValue };
 
   bind<
@@ -308,7 +337,7 @@ export interface OperatorBindingDefinition {
     TOutputSchema extends TSchema,
   >(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema, string, null>,
+    source: EventPort<TInputSchema, string, null, boolean>,
     operator: MapAsync<string, TInputSchema, TOutputSchema>,
   ): EventPort<
     OperatorSettlementSchema<TOutputSchema>,
@@ -322,7 +351,7 @@ export interface OperatorBindingDefinition {
     TOutputSchema extends TSchema,
   >(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema, string, null>,
+    source: EventPort<TInputSchema, string, null, boolean>,
     operator: CoalescingOperation<
       string,
       TInputSchema,
@@ -330,7 +359,7 @@ export interface OperatorBindingDefinition {
       OperationQueries
     >,
     options: {
-      readonly continueWith: EventPort<TOutputSchema, string, null>;
+      readonly continueWith: EventPort<TOutputSchema, string, null, true>;
     },
   ): EventPort<
     OperatorSettlementSchema<TOutputSchema>,
@@ -347,7 +376,8 @@ export interface OperatorBindingDefinition {
     source: EventPort<
       OperatorSettlementSchema<TInputSchema>,
       string,
-      TInputSchema
+      TInputSchema,
+      boolean
     >,
     operator: MapAsync<string, TInputSchema, TOutputSchema>,
   ): EventPort<
@@ -358,7 +388,7 @@ export interface OperatorBindingDefinition {
 
   bind<const TBindingId extends string, TInputSchema extends TSchema>(
     bindingId: TBindingId,
-    source: EventPort<TInputSchema, string, null>,
+    source: EventPort<TInputSchema, string, null, boolean>,
     operator: ForEach<string, TInputSchema>,
   ): Sink;
 
@@ -367,7 +397,8 @@ export interface OperatorBindingDefinition {
     source: EventPort<
       OperatorSettlementSchema<TInputSchema>,
       string,
-      TInputSchema
+      TInputSchema,
+      boolean
     >,
     operator: ForEach<string, TInputSchema>,
   ): Sink;
@@ -383,7 +414,12 @@ export interface OperatorBindingDefinition {
       readonly event: ProjectionIndexerEvent<string>;
       readonly db: ProjectionReadDatabase<TProjectionSchema, TEvents, TSignals>;
     },
-    ancestor: EventPort<TAncestorSchema, string, TAncestorSettlementSchema>,
+    ancestor: EventPort<
+      TAncestorSchema,
+      string,
+      TAncestorSettlementSchema,
+      boolean
+    >,
   ): Promise<OperatorOriginEvent<TAncestorSchema>>;
 }
 
@@ -440,14 +476,17 @@ type RuntimeRegistration = {
 };
 
 /** Private compiler state owned by one `defineModule` invocation. */
-export function createOperatorBindingCompiler(moduleId: string): {
+export function createOperatorBindingCompiler(
+  moduleId: string,
+  isObservation: (value: unknown) => value is EventObservation,
+): {
   readonly definition: OperatorBindingDefinition;
   augmentContract(input: {
-    readonly events: Readonly<Record<string, TSchema | EventToken>>;
+    readonly events: Readonly<Record<string, TSchema | EventContract>>;
     readonly queries?: Readonly<Record<string, QueryToken>>;
     readonly queues?: Readonly<Record<string, TSchema>>;
   }): {
-    readonly events: Record<string, TSchema | EventToken>;
+    readonly events: Record<string, TSchema | EventContract>;
     readonly queues: Record<string, TSchema>;
   };
   augmentRegistration<TRegistration>(
@@ -456,12 +495,12 @@ export function createOperatorBindingCompiler(moduleId: string): {
   ): TRegistration;
   reveal(
     value: unknown,
-    events: Readonly<Record<string, EventToken>>,
+    events: Readonly<Record<string, EventContract>>,
     preserve: (value: object) => boolean,
   ): unknown;
 } {
   const ports = new Map<string, RuntimePort>();
-  const imported = new Map<EventToken, RuntimePort>();
+  const imported = new Map<EventContract, RuntimePort>();
   const bindings: RuntimeBinding[] = [];
   let declared = false;
 
@@ -476,13 +515,15 @@ export function createOperatorBindingCompiler(moduleId: string): {
     TSchemaValue extends TSchema,
     TName extends string,
     TSettlementValueSchema extends TSchema | null,
+    TCanContinue extends boolean,
   >(
     localName: TName,
     schema: TSchemaValue,
-    definition: TSchema | EventToken,
+    definition: TSchema | EventContract,
     settlementValueSchema: TSettlementValueSchema,
     source: RuntimePort | null,
-  ): RuntimePort<TSchemaValue, TName, TSettlementValueSchema> => {
+    canContinue: TCanContinue,
+  ): RuntimePort<TSchemaValue, TName, TSettlementValueSchema, TCanContinue> => {
     assertAuthoring();
 
     if (definition === schema && localName.startsWith(privateGraphIdPrefix)) {
@@ -500,8 +541,10 @@ export function createOperatorBindingCompiler(moduleId: string): {
         [eventPortBrand]: schema,
         [eventPortNameBrand]: localName,
         [eventPortSettlementBrand]: settlementValueSchema,
+        [eventPortContinuationBrand]: canContinue,
         definition,
         localName,
+        canContinue,
         settlementValueSchema,
         source,
       }),
@@ -510,7 +553,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
     return port;
   };
   const event: OperatorBindingDefinition["event"] = (name, schema) =>
-    createPort(name, schema, schema, null, null);
+    createPort(name, schema, schema, null, null, true);
   const indexer: OperatorBindingDefinition["indexer"] = (source) => {
     const port = readPort(source);
 
@@ -525,12 +568,14 @@ export function createOperatorBindingCompiler(moduleId: string): {
     });
     return definition;
   };
-  const importEvent: OperatorBindingDefinition["import"] = (external) => {
+  const importEvent: OperatorBindingDefinition["import"] = (
+    external: EventContract,
+  ) => {
     assertAuthoring();
     const existing = imported.get(external);
 
     if (existing !== undefined) {
-      return existing as unknown as EventPort<SchemaOfEvent<typeof external>>;
+      return existing as never;
     }
 
     const schema = operatorInputPlaceholder as SchemaOfEvent<typeof external>;
@@ -540,13 +585,14 @@ export function createOperatorBindingCompiler(moduleId: string): {
       external,
       null,
       null,
+      !isObservation(external),
     );
     imported.set(external, port);
-    return port;
+    return port as never;
   };
   function bind<TInputSchema extends TSchema, TOutputSchema extends TSchema>(
     bindingId: string,
-    source: EventPort<TInputSchema, string, TSchema | null>,
+    source: EventPort<TInputSchema, string, TSchema | null, boolean>,
     operator:
       | MapAsync<string, TInputSchema, TOutputSchema>
       | CoalescingOperation<
@@ -557,7 +603,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
         >
       | ForEach<string, TInputSchema>,
     options?: {
-      readonly continueWith: EventPort<TOutputSchema, string, null>;
+      readonly continueWith: EventPort<TOutputSchema, string, null, true>;
     },
   ):
     | EventPort<OperatorSettlementSchema<TOutputSchema>, string, TOutputSchema>
@@ -604,6 +650,10 @@ export function createOperatorBindingCompiler(moduleId: string): {
         throw new Error("continuation event does not belong to this module");
       }
 
+      if (runtimeContinuation !== null && !runtimeContinuation.canContinue) {
+        throw new Error("event observation cannot be used as a continuation");
+      }
+
       const outputSchema = SettlementSchema(operator.output);
       const output = createPort(
         bindingId,
@@ -611,6 +661,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
         outputSchema,
         operator.output,
         runtimeSource,
+        true,
       );
       bindings.push({
         bindingId,
@@ -695,7 +746,7 @@ export function createOperatorBindingCompiler(moduleId: string): {
     augmentContract: (input) => {
       assertAuthoring();
       declared = true;
-      const events: Record<string, TSchema | EventToken> = {};
+      const events: Record<string, TSchema | EventContract> = {};
       const queues = { ...input.queues };
 
       for (const [localName, definition] of Object.entries(input.events)) {
@@ -708,7 +759,9 @@ export function createOperatorBindingCompiler(moduleId: string): {
         }
 
         if (typeof definition === "object" && eventPortBrand in definition) {
-          const port = readPort(definition as EventPort<TSchema>);
+          const port = readPort(
+            definition as EventPort<TSchema, string, TSchema | null, boolean>,
+          );
 
           if (
             ports.get(port.localName) !== port ||
@@ -1042,11 +1095,12 @@ function readPort<
   TSchemaValue extends TSchema,
   TName extends string,
   TSettlementValueSchema extends TSchema | null,
+  TCanContinue extends boolean,
 >(
-  port: EventPort<TSchemaValue, TName, TSettlementValueSchema>,
-): RuntimePort<TSchemaValue, TName, TSettlementValueSchema> {
+  port: EventPort<TSchemaValue, TName, TSettlementValueSchema, TCanContinue>,
+): RuntimePort<TSchemaValue, TName, TSettlementValueSchema, TCanContinue> {
   const candidate = port as Partial<
-    RuntimePort<TSchemaValue, TName, TSettlementValueSchema>
+    RuntimePort<TSchemaValue, TName, TSettlementValueSchema, TCanContinue>
   >;
 
   if (
@@ -1056,7 +1110,12 @@ function readPort<
     throw new Error("event port does not belong to this ledger module");
   }
 
-  return candidate as RuntimePort<TSchemaValue, TName, TSettlementValueSchema>;
+  return candidate as RuntimePort<
+    TSchemaValue,
+    TName,
+    TSettlementValueSchema,
+    TCanContinue
+  >;
 }
 
 function decodeSourceSettlement(
@@ -1072,7 +1131,7 @@ function decodeSourceSettlement(
 
 function mapRevealed(
   value: unknown,
-  events: Readonly<Record<string, EventToken>>,
+  events: Readonly<Record<string, EventContract>>,
   preserve: (value: object) => boolean,
   ownedPorts: ReadonlyMap<string, RuntimePort>,
 ): RevealResult {
@@ -1081,7 +1140,9 @@ function mapRevealed(
   }
 
   if (eventPortBrand in value) {
-    const port = readPort(value as EventPort<TSchema>);
+    const port = readPort(
+      value as EventPort<TSchema, string, TSchema | null, boolean>,
+    );
     const localName = port.localName;
 
     if (ownedPorts.get(localName) !== port) {

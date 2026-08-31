@@ -13,7 +13,12 @@ import {
 } from "typebox";
 
 import { createBetterSqliteStorageRuntime } from "./ledger/better-sqlite3-ledger.ts";
-import { defineMaterialization, type QueryToken } from "./ledger/ledger.ts";
+import {
+  defineMaterialization,
+  type EventObservation,
+  type EventToken,
+  type QueryToken,
+} from "./ledger/ledger.ts";
 import { createTursoStorageRuntime } from "./ledger/turso-ledger.ts";
 import type { LedgerQuiescence as LedgerModuleQuiescence } from "./ledger.ts";
 import { createBetterSqliteDriver } from "./better-sqlite3.ts";
@@ -36,6 +41,74 @@ const timing = {
 };
 
 if (false) {
+  const GenericEventPayloadSchema = Type.Object({ id: Type.String() });
+  const defineGenericEventConsumer = <
+    TModuleId extends string,
+    TSourceModuleId extends string,
+  >(input: {
+    readonly moduleId: TModuleId;
+    readonly granted: EventToken<
+      TSourceModuleId,
+      "granted",
+      typeof GenericEventPayloadSchema,
+      null
+    >;
+    readonly observed: EventObservation<
+      EventToken<
+        TSourceModuleId,
+        "observed",
+        typeof GenericEventPayloadSchema,
+        null
+      >
+    >;
+  }) =>
+    defineModule(input.moduleId, (module) => {
+      const declaration = module.declare({
+        events: {
+          granted: input.granted,
+          observed: input.observed,
+          owned: GenericEventPayloadSchema,
+          ownedResult: {
+            payload: GenericEventPayloadSchema,
+            outcome: Type.String(),
+          },
+        },
+        queues: { publish: GenericEventPayloadSchema },
+      });
+      if (false) {
+        // @ts-expect-error generic result events still require their owner
+        module.link(declaration, null, {});
+        module.link(declaration, null, {
+          events: {
+            // @ts-expect-error generic result events retain their outcome type
+            ownedResult: () => 1,
+          },
+        });
+      }
+      const registered = module.link(declaration, null, {
+        events: {
+          ownedResult: () => "recorded",
+        },
+        queues: {
+          publish: async ({ work, actions, ledger }) => {
+            actions.emit("owned", work.payload);
+            actions.emit("granted", work.payload);
+            await ledger.emit(declaration.events.owned, work.payload);
+            await ledger.emit(declaration.events.granted, work.payload);
+
+            // @ts-expect-error observations remain read-only in generic modules
+            actions.emit("observed", work.payload);
+            await ledger.emit(
+              // @ts-expect-error observation tokens remain read-only in generic modules
+              declaration.events.observed,
+              work.payload,
+            );
+          },
+        },
+      });
+
+      return module.expose(registered, {});
+    });
   const verifyQuiescenceExports = (
     rootQuiescence: RootLedgerQuiescence,
     moduleQuiescence: LedgerModuleQuiescence,
@@ -99,6 +172,7 @@ if (false) {
   void verifyConcreteQuery;
   void verifyQuiescenceExports;
   void queryGenerically;
+  void defineGenericEventConsumer;
   void defineGenericQueryConsumer;
 
   void (async () => {
@@ -308,6 +382,110 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
 
     assert.deepEqual(errors, []);
     assert.deepEqual(observations, [["alpha", "beta"]]);
+  });
+
+  test(`${driver} event observations react through owned work and explicit continuations`, async () => {
+    await using fixture = await createFixture(driver, "event-observation");
+    const continued: string[][] = [];
+    const Reaction = Type.Object({ moduleIds: Type.Array(Type.String()) });
+    const application = defineLedger((sledge) => {
+      const registry = sledge.install(defineRegistryModule());
+      const destination = sledge.install(
+        defineModule("contract.observation-destination", (module) => {
+          const declaration = module.declare({
+            events: { continued: Reaction },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              continued: ({ event }) => {
+                continued.push([...event.payload.moduleIds]);
+              },
+            },
+          });
+
+          return module.expose(registered, {
+            continued: registered.events.continued,
+          });
+        })(),
+      );
+      const reaction = sledge.install(
+        defineModule("contract.event-observation", (module) => {
+          const declaration = module.declare({
+            events: {
+              configured: registry.observations.configured,
+              continued: destination.continued,
+            },
+            queries: {
+              configuredModuleIds: registry.queries.configuredModuleIds,
+            },
+            queues: { react: Reaction },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              configured: async ({ event, actions }) => {
+                const moduleIds = await actions.query(
+                  "configuredModuleIds",
+                  {},
+                );
+                assert.deepEqual(moduleIds, event.payload.moduleIds);
+                await actions.enqueue("react", {
+                  moduleIds: [...(moduleIds ?? [])],
+                });
+              },
+            },
+            queues: {
+              react: async ({ work, actions, ledger }) => {
+                if (false) {
+                  // @ts-expect-error observations cannot be emitted by name
+                  await actions.emit("configured", work.payload);
+                  await ledger.emit(
+                    // @ts-expect-error observations cannot be emitted by token
+                    declaration.events.configured,
+                    work.payload,
+                  );
+                  await actions.emit("continued", work.payload);
+                  await ledger.emit(declaration.events.continued, work.payload);
+                }
+
+                const unsafeActions = actions as unknown as {
+                  emit(eventName: string, payload: unknown): Promise<unknown>;
+                };
+                assert.throws(
+                  () => unsafeActions.emit("configured", work.payload),
+                  /event observation configured is read-only/,
+                );
+                await actions.emit("continued", work.payload);
+              },
+            },
+          });
+
+          return module.expose(registered, {});
+        })(),
+      );
+
+      return { destination, reaction, registry };
+    });
+    await using opened = await fixture.open(application);
+
+    if (false) {
+      await opened.ledger.emit(
+        // @ts-expect-error observations are not application emission authority
+        opened.capabilities.registry.observations.configured,
+        { moduleIds: ["forbidden"] },
+      );
+    }
+
+    await opened.ledger.emit(opened.capabilities.registry.events.configured, {
+      moduleIds: ["alpha", "beta"],
+    });
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+    await runtime.flush();
+    await workers.waitForIdle({ signal: AbortSignal.timeout(2_000) });
+
+    assert.deepEqual(continued, [["alpha", "beta"]]);
   });
 
   test(`${driver} opens a fresh Sledge application with its installed modules`, async () => {
@@ -827,6 +1005,9 @@ const defineRegistryModuleFactory = defineModule(
 
     return module.expose(registered, {
       events: registered.events,
+      observations: {
+        configured: module.observation(registered.events.configured),
+      },
       queries: registered.queries,
     });
   },

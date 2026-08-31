@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add owner-minted `EventObservation` capabilities for read-only event
+  contribution. An observing module may handle the typed event, query imported
+  state, and enqueue its own work, but only declared `EventToken` capabilities
+  can be emitted or used as operator continuations.
 - Add `querySnapshot(...requests)` to atomically return an ordered tuple of
   validated projection results and the opaque durable-event cursor through
   which they were read. Resuming from that cursor cannot omit an event
