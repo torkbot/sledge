@@ -88,6 +88,7 @@ const materializationMigrationChainStateBrand: unique symbol = Symbol(
   "sledge.materializationMigrationChainState",
 );
 declare const eventTokenTypeBrand: unique symbol;
+declare const eventObservationTypeBrand: unique symbol;
 declare const queryTokenTypeBrand: unique symbol;
 declare const queueTokenTypeBrand: unique symbol;
 declare const signalTokenTypeBrand: unique symbol;
@@ -98,6 +99,7 @@ const ledgerContractTokenMetadata = new WeakMap<
   object,
   LedgerContractMetadata
 >();
+const observedEventTokens = new WeakMap<object, AnyEventToken>();
 const reservedMaterializationSqliteObjectNames = [
   "events",
   "idx_work_coalescing_pending",
@@ -182,6 +184,14 @@ export type EventToken<
   };
 };
 
+/**
+ * Read-only authority to contribute a handler to an event owned by another
+ * module. Only the event's scoped module owner can mint this capability.
+ */
+export type EventObservation<TEvent extends EventToken = EventToken> = {
+  readonly [eventObservationTypeBrand]: TEvent;
+};
+
 export type QueryToken<
   TModuleId extends string = string,
   TName extends string = string,
@@ -233,6 +243,8 @@ type SignalQueueToken<
 };
 
 type AnyEventToken = EventToken<string, string, TSchema, TSchema | null>;
+type AnyEventObservation = EventObservation<AnyEventToken>;
+type AnyEventContractToken = AnyEventToken | AnyEventObservation;
 type AnyQueryToken = QueryToken<string, string, TSchema, TSchema>;
 type AnyQueueToken = QueueToken<string, string, TSchema>;
 type AnySignalToken = SignalToken<string, string, TSchema>;
@@ -288,11 +300,16 @@ type OutcomeEventDefinition<
   readonly outcome: TOutcomeSchema;
 };
 
-type EventDefinition = TSchema | OutcomeEventDefinition | AnyEventToken;
+type EventDefinition =
+  | TSchema
+  | OutcomeEventDefinition
+  | AnyEventToken
+  | AnyEventObservation;
 
 type PrivateSchemaDefinitions<TDefinitions> = {
   readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends
     | AnyEventToken
+    | AnyEventObservation
     | AnyQueryToken
     | AnyQueueToken
     | AnySignalToken
@@ -302,36 +319,54 @@ type PrivateSchemaDefinitions<TDefinitions> = {
 };
 
 type EventSchemaFor<TDefinition> =
-  TDefinition extends EventToken<
-    infer _TModuleId,
-    infer _TName,
-    infer TSchemaToInfer,
-    infer _TOutcomeSchema
+  TDefinition extends EventObservation<
+    EventToken<
+      infer _TObservedModuleId,
+      infer _TObservedName,
+      infer TObservedSchema,
+      infer _TObservedOutcomeSchema
+    >
   >
-    ? TSchemaToInfer
-    : TDefinition extends OutcomeEventDefinition<
-          infer TPayloadSchema,
+    ? TObservedSchema
+    : TDefinition extends EventToken<
+          infer _TModuleId,
+          infer _TName,
+          infer TSchemaToInfer,
           infer _TOutcomeSchema
         >
-      ? TPayloadSchema
-      : TDefinition extends TSchema
-        ? TDefinition
-        : never;
+      ? TSchemaToInfer
+      : TDefinition extends OutcomeEventDefinition<
+            infer TPayloadSchema,
+            infer _TOutcomeSchema
+          >
+        ? TPayloadSchema
+        : TDefinition extends TSchema
+          ? TDefinition
+          : never;
 
 type EventOutcomeSchemaFor<TDefinition> =
-  TDefinition extends EventToken<
-    infer _TModuleId,
-    infer _TName,
-    infer _TPayloadSchema,
-    infer TOutcomeSchema
+  TDefinition extends EventObservation<
+    EventToken<
+      infer _TObservedModuleId,
+      infer _TObservedName,
+      infer _TObservedPayloadSchema,
+      infer TObservedOutcomeSchema
+    >
   >
-    ? TOutcomeSchema
-    : TDefinition extends OutcomeEventDefinition<
+    ? TObservedOutcomeSchema
+    : TDefinition extends EventToken<
+          infer _TModuleId,
+          infer _TName,
           infer _TPayloadSchema,
           infer TOutcomeSchema
         >
       ? TOutcomeSchema
-      : null;
+      : TDefinition extends OutcomeEventDefinition<
+            infer _TPayloadSchema,
+            infer TOutcomeSchema
+          >
+        ? TOutcomeSchema
+        : null;
 
 type EventSchemasFor<TDefinitions extends Record<string, EventDefinition>> = {
   readonly [TName in keyof TDefinitions]: EventSchemaFor<TDefinitions[TName]>;
@@ -349,20 +384,30 @@ type EventTokensFor<
   TModuleId extends string,
   TDefinitions extends Record<string, EventDefinition>,
 > = {
-  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends EventToken<
-    infer _TReferencedModuleId,
-    infer _TReferencedName,
-    infer _TReferencedSchema,
-    infer _TReferencedOutcomeSchema
-  >
+  readonly [TName in keyof TDefinitions]: TDefinitions[TName] extends AnyEventObservation
     ? TDefinitions[TName]
-    : EventToken<
-        TModuleId,
-        Extract<TName, string>,
-        EventSchemaFor<TDefinitions[TName]>,
-        EventOutcomeSchemaFor<TDefinitions[TName]>
-      >;
+    : TDefinitions[TName] extends EventToken<
+          infer _TReferencedModuleId,
+          infer _TReferencedName,
+          infer _TReferencedSchema,
+          infer _TReferencedOutcomeSchema
+        >
+      ? TDefinitions[TName]
+      : EventToken<
+          TModuleId,
+          Extract<TName, string>,
+          EventSchemaFor<TDefinitions[TName]>,
+          EventOutcomeSchemaFor<TDefinitions[TName]>
+        >;
 };
+
+type EmittableEventNames<
+  TEventTokens extends Readonly<Record<string, AnyEventContractToken>>,
+> = {
+  readonly [TEventName in keyof TEventTokens]: TEventTokens[TEventName] extends AnyEventToken
+    ? TEventName
+    : never;
+}[keyof TEventTokens];
 
 type EventTokensForSchemas<
   TModuleId extends string,
@@ -712,8 +757,13 @@ export interface QueueActions<
   TEvents extends Record<string, TSchema>,
   TQueries extends Record<string, AnyQuerySchema>,
   TSignals extends Record<string, TSchema> = {},
+  TEventTokens extends {
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
+  } = EventTokensForSchemas<string, TEvents>,
 > {
-  emit<const TEventName extends keyof TEvents>(
+  emit<
+    const TEventName extends EmittableEventNames<TEventTokens> & keyof TEvents,
+  >(
     eventName: TEventName,
     event: Static<TEvents[TEventName]>,
     options?: EmitOptions,
@@ -940,7 +990,7 @@ export interface EventEnqueueAction<TQueues extends Record<string, TSchema>> {
 
 type EventHandlerResult<
   TModuleId extends string,
-  TEventToken extends AnyEventToken,
+  TEventToken extends AnyEventContractToken,
 > =
   TEventToken extends EventToken<
     infer TOwnerModuleId,
@@ -961,7 +1011,7 @@ type RequiredOwnedResultEventNames<
   TModuleId extends string,
   TEvents extends Record<string, TSchema>,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
 > = {
   readonly [TEventName in keyof TEvents]: TEventTokens[TEventName] extends EventToken<
@@ -988,7 +1038,7 @@ type EventHandlerRegistrations<
   TQueries extends Record<string, AnyQuerySchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
 > = {
   readonly [TEventName in keyof TEvents]?: EventHandlerFunction<
@@ -1024,7 +1074,7 @@ type EventRegistrationProperty<
   TQueries extends Record<string, AnyQuerySchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
 > = [RequiredOwnedResultEventNames<TModuleId, TEvents, TEventTokens>] extends [
   never,
@@ -1082,7 +1132,7 @@ export type QueueHandlerFunction<
   TQueries extends Record<string, AnyQuerySchema>,
   TSignals extends Record<string, TSchema> = {},
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   } = EventTokensForSchemas<string, TEvents>,
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
@@ -1090,9 +1140,9 @@ export type QueueHandlerFunction<
 > = (input: {
   readonly work: QueueWorkItem<TQueues, TQueueName>;
   readonly lease: WorkLease<TQueues, TQueueName>;
-  readonly actions: QueueActions<TEvents, TQueries, TSignals>;
+  readonly actions: QueueActions<TEvents, TQueries, TSignals, TEventTokens>;
   readonly ledger: QueueLedger<
-    TEventTokens[keyof TEventTokens],
+    Extract<TEventTokens[keyof TEventTokens], AnyEventToken>,
     TQueryTokens[keyof TQueryTokens]
   >;
   readonly control: QueueHandlerControl;
@@ -1124,7 +1174,7 @@ export type RegisterFunction<
   TSignalQueues extends Record<string, TSchema> = {},
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string> = {},
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   } = EventTokensForSchemas<string, TEvents>,
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
@@ -1448,7 +1498,7 @@ export type RegisteredLedgerModule<
     AnyMaterializationHistory<TEvents> | null,
   TModuleId extends string = string,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   } = EventTokensForSchemas<TModuleId, TEvents>,
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
@@ -2205,7 +2255,7 @@ export function defineMaterialization<
   const TSignalQueues extends Record<string, TSchema>,
   const TNamespace extends string,
   const TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
 >(
@@ -2256,7 +2306,7 @@ export type DeclaredLedgerModule<
   TSignalQueues extends Record<string, TSchema>,
   TModuleId extends string = string,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   } = EventTokensForSchemas<TModuleId, TEvents>,
   TQueryTokens extends Record<string, AnyQueryToken> = {},
 > = {
@@ -2304,6 +2354,12 @@ type LedgerModuleContractDefinitions<
 /** The scoped construction capability received by one module factory. */
 export interface LedgerModuleDefinition<TModuleId extends string>
   extends LedgerModuleOwner<TModuleId>, OperatorBindingDefinition {
+  observation<
+    const TEvent extends EventToken<TModuleId, string, TSchema, TSchema | null>,
+  >(
+    event: TEvent,
+  ): EventObservation<TEvent>;
+
   declare<
     const TEventDefinitions extends Record<string, EventDefinition>,
     const TQueries extends Record<string, AnyQueryToken>,
@@ -2338,7 +2394,7 @@ export interface LedgerModuleDefinition<TModuleId extends string>
     const TSignals extends Record<string, TSchema>,
     const TSignalQueues extends Record<string, TSchema>,
     const TEventTokens extends {
-      readonly [TEventName in keyof TEvents]: AnyEventToken;
+      readonly [TEventName in keyof TEvents]: AnyEventContractToken;
     },
     const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
     const TMaterializations extends Materializations<
@@ -2412,7 +2468,7 @@ export type LinkedLedgerModule<
     AnyMaterializationHistory<TEvents> | null,
   TModuleId extends string = string,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   } = EventTokensForSchemas<TModuleId, TEvents>,
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
@@ -2584,7 +2640,10 @@ export function defineModule<
     let revealedModule: AnyRegisteredLedgerModule | undefined;
     const ownedDeclarations = new WeakSet<object>();
     const constructionScope = Object.freeze({});
-    const operatorBindings = createOperatorBindingCompiler(moduleId);
+    const operatorBindings = createOperatorBindingCompiler(
+      moduleId,
+      isEventObservation,
+    );
 
     const assertDefinitionOpen = (): void => {
       if (!definitionOpen) {
@@ -2594,6 +2653,25 @@ export function defineModule<
     const readModuleId = (): TModuleId => {
       assertDefinitionOpen();
       return moduleId;
+    };
+    const observation: LedgerModuleDefinition<TModuleId>["observation"] = (
+      event,
+    ) => {
+      assertDefinitionOpen();
+      const metadata = readLedgerContractToken(event, "event");
+
+      if (
+        metadata.moduleId !== moduleId ||
+        !belongsToLedgerModuleConstructionScope(event, constructionScope)
+      ) {
+        throw new Error(
+          `ledger module ${moduleId} cannot grant observation of event ${metadata.moduleId}.${metadata.localName}`,
+        );
+      }
+
+      const capability = Object.freeze({}) as EventObservation<typeof event>;
+      observedEventTokens.set(capability, event);
+      return capability;
     };
     const declare = <
       const TEventDefinitions extends Record<string, EventDefinition>,
@@ -2641,7 +2719,10 @@ export function defineModule<
       });
 
       for (const [localName, definition] of Object.entries(input.events)) {
-        if (isLedgerContractToken(definition)) {
+        if (
+          isLedgerContractToken(definition) ||
+          isEventObservation(definition)
+        ) {
           continue;
         }
 
@@ -2719,7 +2800,7 @@ export function defineModule<
       const publicCapabilities = operatorBindings.reveal(
         capabilities,
         registeredModule.events,
-        isLedgerContractToken,
+        (value) => isLedgerContractToken(value) || isEventObservation(value),
       ) as RevealedModuleCapabilities<typeof capabilities>;
       const contribution = createLedgerModuleContribution(publicCapabilities);
       revealed = contribution;
@@ -2734,6 +2815,7 @@ export function defineModule<
             return readModuleId();
           },
           ...operatorBindings.definition,
+          observation,
           declare,
           link,
           expose,
@@ -2776,7 +2858,7 @@ type LinkedLedgerModuleFor<
   TSignalQueues extends Record<string, TSchema>,
   TModuleId extends string,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
   TMaterializations extends Materializations<
@@ -2838,7 +2920,7 @@ export function linkLedgerModuleInternal<
   const TSignals extends Record<string, TSchema>,
   const TSignalQueues extends Record<string, TSchema>,
   const TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
   const TMaterializations extends Materializations<
@@ -2943,7 +3025,7 @@ function linkMaterializedLedgerModule<
   >,
   const TQueryDefinitions extends LedgerQueryDefinitions,
   const TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   const TDeclaredQueryTokens extends Record<string, AnyQueryToken>,
 >(
@@ -3059,11 +3141,11 @@ function validateQueryDefinitionNames(
 export type AnyRegisteredLedgerModule = {
   readonly [registeredLedgerModelBrand]: true;
   readonly moduleId: string;
-  readonly events: Readonly<Record<string, AnyEventToken>>;
+  readonly events: Readonly<Record<string, AnyEventContractToken>>;
   readonly queries: Readonly<Record<string, AnyQueryToken>>;
   readonly signals: Readonly<Record<string, AnySignalToken>>;
   readonly [registeredLedgerContractsBrand]: {
-    readonly events: Readonly<Record<string, AnyEventToken>>;
+    readonly events: Readonly<Record<string, AnyEventContractToken>>;
     readonly queries: Readonly<Record<string, AnyQueryToken>>;
     readonly queues: Readonly<Record<string, AnyQueueToken>>;
     readonly signals: Readonly<Record<string, AnySignalToken>>;
@@ -3102,7 +3184,12 @@ type ContractValues<TContracts extends Readonly<Record<string, object>>> =
 
 export type RegisteredLedgerModuleEventTokens<TModule> =
   TModule extends AnyRegisteredLedgerModule
-    ? ContractValues<TModule[typeof registeredLedgerContractsBrand]["events"]>
+    ? Extract<
+        ContractValues<
+          TModule[typeof registeredLedgerContractsBrand]["events"]
+        >,
+        AnyEventToken
+      >
     : never;
 
 export type RegisteredLedgerModuleSignalTokens<TModule> =
@@ -3139,7 +3226,10 @@ function composeLedgerModules<
     const moduleContracts = module[registeredLedgerContractsBrand];
 
     for (const token of Object.values(moduleContracts.events)) {
-      const metadata = readLedgerContractToken(token, "event");
+      const metadata = readEventContractToken(token);
+      const ownedToken = isEventObservation(token)
+        ? readObservedEventToken(token)
+        : token;
       const owner = modules.find(
         (candidate) => candidate.moduleId === metadata.moduleId,
       );
@@ -3147,7 +3237,7 @@ function composeLedgerModules<
       if (
         owner === undefined ||
         !Object.values(owner[registeredLedgerContractsBrand].events).includes(
-          token,
+          ownedToken,
         )
       ) {
         throw new Error(
@@ -3318,7 +3408,7 @@ function mergeEventContributionHandlers(
     for (const token of Object.values(
       module[registeredLedgerContractsBrand].events,
     )) {
-      const metadata = readLedgerContractToken(token, "event");
+      const metadata = readEventContractToken(token);
       owners.set(metadata.physicalName, metadata.moduleId);
     }
 
@@ -3401,7 +3491,10 @@ function mergeRootContracts(
     const moduleContracts = module[registeredLedgerContractsBrand];
 
     for (const token of Object.values(moduleContracts.events)) {
-      events[readLedgerContractToken(token, "event").physicalName] = token;
+      const event = isEventObservation(token)
+        ? readObservedEventToken(token)
+        : token;
+      events[readLedgerContractToken(event, "event").physicalName] = event;
     }
 
     for (const token of Object.values(moduleContracts.queues)) {
@@ -4763,7 +4856,7 @@ function createPhysicalRegisteredModule<
   TSignalQueues extends Record<string, TSchema>,
   TIndexerDefinitions extends ProjectionIndexerDefinitions<string>,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;
@@ -4866,7 +4959,7 @@ function createPhysicalRegisteredModule<
   > = {};
 
   for (const [localName, token] of Object.entries(input.contracts.events)) {
-    const eventMetadata = readLedgerContractToken(token, "event");
+    const eventMetadata = readEventContractToken(token);
 
     if (
       eventMetadata.moduleId === input.moduleId &&
@@ -4888,7 +4981,7 @@ function createPhysicalRegisteredModule<
       throw new Error(`unknown event registration ${localName}`);
     }
 
-    const eventMetadata = readLedgerContractToken(token, "event");
+    const eventMetadata = readEventContractToken(token);
     const physicalName = eventMetadata.physicalName;
     const ownsEvent = eventMetadata.moduleId === input.moduleId;
     const previous = events[physicalName];
@@ -4988,12 +5081,12 @@ function createPhysicalRegisteredModule<
         },
         actions: {
           emit: (eventName, event, options) => {
+            const token = readEmittableEventToken(
+              input.contracts.events[eventName],
+              eventName,
+            );
             physicalInput.actions.emit(
-              readTokenPhysicalName(
-                input.contracts.events[eventName],
-                "event",
-                eventName,
-              ),
+              readTokenPhysicalName(token, "event", eventName),
               event,
               options,
             );
@@ -5027,12 +5120,12 @@ function createPhysicalRegisteredModule<
               event,
               "event",
             );
+            const token = readEmittableEventToken(
+              input.contracts.events[localName],
+              localName,
+            );
             return physicalInput.ledger.emit(
-              readTokenPhysicalName(
-                input.contracts.events[localName],
-                "event",
-                localName,
-              ),
+              readTokenPhysicalName(token, "event", localName),
               payload,
               options,
             );
@@ -5218,7 +5311,13 @@ function createPhysicalSchemaMap(
 
   for (const [localName, schema] of Object.entries(schemas)) {
     const token = tokens[localName];
-    physical[readTokenPhysicalName(token, kind, localName)] = schema;
+    const physicalName =
+      kind === "event"
+        ? token === undefined
+          ? readTokenPhysicalName(token, kind, localName)
+          : readEventContractToken(token as AnyEventContractToken).physicalName
+        : readTokenPhysicalName(token, kind, localName);
+    physical[physicalName] = schema;
   }
 
   return physical;
@@ -5230,7 +5329,7 @@ function createPhysicalEventOutcomeMap(
   const physical: Record<string, TSchema | null> = {};
 
   for (const token of Object.values(tokens)) {
-    const metadata = readLedgerContractToken(token, "event");
+    const metadata = readEventContractToken(token as AnyEventContractToken);
     physical[metadata.physicalName] = metadata.outcome;
   }
 
@@ -5326,7 +5425,7 @@ function validatePrivateSchemaDefinitions(
   definitions: Readonly<Record<string, unknown>>,
 ): void {
   for (const [name, definition] of Object.entries(definitions)) {
-    if (isLedgerContractToken(definition)) {
+    if (isLedgerContractToken(definition) || isEventObservation(definition)) {
       throw new Error(`${kind} ${name} must be defined by its owning module`);
     }
   }
@@ -5349,9 +5448,15 @@ function createEventTokens<
   moduleId: TModuleId,
   definitions: TDefinitions,
 ): EventTokensFor<TModuleId, TDefinitions> {
-  const tokens: Record<string, AnyEventToken> = {};
+  const tokens: Record<string, AnyEventContractToken> = {};
 
   for (const [localName, definition] of Object.entries(definitions)) {
+    if (isEventObservation(definition)) {
+      readEventContractToken(definition);
+      defineRecordEntry(tokens, localName, definition);
+      continue;
+    }
+
     if (isLedgerContractToken(definition)) {
       const metadata = readLedgerContractToken(definition, "event");
       defineRecordEntry(tokens, localName, definition as AnyEventToken);
@@ -5396,9 +5501,11 @@ function readEventSchemas<TDefinitions extends Record<string, EventDefinition>>(
     defineRecordEntry(
       schemas,
       localName,
-      isLedgerContractToken(definition)
-        ? readLedgerContractToken(definition, "event").schema
-        : (outcomeDefinition?.payload ?? (definition as TSchema)),
+      isEventObservation(definition)
+        ? readEventContractToken(definition).schema
+        : isLedgerContractToken(definition)
+          ? readLedgerContractToken(definition, "event").schema
+          : (outcomeDefinition?.payload ?? (definition as TSchema)),
     );
   }
 
@@ -5418,9 +5525,11 @@ function readEventOutcomeSchemas<
     defineRecordEntry(
       schemas,
       localName,
-      isLedgerContractToken(definition)
-        ? readLedgerContractToken(definition, "event").outcome
-        : (outcomeDefinition?.outcome ?? null),
+      isEventObservation(definition)
+        ? readEventContractToken(definition).outcome
+        : isLedgerContractToken(definition)
+          ? readLedgerContractToken(definition, "event").outcome
+          : (outcomeDefinition?.outcome ?? null),
     );
   }
 
@@ -5583,6 +5692,50 @@ function isLedgerContractToken(value: unknown): value is object {
     value !== null &&
     ledgerContractTokenMetadata.has(value)
   );
+}
+
+function isEventObservation(value: unknown): value is AnyEventObservation {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    observedEventTokens.has(value)
+  );
+}
+
+function readObservedEventToken(
+  observation: AnyEventObservation,
+): AnyEventToken {
+  const event = observedEventTokens.get(observation);
+
+  if (event === undefined) {
+    throw new Error("expected Sledge event observation");
+  }
+
+  return event;
+}
+
+function readEventContractToken(
+  token: AnyEventContractToken,
+): Extract<LedgerContractMetadata, { readonly kind: "event" }> {
+  return readLedgerContractToken(
+    isEventObservation(token) ? readObservedEventToken(token) : token,
+    "event",
+  );
+}
+
+function readEmittableEventToken(
+  token: AnyEventContractToken | undefined,
+  localName: string,
+): AnyEventToken {
+  if (token === undefined) {
+    throw new Error(`unknown event: ${localName}`);
+  }
+
+  if (isEventObservation(token)) {
+    throw new Error(`event observation ${localName} is read-only`);
+  }
+
+  return token;
 }
 
 function readLedgerContractToken<TKind extends LedgerContractMetadata["kind"]>(
@@ -5751,7 +5904,7 @@ function createModuleProjectionStatementCompiler(
   compiler: ProjectionStatementCompiler,
   moduleId: string,
   contracts: {
-    readonly events: Readonly<Record<string, AnyEventToken>>;
+    readonly events: Readonly<Record<string, AnyEventContractToken>>;
     readonly signals: Readonly<Record<string, AnySignalToken>>;
   },
 ): ProjectionStatementCompiler {
@@ -5761,7 +5914,14 @@ function createModuleProjectionStatementCompiler(
   ): string => {
     const tokens =
       streamKind === "event" ? contracts.events : contracts.signals;
-    return readTokenPhysicalName(tokens[localName], streamKind, localName);
+    const token = tokens[localName];
+
+    if (streamKind === "event" && token !== undefined) {
+      return readEventContractToken(token as AnyEventContractToken)
+        .physicalName;
+    }
+
+    return readTokenPhysicalName(token, streamKind, localName);
   };
 
   return {
@@ -5894,7 +6054,7 @@ function createLinkedLedgerModule<
   TAllQueryDefinitions extends ProjectionQueryDefinitions,
   TMaterializationHistory extends AnyMaterializationHistory<TEvents> | null,
   TEventTokens extends {
-    readonly [TEventName in keyof TEvents]: AnyEventToken;
+    readonly [TEventName in keyof TEvents]: AnyEventContractToken;
   },
   TQueryTokens extends {
     readonly [TQueryName in keyof TQueries]: AnyQueryToken;

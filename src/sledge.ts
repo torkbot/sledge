@@ -27,6 +27,7 @@ export {
   type SerializedExceptionFrame,
 } from "./exception.ts";
 export type {
+  EventObservation,
   LedgerCursor,
   LedgerModuleContribution,
   LedgerModuleDefinition,

@@ -310,6 +310,110 @@ for (const driver of ["better-sqlite3", "turso"] as const) {
     assert.deepEqual(observations, [["alpha", "beta"]]);
   });
 
+  test(`${driver} event observations react through owned work and explicit continuations`, async () => {
+    await using fixture = await createFixture(driver, "event-observation");
+    const continued: string[][] = [];
+    const Reaction = Type.Object({ moduleIds: Type.Array(Type.String()) });
+    const application = defineLedger((sledge) => {
+      const registry = sledge.install(defineRegistryModule());
+      const destination = sledge.install(
+        defineModule("contract.observation-destination", (module) => {
+          const declaration = module.declare({
+            events: { continued: Reaction },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              continued: ({ event }) => {
+                continued.push([...event.payload.moduleIds]);
+              },
+            },
+          });
+
+          return module.expose(registered, {
+            continued: registered.events.continued,
+          });
+        })(),
+      );
+      const reaction = sledge.install(
+        defineModule("contract.event-observation", (module) => {
+          const declaration = module.declare({
+            events: {
+              configured: registry.observations.configured,
+              continued: destination.continued,
+            },
+            queries: {
+              configuredModuleIds: registry.queries.configuredModuleIds,
+            },
+            queues: { react: Reaction },
+          });
+          const registered = module.link(declaration, null, {
+            events: {
+              configured: async ({ event, actions }) => {
+                const moduleIds = await actions.query(
+                  "configuredModuleIds",
+                  {},
+                );
+                assert.deepEqual(moduleIds, event.payload.moduleIds);
+                await actions.enqueue("react", {
+                  moduleIds: [...(moduleIds ?? [])],
+                });
+              },
+            },
+            queues: {
+              react: async ({ work, actions, ledger }) => {
+                if (false) {
+                  // @ts-expect-error observations cannot be emitted by name
+                  await actions.emit("configured", work.payload);
+                  await ledger.emit(
+                    // @ts-expect-error observations cannot be emitted by token
+                    declaration.events.configured,
+                    work.payload,
+                  );
+                  await actions.emit("continued", work.payload);
+                  await ledger.emit(declaration.events.continued, work.payload);
+                }
+
+                const unsafeActions = actions as unknown as {
+                  emit(eventName: string, payload: unknown): Promise<unknown>;
+                };
+                assert.throws(
+                  () => unsafeActions.emit("configured", work.payload),
+                  /event observation configured is read-only/,
+                );
+                await actions.emit("continued", work.payload);
+              },
+            },
+          });
+
+          return module.expose(registered, {});
+        })(),
+      );
+
+      return { destination, reaction, registry };
+    });
+    await using opened = await fixture.open(application);
+
+    if (false) {
+      await opened.ledger.emit(
+        // @ts-expect-error observations are not application emission authority
+        opened.capabilities.registry.observations.configured,
+        { moduleIds: ["forbidden"] },
+      );
+    }
+
+    await opened.ledger.emit(opened.capabilities.registry.events.configured, {
+      moduleIds: ["alpha", "beta"],
+    });
+    await using workers = await opened.ledger.startWorkers({
+      configureQueue: () => ({ maxInFlight: 1 }),
+      scheduler: runtime.scheduler,
+    });
+    await runtime.flush();
+    await workers.waitForIdle({ signal: AbortSignal.timeout(2_000) });
+
+    assert.deepEqual(continued, [["alpha", "beta"]]);
+  });
+
   test(`${driver} opens a fresh Sledge application with its installed modules`, async () => {
     await using fixture = await createFixture(driver, "fresh");
     const application = defineLedger((sledge) => {
@@ -827,6 +931,9 @@ const defineRegistryModuleFactory = defineModule(
 
     return module.expose(registered, {
       events: registered.events,
+      observations: {
+        configured: module.observation(registered.events.configured),
+      },
       queries: registered.queries,
     });
   },

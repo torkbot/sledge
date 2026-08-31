@@ -310,6 +310,9 @@ const defineUsersModule = defineModule("app.users", (module) => {
 
   return module.expose(registered, {
     events: registered.events,
+    observations: {
+      created: module.observation(registered.events.created),
+    },
   });
 });
 ```
@@ -331,7 +334,7 @@ const defineAuditModule = defineModule(
   "app.audit",
   (module, users: UsersPort) => {
     const declaration = module.declare({
-      events: { userCreated: users.events.created },
+      events: { userCreated: users.observations.created },
     });
     const registered = module.link(declaration, null, {
       events: {
@@ -604,10 +607,18 @@ boundary contracts with TypeBox:
 `events` is required. Omit `queries`, `queues`, `signals`, or `signalQueues`
 when the module does not define contracts in that category. Imported queries
 do not give the module ownership of another projection; they name an explicit
-read capability that its private durable work may invoke. Plain event definitions
-create contracts owned by that module and produce opaque event tokens such as
-`declaration.events["user.created"]`. Runtime APIs accept these tokens
-instead of string names.
+read capability that its private durable work may invoke. Plain event
+definitions create contracts owned by that module and produce opaque event
+tokens such as `declaration.events["user.created"]`. Runtime APIs accept these
+tokens instead of string names.
+
+An event owner may grant handler-only access with
+`module.observation(eventToken)`. A module declaring that `EventObservation`
+can handle the typed event, query declared state, and enqueue its own durable
+work in the append transaction. Experimental operator graphs may import it as
+a source. It cannot be emitted from a queue or used as an operator
+continuation. Grant an `EventToken` only when the consumer is also allowed to
+emit that event.
 
 Module construction has no standalone equivalent. `module.declare(...)` and
 `module.link(...)` are scoped to the current factory invocation so identity and
