@@ -105,5 +105,10 @@ export async function raceWithSignal<T>(
     ]);
   } finally {
     signal.removeEventListener("abort", onAbort);
+    // Suppress any rejection from operation that arrives after the signal
+    // already won the race. Without this, a post-abort rejection on
+    // operation.then(...) has no active handler and triggers
+    // UnhandledPromiseRejection in Node.js 15+.
+    void operation.catch(() => undefined);
   }
 }
