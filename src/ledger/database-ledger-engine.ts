@@ -5449,6 +5449,7 @@ function openDatabaseLedgerEngine<
 
       const nowMs = clock.nowMs();
       let cancelledLeaseId: string | null = null;
+      let wasAlreadyTerminal = false;
       const work = await runInTransaction(async (database) => {
         const existing = await readWorkSnapshotByRef(database, ref);
 
@@ -5457,10 +5458,12 @@ function openDatabaseLedgerEngine<
         }
 
         if (existing.state === "dead") {
+          wasAlreadyTerminal = true;
           return existing;
         }
 
         if (existing.state === "cancelled") {
+          wasAlreadyTerminal = true;
           cancelledLeaseId = existing.lease?.leaseId ?? null;
           return existing;
         }
@@ -5512,7 +5515,7 @@ function openDatabaseLedgerEngine<
         };
       }
 
-      if (work.state === "dead") {
+      if (wasAlreadyTerminal) {
         return {
           status: "already_terminal",
           ref,
