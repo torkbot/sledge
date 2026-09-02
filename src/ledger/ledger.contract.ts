@@ -2950,7 +2950,9 @@ export function runLedgerContractSuite(input: {
             reason: "recover cancellation settlement",
           });
 
-          assert.equal(recoveredCancellation.status, "cancelled");
+          // After restart the work is already in cancelled state, so a
+          // second cancelWork call must return "already_terminal" (issue #70).
+          assert.equal(recoveredCancellation.status, "already_terminal");
         });
       },
     );

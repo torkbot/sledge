@@ -5092,3 +5092,156 @@ test("enqueue option types keep coalescing off signal queues", () => {
     },
   });
 });
+// Regression test for issue #70:
+// cancelWork previously returned { status: "cancelled" } for already-cancelled
+// work instead of { status: "already_terminal" }. The dead branch was correct;
+// the cancelled branch was not. Both must now return "already_terminal".
+
+test("cancelWork returns already_terminal on second call for same ref (issue #70)", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+
+  // workKey is required for the engine to assign a WorkRef.
+  const model = defineEngineFixtureModel({
+    events: { "job.requested": Type.Object({ id: Type.Number() }) },
+    queues: { "job.run": Type.Object({ id: Type.Number() }) },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            { workKey: `job:${event.payload.id}` },
+          );
+        },
+      },
+      // No workers started — work stays pending so we can cancel it twice.
+      queues: { "job.run": () => {} },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+  });
+
+  await ledger.emit("job.requested", { id: 1 });
+  const [work] = await ledger.listWork();
+
+  assert.notEqual(work, undefined);
+  assert.ok(work.ref !== null, "expected work to have a ref — workKey must be set");
+
+  // First cancellation — fresh, must return "cancelled".
+  const first = await ledger.cancelWork({ ref: work.ref, reason: "first" });
+  assert.equal(first.status, "cancelled");
+  assert.equal(first.work.state, "cancelled");
+
+  // Second cancellation — idempotent, must return "already_terminal".
+  const second = await ledger.cancelWork({ ref: work.ref, reason: "duplicate" });
+  assert.equal(second.status, "already_terminal");
+  assert.equal(second.work.state, "cancelled");
+});
+
+test("cancelWork work snapshot on already_terminal matches the cancelled record", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+
+  const model = defineEngineFixtureModel({
+    events: { "job.requested": Type.Object({ id: Type.Number() }) },
+    queues: { "job.run": Type.Object({ id: Type.Number() }) },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            { workKey: `job:${event.payload.id}` },
+          );
+        },
+      },
+      queues: { "job.run": () => {} },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+  });
+
+  await ledger.emit("job.requested", { id: 2 });
+  const [work] = await ledger.listWork();
+  assert.ok(work !== undefined && work.ref !== null, "expected work ref");
+
+  await ledger.cancelWork({ ref: work.ref, reason: "original" });
+
+  const second = await ledger.cancelWork({ ref: work.ref });
+  assert.equal(second.status, "already_terminal");
+
+  // The snapshot on the result must match what queryWork returns.
+  const stored = await ledger.queryWork({ workId: work.workId });
+  assert.deepEqual(second.work, stored);
+});
+
+test("cancelWork still returns already_terminal for dead work (regression guard)", async () => {
+  const runtime = new VirtualRuntimeHarness(1_900_000_000_000);
+  const databaseUrl = createTempDatabasePath();
+
+  const model = defineEngineFixtureModel({
+    events: {
+      "job.requested": Type.Object({ id: Type.Number() }),
+    },
+    queues: {
+      "job.run": Type.Object({ id: Type.Number() }),
+    },
+    indexers: {},
+    queries: {},
+    register: {
+      events: {
+        "job.requested": ({ event, actions }) => {
+          actions.enqueue(
+            "job.run",
+            { id: event.payload.id },
+            { workKey: `job:${event.payload.id}` },
+          );
+        },
+      },
+      queues: {
+        "job.run": ({ control }) => {
+          control.deadLetter("permanent failure");
+        },
+      },
+    },
+  });
+
+  await using ledger = createBetterSqliteLedger({
+    databaseUrl,
+    model: model.withImplementations({ indexers: {}, queries: {} }),
+    timing: { clock: runtime.clock, scheduler: runtime.scheduler },
+  });
+  await using _workers = await ledger.startWorkers({
+    configureQueue: () => ({ maxInFlight: 1 }),
+    scheduler: runtime.scheduler,
+  });
+
+  await ledger.emit("job.requested", { id: 3 });
+
+  // Wait until the handler dead-letters the work.
+  await waitFor(runtime, async () => {
+    const [item] = await ledger.listWork({ states: ["dead"] });
+    return item !== undefined;
+  });
+
+  const [deadWork] = await ledger.listWork({ states: ["dead"] });
+  assert.ok(deadWork !== undefined);
+  assert.ok(deadWork.ref !== null, "expected work to have a ref");
+
+  const result = await ledger.cancelWork({ ref: deadWork.ref });
+  assert.equal(result.status, "already_terminal");
+  assert.equal(result.work.state, "dead");
+});
